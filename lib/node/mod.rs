@@ -20,11 +20,11 @@ use crate::{
     mempool::{self, MemPool},
     net::{self, Net, Peer},
     state::{
-        self, AmmPair, AmmPoolState, BitAssetSeqId, DutchAuctionState, State,
+        self, AmmPair, AmmPoolState, TruthcoinSeqId, DutchAuctionState, State,
     },
     types::{
         Address, AmountOverflowError, AmountUnderflowError, AssetId,
-        Authorized, AuthorizedTransaction, BitAssetData, BitAssetId, Block,
+        Authorized, AuthorizedTransaction, TruthcoinData, TruthcoinId, Block,
         BlockHash, BmmResult, Body, DutchAuctionId, FilledOutput,
         FilledTransaction, GetBitcoinValue, Header, InPoint, Network, OutPoint,
         OutPointKey, Output, SpentOutput, Tip, Transaction, TxIn, Txid,
@@ -323,36 +323,36 @@ where
         Ok(res)
     }
 
-    /// List all BitAssets and their current data
-    pub fn bitassets(
+    /// List all Truthcoin and their current data
+    pub fn truthcoin(
         &self,
-    ) -> Result<Vec<(BitAssetSeqId, BitAssetId, BitAssetData)>, Error> {
+    ) -> Result<Vec<(TruthcoinSeqId, TruthcoinId, TruthcoinData)>, Error> {
         let rotxn = self.env.read_txn()?;
-        let bitasset_ids_to_data: HashMap<_, _> = self
+        let truthcoin_ids_to_data: HashMap<_, _> = self
             .state
-            .bitassets()
-            .bitassets()
+            .truthcoin()
+            .truthcoin()
             .iter(&rotxn)
             .map_err(state::Error::from)?
             .map_err(state::Error::from)
-            .map(|(bitasset_id, bitasset_data)| {
-                Ok((bitasset_id, bitasset_data.current()))
+            .map(|(truthcoin_id, truthcoin_data)| {
+                Ok((truthcoin_id, truthcoin_data.current()))
             })
             .collect()?;
         let res = self
             .state
-            .bitassets()
-            .seq_to_bitasset()
+            .truthcoin()
+            .seq_to_truthcoin()
             .iter(&rotxn)
             .map_err(state::Error::from)?
             .map_err(state::Error::from)
-            .map(|(bitasset_seq_id, bitasset_id)| {
-                let bitasset_data = bitasset_ids_to_data
-                    .get(&bitasset_id)
-                    .ok_or_else(|| state::error::BitAsset::Missing {
-                        bitasset: bitasset_id,
+            .map(|(truthcoin_seq_id, truthcoin_id)| {
+                let truthcoin_data = truthcoin_ids_to_data
+                    .get(&truthcoin_id)
+                    .ok_or_else(|| state::error::Truthcoin::Missing {
+                        truthcoin: truthcoin_id,
                     })?;
-                Ok((bitasset_seq_id, bitasset_id, bitasset_data.clone()))
+                Ok((truthcoin_seq_id, truthcoin_id, truthcoin_data.clone()))
             })
             .collect()?;
         Ok(res)
@@ -435,45 +435,45 @@ where
         Ok(self.archive.is_descendant(&rotxn, ancestor, descendant)?)
     }
 
-    /** Resolve bitasset data at the specified block height.
+    /** Resolve truthcoin data at the specified block height.
      * Returns an error if it does not exist.rror if it does not exist. */
-    pub fn get_bitasset_data_at_block_height(
+    pub fn get_truthcoin_data_at_block_height(
         &self,
-        bitasset: &BitAssetId,
+        truthcoin: &TruthcoinId,
         height: u32,
-    ) -> Result<BitAssetData, Error> {
+    ) -> Result<TruthcoinData, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self
             .state
-            .bitassets()
-            .get_bitasset_data_at_block_height(&rotxn, bitasset, height)
-            .map_err(state::Error::BitAsset)?)
+            .truthcoin()
+            .get_truthcoin_data_at_block_height(&rotxn, truthcoin, height)
+            .map_err(state::Error::Truthcoin)?)
     }
 
-    /// resolve current bitasset data, if it exists
-    pub fn try_get_current_bitasset_data(
+    /// resolve current truthcoin data, if it exists
+    pub fn try_get_current_truthcoin_data(
         &self,
-        bitasset: &BitAssetId,
-    ) -> Result<Option<BitAssetData>, Error> {
+        truthcoin: &TruthcoinId,
+    ) -> Result<Option<TruthcoinData>, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self
             .state
-            .bitassets()
-            .try_get_current_bitasset_data(&rotxn, bitasset)
-            .map_err(state::Error::BitAsset)?)
+            .truthcoin()
+            .try_get_current_truthcoin_data(&rotxn, truthcoin)
+            .map_err(state::Error::Truthcoin)?)
     }
 
-    /// Resolve current bitasset data. Returns an error if it does not exist.
-    pub fn get_current_bitasset_data(
+    /// Resolve current truthcoin data. Returns an error if it does not exist.
+    pub fn get_current_truthcoin_data(
         &self,
-        bitasset: &BitAssetId,
-    ) -> Result<BitAssetData, Error> {
+        truthcoin: &TruthcoinId,
+    ) -> Result<TruthcoinData, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self
             .state
-            .bitassets()
-            .get_current_bitasset_data(&rotxn, bitasset)
-            .map_err(state::Error::BitAsset)?)
+            .truthcoin()
+            .get_current_truthcoin_data(&rotxn, truthcoin)
+            .map_err(state::Error::Truthcoin)?)
     }
 
     pub fn submit_transaction(

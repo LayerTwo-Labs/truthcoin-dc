@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<std::process::ExitCode> {
     let rt_handle = tokio::runtime::Handle::current();
     // Read env vars
     if let Some(env_filepath) =
-        std::env::var_os("BITASSETS_INTEGRATION_TEST_ENV")
+        std::env::var_os("TRUTHCOIN_INTEGRATION_TEST_ENV")
     {
         let env_filepath: &std::path::Path = env_filepath.as_ref();
         tracing::info!("Adding env vars from `{}`", env_filepath.display());

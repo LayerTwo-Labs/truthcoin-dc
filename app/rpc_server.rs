@@ -8,19 +8,19 @@ use jsonrpsee::{
     types::ErrorObject,
 };
 
-use plain_bitassets::{
+use truthcoin_dc::{
     authorization::{self, Dst, Signature},
     net::Peer,
-    state::{self, AmmPair, AmmPoolState, BitAssetSeqId, DutchAuctionState},
+    state::{self, AmmPair, AmmPoolState, TruthcoinSeqId, DutchAuctionState},
     types::{
-        Address, AssetId, Authorization, BitAssetData, BitAssetId, Block,
+        Address, AssetId, Authorization, TruthcoinData, TruthcoinId, Block,
         BlockHash, DutchAuctionId, DutchAuctionParams, EncryptionPubKey,
         FilledOutputContent, PointedOutput, Transaction, Txid, VerifyingKey,
         WithdrawalBundle, keys::Ecies,
     },
     wallet::Balance,
 };
-use plain_bitassets_app_rpc_api::{RpcServer, TxInfo};
+use truthcoin_dc_app_rpc_api::{RpcServer, TxInfo};
 use tower_http::{
     request_id::{
         MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
@@ -151,20 +151,20 @@ impl RpcServer for RpcServerImpl {
         Ok(amount_receive)
     }
 
-    async fn bitasset_data(
+    async fn truthcoin_data(
         &self,
-        bitasset_id: BitAssetId,
-    ) -> RpcResult<BitAssetData> {
+        truthcoin_id: TruthcoinId,
+    ) -> RpcResult<TruthcoinData> {
         self.app
             .node
-            .get_current_bitasset_data(&bitasset_id)
+            .get_current_truthcoin_data(&truthcoin_id)
             .map_err(custom_err)
     }
 
-    async fn bitassets(
+    async fn truthcoin(
         &self,
-    ) -> RpcResult<Vec<(BitAssetSeqId, BitAssetId, BitAssetData)>> {
-        self.app.node.bitassets().map_err(custom_err)
+    ) -> RpcResult<Vec<(TruthcoinSeqId, TruthcoinId, TruthcoinData)>> {
+        self.app.node.truthcoin().map_err(custom_err)
     }
 
     async fn bitcoin_balance(&self) -> RpcResult<Balance> {
@@ -397,7 +397,7 @@ impl RpcServer for RpcServerImpl {
 
     async fn get_bmm_inclusions(
         &self,
-        block_hash: plain_bitassets::types::BlockHash,
+        block_hash: truthcoin_dc::types::BlockHash,
     ) -> RpcResult<Vec<bitcoin::BlockHash>> {
         self.app
             .node
@@ -559,7 +559,7 @@ impl RpcServer for RpcServerImpl {
 
     async fn openapi_schema(&self) -> RpcResult<utoipa::openapi::OpenApi> {
         let res =
-            <plain_bitassets_app_rpc_api::RpcDoc as utoipa::OpenApi>::openapi();
+            <truthcoin_dc_app_rpc_api::RpcDoc as utoipa::OpenApi>::openapi();
         Ok(res)
     }
 
@@ -572,18 +572,18 @@ impl RpcServer for RpcServerImpl {
             .map_err(custom_err)
     }
 
-    async fn register_bitasset(
+    async fn register_truthcoin(
         &self,
         plain_name: String,
         initial_supply: u64,
-        bitasset_data: Option<BitAssetData>,
+        truthcoin_data: Option<TruthcoinData>,
     ) -> RpcResult<Txid> {
         let mut tx = Transaction::default();
-        let bitasset_data = Cow::Owned(bitasset_data.unwrap_or_default());
-        let () = match self.app.wallet.register_bitasset(
+        let truthcoin_data = Cow::Owned(truthcoin_data.unwrap_or_default());
+        let () = match self.app.wallet.register_truthcoin(
             &mut tx,
             &plain_name,
-            bitasset_data,
+            truthcoin_data,
             initial_supply,
         ) {
             Ok(()) => (),
@@ -598,9 +598,9 @@ impl RpcServer for RpcServerImpl {
         self.app.node.remove_from_mempool(txid).map_err(custom_err)
     }
 
-    async fn reserve_bitasset(&self, plain_name: String) -> RpcResult<Txid> {
+    async fn reserve_truthcoin(&self, plain_name: String) -> RpcResult<Txid> {
         let mut tx = Transaction::default();
-        let () = match self.app.wallet.reserve_bitasset(&mut tx, &plain_name) {
+        let () = match self.app.wallet.reserve_truthcoin(&mut tx, &plain_name) {
             Ok(()) => (),
             Err(err) => return Err(custom_err(err)),
         };
@@ -677,10 +677,10 @@ impl RpcServer for RpcServerImpl {
         Ok(txid)
     }
 
-    async fn transfer_bitasset(
+    async fn transfer_truthcoin(
         &self,
         dest: Address,
-        asset_id: BitAssetId,
+        asset_id: TruthcoinId,
         amount: u64,
         fee_sats: u64,
         memo: Option<String>,
@@ -695,7 +695,7 @@ impl RpcServer for RpcServerImpl {
         let tx = self
             .app
             .wallet
-            .create_bitasset_transfer(
+            .create_truthcoin_transfer(
                 dest,
                 asset_id,
                 amount,

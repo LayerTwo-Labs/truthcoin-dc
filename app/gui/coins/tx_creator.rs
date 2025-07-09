@@ -8,10 +8,10 @@ use std::{
 use eframe::egui::{self, InnerResponse, Response, TextBuffer};
 use hex::FromHex;
 
-use plain_bitassets::{
+use truthcoin_dc::{
     state::AmmPair,
     types::{
-        AssetId, BitAssetData, DutchAuctionId, EncryptionPubKey, Hash,
+        AssetId, TruthcoinData, DutchAuctionId, EncryptionPubKey, Hash,
         Transaction, Txid, VerifyingKey,
     },
 };
@@ -26,9 +26,9 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrySetOption<T>(Result<Option<T>, String>);
 
-// try to set BitAsset Data
+// try to set Truthcoin Data
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TrySetBitAssetData {
+pub struct TrySetTruthcoinData {
     /// commitment to arbitrary data
     pub commitment: TrySetOption<Hash>,
     /// optional ipv4 addr
@@ -60,10 +60,10 @@ pub struct DutchAuctionParams {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct BitAssetRegistration {
+pub struct TruthcoinRegistration {
     plaintext_name: String,
     initial_supply: String,
-    bitasset_data: Box<TrySetBitAssetData>,
+    truthcoin_data: Box<TrySetTruthcoinData>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -95,10 +95,10 @@ pub struct DexSwap {
 pub enum TxType {
     #[default]
     Regular,
-    #[strum(to_string = "Register BitAsset")]
-    BitAssetRegistration(BitAssetRegistration),
-    #[strum(to_string = "Reserve BitAsset")]
-    BitAssetReservation { plaintext_name: String },
+    #[strum(to_string = "Register Truthcoin")]
+    TruthcoinRegistration(TruthcoinRegistration),
+    #[strum(to_string = "Reserve Truthcoin")]
+    TruthcoinReservation { plaintext_name: String },
     #[strum(to_string = "DEX (Burn Position)")]
     DexBurn(DexBurn),
     #[strum(to_string = "DEX (Mint Position)")]
@@ -132,16 +132,16 @@ impl<T> std::default::Default for TrySetOption<T> {
     }
 }
 
-impl TryFrom<TrySetBitAssetData> for BitAssetData {
+impl TryFrom<TrySetTruthcoinData> for TruthcoinData {
     type Error = String;
 
-    fn try_from(try_set: TrySetBitAssetData) -> Result<Self, Self::Error> {
+    fn try_from(try_set: TrySetTruthcoinData) -> Result<Self, Self::Error> {
         fn parse_err_msg<E: Display>(
             item_name: &str,
         ) -> impl Fn(E) -> String + '_ {
             move |err| format!("Cannot parse {item_name}: \"{err}\"")
         }
-        let TrySetBitAssetData {
+        let TrySetTruthcoinData {
             commitment,
             socket_addr_v4,
             socket_addr_v6,
@@ -158,7 +158,7 @@ impl TryFrom<TrySetBitAssetData> for BitAssetData {
             .map_err(parse_err_msg("encryption pubkey"))?;
         let signing_pubkey =
             signing_pubkey.0.map_err(parse_err_msg("signing pubkey"))?;
-        Ok(BitAssetData {
+        Ok(TruthcoinData {
             commitment,
             socket_addr_v4,
             socket_addr_v6,
@@ -194,24 +194,24 @@ where
 }
 
 impl TxCreator {
-    fn set_bitasset_registration(
+    fn set_truthcoin_registration(
         app: &App,
         mut tx: Transaction,
-        bitasset_registration: &BitAssetRegistration,
+        truthcoin_registration: &TruthcoinRegistration,
     ) -> anyhow::Result<Transaction> {
-        let bitasset_data: BitAssetData =
-            (bitasset_registration.bitasset_data.as_ref())
+        let truthcoin_data: TruthcoinData =
+            (truthcoin_registration.truthcoin_data.as_ref())
                 .clone()
                 .try_into()
                 .map_err(|err| anyhow::anyhow!("{err}"))?;
         let initial_supply =
-            u64::from_str(&bitasset_registration.initial_supply).map_err(
+            u64::from_str(&truthcoin_registration.initial_supply).map_err(
                 |err| anyhow::anyhow!("Failed to parse initial supply: {err}"),
             )?;
-        let () = app.wallet.register_bitasset(
+        let () = app.wallet.register_truthcoin(
             &mut tx,
-            &bitasset_registration.plaintext_name,
-            Cow::Borrowed(&bitasset_data),
+            &truthcoin_registration.plaintext_name,
+            Cow::Borrowed(&truthcoin_data),
             initial_supply,
         )?;
         Ok(tx)
@@ -418,7 +418,7 @@ impl TxCreator {
             u64::from_str(&auction_params.final_price).map_err(|err| {
                 anyhow::anyhow!("Failed to parse final price: {err}")
             })?;
-        let dutch_auction_params = plain_bitassets::types::DutchAuctionParams {
+        let dutch_auction_params = truthcoin_dc::types::DutchAuctionParams {
             start_block,
             duration,
             base_asset,
@@ -441,12 +441,12 @@ impl TxCreator {
     ) -> anyhow::Result<Transaction> {
         match &self.tx_type {
             TxType::Regular => Ok(tx),
-            TxType::BitAssetRegistration(bitasset_registration) => {
-                Self::set_bitasset_registration(app, tx, bitasset_registration)
+            TxType::TruthcoinRegistration(truthcoin_registration) => {
+                Self::set_truthcoin_registration(app, tx, truthcoin_registration)
             }
-            TxType::BitAssetReservation { plaintext_name } => {
+            TxType::TruthcoinReservation { plaintext_name } => {
                 let () =
-                    app.wallet.reserve_bitasset(&mut tx, plaintext_name)?;
+                    app.wallet.reserve_truthcoin(&mut tx, plaintext_name)?;
                 Ok(tx)
             }
             TxType::DexBurn(dex_burn) => Self::set_dex_burn(app, tx, dex_burn),
@@ -527,17 +527,17 @@ impl TxCreator {
         }
     }
 
-    pub(in crate::gui) fn show_bitasset_options(
+    pub(in crate::gui) fn show_truthcoin_options(
         ui: &mut egui::Ui,
-        bitasset_data: &mut TrySetBitAssetData,
+        truthcoin_data: &mut TrySetTruthcoinData,
     ) -> Response {
         let commitment_resp = ui.horizontal(|ui| {
             ui.monospace("Commitment:       ")
                 | Self::show_option_field_default(
                     ui,
-                    "bitasset_data_commitment",
+                    "truthcoin_data_commitment",
                     Default::default(),
-                    &mut bitasset_data.commitment,
+                    &mut truthcoin_data.commitment,
                     Hash::from_hex,
                     |commitment| hex::encode(commitment),
                 )
@@ -546,9 +546,9 @@ impl TxCreator {
             ui.monospace("IPv4 Address:       ")
                 | Self::show_option_field_default(
                     ui,
-                    "bitasset_data_ipv4",
+                    "truthcoin_data_ipv4",
                     SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 3000),
-                    &mut bitasset_data.socket_addr_v4,
+                    &mut truthcoin_data.socket_addr_v4,
                     |s| SocketAddrV4::from_str(&s),
                     SocketAddrV4::to_string,
                 )
@@ -557,9 +557,9 @@ impl TxCreator {
             ui.monospace("IPv6 Address:       ")
                 | Self::show_option_field_default(
                     ui,
-                    "bitasset_data_ipv6",
+                    "truthcoin_data_ipv6",
                     SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 3000, 0, 0),
-                    &mut bitasset_data.socket_addr_v6,
+                    &mut truthcoin_data.socket_addr_v6,
                     |s| SocketAddrV6::from_str(&s),
                     SocketAddrV6::to_string,
                 )
@@ -570,9 +570,9 @@ impl TxCreator {
             ui.monospace("Encryption PubKey:       ")
                 | Self::show_option_field_default(
                     ui,
-                    "bitasset_data_encryption_pubkey",
+                    "truthcoin_data_encryption_pubkey",
                     default_pubkey,
-                    &mut bitasset_data.encryption_pubkey,
+                    &mut truthcoin_data.encryption_pubkey,
                     |s| EncryptionPubKey::from_str(&s),
                     EncryptionPubKey::to_string,
                 )
@@ -582,9 +582,9 @@ impl TxCreator {
             ui.monospace("Signing PubKey:       ")
                 | Self::show_option_field_default(
                     ui,
-                    "bitasset_data_signing_pubkey",
+                    "truthcoin_data_signing_pubkey",
                     default_pubkey,
-                    &mut bitasset_data.signing_pubkey,
+                    &mut truthcoin_data.signing_pubkey,
                     |s| VerifyingKey::from_str(&s),
                     VerifyingKey::to_string,
                 )
@@ -596,31 +596,31 @@ impl TxCreator {
             | signing_pubkey_resp.join()
     }
 
-    fn show_bitasset_registration(
+    fn show_truthcoin_registration(
         ui: &mut egui::Ui,
-        bitasset_registration: &mut BitAssetRegistration,
+        truthcoin_registration: &mut TruthcoinRegistration,
     ) -> Option<Response> {
         let plaintext_name_resp = show_monospace_single_line_input(
             ui,
-            &mut bitasset_registration.plaintext_name,
+            &mut truthcoin_registration.plaintext_name,
             "Plaintext Name",
         );
         let initial_supply_resp = show_monospace_single_line_input(
             ui,
-            &mut bitasset_registration.initial_supply,
+            &mut truthcoin_registration.initial_supply,
             "Initial Supply",
         );
-        let bitasset_options_resp = Self::show_bitasset_options(
+        let truthcoin_options_resp = Self::show_truthcoin_options(
             ui,
-            bitasset_registration.bitasset_data.as_mut(),
+            truthcoin_registration.truthcoin_data.as_mut(),
         );
         let resp = plaintext_name_resp.join()
             | initial_supply_resp.join()
-            | bitasset_options_resp;
+            | truthcoin_options_resp;
         Some(resp)
     }
 
-    fn show_bitasset_reservation(
+    fn show_truthcoin_reservation(
         ui: &mut egui::Ui,
         plaintext_name: &mut dyn TextBuffer,
     ) -> Option<Response> {
@@ -749,11 +749,11 @@ impl TxCreator {
         });
         let tx_data_ui = match &mut self.tx_type {
             TxType::Regular => None,
-            TxType::BitAssetRegistration(bitasset_registration) => {
-                Self::show_bitasset_registration(ui, bitasset_registration)
+            TxType::TruthcoinRegistration(truthcoin_registration) => {
+                Self::show_truthcoin_registration(ui, truthcoin_registration)
             }
-            TxType::BitAssetReservation { plaintext_name } => {
-                Self::show_bitasset_reservation(ui, plaintext_name)
+            TxType::TruthcoinReservation { plaintext_name } => {
+                Self::show_truthcoin_reservation(ui, plaintext_name)
             }
             TxType::DexBurn(dex_burn) => Self::show_dex_burn(ui, dex_burn),
             TxType::DexMint(dex_mint) => Self::show_dex_mint(ui, dex_mint),

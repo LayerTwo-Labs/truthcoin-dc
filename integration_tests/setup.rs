@@ -10,13 +10,13 @@ use bip300301_enforcer_integration_tests::{
 };
 use bip300301_enforcer_lib::types::SidechainNumber;
 use futures::{TryFutureExt as _, channel::mpsc, future};
-use plain_bitassets::types::{FilledOutputContent, PointedOutput};
-use plain_bitassets_app_rpc_api::RpcClient as _;
+use truthcoin_dc::types::{FilledOutputContent, PointedOutput};
+use truthcoin_dc_app_rpc_api::RpcClient as _;
 use reserve_port::ReservedPort;
 use thiserror::Error;
 use tokio::time::sleep;
 
-use crate::util::BitAssetsApp;
+use crate::util::TruthcoinApp;
 
 #[derive(Debug)]
 pub struct ReservedPorts {
@@ -37,7 +37,7 @@ impl ReservedPorts {
 
 #[derive(Debug)]
 pub struct Init {
-    pub bitassets_app: PathBuf,
+    pub truthcoin_app: PathBuf,
     pub data_dir_suffix: Option<String>,
 }
 
@@ -51,8 +51,8 @@ pub enum BmmError {
 
 #[derive(Debug, Error)]
 pub enum SetupError {
-    #[error("Failed to create BitAssets dir")]
-    CreateBitAssetsDir(#[source] std::io::Error),
+    #[error("Failed to create Truthcoin dir")]
+    CreateTruthcoinDir(#[source] std::io::Error),
     #[error(transparent)]
     ReservePort(#[from] reserve_port::Error),
     #[error(transparent)]
@@ -83,11 +83,11 @@ pub enum CreateWithdrawalError {
 pub struct PostSetup {
     // MUST occur before temp dirs and reserved ports in order to ensure that processes are dropped
     // before reserved ports are freed and temp dirs are cleared
-    pub _bitassets_app_task: AbortOnDrop<()>,
-    /// RPC client for bitassets_app
+    pub _truthcoin_app_task: AbortOnDrop<()>,
+    /// RPC client for truthcoin_app
     pub rpc_client: jsonrpsee::http_client::HttpClient,
     /// Address for receiving deposits
-    pub deposit_address: plain_bitassets::types::Address,
+    pub deposit_address: truthcoin_dc::types::Address,
     // MUST occur after tasks in order to ensure that tasks are dropped
     // before reserved ports are freed
     pub reserved_ports: ReservedPorts,
@@ -137,7 +137,7 @@ impl PostSetup {
 
 impl Sidechain for PostSetup {
     const SIDECHAIN_NUMBER: SidechainNumber =
-        SidechainNumber(plain_bitassets::types::THIS_SIDECHAIN);
+        SidechainNumber(truthcoin_dc::types::THIS_SIDECHAIN);
 
     type Init = Init;
 
@@ -149,20 +149,20 @@ impl Sidechain for PostSetup {
         res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
     ) -> Result<Self, Self::SetupError> {
         let reserved_ports = ReservedPorts::new()?;
-        let bitassets_dir = if let Some(suffix) = init.data_dir_suffix {
+        let truthcoin_dir = if let Some(suffix) = init.data_dir_suffix {
             post_setup
                 .directories
                 .base_dir
                 .path()
-                .join(format!("bitassets-{suffix}"))
+                .join(format!("truthcoin-{suffix}"))
         } else {
-            post_setup.directories.base_dir.path().join("bitassets")
+            post_setup.out_dir.path().join("truthcoin")
         };
-        std::fs::create_dir(&bitassets_dir)
-            .map_err(Self::SetupError::CreateBitAssetsDir)?;
-        let bitassets_app = BitAssetsApp {
-            path: init.bitassets_app,
-            data_dir: bitassets_dir,
+        std::fs::create_dir(&truthcoin_dir)
+            .map_err(Self::SetupError::CreateTruthcoinDir)?;
+        let truthcoin_app = TruthcoinApp {
+            path: init.truthcoin_app,
+            data_dir: truthcoin_dir,
             log_level: Some(tracing::Level::TRACE),
             mainchain_grpc_port: post_setup
                 .reserved_ports
@@ -172,14 +172,14 @@ impl Sidechain for PostSetup {
             rpc_port: reserved_ports.rpc.port(),
             zmq_port: reserved_ports.zmq.port(),
         };
-        let bitassets_app_task = bitassets_app
+        let truthcoin_app_task = truthcoin_app
             .spawn_command_with_args::<String, String, _, _, _>([], [], {
                 let res_tx = res_tx.clone();
                 move |err| {
                     let _err: Result<(), _> = res_tx.unbounded_send(Err(err));
                 }
             });
-        tracing::debug!("Started BitAssets");
+        tracing::debug!("Started Truthcoin");
         sleep(Duration::from_secs(1)).await;
         let rpc_client = jsonrpsee::http_client::HttpClient::builder()
             .build(format!("http://127.0.0.1:{}", reserved_ports.rpc.port()))?;
@@ -190,7 +190,7 @@ impl Sidechain for PostSetup {
         tracing::debug!("Generating deposit address");
         let deposit_address = rpc_client.get_new_address().await?;
         Ok(Self {
-            _bitassets_app_task: bitassets_app_task,
+            _truthcoin_app_task: truthcoin_app_task,
             rpc_client,
             deposit_address,
             reserved_ports,
@@ -222,13 +222,13 @@ impl Sidechain for PostSetup {
                     }
                     FilledOutputContent::AmmLpToken { .. }
                     | FilledOutputContent::BitcoinWithdrawal { .. }
-                    | FilledOutputContent::BitAsset(..)
-                    | FilledOutputContent::BitAssetControl(_)
-                    | FilledOutputContent::BitAssetReservation(_, _)
+                    | FilledOutputContent::Truthcoin(..)
+                    | FilledOutputContent::TruthcoinControl(_)
+                    | FilledOutputContent::TruthcoinReservation(_, _)
                     | FilledOutputContent::DutchAuctionReceipt(_) => false,
                 }
                 && match utxo.outpoint {
-                    plain_bitassets::types::OutPoint::Deposit(outpoint) => {
+                    truthcoin_dc::types::OutPoint::Deposit(outpoint) => {
                         outpoint.txid == txid
                     }
                     _ => false,
@@ -268,7 +268,7 @@ impl Sidechain for PostSetup {
             )
             .await?;
         let blocks_to_mine = 'blocks_to_mine: {
-            use plain_bitassets::state::WITHDRAWAL_BUNDLE_FAILURE_GAP;
+            use truthcoin_dc::state::WITHDRAWAL_BUNDLE_FAILURE_GAP;
             let block_count = self.rpc_client.getblockcount().await?;
             let Some(block_height) = block_count.checked_sub(1) else {
                 break 'blocks_to_mine WITHDRAWAL_BUNDLE_FAILURE_GAP;
@@ -286,7 +286,7 @@ impl Sidechain for PostSetup {
             }
         };
         tracing::debug!(
-            "Mining BitAssets blocks until withdrawal bundle is broadcast"
+            "Mining Truthcoin blocks until withdrawal bundle is broadcast"
         );
         let () = self.bmm(post_setup, blocks_to_mine).await?;
         let pending_withdrawal_bundle =

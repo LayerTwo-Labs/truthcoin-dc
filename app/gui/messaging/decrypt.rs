@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use plain_bitassets::types::EncryptionPubKey;
+use truthcoin_dc::types::EncryptionPubKey;
 
 use crate::{
     app::App,
@@ -9,7 +9,7 @@ use crate::{
 
 #[derive(Debug)]
 pub struct DecryptMessage {
-    // Encryption pubkey or BitAsset ID
+    // Encryption pubkey or Truthcoin ID
     receiver_input: String,
     // none if not yet set, otherwise result of parsing/resolving receiver pubkey
     receiver_pubkey: Option<anyhow::Result<EncryptionPubKey>>,
@@ -43,22 +43,22 @@ impl DecryptMessage {
         let receiver_input_response = ui
             .horizontal(|ui| {
                 ui.monospace(
-                    "Receiver's BitAsset ID or Encryption Pubkey (Bech32m): ",
+                    "Receiver's Truthcoin ID or Encryption Pubkey (Bech32m): ",
                 ) | ui.add(egui::TextEdit::singleline(&mut self.receiver_input))
             })
             .join();
         if receiver_input_response.changed() {
             let receiver_pubkey: anyhow::Result<EncryptionPubKey> = {
-                if let Ok(bitasset_id) =
+                if let Ok(truthcoin_id) =
                     borsh_deserialize_hex(&self.receiver_input)
                 {
                     app.node
-                        .get_current_bitasset_data(&bitasset_id)
+                        .get_current_truthcoin_data(&truthcoin_id)
                         .map_err(anyhow::Error::from)
-                        .and_then(|bitasset_data| {
-                            bitasset_data.encryption_pubkey.ok_or(
+                        .and_then(|truthcoin_data| {
+                            truthcoin_data.encryption_pubkey.ok_or(
                                 anyhow::anyhow!(
-                                "No encryption pubkey exists for this BitAsset"
+                                "No encryption pubkey exists for this Truthcoin"
                         ),
                             )
                         })
@@ -66,7 +66,7 @@ impl DecryptMessage {
                     EncryptionPubKey::bech32m_decode(&self.receiver_input)
                         .map_err(|_| {
                             anyhow::anyhow!(
-                                "Failed to parse BitAsset ID or Encryption Pubkey"
+                                "Failed to parse Truthcoin ID or Encryption Pubkey"
                             )
                         })
                 }
@@ -130,7 +130,7 @@ impl DecryptMessage {
             };
         });
         // show UTF8-decoded plaintext if possible
-        if let Ok(plaintext) = str::from_utf8(plaintext_bytes) {
+        if let Ok(plaintext) = std::str::from_utf8(plaintext_bytes) {
             let _resp = ui.horizontal_wrapped(|ui| {
                 ui.monospace_selectable_multiline(format!(
                     "Decrypted message (UTF-8): \n{plaintext}",

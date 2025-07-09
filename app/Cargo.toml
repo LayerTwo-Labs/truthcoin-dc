@@ -1,5 +1,5 @@
 [package]
-name = "plain_bitassets_app"
+name = "truthcoin_dc_app"
 authors.workspace = true
 edition.workspace = true
 license-file.workspace = true
@@ -27,9 +27,9 @@ include_path = "0.1.1"
 jsonrpsee = { workspace = true, features = ["server"] }
 mimalloc = { version = "0.1.48", features = ["v3"] }
 parking_lot = { workspace = true }
-plain_bitassets = { path = "../lib", features = ["clap"] }
-plain_bitassets_app_cli = { path = "../cli" }
-plain_bitassets_app_rpc_api = { path = "../rpc-api" }
+truthcoin_dc = { path = "../lib", features = ["clap"] }
+truthcoin_dc_app_cli = { path = "../cli" }
+truthcoin_dc_app_rpc_api = { path = "../rpc-api" }
 poll-promise = { version = "0.3.0", features = ["tokio"] }
 serde = { workspace = true, features = ["derive"] }
 shlex = "1.3.0"
@@ -56,11 +56,11 @@ features = ["AES256-GCM", "ECIES-MAC", "HMAC-SHA256", "x25519"]
 
 [features]
 default = ["zmq"]
-zmq = ["plain_bitassets/zmq"]
+zmq = ["truthcoin_dc/zmq"]
 
 [lints]
 workspace = true
 
 [[bin]]
-name = "plain_bitassets_app"
+name = "truthcoin_dc_app"
 path = "main.rs"

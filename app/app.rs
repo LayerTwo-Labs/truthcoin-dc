@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use fallible_iterator::FallibleIterator as _;
 use futures::{StreamExt as _, TryFutureExt as _};
 use parking_lot::RwLock;
-use plain_bitassets::{
+use truthcoin_dc::{
     miner::{self, Miner},
     node::{self, Node},
     types::{
@@ -30,7 +30,7 @@ pub enum Error {
     #[error(transparent)]
     AmountOverflow(#[from] AmountOverflowError),
     #[error("CUSF mainchain proto error")]
-    CusfMainchain(#[from] plain_bitassets::types::proto::Error),
+    CusfMainchain(#[from] truthcoin_dc::types::proto::Error),
     #[error("io error")]
     Io(#[from] std::io::Error),
     #[error("miner error: {0}")]
@@ -473,7 +473,7 @@ impl App {
             miner_write.confirm_bmm().await.inspect_err(|err| {
                 tracing::error!(
                     "{:#}",
-                    plain_bitassets::util::ErrorChain::new(err)
+                    truthcoin_dc::util::ErrorChain::new(err)
                 )
             })?
         {
@@ -489,7 +489,7 @@ impl App {
                 .inspect_err(|err| {
                     tracing::error!(
                         "{:#}",
-                        plain_bitassets::util::ErrorChain::new(err)
+                        truthcoin_dc::util::ErrorChain::new(err)
                     )
                 })? {
                 true => {

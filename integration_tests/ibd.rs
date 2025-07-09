@@ -11,7 +11,7 @@ use bip300301_enforcer_integration_tests::{
     util::{AbortOnDrop, AsyncTrial, TestFailureCollector, TestFileRegistry},
 };
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::BoxFuture};
-use plain_bitassets_app_rpc_api::RpcClient as _;
+use truthcoin_dc_app_rpc_api::RpcClient as _;
 use tokio::time::sleep;
 use tracing::Instrument as _;
 
@@ -21,7 +21,7 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct BitAssetsNodes {
+struct TruthcoinNodes {
     /// Sidechain process that will be sending blocks
     sender: PostSetup,
     /// The sidechain instance that will be syncing blocks
@@ -32,7 +32,7 @@ struct BitAssetsNodes {
 async fn setup(
     bin_paths: BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
-) -> anyhow::Result<(EnforcerPostSetup, BitAssetsNodes)> {
+) -> anyhow::Result<(EnforcerPostSetup, TruthcoinNodes)> {
     let mut enforcer_post_setup = setup_enforcer(
         &bin_paths.others,
         Network::Regtest,
@@ -42,25 +42,25 @@ async fn setup(
     .await?;
     let sidechain_sender = PostSetup::setup(
         Init {
-            bitassets_app: bin_paths.bitassets.clone(),
+            truthcoin_app: bin_paths.truthcoin.clone(),
             data_dir_suffix: Some("sender".to_owned()),
         },
         &enforcer_post_setup,
         res_tx.clone(),
     )
     .await?;
-    tracing::info!("Setup BitAssets send node successfully");
+    tracing::info!("Setup Truthcoin send node successfully");
     let sidechain_syncer = PostSetup::setup(
         Init {
-            bitassets_app: bin_paths.bitassets.clone(),
+            truthcoin_app: bin_paths.truthcoin.clone(),
             data_dir_suffix: Some("syncer".to_owned()),
         },
         &enforcer_post_setup,
         res_tx,
     )
     .await?;
-    tracing::info!("Setup BitAssets sync node successfully");
-    let bitassets_nodes = BitAssetsNodes {
+    tracing::info!("Setup Truthcoin sync node successfully");
+    let truthcoin_nodes = TruthcoinNodes {
         sender: sidechain_sender,
         syncer: sidechain_syncer,
     };
@@ -70,15 +70,15 @@ async fn setup(
     let () = activate_sidechain::<PostSetup>(&mut enforcer_post_setup).await?;
     tracing::info!("Activated sidechain successfully");
     let () = fund_enforcer::<PostSetup>(&mut enforcer_post_setup).await?;
-    Ok((enforcer_post_setup, bitassets_nodes))
+    Ok((enforcer_post_setup, truthcoin_nodes))
 }
 
-/// Check that a BitAssets node is connected to the specified peer
+/// Check that a Truthcoin node is connected to the specified peer
 async fn check_peer_connection(
-    bitassets_setup: &PostSetup,
+    truthcoin_setup: &PostSetup,
     expected_peer: SocketAddr,
 ) -> anyhow::Result<()> {
-    let peers = bitassets_setup
+    let peers = truthcoin_setup
         .rpc_client
         .list_peers()
         .await?
@@ -98,46 +98,46 @@ async fn initial_block_download_task(
     bin_paths: BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let (mut enforcer_post_setup, bitassets_nodes) =
+    let (mut enforcer_post_setup, truthcoin_nodes) =
         setup(bin_paths, res_tx).await?;
     const BMM_BLOCKS: u32 = 16;
     tracing::info!(blocks = %BMM_BLOCKS, "Attempting BMM");
-    bitassets_nodes
+    truthcoin_nodes
         .sender
         .bmm(&mut enforcer_post_setup, BMM_BLOCKS)
         .await?;
     // Check that sender has all blocks, and syncer has 0
     {
         let sender_blocks =
-            bitassets_nodes.sender.rpc_client.getblockcount().await?;
+            truthcoin_nodes.sender.rpc_client.getblockcount().await?;
         anyhow::ensure!(sender_blocks == BMM_BLOCKS);
         let syncer_blocks =
-            bitassets_nodes.syncer.rpc_client.getblockcount().await?;
+            truthcoin_nodes.syncer.rpc_client.getblockcount().await?;
         anyhow::ensure!(syncer_blocks == 0);
     }
     tracing::info!("Attempting sync");
     tracing::debug!(
-        sender_addr = %bitassets_nodes.sender.net_addr(),
-        syncer_addr = %bitassets_nodes.syncer.net_addr(),
+        sender_addr = %truthcoin_nodes.sender.net_addr(),
+        syncer_addr = %truthcoin_nodes.syncer.net_addr(),
         "Connecting syncer to sender");
-    let () = bitassets_nodes
+    let () = truthcoin_nodes
         .syncer
         .rpc_client
-        .connect_peer(bitassets_nodes.sender.net_addr().into())
+        .connect_peer(truthcoin_nodes.sender.net_addr().into())
         .await?;
     // Wait for connection to be established
     sleep(std::time::Duration::from_secs(1)).await;
     tracing::debug!("Checking peer connections");
     // Check peer connections
     let () = check_peer_connection(
-        &bitassets_nodes.syncer,
-        bitassets_nodes.sender.net_addr().into(),
+        &truthcoin_nodes.syncer,
+        truthcoin_nodes.sender.net_addr().into(),
     )
     .await?;
     tracing::debug!("Syncer has connection to sender");
     let () = check_peer_connection(
-        &bitassets_nodes.sender,
-        bitassets_nodes.syncer.net_addr().into(),
+        &truthcoin_nodes.sender,
+        truthcoin_nodes.syncer.net_addr().into(),
     )
     .await?;
     tracing::debug!("Sender has connection to syncer");
@@ -145,26 +145,23 @@ async fn initial_block_download_task(
     sleep(std::time::Duration::from_secs(10)).await;
     // Check peer connections
     let () = check_peer_connection(
-        &bitassets_nodes.syncer,
-        bitassets_nodes.sender.net_addr().into(),
+        &truthcoin_nodes.syncer,
+        truthcoin_nodes.sender.net_addr().into(),
     )
     .await?;
     tracing::debug!("Syncer still has connection to sender");
     // Check that sender and syncer have all blocks
     {
         let sender_blocks =
-            bitassets_nodes.sender.rpc_client.getblockcount().await?;
+            truthcoin_nodes.sender.rpc_client.getblockcount().await?;
         anyhow::ensure!(sender_blocks == BMM_BLOCKS);
         let syncer_blocks =
-            bitassets_nodes.syncer.rpc_client.getblockcount().await?;
+            truthcoin_nodes.syncer.rpc_client.getblockcount().await?;
         anyhow::ensure!(syncer_blocks == BMM_BLOCKS);
     }
-    drop(bitassets_nodes.syncer);
-    drop(bitassets_nodes.sender);
-    tracing::info!(
-        "Removing {}",
-        enforcer_post_setup.directories.base_dir.path().display()
-    );
+    drop(truthcoin_nodes.syncer);
+    drop(truthcoin_nodes.sender);
+    tracing::info!("Removing {}", enforcer_post_setup.out_dir.path().display());
     drop(enforcer_post_setup.tasks);
     // Wait for tasks to die
     sleep(std::time::Duration::from_secs(1)).await;

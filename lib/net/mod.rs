@@ -142,7 +142,7 @@ const SIGNET_SEED_NODE_ADDRS: &[SocketAddr] = {
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 105, 148, 135)),
         4000 + THIS_SIDECHAIN as u16,
     );
-    // bitassets.bip300.xyz
+    // truthcoin.bip300.xyz
     const BIP300_XYZ: SocketAddr = SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(95, 217, 243, 12)),
         4000 + THIS_SIDECHAIN as u16,

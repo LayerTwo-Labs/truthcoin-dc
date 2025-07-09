@@ -1,7 +1,7 @@
 use eframe::egui;
 use itertools::{Either, Itertools};
 
-use plain_bitassets::types::{BitAssetId, FilledOutput, Hash, Txid};
+use truthcoin_dc::types::{TruthcoinId, FilledOutput, Hash, Txid};
 
 use crate::{app::App, gui::util::UiExt};
 
@@ -9,66 +9,66 @@ type KnownNameReservation = (Txid, Hash, String);
 type UnknownNameReservation = (Txid, Hash);
 
 #[derive(Debug, Default)]
-pub struct MyBitAssets;
+pub struct MyTruthcoin;
 
-impl MyBitAssets {
-    /// Returns BitAsset reservations with known and unknown names
-    fn get_bitasset_reservations(
+impl MyTruthcoin {
+    /// Returns Truthcoin reservations with known and unknown names
+    fn get_truthcoin_reservations(
         app: &App,
     ) -> (Vec<KnownNameReservation>, Vec<UnknownNameReservation>) {
         let utxos_read = app.utxos.read();
-        // all bitasset reservations
-        let bitasset_reservations = utxos_read
+        // all truthcoin reservations
+        let truthcoin_reservations = utxos_read
             .values()
             .filter_map(FilledOutput::reservation_data);
-        // split into bitasset reservations for which the names are known,
+        // split into truthcoin reservations for which the names are known,
         // or unknown
         let (
-            mut known_name_bitasset_reservations,
-            mut unknown_name_bitasset_reservations,
+            mut known_name_truthcoin_reservations,
+            mut unknown_name_truthcoin_reservations,
         ): (Vec<_>, Vec<_>) =
-            bitasset_reservations.partition_map(|(txid, commitment)| {
-                let plain_bitasset = app
+            truthcoin_reservations.partition_map(|(txid, commitment)| {
+                let plain_truthcoin = app
                     .wallet
-                    .get_bitasset_reservation_plaintext(commitment)
-                    .expect("failed to retrieve bitasset reservation data");
-                match plain_bitasset {
-                    Some(plain_bitasset) => {
-                        Either::Left((*txid, *commitment, plain_bitasset))
+                    .get_truthcoin_reservation_plaintext(commitment)
+                    .expect("failed to retrieve truthcoin reservation data");
+                match plain_truthcoin {
+                    Some(plain_truthcoin) => {
+                        Either::Left((*txid, *commitment, plain_truthcoin))
                     }
                     None => Either::Right((*txid, *commitment)),
                 }
             });
-        // sort name-known bitasset reservations by plain name
-        known_name_bitasset_reservations.sort_by(
+        // sort name-known truthcoin reservations by plain name
+        known_name_truthcoin_reservations.sort_by(
             |(_, _, plain_name_l), (_, _, plain_name_r)| {
                 plain_name_l.cmp(plain_name_r)
             },
         );
-        // sort name-unknown bitasset reservations by txid
-        unknown_name_bitasset_reservations.sort_by_key(|(txid, _)| *txid);
+        // sort name-unknown truthcoin reservations by txid
+        unknown_name_truthcoin_reservations.sort_by_key(|(txid, _)| *txid);
         (
-            known_name_bitasset_reservations,
-            unknown_name_bitasset_reservations,
+            known_name_truthcoin_reservations,
+            unknown_name_truthcoin_reservations,
         )
     }
 
     pub fn show_reservations(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
         let (
-            known_name_bitasset_reservations,
-            unknown_name_bitasset_reservations,
-        ) = app.map(Self::get_bitasset_reservations).unwrap_or_default();
-        let _response = egui::SidePanel::left("My BitAsset Reservations")
+            known_name_truthcoin_reservations,
+            unknown_name_truthcoin_reservations,
+        ) = app.map(Self::get_truthcoin_reservations).unwrap_or_default();
+        let _response = egui::SidePanel::left("My Truthcoin Reservations")
             .exact_width(350.)
             .resizable(false)
             .show_inside(ui, move |ui| {
-                ui.heading("BitAsset Reservations");
-                egui::Grid::new("My BitAsset Reservations")
+                ui.heading("Truthcoin Reservations");
+                egui::Grid::new("My Truthcoin Reservations")
                     .num_columns(1)
                     .striped(true)
                     .show(ui, |ui| {
                         for (txid, commitment, plaintext_name) in
-                            known_name_bitasset_reservations
+                            known_name_truthcoin_reservations
                         {
                             let txid = hex::encode(txid.0);
                             let commitment = hex::encode(commitment);
@@ -89,7 +89,7 @@ impl MyBitAssets {
                             ui.end_row()
                         }
                         for (txid, commitment) in
-                            unknown_name_bitasset_reservations
+                            unknown_name_truthcoin_reservations
                         {
                             let txid = hex::encode(txid.0);
                             let commitment = hex::encode(commitment);
@@ -109,51 +109,51 @@ impl MyBitAssets {
             });
     }
 
-    /// Returns BitAssets with known and unknown names
-    fn get_bitassets(
+    /// Returns Truthcoin with known and unknown names
+    fn get_truthcoin(
         app: &App,
-    ) -> (Vec<(BitAssetId, String)>, Vec<BitAssetId>) {
+    ) -> (Vec<(TruthcoinId, String)>, Vec<TruthcoinId>) {
         let utxos_read = app.utxos.read();
-        // all owned bitassets
-        let bitassets = utxos_read.values().filter_map(FilledOutput::bitasset);
-        // split into bitassets for which the names are known or unknown
-        let (mut known_name_bitassets, mut unknown_name_bitassets): (
+        // all owned truthcoin
+        let truthcoin = utxos_read.values().filter_map(FilledOutput::truthcoin);
+        // split into truthcoin for which the names are known or unknown
+        let (mut known_name_truthcoin, mut unknown_name_truthcoin): (
             Vec<_>,
             Vec<_>,
-        ) = bitassets.partition_map(|bitasset| {
-            let plain_bitasset = app
+        ) = truthcoin.partition_map(|truthcoin| {
+            let plain_truthcoin = app
                 .wallet
-                .get_bitasset_plaintext(bitasset)
-                .expect("failed to retrieve bitasset data");
-            match plain_bitasset {
-                Some(plain_bitasset) => {
-                    Either::Left((*bitasset, plain_bitasset))
+                .get_truthcoin_plaintext(truthcoin)
+                .expect("failed to retrieve truthcoin data");
+            match plain_truthcoin {
+                Some(plain_truthcoin) => {
+                    Either::Left((*truthcoin, plain_truthcoin))
                 }
-                None => Either::Right(*bitasset),
+                None => Either::Right(*truthcoin),
             }
         });
-        // sort name-known bitassets by plain name
-        known_name_bitassets.sort_by(|(_, plain_name_l), (_, plain_name_r)| {
+        // sort name-known truthcoin by plain name
+        known_name_truthcoin.sort_by(|(_, plain_name_l), (_, plain_name_r)| {
             plain_name_l.cmp(plain_name_r)
         });
-        // sort name-unknown bitassets by bitasset value
-        unknown_name_bitassets.sort();
-        (known_name_bitassets, unknown_name_bitassets)
+        // sort name-unknown truthcoin by truthcoin value
+        unknown_name_truthcoin.sort();
+        (known_name_truthcoin, unknown_name_truthcoin)
     }
 
-    pub fn show_bitassets(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
-        let (known_name_bitassets, unknown_name_bitassets) =
-            app.map(Self::get_bitassets).unwrap_or_default();
-        egui::SidePanel::left("My BitAssets")
+    pub fn show_truthcoin(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
+        let (known_name_truthcoin, unknown_name_truthcoin) =
+            app.map(Self::get_truthcoin).unwrap_or_default();
+        egui::SidePanel::left("My Truthcoin")
             .exact_width(350.)
             .resizable(false)
             .show_inside(ui, |ui| {
-                ui.heading("BitAssets");
-                egui::Grid::new("My BitAssets")
+                ui.heading("Truthcoin");
+                egui::Grid::new("My Truthcoin")
                     .striped(true)
                     .num_columns(1)
                     .show(ui, |ui| {
-                        for (bitasset, plaintext_name) in known_name_bitassets {
+                        for (truthcoin, plaintext_name) in known_name_truthcoin {
                             ui.vertical(|ui| {
                                 ui.monospace_selectable_singleline(
                                     true,
@@ -162,19 +162,19 @@ impl MyBitAssets {
                                 ui.monospace_selectable_singleline(
                                     false,
                                     format!(
-                                        "bitasset: {}",
-                                        hex::encode(bitasset.0)
+                                        "truthcoin: {}",
+                                        hex::encode(truthcoin.0)
                                     ),
                                 );
                             });
                             ui.end_row()
                         }
-                        for bitasset in unknown_name_bitassets {
+                        for truthcoin in unknown_name_truthcoin {
                             ui.monospace_selectable_singleline(
                                 false,
                                 format!(
-                                    "bitasset: {}",
-                                    hex::encode(bitasset.0)
+                                    "truthcoin: {}",
+                                    hex::encode(truthcoin.0)
                                 ),
                             );
                             ui.end_row()
@@ -185,6 +185,6 @@ impl MyBitAssets {
 
     pub fn show(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
         let _reservations_response = self.show_reservations(app, ui);
-        let _bitassets_response = self.show_bitassets(app, ui);
+        let _truthcoin_response = self.show_truthcoin(app, ui);
     }
 }

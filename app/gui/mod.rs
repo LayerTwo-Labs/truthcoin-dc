@@ -1,13 +1,13 @@
 use std::task::Poll;
 
 use eframe::egui::{self, Color32, RichText};
-use plain_bitassets::{util::Watchable, wallet::Wallet};
+use truthcoin_dc::{util::Watchable, wallet::Wallet};
 use strum::{EnumIter, IntoEnumIterator};
 
 use crate::{app::App, line_buffer::LineBuffer, util::PromiseStream};
 
 mod activity;
-mod bitassets;
+mod truthcoin;
 mod coins;
 mod console_logs;
 mod fonts;
@@ -18,7 +18,7 @@ mod seed;
 mod util;
 
 use activity::Activity;
-use bitassets::BitAssets;
+use truthcoin::Truthcoin;
 use coins::Coins;
 use console_logs::ConsoleLogs;
 use fonts::FONT_DEFINITIONS;
@@ -157,7 +157,7 @@ impl BottomPanel {
 pub struct EguiApp {
     activity: Activity,
     app: Option<App>,
-    bitassets: BitAssets,
+    truthcoin: Truthcoin,
     bottom_panel: BottomPanel,
     coins: Coins,
     console_logs: ConsoleLogs,
@@ -175,8 +175,8 @@ enum Tab {
     ParentChain,
     #[strum(to_string = "Coins")]
     Coins,
-    #[strum(to_string = "BitAssets")]
-    BitAssets,
+    #[strum(to_string = "Truthcoin")]
+    Truthcoin,
     #[strum(to_string = "Messaging")]
     Messaging,
     #[strum(to_string = "Activity")]
@@ -222,7 +222,7 @@ impl EguiApp {
         Self {
             activity,
             app,
-            bitassets: BitAssets::default(),
+            truthcoin: Truthcoin::default(),
             bottom_panel,
             coins,
             console_logs,
@@ -268,8 +268,8 @@ impl eframe::App for EguiApp {
                 Tab::Coins => {
                     let () = self.coins.show(self.app.as_ref(), ui).unwrap();
                 }
-                Tab::BitAssets => {
-                    self.bitassets.show(self.app.as_ref(), ui);
+                Tab::Truthcoin => {
+                    self.truthcoin.show(self.app.as_ref(), ui);
                 }
                 Tab::Messaging => {
                     self.messaging.show(self.app.as_ref(), ui);

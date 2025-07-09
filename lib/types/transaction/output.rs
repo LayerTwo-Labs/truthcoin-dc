@@ -4,7 +4,7 @@ use serde_with::{DeserializeAs, IfIsHumanReadable, SerializeAs, serde_as};
 use utoipa::ToSchema;
 
 use crate::types::{
-    Address, AssetId, BitAssetId, DutchAuctionId, GetBitcoinValue, Hash,
+    Address, AssetId, TruthcoinId, DutchAuctionId, GetBitcoinValue, Hash,
     InPoint, OutPoint, Txid, serde_display_fromstr_human_readable,
     serde_hexstr_human_readable,
 };
@@ -251,8 +251,8 @@ pub use withdrawal_content::WithdrawalContent;
 // The subset of output contents that correspond to assets
 #[derive(Clone, Debug, Eq, PartialEq, ToSchema)]
 pub enum AssetContent {
-    BitAsset(u64),
-    BitAssetControl,
+    Truthcoin(u64),
+    TruthcoinControl,
     Bitcoin(BitcoinContent),
     Withdrawal(WithdrawalContent),
 }
@@ -285,9 +285,9 @@ mod content {
                     $(#[$bitcoin_attr])*
                 )?
                 Bitcoin(super::BitcoinContent),
-                BitAsset(u64),
-                BitAssetControl,
-                BitAssetReservation,
+                Truthcoin(u64),
+                TruthcoinControl,
+                TruthcoinReservation,
                 /// Receipt used to redeem the proceeds of an auction
                 DutchAuctionReceipt,
                 Withdrawal(super::WithdrawalContent),
@@ -325,19 +325,19 @@ mod content {
     );
 
     impl Content {
-        /// `true` if the output content corresponds to a BitAsset
-        pub fn is_bitasset(&self) -> bool {
-            matches!(self, Self::BitAsset(_))
+        /// `true` if the output content corresponds to a Truthcoin
+        pub fn is_truthcoin(&self) -> bool {
+            matches!(self, Self::Truthcoin(_))
         }
 
-        /// `true` if the output content corresponds to a BitAsset control coin
-        pub fn is_bitasset_control(&self) -> bool {
-            matches!(self, Self::BitAssetControl)
+        /// `true` if the output content corresponds to a Truthcoin control coin
+        pub fn is_truthcoin_control(&self) -> bool {
+            matches!(self, Self::TruthcoinControl)
         }
 
         /// `true` if the output content corresponds to a reservation
         pub fn is_reservation(&self) -> bool {
-            matches!(self, Self::BitAssetReservation)
+            matches!(self, Self::TruthcoinReservation)
         }
 
         pub fn is_bitcoin(&self) -> bool {
@@ -351,8 +351,8 @@ mod content {
         pub fn is_asset(&self) -> bool {
             matches!(
                 self,
-                Self::BitAsset(_)
-                    | Self::BitAssetControl
+                Self::Truthcoin(_)
+                    | Self::TruthcoinControl
                     | Self::Bitcoin(_)
                     | Self::Withdrawal { .. }
             )
@@ -367,11 +367,11 @@ mod content {
 
         pub fn as_asset(self) -> Option<super::AssetContent> {
             match self {
-                Self::BitAsset(value) => {
-                    Some(super::AssetContent::BitAsset(value))
+                Self::Truthcoin(value) => {
+                    Some(super::AssetContent::Truthcoin(value))
                 }
-                Self::BitAssetControl => {
-                    Some(super::AssetContent::BitAssetControl)
+                Self::TruthcoinControl => {
+                    Some(super::AssetContent::TruthcoinControl)
                 }
                 Self::Bitcoin(value) => {
                     Some(super::AssetContent::Bitcoin(value))
@@ -380,7 +380,7 @@ mod content {
                     Some(super::AssetContent::Withdrawal(withdrawal))
                 }
                 Self::AmmLpToken(_)
-                | Self::BitAssetReservation
+                | Self::TruthcoinReservation
                 | Self::DutchAuctionReceipt => None,
             }
         }
@@ -395,8 +395,8 @@ mod content {
     impl From<super::AssetContent> for Content {
         fn from(content: super::AssetContent) -> Self {
             match content {
-                super::AssetContent::BitAsset(value) => Self::BitAsset(value),
-                super::AssetContent::BitAssetControl => Self::BitAssetControl,
+                super::AssetContent::Truthcoin(value) => Self::Truthcoin(value),
+                super::AssetContent::TruthcoinControl => Self::TruthcoinControl,
                 super::AssetContent::Bitcoin(value) => Self::Bitcoin(value),
                 super::AssetContent::Withdrawal(withdrawal) => {
                     Self::Withdrawal(withdrawal)
@@ -409,9 +409,9 @@ mod content {
         fn from(repr: DefaultRepr) -> Self {
             match repr {
                 DefaultRepr::AmmLpToken(value) => Self::AmmLpToken(value),
-                DefaultRepr::BitAsset(value) => Self::BitAsset(value),
-                DefaultRepr::BitAssetControl => Self::BitAssetControl,
-                DefaultRepr::BitAssetReservation => Self::BitAssetReservation,
+                DefaultRepr::Truthcoin(value) => Self::Truthcoin(value),
+                DefaultRepr::TruthcoinControl => Self::TruthcoinControl,
+                DefaultRepr::TruthcoinReservation => Self::TruthcoinReservation,
                 DefaultRepr::Bitcoin(value) => Self::Bitcoin(value),
                 DefaultRepr::DutchAuctionReceipt => Self::DutchAuctionReceipt,
                 DefaultRepr::Withdrawal(withdrawal) => {
@@ -425,10 +425,10 @@ mod content {
         fn from(repr: HumanReadableRepr) -> Self {
             match repr {
                 HumanReadableRepr::AmmLpToken(value) => Self::AmmLpToken(value),
-                HumanReadableRepr::BitAsset(value) => Self::BitAsset(value),
-                HumanReadableRepr::BitAssetControl => Self::BitAssetControl,
-                HumanReadableRepr::BitAssetReservation => {
-                    Self::BitAssetReservation
+                HumanReadableRepr::Truthcoin(value) => Self::Truthcoin(value),
+                HumanReadableRepr::TruthcoinControl => Self::TruthcoinControl,
+                HumanReadableRepr::TruthcoinReservation => {
+                    Self::TruthcoinReservation
                 }
                 HumanReadableRepr::Bitcoin(value) => Self::Bitcoin(value),
                 HumanReadableRepr::DutchAuctionReceipt => {
@@ -445,9 +445,9 @@ mod content {
         fn from(content: Content) -> Self {
             match content {
                 Content::AmmLpToken(value) => Self::AmmLpToken(value),
-                Content::BitAsset(value) => Self::BitAsset(value),
-                Content::BitAssetControl => Self::BitAssetControl,
-                Content::BitAssetReservation => Self::BitAssetReservation,
+                Content::Truthcoin(value) => Self::Truthcoin(value),
+                Content::TruthcoinControl => Self::TruthcoinControl,
+                Content::TruthcoinReservation => Self::TruthcoinReservation,
                 Content::Bitcoin(value) => Self::Bitcoin(value),
                 Content::DutchAuctionReceipt => Self::DutchAuctionReceipt,
                 Content::Withdrawal(withdrawal) => Self::Withdrawal(withdrawal),
@@ -459,9 +459,9 @@ mod content {
         fn from(content: Content) -> Self {
             match content {
                 Content::AmmLpToken(value) => Self::AmmLpToken(value),
-                Content::BitAsset(value) => Self::BitAsset(value),
-                Content::BitAssetControl => Self::BitAssetControl,
-                Content::BitAssetReservation => Self::BitAssetReservation,
+                Content::Truthcoin(value) => Self::Truthcoin(value),
+                Content::TruthcoinControl => Self::TruthcoinControl,
+                Content::TruthcoinReservation => Self::TruthcoinReservation,
                 Content::Bitcoin(value) => Self::Bitcoin(value),
                 Content::DutchAuctionReceipt => Self::DutchAuctionReceipt,
                 Content::Withdrawal(withdrawal) => Self::Withdrawal(withdrawal),
@@ -508,9 +508,9 @@ mod content {
         fn get_bitcoin_value(&self) -> bitcoin::Amount {
             match self {
                 Self::AmmLpToken(_)
-                | Self::BitAsset(_)
-                | Self::BitAssetControl
-                | Self::BitAssetReservation
+                | Self::Truthcoin(_)
+                | Self::TruthcoinControl
+                | Self::TruthcoinReservation
                 | Self::DutchAuctionReceipt => bitcoin::Amount::ZERO,
                 Self::Bitcoin(value) => value.0,
                 Self::Withdrawal(withdrawal) => withdrawal.get_bitcoin_value(),
@@ -523,7 +523,7 @@ pub use content::Content;
 mod filled_content {
     use serde::{Deserialize, Serialize};
 
-    use crate::types::{AssetId, BitAssetId, DutchAuctionId, Hash, Txid};
+    use crate::types::{AssetId, TruthcoinId, DutchAuctionId, Hash, Txid};
 
     /// Defines a FilledContent enum with the specified visibility, name,
     /// derives, and attributes for each variant
@@ -531,8 +531,8 @@ mod filled_content {
         (   $vis:vis $enum_name:ident
             $(, attrs: [$($attr:meta),* $(,)?])?
             $(, bitcoin_attrs: [$($bitcoin_attr:meta),* $(,)?])?
-            $(, bitasset_reservation_commitment_attrs:
-                [$($bitasset_reservation_commitment_attr:meta),* $(,)?]
+            $(, truthcoin_reservation_commitment_attrs:
+                [$($truthcoin_reservation_commitment_attr:meta),* $(,)?]
             )?
             $(,)?
         ) => {
@@ -554,14 +554,14 @@ mod filled_content {
                 )?
                 Bitcoin(super::BitcoinContent),
                 BitcoinWithdrawal(super::WithdrawalContent),
-                /// BitAsset ID and coin value
-                BitAsset(BitAssetId, u64),
-                BitAssetControl(BitAssetId),
+                /// Truthcoin ID and coin value
+                Truthcoin(TruthcoinId, u64),
+                TruthcoinControl(TruthcoinId),
                 /// Reservation txid and commitment
-                BitAssetReservation(
+                TruthcoinReservation(
                     crate::types::Txid,
                     $(
-                        $(#[$bitasset_reservation_commitment_attr])*
+                        $(#[$truthcoin_reservation_commitment_attr])*
                     )?
                     crate::types::Hash
                 ),
@@ -582,7 +582,7 @@ mod filled_content {
         bitcoin_attrs: [
             serde(rename = "BitcoinSats")
         ],
-        bitasset_reservation_commitment_attrs: [
+        truthcoin_reservation_commitment_attrs: [
             serde(with = "hex::serde")
         ]
     );
@@ -603,31 +603,31 @@ mod filled_content {
     );
 
     impl FilledContent {
-        /** Returns the BitAsset ID, if the filled
-         * output content corresponds to a BitAsset. */
-        pub fn bitasset(&self) -> Option<&BitAssetId> {
+        /** Returns the Truthcoin ID, if the filled
+         * output content corresponds to a Truthcoin. */
+        pub fn truthcoin(&self) -> Option<&TruthcoinId> {
             match self {
-                Self::BitAsset(bitasset_id, _) => Some(bitasset_id),
+                Self::Truthcoin(truthcoin_id, _) => Some(truthcoin_id),
                 _ => None,
             }
         }
 
-        /** Returns the BitAsset ID (name hash) and if the filled
-         * output content corresponds to a BitAsset or BitAsset control coin. */
-        pub fn get_bitasset(&self) -> Option<BitAssetId> {
+        /** Returns the Truthcoin ID (name hash) and if the filled
+         * output content corresponds to a Truthcoin or Truthcoin control coin. */
+        pub fn get_truthcoin(&self) -> Option<TruthcoinId> {
             match self {
-                Self::BitAsset(bitasset_id, _)
-                | Self::BitAssetControl(bitasset_id) => Some(*bitasset_id),
+                Self::Truthcoin(truthcoin_id, _)
+                | Self::TruthcoinControl(truthcoin_id) => Some(*truthcoin_id),
                 _ => None,
             }
         }
 
-        /** Returns the BitAsset ID and coin value, if the filled
-         *  output content corresponds to a BitAsset output. */
-        pub fn bitasset_value(&self) -> Option<(BitAssetId, u64)> {
+        /** Returns the Truthcoin ID and coin value, if the filled
+         *  output content corresponds to a Truthcoin output. */
+        pub fn truthcoin_value(&self) -> Option<(TruthcoinId, u64)> {
             match self {
-                Self::BitAsset(bitasset_id, value) => {
-                    Some((*bitasset_id, *value))
+                Self::Truthcoin(truthcoin_id, value) => {
+                    Some((*truthcoin_id, *value))
                 }
                 _ => None,
             }
@@ -637,11 +637,11 @@ mod filled_content {
          *  output content corresponds to an asset output. */
         pub fn asset_value(&self) -> Option<(AssetId, u64)> {
             match self {
-                Self::BitAsset(bitasset_id, value) => {
-                    Some((AssetId::BitAsset(*bitasset_id), *value))
+                Self::Truthcoin(truthcoin_id, value) => {
+                    Some((AssetId::Truthcoin(*truthcoin_id), *value))
                 }
-                Self::BitAssetControl(bitasset_id) => {
-                    Some((AssetId::BitAssetControl(*bitasset_id), 1))
+                Self::TruthcoinControl(truthcoin_id) => {
+                    Some((AssetId::TruthcoinControl(*truthcoin_id), 1))
                 }
                 Self::Bitcoin(value) => {
                     Some((AssetId::Bitcoin, value.0.to_sat()))
@@ -672,14 +672,14 @@ mod filled_content {
             }
         }
 
-        /// `true` if the output content corresponds to a BitAsset
-        pub fn is_bitasset(&self) -> bool {
-            matches!(self, Self::BitAsset(_, _))
+        /// `true` if the output content corresponds to a Truthcoin
+        pub fn is_truthcoin(&self) -> bool {
+            matches!(self, Self::Truthcoin(_, _))
         }
 
-        /// `true` if the output content corresponds to a BitAsset control coin
-        pub fn is_bitasset_control(&self) -> bool {
-            matches!(self, Self::BitAssetControl(_))
+        /// `true` if the output content corresponds to a Truthcoin control coin
+        pub fn is_truthcoin_control(&self) -> bool {
+            matches!(self, Self::TruthcoinControl(_))
         }
 
         /// `true` if the output content corresponds to a Bitcoin
@@ -699,7 +699,7 @@ mod filled_content {
 
         /// `true` if the output content corresponds to a reservation
         pub fn is_reservation(&self) -> bool {
-            matches!(self, Self::BitAssetReservation { .. })
+            matches!(self, Self::TruthcoinReservation { .. })
         }
 
         /// `true` if the output content corresponds to a withdrawal
@@ -708,10 +708,10 @@ mod filled_content {
         }
 
         /** Returns the reservation txid and commitment if the filled output
-         * content corresponds to a BitAsset reservation output. */
+         * content corresponds to a Truthcoin reservation output. */
         pub fn reservation_data(&self) -> Option<(&Txid, &Hash)> {
             match self {
-                Self::BitAssetReservation(txid, commitment) => {
+                Self::TruthcoinReservation(txid, commitment) => {
                     Some((txid, commitment))
                 }
                 _ => None,
@@ -719,7 +719,7 @@ mod filled_content {
         }
 
         /** Returns the reservation commitment if the filled output content
-         *  corresponds to a BitAsset reservation output. */
+         *  corresponds to a Truthcoin reservation output. */
         pub fn reservation_commitment(&self) -> Option<&Hash> {
             self.reservation_data().map(|(_, commitment)| commitment)
         }
@@ -737,14 +737,14 @@ mod filled_content {
                 FilledContent::BitcoinWithdrawal(withdrawal) => {
                     super::Content::Withdrawal(withdrawal)
                 }
-                FilledContent::BitAsset(_, value) => {
-                    super::Content::BitAsset(value)
+                FilledContent::Truthcoin(_, value) => {
+                    super::Content::Truthcoin(value)
                 }
-                FilledContent::BitAssetControl(_) => {
-                    super::Content::BitAssetControl
+                FilledContent::TruthcoinControl(_) => {
+                    super::Content::TruthcoinControl
                 }
-                FilledContent::BitAssetReservation { .. } => {
-                    super::Content::BitAssetReservation
+                FilledContent::TruthcoinReservation { .. } => {
+                    super::Content::TruthcoinReservation
                 }
                 FilledContent::DutchAuctionReceipt(_) => {
                     super::Content::DutchAuctionReceipt
@@ -765,14 +765,14 @@ mod filled_content {
                     asset1,
                     amount,
                 },
-                DefaultRepr::BitAsset(asset_id, value) => {
-                    Self::BitAsset(asset_id, value)
+                DefaultRepr::Truthcoin(asset_id, value) => {
+                    Self::Truthcoin(asset_id, value)
                 }
-                DefaultRepr::BitAssetControl(bitasset_id) => {
-                    Self::BitAssetControl(bitasset_id)
+                DefaultRepr::TruthcoinControl(truthcoin_id) => {
+                    Self::TruthcoinControl(truthcoin_id)
                 }
-                DefaultRepr::BitAssetReservation(txid, commitment) => {
-                    Self::BitAssetReservation(txid, commitment)
+                DefaultRepr::TruthcoinReservation(txid, commitment) => {
+                    Self::TruthcoinReservation(txid, commitment)
                 }
                 DefaultRepr::Bitcoin(value) => Self::Bitcoin(value),
                 DefaultRepr::BitcoinWithdrawal(withdrawal) => {
@@ -797,14 +797,14 @@ mod filled_content {
                     asset1,
                     amount,
                 },
-                HumanReadableRepr::BitAsset(asset_id, value) => {
-                    Self::BitAsset(asset_id, value)
+                HumanReadableRepr::Truthcoin(asset_id, value) => {
+                    Self::Truthcoin(asset_id, value)
                 }
-                HumanReadableRepr::BitAssetControl(bitasset_id) => {
-                    Self::BitAssetControl(bitasset_id)
+                HumanReadableRepr::TruthcoinControl(truthcoin_id) => {
+                    Self::TruthcoinControl(truthcoin_id)
                 }
-                HumanReadableRepr::BitAssetReservation(txid, commitment) => {
-                    Self::BitAssetReservation(txid, commitment)
+                HumanReadableRepr::TruthcoinReservation(txid, commitment) => {
+                    Self::TruthcoinReservation(txid, commitment)
                 }
                 HumanReadableRepr::Bitcoin(value) => Self::Bitcoin(value),
                 HumanReadableRepr::BitcoinWithdrawal(withdrawal) => {
@@ -829,14 +829,14 @@ mod filled_content {
                     asset1,
                     amount,
                 },
-                FilledContent::BitAsset(asset_id, value) => {
-                    Self::BitAsset(asset_id, value)
+                FilledContent::Truthcoin(asset_id, value) => {
+                    Self::Truthcoin(asset_id, value)
                 }
-                FilledContent::BitAssetControl(bitasset_id) => {
-                    Self::BitAssetControl(bitasset_id)
+                FilledContent::TruthcoinControl(truthcoin_id) => {
+                    Self::TruthcoinControl(truthcoin_id)
                 }
-                FilledContent::BitAssetReservation(txid, commitment) => {
-                    Self::BitAssetReservation(txid, commitment)
+                FilledContent::TruthcoinReservation(txid, commitment) => {
+                    Self::TruthcoinReservation(txid, commitment)
                 }
                 FilledContent::Bitcoin(value) => Self::Bitcoin(value),
                 FilledContent::BitcoinWithdrawal(withdrawal) => {
@@ -861,14 +861,14 @@ mod filled_content {
                     asset1,
                     amount,
                 },
-                FilledContent::BitAsset(asset_id, value) => {
-                    Self::BitAsset(asset_id, value)
+                FilledContent::Truthcoin(asset_id, value) => {
+                    Self::Truthcoin(asset_id, value)
                 }
-                FilledContent::BitAssetControl(bitasset_id) => {
-                    Self::BitAssetControl(bitasset_id)
+                FilledContent::TruthcoinControl(truthcoin_id) => {
+                    Self::TruthcoinControl(truthcoin_id)
                 }
-                FilledContent::BitAssetReservation(txid, commitment) => {
-                    Self::BitAssetReservation(txid, commitment)
+                FilledContent::TruthcoinReservation(txid, commitment) => {
+                    Self::TruthcoinReservation(txid, commitment)
                 }
                 FilledContent::Bitcoin(value) => Self::Bitcoin(value),
                 FilledContent::BitcoinWithdrawal(withdrawal) => {
@@ -986,14 +986,14 @@ impl TxOutput {
         self.content.is_withdrawal()
     }
 
-    /// `true` if the output content corresponds to a BitAsset
-    pub fn is_bitasset(&self) -> bool {
-        self.content.is_bitasset()
+    /// `true` if the output content corresponds to a Truthcoin
+    pub fn is_truthcoin(&self) -> bool {
+        self.content.is_truthcoin()
     }
 
-    /// `true` if the output content corresponds to a BitAsset control coin
-    pub fn is_bitasset_control(&self) -> bool {
-        self.content.is_bitasset_control()
+    /// `true` if the output content corresponds to a Truthcoin control coin
+    pub fn is_truthcoin_control(&self) -> bool {
+        self.content.is_truthcoin_control()
     }
 
     /// `true` if the output content corresponds to a reservation
@@ -1033,22 +1033,22 @@ impl From<TxOutput> for Option<AssetOutput> {
 pub type FilledOutput = Output<FilledContent>;
 
 impl FilledOutput {
-    /** Returns the BitAsset ID if the filled output content
-     * corresponds to a BitAsset */
-    pub fn bitasset(&self) -> Option<&BitAssetId> {
-        self.content.bitasset()
+    /** Returns the Truthcoin ID if the filled output content
+     * corresponds to a Truthcoin */
+    pub fn truthcoin(&self) -> Option<&TruthcoinId> {
+        self.content.truthcoin()
     }
 
-    /** Returns the BitAsset ID if the filled output content
-     * corresponds to a BitAsset or BitAsset control coin. */
-    pub fn get_bitasset(&self) -> Option<BitAssetId> {
-        self.content.get_bitasset()
+    /** Returns the Truthcoin ID if the filled output content
+     * corresponds to a Truthcoin or Truthcoin control coin. */
+    pub fn get_truthcoin(&self) -> Option<TruthcoinId> {
+        self.content.get_truthcoin()
     }
 
-    /** Returns the BitAsset ID and coin value
-     * if the filled output content corresponds to a BitAsset output. */
-    pub fn bitasset_value(&self) -> Option<(BitAssetId, u64)> {
-        self.content.bitasset_value()
+    /** Returns the Truthcoin ID and coin value
+     * if the filled output content corresponds to a Truthcoin output. */
+    pub fn truthcoin_value(&self) -> Option<(TruthcoinId, u64)> {
+        self.content.truthcoin_value()
     }
 
     /** Returns the [`AssetId`] and coin value
@@ -1074,14 +1074,14 @@ impl FilledOutput {
         &self.content
     }
 
-    /// `true` if the output content corresponds to a BitAsset
-    pub fn is_bitasset(&self) -> bool {
-        self.content.is_bitasset()
+    /// `true` if the output content corresponds to a Truthcoin
+    pub fn is_truthcoin(&self) -> bool {
+        self.content.is_truthcoin()
     }
 
-    /// `true` if the output content corresponds to a BitAsset control coin
-    pub fn is_bitasset_control(&self) -> bool {
-        self.content.is_bitasset_control()
+    /// `true` if the output content corresponds to a Truthcoin control coin
+    pub fn is_truthcoin_control(&self) -> bool {
+        self.content.is_truthcoin_control()
     }
 
     /// `true` if the output content corresponds to a Bitcoin
@@ -1105,13 +1105,13 @@ impl FilledOutput {
     }
 
     /** Returns the reservation txid and commitment if the filled output
-     *  content corresponds to a BitAsset reservation output. */
+     *  content corresponds to a Truthcoin reservation output. */
     pub fn reservation_data(&self) -> Option<(&Txid, &Hash)> {
         self.content.reservation_data()
     }
 
     /** Returns the reservation commitment if the filled output content
-     *  corresponds to a BitAsset reservation output. */
+     *  corresponds to a Truthcoin reservation output. */
     pub fn reservation_commitment(&self) -> Option<&Hash> {
         self.content.reservation_commitment()
     }

@@ -1,4 +1,4 @@
-# BitAssets
+# Truthcoin
 
 ## Install
 

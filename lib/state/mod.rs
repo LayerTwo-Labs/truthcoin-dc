@@ -11,7 +11,7 @@ use crate::{
     authorization::Authorization,
     types::{
         Address, AmountOverflowError, Authorized, AuthorizedTransaction,
-        BitAssetId, BlockHash, Body, FilledOutput, FilledTransaction,
+        TruthcoinId, BlockHash, Body, FilledOutput, FilledTransaction,
         GetAddress as _, GetBitcoinValue as _, Header, InPoint, M6id, OutPoint,
         OutPointKey, SpentOutput, Transaction, TxData, VERSION, Verify as _,
         Version, WithdrawalBundle, WithdrawalBundleStatus,
@@ -21,7 +21,7 @@ use crate::{
 };
 
 mod amm;
-pub mod bitassets;
+pub mod truthcoin;
 mod block;
 mod dutch_auction;
 pub mod error;
@@ -29,7 +29,7 @@ mod rollback;
 mod two_way_peg_data;
 
 pub use amm::{AmmPair, PoolState as AmmPoolState};
-pub use bitassets::SeqId as BitAssetSeqId;
+pub use truthcoin::SeqId as TruthcoinSeqId;
 pub use dutch_auction::DutchAuctionState;
 pub use error::Error;
 use rollback::{HeightStamped, RollBack};
@@ -83,9 +83,9 @@ pub struct State {
     tip: DatabaseUnique<UnitKey, SerdeBincode<BlockHash>>,
     /// Current height
     height: DatabaseUnique<UnitKey, SerdeBincode<u32>>,
-    /// Associates ordered pairs of BitAssets to their AMM pool states
+    /// Associates ordered pairs of Truthcoin to their AMM pool states
     amm_pools: amm::PoolsDb,
-    bitassets: bitassets::Dbs,
+    truthcoin: truthcoin::Dbs,
     /// Associates Dutch auction sequence numbers with auction state
     dutch_auctions: dutch_auction::Db,
     utxos: DatabaseUnique<OutPointKey, SerdeBincode<FilledOutput>>,
@@ -114,14 +114,14 @@ pub struct State {
 }
 
 impl State {
-    pub const NUM_DBS: u32 = bitassets::Dbs::NUM_DBS + 12;
+    pub const NUM_DBS: u32 = truthcoin::Dbs::NUM_DBS + 12;
 
     pub fn new(env: &sneed::Env) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
         let tip = DatabaseUnique::create(env, &mut rwtxn, "tip")?;
         let height = DatabaseUnique::create(env, &mut rwtxn, "height")?;
         let amm_pools = DatabaseUnique::create(env, &mut rwtxn, "amm_pools")?;
-        let bitassets = bitassets::Dbs::new(env, &mut rwtxn)?;
+        let truthcoin = truthcoin::Dbs::new(env, &mut rwtxn)?;
         let dutch_auctions =
             DatabaseUnique::create(env, &mut rwtxn, "dutch_auctions")?;
         let utxos = DatabaseUnique::create(env, &mut rwtxn, "utxos")?;
@@ -154,7 +154,7 @@ impl State {
             tip,
             height,
             amm_pools,
-            bitassets,
+            truthcoin,
             dutch_auctions,
             utxos,
             stxos,
@@ -171,8 +171,8 @@ impl State {
         &self.amm_pools
     }
 
-    pub fn bitassets(&self) -> &bitassets::Dbs {
-        &self.bitassets
+    pub fn truthcoin(&self) -> &truthcoin::Dbs {
+        &self.truthcoin
     }
 
     pub fn deposit_blocks(
@@ -334,15 +334,15 @@ impl State {
     }
 
     /// Check that
-    /// * If the tx is a BitAsset reservation, then the number of bitasset
+    /// * If the tx is a Truthcoin reservation, then the number of truthcoin
     ///   reservations in the outputs is exactly one more than the number of
-    ///   bitasset reservations in the inputs.
-    /// * If the tx is a BitAsset
-    ///   registration, then the number of bitasset reservations in the outputs
-    ///   is exactly one less than the number of bitasset reservations in the
+    ///   truthcoin reservations in the inputs.
+    /// * If the tx is a Truthcoin
+    ///   registration, then the number of truthcoin reservations in the outputs
+    ///   is exactly one less than the number of truthcoin reservations in the
     ///   inputs.
-    /// * Otherwise, the number of bitasset reservations in the outputs
-    ///   is exactly equal to the number of bitasset reservations in the inputs.
+    /// * Otherwise, the number of truthcoin reservations in the outputs
+    ///   is exactly equal to the number of truthcoin reservations in the inputs.
     pub fn validate_reservations(
         &self,
         tx: &FilledTransaction,
@@ -367,194 +367,194 @@ impl State {
     }
 
     /** Check that
-     *  * If the tx is a BitAsset registration, then
-     *    * The number of BitAsset control coins in the outputs is exactly
-     *      one more than the number of BitAsset control coins in the
+     *  * If the tx is a Truthcoin registration, then
+     *    * The number of Truthcoin control coins in the outputs is exactly
+     *      one more than the number of Truthcoin control coins in the
      *      inputs
-     *    * The number of BitAsset outputs is at least
-     *      * The number of unique BitAsset inputs,
+     *    * The number of Truthcoin outputs is at least
+     *      * The number of unique Truthcoin inputs,
      *        if the initial supply is zero
-     *      * One more than the number of unique BitAsset inputs,
+     *      * One more than the number of unique Truthcoin inputs,
      *        if the initial supply is nonzero.
-     *    * The newly registered BitAsset must have been unregistered,
+     *    * The newly registered Truthcoin must have been unregistered,
      *      prior to the registration tx.
-     *    * The last output must be a BitAsset control coin
+     *    * The last output must be a Truthcoin control coin
      *    * If the initial supply is nonzero,
-     *      the second-to-last output must be a BitAsset output
+     *      the second-to-last output must be a Truthcoin output
      *    * Otherwise,
-     *      * The number of BitAsset control coin outputs is exactly the number
-     *        of BitAsset control coin inputs
-     *      * The number of BitAsset outputs is at least
-     *        the number of unique BitAssets in the inputs.
-     *  * If the tx is a BitAsset update, then there must be at least one
-     *    BitAsset control coin input and output.
+     *      * The number of Truthcoin control coin outputs is exactly the number
+     *        of Truthcoin control coin inputs
+     *      * The number of Truthcoin outputs is at least
+     *        the number of unique Truthcoin in the inputs.
+     *  * If the tx is a Truthcoin update, then there must be at least one
+     *    Truthcoin control coin input and output.
      *  * If the tx is an AMM Burn, then
-     *    * There must be at least two unique BitAsset outputs
-     *    * The number of unique BitAsset outputs must be at most two more than
-     *      the number of unique BitAsset inputs
-     *    * The number of unique BitAsset inputs must be at most equal to the
-     *      number of unique BitAsset outputs
+     *    * There must be at least two unique Truthcoin outputs
+     *    * The number of unique Truthcoin outputs must be at most two more than
+     *      the number of unique Truthcoin inputs
+     *    * The number of unique Truthcoin inputs must be at most equal to the
+     *      number of unique Truthcoin outputs
      *  * If the tx is an AMM Mint, then
-     *    * There must be at least two BitAsset inputs
-     *    * The number of unique BitAsset outputs must be at most equal to the
-     *      number of unique BitAsset inputs
-     *    * The number of unique BitAsset inputs must be at most two more than
-     *      the number of unique BitAsset outputs.
+     *    * There must be at least two Truthcoin inputs
+     *    * The number of unique Truthcoin outputs must be at most equal to the
+     *      number of unique Truthcoin inputs
+     *    * The number of unique Truthcoin inputs must be at most two more than
+     *      the number of unique Truthcoin outputs.
      *  * If the tx is an AMM Swap, then
-     *    * There must be at least one BitAsset input
-     *    * The number of unique BitAsset outputs must be one less than,
-     *      one greater than, or equal to, the number of unique BitAsset inputs.
+     *    * There must be at least one Truthcoin input
+     *    * The number of unique Truthcoin outputs must be one less than,
+     *      one greater than, or equal to, the number of unique Truthcoin inputs.
      *  * If the tx is a Dutch auction create, then
-     *    * There must be at least one unique BitAsset input
-     *    * The number of unique BitAsset outputs must be at most equal to the
-     *      number of unique BitAsset inputs
-     *    * The number of unique BitAsset inputs must be at most one more than
-     *      the number of unique BitAsset outputs.
+     *    * There must be at least one unique Truthcoin input
+     *    * The number of unique Truthcoin outputs must be at most equal to the
+     *      number of unique Truthcoin inputs
+     *    * The number of unique Truthcoin inputs must be at most one more than
+     *      the number of unique Truthcoin outputs.
      *  * If the tx is a Dutch auction bid, then
-     *    * There must be at least one BitAsset input
-     *    * The number of unique BitAsset outputs must be one less than,
-     *      one greater than, or equal to, the number of unique BitAsset inputs.
+     *    * There must be at least one Truthcoin input
+     *    * The number of unique Truthcoin outputs must be one less than,
+     *      one greater than, or equal to, the number of unique Truthcoin inputs.
      *  * If the tx is a Dutch auction collect, then
-     *    * There must be at least one unique BitAsset output
-     *    * The number of unique BitAsset outputs must be at most two more than
-     *      the number of unique BitAsset inputs
-     *    * The number of unique BitAsset inputs must be at most equal to the
-     *      number of unique BitAsset outputs
+     *    * There must be at least one unique Truthcoin output
+     *    * The number of unique Truthcoin outputs must be at most two more than
+     *      the number of unique Truthcoin inputs
+     *    * The number of unique Truthcoin inputs must be at most equal to the
+     *      number of unique Truthcoin outputs
      * */
-    pub fn validate_bitassets(
+    pub fn validate_truthcoin(
         &self,
         rotxn: &RoTxn,
         tx: &FilledTransaction,
     ) -> Result<(), Error> {
-        // number of unique bitassets in the inputs
-        let n_unique_bitasset_inputs: usize = tx
-            .spent_bitassets()
-            .filter_map(|(_, output)| output.bitasset())
+        // number of unique truthcoin in the inputs
+        let n_unique_truthcoin_inputs: usize = tx
+            .spent_truthcoin()
+            .filter_map(|(_, output)| output.truthcoin())
             .unique()
             .count();
-        let n_bitasset_control_inputs: usize =
-            tx.spent_bitasset_controls().count();
-        let n_bitasset_outputs: usize = tx.bitasset_outputs().count();
-        let n_unique_bitasset_outputs: usize =
-            tx.unique_spent_bitassets().len();
-        let n_bitasset_control_outputs: usize =
-            tx.bitasset_control_outputs().count();
+        let n_truthcoin_control_inputs: usize =
+            tx.spent_truthcoin_controls().count();
+        let n_truthcoin_outputs: usize = tx.truthcoin_outputs().count();
+        let n_unique_truthcoin_outputs: usize =
+            tx.unique_spent_truthcoin().len();
+        let n_truthcoin_control_outputs: usize =
+            tx.truthcoin_control_outputs().count();
         if tx.is_update()
-            && (n_bitasset_control_inputs < 1 || n_bitasset_control_outputs < 1)
+            && (n_truthcoin_control_inputs < 1 || n_truthcoin_control_outputs < 1)
         {
-            return Err(error::BitAsset::NoBitAssetsToUpdate.into());
+            return Err(error::Truthcoin::NoTruthcoinToUpdate.into());
         };
         if tx.is_amm_burn()
-            && (n_unique_bitasset_outputs < 2
-                || n_unique_bitasset_inputs > n_unique_bitasset_outputs
-                || n_unique_bitasset_outputs > n_unique_bitasset_inputs + 2)
+            && (n_unique_truthcoin_outputs < 2
+                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs
+                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs + 2)
         {
             return Err(error::Amm::InvalidBurn.into());
         };
         if tx.is_amm_mint()
-            && (n_unique_bitasset_inputs < 2
-                || n_unique_bitasset_outputs > n_unique_bitasset_inputs
-                || n_unique_bitasset_inputs > n_unique_bitasset_outputs + 2)
+            && (n_unique_truthcoin_inputs < 2
+                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs
+                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs + 2)
         {
-            return Err(error::Amm::TooFewBitAssetsToMint.into());
+            return Err(error::Amm::TooFewTruthcoinToMint.into());
         };
         if (tx.is_amm_swap() || tx.is_dutch_auction_bid())
-            && (n_unique_bitasset_inputs < 1
+            && (n_unique_truthcoin_inputs < 1
                 || !{
-                    let min_unique_bitasset_outputs =
-                        n_unique_bitasset_inputs.saturating_sub(1);
-                    let max_unique_bitasset_outputs =
-                        n_unique_bitasset_inputs + 1;
-                    (min_unique_bitasset_outputs..=max_unique_bitasset_outputs)
-                        .contains(&n_unique_bitasset_outputs)
+                    let min_unique_truthcoin_outputs =
+                        n_unique_truthcoin_inputs.saturating_sub(1);
+                    let max_unique_truthcoin_outputs =
+                        n_unique_truthcoin_inputs + 1;
+                    (min_unique_truthcoin_outputs..=max_unique_truthcoin_outputs)
+                        .contains(&n_unique_truthcoin_outputs)
                 })
         {
             let err = error::dutch_auction::Bid::Invalid;
             return Err(Error::DutchAuction(err.into()));
         };
         if tx.is_dutch_auction_create()
-            && (n_unique_bitasset_inputs < 1
-                || n_unique_bitasset_outputs > n_unique_bitasset_inputs
-                || n_unique_bitasset_inputs > n_unique_bitasset_outputs + 1)
+            && (n_unique_truthcoin_inputs < 1
+                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs
+                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs + 1)
         {
-            return Err(error::DutchAuction::TooFewBitAssetsToCreate.into());
+            return Err(error::DutchAuction::TooFewTruthcoinToCreate.into());
         };
         if tx.is_dutch_auction_collect()
-            && (n_unique_bitasset_outputs < 1
-                || n_unique_bitasset_inputs > n_unique_bitasset_outputs
-                || n_unique_bitasset_outputs > n_unique_bitasset_inputs + 2)
+            && (n_unique_truthcoin_outputs < 1
+                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs
+                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs + 2)
         {
             let err = error::dutch_auction::Collect::Invalid;
             return Err(Error::DutchAuction(err.into()));
         };
-        if let Some(TxData::BitAssetRegistration {
+        if let Some(TxData::TruthcoinRegistration {
             name_hash,
             initial_supply,
             ..
         }) = tx.data()
         {
-            if n_bitasset_control_outputs != n_bitasset_control_inputs + 1 {
-                return Err(Error::UnbalancedBitAssetControls {
-                    n_bitasset_control_inputs,
-                    n_bitasset_control_outputs,
+            if n_truthcoin_control_outputs != n_truthcoin_control_inputs + 1 {
+                return Err(Error::UnbalancedTruthcoinControls {
+                    n_truthcoin_control_inputs,
+                    n_truthcoin_control_outputs,
                 });
             };
             if !tx
                 .outputs()
                 .last()
-                .is_some_and(|last_output| last_output.is_bitasset_control())
+                .is_some_and(|last_output| last_output.is_truthcoin_control())
             {
                 return Err(Error::LastOutputNotControlCoin);
             }
             if *initial_supply == 0 {
-                if n_bitasset_outputs < n_unique_bitasset_inputs {
-                    return Err(Error::UnbalancedBitAssets {
-                        n_unique_bitasset_inputs,
-                        n_bitasset_outputs,
+                if n_truthcoin_outputs < n_unique_truthcoin_inputs {
+                    return Err(Error::UnbalancedTruthcoin {
+                        n_unique_truthcoin_inputs,
+                        n_truthcoin_outputs,
                     });
                 }
             } else {
-                if n_bitasset_outputs < n_unique_bitasset_inputs + 1 {
-                    return Err(Error::UnbalancedBitAssets {
-                        n_unique_bitasset_inputs,
-                        n_bitasset_outputs,
+                if n_truthcoin_outputs < n_unique_truthcoin_inputs + 1 {
+                    return Err(Error::UnbalancedTruthcoin {
+                        n_unique_truthcoin_inputs,
+                        n_truthcoin_outputs,
                     });
                 }
                 let outputs = tx.outputs();
                 let second_to_last_output = outputs.get(outputs.len() - 2);
                 if !second_to_last_output
-                    .is_some_and(|s2l_output| s2l_output.is_bitasset())
+                    .is_some_and(|s2l_output| s2l_output.is_truthcoin())
                 {
-                    return Err(Error::SecondLastOutputNotBitAsset);
+                    return Err(Error::SecondLastOutputNotTruthcoin);
                 }
             }
             if self
-                .bitassets
-                .try_get_bitasset(rotxn, &BitAssetId(*name_hash))?
+                .truthcoin
+                .try_get_truthcoin(rotxn, &TruthcoinId(*name_hash))?
                 .is_some()
             {
-                return Err(Error::BitAssetAlreadyRegistered {
+                return Err(Error::TruthcoinAlreadyRegistered {
                     name_hash: *name_hash,
                 });
             };
             Ok(())
         } else {
-            if n_bitasset_control_outputs != n_bitasset_control_inputs {
-                return Err(Error::UnbalancedBitAssetControls {
-                    n_bitasset_control_inputs,
-                    n_bitasset_control_outputs,
+            if n_truthcoin_control_outputs != n_truthcoin_control_inputs {
+                return Err(Error::UnbalancedTruthcoinControls {
+                    n_truthcoin_control_inputs,
+                    n_truthcoin_control_outputs,
                 });
             };
-            if n_bitasset_outputs < n_unique_bitasset_inputs {
-                return Err(Error::UnbalancedBitAssets {
-                    n_unique_bitasset_inputs,
-                    n_bitasset_outputs,
+            if n_truthcoin_outputs < n_unique_truthcoin_inputs {
+                return Err(Error::UnbalancedTruthcoin {
+                    n_unique_truthcoin_inputs,
+                    n_truthcoin_outputs,
                 });
             }
-            if n_unique_bitasset_inputs == 0 && n_bitasset_outputs != 0 {
-                return Err(Error::UnbalancedBitAssets {
-                    n_unique_bitasset_inputs,
-                    n_bitasset_outputs,
+            if n_unique_truthcoin_inputs == 0 && n_truthcoin_outputs != 0 {
+                return Err(Error::UnbalancedTruthcoin {
+                    n_unique_truthcoin_inputs,
+                    n_truthcoin_outputs,
                 });
             }
             Ok(())
@@ -568,7 +568,7 @@ impl State {
         tx: &FilledTransaction,
     ) -> Result<bitcoin::Amount, Error> {
         let () = self.validate_reservations(tx)?;
-        let () = self.validate_bitassets(rotxn, tx)?;
+        let () = self.validate_truthcoin(rotxn, tx)?;
         tx.bitcoin_fee()?.ok_or(Error::NotEnoughValueIn)
     }
 

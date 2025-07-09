@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt::Display};
 use eframe::egui::{self, InnerResponse, Response};
 
 use hex::FromHex;
-use plain_bitassets::{state::DutchAuctionState, types::DutchAuctionId};
+use truthcoin_dc::{state::DutchAuctionState, types::DutchAuctionId};
 
 use crate::{
     app::App,

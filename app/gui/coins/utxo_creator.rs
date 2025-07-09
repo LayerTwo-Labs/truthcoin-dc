@@ -1,6 +1,6 @@
 use eframe::egui::{self, Button};
 
-use plain_bitassets::types::{
+use truthcoin_dc::types::{
     self, AssetId, BitcoinOutputContent, Output, OutputContent, Transaction,
     WithdrawalOutputContent,
 };
@@ -140,7 +140,7 @@ impl UtxoCreator {
         };
         ui.separator();
         ui.horizontal(|ui| {
-            if !matches!(asset_id, AssetId::BitAssetControl(_)) {
+            if !matches!(asset_id, AssetId::TruthcoinControl(_)) {
                 ui.monospace("Value:       ");
                 ui.add(egui::TextEdit::singleline(&mut self.value));
             }
@@ -270,11 +270,11 @@ impl UtxoCreator {
                                 bitcoin_amount,
                             ))
                         }),
-                        AssetId::BitAsset(_) => {
-                            self.value.parse().ok().map(OutputContent::BitAsset)
+                        AssetId::Truthcoin(_) => {
+                            self.value.parse().ok().map(OutputContent::Truthcoin)
                         }
-                        AssetId::BitAssetControl(_) => {
-                            Some(OutputContent::BitAssetControl)
+                        AssetId::TruthcoinControl(_) => {
+                            Some(OutputContent::TruthcoinControl)
                         }
                     };
                     if ui

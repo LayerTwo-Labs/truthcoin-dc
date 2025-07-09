@@ -24,7 +24,7 @@ use crate::{
     authorization::{self, Authorization, Signature, get_address},
     types::{
         Address, AmountOverflowError, AmountUnderflowError, AssetId,
-        AuthorizedTransaction, BitAssetData, BitAssetId, BitcoinOutputContent,
+        AuthorizedTransaction, TruthcoinData, TruthcoinId, BitcoinOutputContent,
         DutchAuctionId, DutchAuctionParams, EncryptionPubKey, FilledOutput,
         GetBitcoinValue, Hash, InPoint, OutPoint, Output, OutputContent,
         SpentOutput, Transaction, TxData, VERSION, VerifyingKey, Version,
@@ -95,8 +95,8 @@ pub enum Error {
         "wallet does not have a seed (set with RPC `set-seed-from-mnemonic`)"
     )]
     NoSeed,
-    #[error("could not find bitasset reservation for `{plain_name}`")]
-    NoBitassetReservation { plain_name: String },
+    #[error("could not find truthcoin reservation for `{plain_name}`")]
+    NoTruthcoinReservation { plain_name: String },
     #[error("not enough funds")]
     NotEnoughFunds,
     #[error("utxo does not exist")]
@@ -142,10 +142,10 @@ pub struct Wallet {
         SerdeBincode<OutPoint>,
         SerdeBincode<SpentOutput<OutputContent>>,
     >,
-    /// Associates reservation commitments with plaintext BitAsset names
-    bitasset_reservations: DatabaseUnique<SerdeBincode<[u8; 32]>, Str>,
-    /// Associates BitAssets with plaintext names
-    known_bitassets: DatabaseUnique<SerdeBincode<BitAssetId>, Str>,
+    /// Associates reservation commitments with plaintext Truthcoin names
+    truthcoin_reservations: DatabaseUnique<SerdeBincode<[u8; 32]>, Str>,
+    /// Associates Truthcoin with plaintext names
+    known_truthcoin: DatabaseUnique<SerdeBincode<TruthcoinId>, Str>,
     /// Map each verifying key to it's index
     vk_to_index: DatabaseUnique<SerdeBincode<VerifyingKey>, U32<BigEndian>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
@@ -208,10 +208,10 @@ impl Wallet {
             &mut rwtxn,
             "spent_unconfirmed_utxos",
         )?;
-        let bitasset_reservations =
-            DatabaseUnique::create(&env, &mut rwtxn, "bitasset_reservations")?;
-        let known_bitassets =
-            DatabaseUnique::create(&env, &mut rwtxn, "known_bitassets")?;
+        let truthcoin_reservations =
+            DatabaseUnique::create(&env, &mut rwtxn, "truthcoin_reservations")?;
+        let known_truthcoin =
+            DatabaseUnique::create(&env, &mut rwtxn, "known_truthcoin")?;
         let vk_to_index =
             DatabaseUnique::create(&env, &mut rwtxn, "vk_to_index")?;
         let version = DatabaseUnique::create(&env, &mut rwtxn, "version")?;
@@ -231,8 +231,8 @@ impl Wallet {
             utxos,
             stxos,
             spent_unconfirmed_utxos,
-            bitasset_reservations,
-            known_bitassets,
+            truthcoin_reservations,
+            known_truthcoin,
             vk_to_index,
             _version: version,
         })
@@ -402,7 +402,7 @@ impl Wallet {
         self.spent_unconfirmed_utxos
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
-        self.bitasset_reservations
+        self.truthcoin_reservations
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
         rwtxn.commit()?;
@@ -541,10 +541,10 @@ impl Wallet {
         Ok(Transaction::new(inputs, outputs))
     }
 
-    pub fn create_bitasset_transfer(
+    pub fn create_truthcoin_transfer(
         &self,
         address: Address,
-        asset_id: BitAssetId,
+        asset_id: TruthcoinId,
         amount: u64,
         fee: bitcoin::Amount,
         memo: Option<Vec<u8>>,
@@ -552,13 +552,13 @@ impl Wallet {
         let (total_sats, bitcoins) = self.select_bitcoins(fee)?;
         let change_sats = total_sats - fee;
         let mut inputs: Vec<_> = bitcoins.into_keys().collect();
-        let (total_bitasset, bitasset_utxos) =
-            self.select_bitasset_utxos(asset_id, amount)?;
-        let bitasset_change = total_bitasset - amount;
-        inputs.extend(bitasset_utxos.into_keys());
+        let (total_truthcoin, truthcoin_utxos) =
+            self.select_truthcoin_utxos(asset_id, amount)?;
+        let truthcoin_change = total_truthcoin - amount;
+        inputs.extend(truthcoin_utxos.into_keys());
         let mut outputs = vec![Output {
             address,
-            content: OutputContent::BitAsset(amount),
+            content: OutputContent::Truthcoin(amount),
             memo: memo.unwrap_or_default(),
         }];
         if change_sats != Amount::ZERO {
@@ -567,34 +567,34 @@ impl Wallet {
                 OutputContent::Bitcoin(BitcoinOutputContent(change_sats)),
             ))
         }
-        if bitasset_change != 0 {
+        if truthcoin_change != 0 {
             outputs.push(Output::new(
                 self.get_new_address()?,
-                OutputContent::BitAsset(bitasset_change),
+                OutputContent::Truthcoin(truthcoin_change),
             ))
         }
         Ok(Transaction::new(inputs, outputs))
     }
 
-    /// given a regular transaction, add a bitasset reservation.
-    /// given a bitasset reservation tx, change the reserved name.
-    /// panics if the tx is not regular or a bitasset reservation tx.
-    pub fn reserve_bitasset(
+    /// given a regular transaction, add a truthcoin reservation.
+    /// given a truthcoin reservation tx, change the reserved name.
+    /// panics if the tx is not regular or a truthcoin reservation tx.
+    pub fn reserve_truthcoin(
         &self,
         tx: &mut Transaction,
         plain_name: &str,
     ) -> Result<(), Error> {
         assert!(
             tx.is_regular() || tx.is_reservation(),
-            "this function only accepts a regular or bitasset reservation tx"
+            "this function only accepts a regular or truthcoin reservation tx"
         );
         // address for the reservation output
         let reservation_addr =
-            // if the tx is already bitasset reservation,
+            // if the tx is already truthcoin reservation,
             // re-use the reservation address
             if tx.is_reservation() {
                 tx.reservation_outputs().next_back()
-                    .expect("A bitasset reservation tx must have at least one reservation output")
+                    .expect("A truthcoin reservation tx must have at least one reservation output")
                     .address
             }
             // if the last output is owned by this wallet, then use
@@ -614,7 +614,7 @@ impl Wallet {
         let reservation_signing_key =
             self.get_tx_signing_key_for_addr(&rotxn, &reservation_addr)?;
         let name_hash: Hash = blake3::hash(plain_name.as_bytes()).into();
-        let bitasset_id = BitAssetId(name_hash);
+        let truthcoin_id = TruthcoinId(name_hash);
         // hmac(secret, name_hash)
         let nonce =
             blake3::keyed_hash(reservation_signing_key.as_bytes(), &name_hash)
@@ -623,32 +623,32 @@ impl Wallet {
         let commitment = blake3::keyed_hash(&nonce, &name_hash).into();
         // store reservation data
         let mut rwtxn = self.env.write_txn()?;
-        self.bitasset_reservations
+        self.truthcoin_reservations
             .put(&mut rwtxn, &commitment, plain_name)?;
-        self.known_bitassets
-            .put(&mut rwtxn, &bitasset_id, plain_name)?;
+        self.known_truthcoin
+            .put(&mut rwtxn, &truthcoin_id, plain_name)?;
         rwtxn.commit()?;
         // if the tx is regular, add a reservation output
         if tx.is_regular() {
             let reservation_output = Output::new(
                 reservation_addr,
-                OutputContent::BitAssetReservation,
+                OutputContent::TruthcoinReservation,
             );
             tx.outputs.push(reservation_output);
         };
-        tx.data = Some(TxData::BitAssetReservation { commitment });
+        tx.data = Some(TxData::TruthcoinReservation { commitment });
         Ok(())
     }
 
-    /// given a regular transaction, add a bitasset registration.
+    /// given a regular transaction, add a truthcoin registration.
     /// panics if the tx is not regular.
     /// returns an error if there is no corresponding reservation utxo
     /// does not modify the tx if there is no corresponding reservation utxo.
-    pub fn register_bitasset(
+    pub fn register_truthcoin(
         &self,
         tx: &mut Transaction,
         plain_name: &str,
-        bitasset_data: Cow<BitAssetData>,
+        truthcoin_data: Cow<TruthcoinData>,
         initial_supply: u64,
     ) -> Result<(), Error> {
         assert!(tx.is_regular(), "this function only accepts a regular tx");
@@ -668,11 +668,11 @@ impl Wallet {
                 self.get_new_address()?
             };
         let name_hash: Hash = blake3::hash(plain_name.as_bytes()).into();
-        let bitasset_id = BitAssetId(name_hash);
+        let truthcoin_id = TruthcoinId(name_hash);
         /* Search for reservation utxo by the following procedure:
         For each reservation:
         * Get the corresponding signing key
-        * Compute a reservation commitment for the bitasset to be registered
+        * Compute a reservation commitment for the truthcoin to be registered
         * If the computed commitment is the same as the reservation commitment,
           then use this utxo. Otherwise, continue */
         // outpoint and nonce, if found
@@ -702,30 +702,30 @@ impl Wallet {
                 }
             }
         }
-        // store bitasset data
+        // store truthcoin data
         let mut rwtxn = self.env.write_txn()?;
-        self.known_bitassets
-            .put(&mut rwtxn, &bitasset_id, plain_name)?;
+        self.known_truthcoin
+            .put(&mut rwtxn, &truthcoin_id, plain_name)?;
         rwtxn.commit()?;
         let (reservation_outpoint, nonce) = reservation_outpoint_nonce
-            .ok_or_else(|| Error::NoBitassetReservation {
+            .ok_or_else(|| Error::NoTruthcoinReservation {
                 plain_name: plain_name.to_owned(),
             })?;
         tx.inputs.push(reservation_outpoint);
         if initial_supply != 0 {
             let mint_output = Output::new(
                 registration_addr,
-                OutputContent::BitAsset(initial_supply),
+                OutputContent::Truthcoin(initial_supply),
             );
             tx.outputs.push(mint_output);
         };
         let control_coin_output =
-            Output::new(registration_addr, OutputContent::BitAssetControl);
+            Output::new(registration_addr, OutputContent::TruthcoinControl);
         tx.outputs.push(control_coin_output);
-        tx.data = Some(TxData::BitAssetRegistration {
+        tx.data = Some(TxData::TruthcoinRegistration {
             name_hash,
             revealed_nonce: nonce,
-            bitasset_data: Box::new(bitasset_data.into_owned()),
+            truthcoin_data: Box::new(truthcoin_data.into_owned()),
             initial_supply,
         });
         Ok(())
@@ -767,7 +767,7 @@ impl Wallet {
             bitcoin_utxos.into_iter().chain(unconfirmed_bitcoin_utxos)
         {
             if output.content.is_withdrawal()
-                || output.is_bitasset()
+                || output.is_truthcoin()
                 || output.is_reservation()
                 || output.get_bitcoin_value() == bitcoin::Amount::ZERO
             {
@@ -788,39 +788,39 @@ impl Wallet {
         }
     }
 
-    // Select UTXOs for the specified BitAsset
-    pub fn select_bitasset_utxos(
+    // Select UTXOs for the specified Truthcoin
+    pub fn select_truthcoin_utxos(
         &self,
-        bitasset: BitAssetId,
+        truthcoin: TruthcoinId,
         value: u64,
     ) -> Result<(u64, HashMap<OutPoint, Output>), Error> {
         let rotxn = self.env.read_txn()?;
-        let mut bitasset_utxos: Vec<_> = self
+        let mut truthcoin_utxos: Vec<_> = self
             .utxos
             .iter(&rotxn)?
             .filter(|(_outpoint, output)| {
-                Ok(output.bitasset().is_some_and(|output_bitasset| {
-                    bitasset == *output_bitasset
+                Ok(output.truthcoin().is_some_and(|output_truthcoin| {
+                    truthcoin == *output_truthcoin
                 }))
             })
             .collect()?;
-        bitasset_utxos.sort_unstable_by_key(|(_, output)| {
+        truthcoin_utxos.sort_unstable_by_key(|(_, output)| {
             output
-                .bitasset_value()
-                .map(|(_, bitasset_value)| bitasset_value)
+                .truthcoin_value()
+                .map(|(_, truthcoin_value)| truthcoin_value)
         });
 
         let mut selected = HashMap::new();
         let mut total_value: u64 = 0;
-        for (outpoint, output) in &bitasset_utxos {
+        for (outpoint, output) in &truthcoin_utxos {
             if output.content.is_withdrawal() {
                 continue;
             }
             if total_value > value {
                 break;
             }
-            let (_, bitasset_value) = output.bitasset_value().unwrap();
-            total_value += bitasset_value;
+            let (_, truthcoin_value) = output.truthcoin_value().unwrap();
+            total_value += truthcoin_value;
             selected.insert(*outpoint, output.clone().into());
         }
         if total_value < value {
@@ -829,23 +829,23 @@ impl Wallet {
         Ok((total_value, selected))
     }
 
-    // Select control coin for the specified BitAsset
-    pub fn select_bitasset_control(
+    // Select control coin for the specified Truthcoin
+    pub fn select_truthcoin_control(
         &self,
-        bitasset: BitAssetId,
+        truthcoin: TruthcoinId,
     ) -> Result<(OutPoint, Output), Error> {
         let rotxn = self.env.read_txn()?;
-        let bitasset_utxo =
+        let truthcoin_utxo =
             self.utxos.iter(&rotxn)?.find_map(|(outpoint, output)| {
-                if let Some(output_bitasset) = output.bitasset()
-                    && bitasset == *output_bitasset
+                if let Some(output_truthcoin) = output.truthcoin()
+                    && truthcoin == *output_truthcoin
                 {
                     Ok(Some((outpoint, output.into())))
                 } else {
                     Ok(None)
                 }
             })?;
-        bitasset_utxo.ok_or(Error::NotEnoughFunds)
+        truthcoin_utxo.ok_or(Error::NotEnoughFunds)
     }
 
     pub fn select_asset_utxos(
@@ -857,12 +857,12 @@ impl Wallet {
             AssetId::Bitcoin => self
                 .select_bitcoins(bitcoin::Amount::from_sat(amount))
                 .map(|(amount, utxos)| (amount.to_sat(), utxos)),
-            AssetId::BitAsset(bitasset) => {
-                self.select_bitasset_utxos(bitasset, amount)
+            AssetId::Truthcoin(truthcoin) => {
+                self.select_truthcoin_utxos(truthcoin, amount)
             }
-            AssetId::BitAssetControl(bitasset) => {
+            AssetId::TruthcoinControl(truthcoin) => {
                 if amount == 1 {
-                    let utxo = self.select_bitasset_control(bitasset)?;
+                    let utxo = self.select_truthcoin_control(truthcoin)?;
                     Ok((1, HashMap::from_iter([utxo])))
                 } else {
                     do yeet Error::NotEnoughFunds
@@ -965,8 +965,8 @@ impl Wallet {
                         bitcoin::Amount::from_sat(change_amount0),
                     ))
                 }
-                AssetId::BitAsset(_) => OutputContent::BitAsset(change_amount0),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount0),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             };
             Some(Output {
                 address,
@@ -984,8 +984,8 @@ impl Wallet {
                         bitcoin::Amount::from_sat(change_amount1),
                     ))
                 }
-                AssetId::BitAsset(_) => OutputContent::BitAsset(change_amount1),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount1),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             };
             Some(Output {
                 address,
@@ -1057,8 +1057,8 @@ impl Wallet {
                 AssetId::Bitcoin => OutputContent::Bitcoin(
                     BitcoinOutputContent(bitcoin::Amount::from_sat(amount0)),
                 ),
-                AssetId::BitAsset(_) => OutputContent::BitAsset(amount0),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount0),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             },
         };
         let asset1_output = Output {
@@ -1068,8 +1068,8 @@ impl Wallet {
                 AssetId::Bitcoin => OutputContent::Bitcoin(
                     BitcoinOutputContent(bitcoin::Amount::from_sat(amount1)),
                 ),
-                AssetId::BitAsset(_) => OutputContent::BitAsset(amount1),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount1),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             },
         };
 
@@ -1113,8 +1113,8 @@ impl Wallet {
                         bitcoin::Amount::from_sat(amount_change),
                     ))
                 }
-                AssetId::BitAsset(_) => OutputContent::BitAsset(amount_change),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount_change),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             };
             Some(Output {
                 address,
@@ -1133,8 +1133,8 @@ impl Wallet {
                         bitcoin::Amount::from_sat(amount_receive),
                     ))
                 }
-                AssetId::BitAsset(_) => OutputContent::BitAsset(amount_receive),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount_receive),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             },
         };
         // The first unique asset in the inputs must be `asset_spend`.
@@ -1171,8 +1171,8 @@ impl Wallet {
                         bitcoin::Amount::from_sat(change_amount),
                     ))
                 }
-                AssetId::BitAsset(_) => OutputContent::BitAsset(change_amount),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             };
             Some(Output {
                 address,
@@ -1216,8 +1216,8 @@ impl Wallet {
                         bitcoin::Amount::from_sat(change_amount),
                     ))
                 }
-                AssetId::BitAsset(_) => OutputContent::BitAsset(change_amount),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             };
             Some(Output {
                 address,
@@ -1234,10 +1234,8 @@ impl Wallet {
                         bitcoin::Amount::from_sat(receive_quantity),
                     ))
                 }
-                AssetId::BitAsset(_) => {
-                    OutputContent::BitAsset(receive_quantity)
-                }
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             };
             Output {
                 address: self.get_new_address()?,
@@ -1282,8 +1280,8 @@ impl Wallet {
                         bitcoin::Amount::from_sat(amount_base),
                     ))
                 }
-                AssetId::BitAsset(_) => OutputContent::BitAsset(amount_base),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount_base),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             };
             Some(Output {
                 address,
@@ -1301,8 +1299,8 @@ impl Wallet {
                         bitcoin::Amount::from_sat(amount_quote),
                     ))
                 }
-                AssetId::BitAsset(_) => OutputContent::BitAsset(amount_quote),
-                AssetId::BitAssetControl(_) => OutputContent::BitAssetControl,
+                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount_quote),
+                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
             };
             Some(Output {
                 address,
@@ -1422,25 +1420,25 @@ impl Wallet {
         Ok(balance)
     }
 
-    /// gets the plaintext name associated with a bitasset reservation
+    /// gets the plaintext name associated with a truthcoin reservation
     /// commitment, if it is known by the wallet.
-    pub fn get_bitasset_reservation_plaintext(
+    pub fn get_truthcoin_reservation_plaintext(
         &self,
         commitment: &Hash,
     ) -> Result<Option<String>, Error> {
         let rotxn = self.env.read_txn()?;
-        let res = self.bitasset_reservations.try_get(&rotxn, commitment)?;
+        let res = self.truthcoin_reservations.try_get(&rotxn, commitment)?;
         Ok(res.map(String::from))
     }
 
-    /// gets the plaintext name associated with a bitasset,
+    /// gets the plaintext name associated with a truthcoin,
     /// if it is known by the wallet.
-    pub fn get_bitasset_plaintext(
+    pub fn get_truthcoin_plaintext(
         &self,
-        bitasset: &BitAssetId,
+        truthcoin: &TruthcoinId,
     ) -> Result<Option<String>, Error> {
         let rotxn = self.env.read_txn()?;
-        let res = self.known_bitassets.try_get(&rotxn, bitasset)?;
+        let res = self.known_truthcoin.try_get(&rotxn, truthcoin)?;
         Ok(res.map(String::from))
     }
 
@@ -1478,21 +1476,21 @@ impl Wallet {
         Ok(stxos)
     }
 
-    /// get all owned bitasset utxos
-    pub fn get_bitassets(
+    /// get all owned truthcoin utxos
+    pub fn get_truthcoin(
         &self,
     ) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
         let mut utxos = self.get_utxos()?;
-        utxos.retain(|_, output| output.is_bitasset());
+        utxos.retain(|_, output| output.is_truthcoin());
         Ok(utxos)
     }
 
-    /// get all spent bitasset utxos
-    pub fn get_spent_bitassets(
+    /// get all spent truthcoin utxos
+    pub fn get_spent_truthcoin(
         &self,
     ) -> Result<HashMap<OutPoint, SpentOutput>, Error> {
         let mut stxos = self.get_stxos()?;
-        stxos.retain(|_, output| output.output.is_bitasset());
+        stxos.retain(|_, output| output.output.is_truthcoin());
         Ok(stxos)
     }
 
@@ -1602,8 +1600,8 @@ impl Watchable<()> for Wallet {
             stxos,
             unconfirmed_utxos,
             spent_unconfirmed_utxos,
-            bitasset_reservations,
-            known_bitassets,
+            truthcoin_reservations,
+            known_truthcoin,
             vk_to_index,
             _version: _,
         } = self;
@@ -1618,8 +1616,8 @@ impl Watchable<()> for Wallet {
             stxos.watch().clone(),
             unconfirmed_utxos.watch().clone(),
             spent_unconfirmed_utxos.watch().clone(),
-            bitasset_reservations.watch().clone(),
-            known_bitassets.watch().clone(),
+            truthcoin_reservations.watch().clone(),
+            known_truthcoin.watch().clone(),
             vk_to_index.watch().clone(),
         ];
         let streams = StreamMap::from_iter(

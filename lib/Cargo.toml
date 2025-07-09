@@ -1,5 +1,5 @@
 [package]
-name = "plain_bitassets"
+name = "truthcoin_dc"
 authors.workspace = true
 edition.workspace = true
 license-file.workspace = true
@@ -84,5 +84,5 @@ features = ["quanta", "std"]
 workspace = true
 
 [lib]
-name = "plain_bitassets"
+name = "truthcoin_dc"
 path = "lib.rs"

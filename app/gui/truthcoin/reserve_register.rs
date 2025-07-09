@@ -1,35 +1,35 @@
 use std::borrow::Cow;
 
 use eframe::egui;
-use plain_bitassets::types::BitAssetData;
+use truthcoin_dc::types::TruthcoinData;
 
 use crate::{
     app::App,
     gui::{coins::tx_creator, util::UiExt},
 };
 
-fn reserve_bitasset(
+fn reserve_truthcoin(
     app: &App,
     plaintext_name: &str,
     fee: bitcoin::Amount,
 ) -> anyhow::Result<()> {
     let mut tx = app.wallet.create_regular_transaction(fee)?;
-    let () = app.wallet.reserve_bitasset(&mut tx, plaintext_name)?;
+    let () = app.wallet.reserve_truthcoin(&mut tx, plaintext_name)?;
     app.sign_and_send(tx).map_err(anyhow::Error::from)
 }
 
-fn register_bitasset(
+fn register_truthcoin(
     app: &App,
     plaintext_name: &str,
     initial_supply: u64,
-    bitasset_data: Cow<BitAssetData>,
+    truthcoin_data: Cow<TruthcoinData>,
     fee: bitcoin::Amount,
 ) -> anyhow::Result<()> {
     let mut tx = app.wallet.create_regular_transaction(fee)?;
-    let () = app.wallet.register_bitasset(
+    let () = app.wallet.register_truthcoin(
         &mut tx,
         plaintext_name,
-        bitasset_data,
+        truthcoin_data,
         initial_supply,
     )?;
     app.sign_and_send(tx).map_err(anyhow::Error::from)
@@ -74,7 +74,7 @@ impl Reserve {
             )
             .clicked()
         {
-            if let Err(err) = reserve_bitasset(
+            if let Err(err) = reserve_truthcoin(
                 app.unwrap(),
                 &self.plaintext_name,
                 fee.expect("should not happen"),
@@ -92,7 +92,7 @@ struct Register {
     plaintext_name: String,
     initial_supply: String,
     fee: String,
-    bitasset_data: tx_creator::TrySetBitAssetData,
+    truthcoin_data: tx_creator::TrySetTruthcoinData,
 }
 
 impl Register {
@@ -132,13 +132,13 @@ impl Register {
             &self.fee,
             bitcoin::Denomination::Bitcoin,
         );
-        tx_creator::TxCreator::show_bitasset_options(
+        tx_creator::TxCreator::show_truthcoin_options(
             ui,
-            &mut self.bitasset_data,
+            &mut self.truthcoin_data,
         );
-        let bitasset_data: Result<BitAssetData, _> =
-            self.bitasset_data.clone().try_into();
-        if let Err(err) = &bitasset_data {
+        let truthcoin_data: Result<TruthcoinData, _> =
+            self.truthcoin_data.clone().try_into();
+        if let Err(err) = &truthcoin_data {
             ui.monospace_selectable_multiline(err.clone());
         }
         if ui
@@ -146,17 +146,17 @@ impl Register {
                 !self.plaintext_name.is_empty()
                     && initial_supply.is_ok()
                     && fee.is_ok()
-                    && bitasset_data.is_ok()
+                    && truthcoin_data.is_ok()
                     && app.is_some(),
                 egui::Button::new("Register"),
             )
             .clicked()
         {
-            if let Err(err) = register_bitasset(
+            if let Err(err) = register_truthcoin(
                 app.unwrap(),
                 &self.plaintext_name,
                 initial_supply.expect("should not happen"),
-                Cow::Borrowed(&bitasset_data.expect("should not happen")),
+                Cow::Borrowed(&truthcoin_data.expect("should not happen")),
                 fee.expect("should not happen"),
             ) {
                 tracing::error!("{err:#}");

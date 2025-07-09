@@ -6,7 +6,7 @@ use thiserror::Error;
 use transitive::Transitive;
 
 use crate::types::{
-    AmountOverflowError, AmountUnderflowError, AssetId, BitAssetId, BlockHash,
+    AmountOverflowError, AmountUnderflowError, AssetId, TruthcoinId, BlockHash,
     Hash, M6id, MerkleRoot, OutPoint, Txid, WithdrawalBundleError,
 };
 
@@ -44,38 +44,31 @@ pub enum Amm {
     RevertMint,
     #[error("Failed to revert AMM swap")]
     RevertSwap,
-    #[error("Too few BitAssets to mint an AMM position")]
-    TooFewBitAssetsToMint,
+    #[error("Too few Truthcoin to mint an AMM position")]
+    TooFewTruthcoinToMint,
 }
 
-impl From<sneed::Error> for Amm {
-    fn from(err: sneed::Error) -> Self {
-        Self::Db(Box::new(err))
-    }
-}
-
-/// Errors related to BitAssets
-#[allow(clippy::duplicated_attributes)]
+/// Errors related to Truthcoin
 #[derive(Debug, Error, Transitive)]
 #[transitive(from(db::Delete, db::Error))]
 #[transitive(from(db::Last, db::Error))]
 #[transitive(from(db::Put, db::Error))]
 #[transitive(from(db::TryGet, db::Error))]
-pub enum BitAsset {
+pub enum Truthcoin {
     #[error(transparent)]
-    Db(Box<db::Error>),
-    #[error("missing BitAsset {bitasset:?}")]
-    Missing { bitasset: BitAssetId },
+    Db(#[from] db::Error),
+    #[error("missing Truthcoin {truthcoin:?}")]
+    Missing { truthcoin: TruthcoinId },
     #[error(
-        "Missing BitAsset data for {name_hash:?} at block height {block_height}"
+        "Missing Truthcoin data for {name_hash:?} at block height {block_height}"
     )]
     MissingData { name_hash: Hash, block_height: u32 },
-    #[error("missing BitAsset reservation {txid}")]
+    #[error("missing Truthcoin reservation {txid}")]
     MissingReservation { txid: Txid },
-    #[error("no BitAssets to mint")]
-    NoBitAssetsToMint,
-    #[error("no BitAssets to update")]
-    NoBitAssetsToUpdate,
+    #[error("no Truthcoin to mint")]
+    NoTruthcoinToMint,
+    #[error("no Truthcoin to update")]
+    NoTruthcoinToUpdate,
     #[error("Mint would cause total supply to overflow")]
     TotalSupplyOverflow,
     #[error("Reverting Mint would cause total supply to underflow")]
@@ -180,8 +173,8 @@ pub mod dutch_auction {
         Db(Box<sneed::Error>),
         #[error("missing Dutch auction {0}")]
         Missing(DutchAuctionId),
-        #[error("Too few BitAssets to create a Dutch auction")]
-        TooFewBitAssetsToCreate,
+        #[error("Too few Truthcoin to create a Dutch auction")]
+        TooFewTruthcoinToCreate,
     }
 
     impl From<sneed::Error> for Error {
@@ -255,9 +248,9 @@ pub enum Error {
     #[error("bad coinbase output content")]
     BadCoinbaseOutputContent,
     #[error(transparent)]
-    BitAsset(#[from] BitAsset),
-    #[error("bitasset {name_hash:?} already registered")]
-    BitAssetAlreadyRegistered { name_hash: Hash },
+    Truthcoin(#[from] Truthcoin),
+    #[error("truthcoin {name_hash:?} already registered")]
+    TruthcoinAlreadyRegistered { name_hash: Hash },
     #[error("bundle too heavy {weight} > {max_weight}")]
     BundleTooHeavy { weight: u64, max_weight: u64 },
     #[error(transparent)]
@@ -278,11 +271,11 @@ pub enum Error {
     #[error("invalid header: {0}")]
     InvalidHeader(InvalidHeader),
     #[error(
-        "The last output in a BitAsset registration tx must be a control coin"
+        "The last output in a Truthcoin registration tx must be a control coin"
     )]
     LastOutputNotControlCoin,
-    #[error("missing BitAsset input {name_hash:?}")]
-    MissingBitAssetInput { name_hash: Hash },
+    #[error("missing Truthcoin input {name_hash:?}")]
+    MissingTruthcoinInput { name_hash: Hash },
     #[error("deposit block doesn't exist")]
     NoDepositBlock,
     #[error("total fees less than coinbase value")]
@@ -298,30 +291,30 @@ pub enum Error {
     #[error("Withdrawal bundle event block doesn't exist")]
     NoWithdrawalBundleEventBlock,
     #[error(
-        "The second-last output in a BitAsset registration tx \
-             must be the BitAsset mint, \
+        "The second-last output in a Truthcoin registration tx \
+             must be the Truthcoin mint, \
              if the initial supply is nonzero"
     )]
-    SecondLastOutputNotBitAsset,
+    SecondLastOutputNotTruthcoin,
     #[error(transparent)]
     SignatureError(#[from] ed25519_dalek::SignatureError),
-    #[error("Too few BitAsset control coin outputs")]
-    TooFewBitAssetControlOutputs,
+    #[error("Too few Truthcoin control coin outputs")]
+    TooFewTruthcoinControlOutputs,
     #[error(
-        "unbalanced BitAsset control coins: \
-         {n_bitasset_control_inputs} BitAsset control coin inputs, \
-         {n_bitasset_control_outputs} BitAsset control coin outputs"
+        "unbalanced Truthcoin control coins: \
+         {n_truthcoin_control_inputs} Truthcoin control coin inputs, \
+         {n_truthcoin_control_outputs} Truthcoin control coin outputs"
     )]
-    UnbalancedBitAssetControls {
-        n_bitasset_control_inputs: usize,
-        n_bitasset_control_outputs: usize,
+    UnbalancedTruthcoinControls {
+        n_truthcoin_control_inputs: usize,
+        n_truthcoin_control_outputs: usize,
     },
     #[error(
-        "unbalanced BitAssets: {n_unique_bitasset_inputs} unique BitAsset inputs, {n_bitasset_outputs} BitAsset outputs"
+        "unbalanced Truthcoin: {n_unique_truthcoin_inputs} unique Truthcoin inputs, {n_truthcoin_outputs} Truthcoin outputs"
     )]
-    UnbalancedBitAssets {
-        n_unique_bitasset_inputs: usize,
-        n_bitasset_outputs: usize,
+    UnbalancedTruthcoin {
+        n_unique_truthcoin_inputs: usize,
+        n_truthcoin_outputs: usize,
     },
     #[error(
         "unbalanced reservations: {n_reservation_inputs} reservation inputs, {n_reservation_outputs} reservation outputs"

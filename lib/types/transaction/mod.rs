@@ -15,11 +15,11 @@ use utoipa::{PartialSchema, ToSchema};
 use crate::{
     authorization::Authorization,
     types::{
-        AmountOverflowError, BitAssetData, BitAssetDataUpdates, GetAddress,
+        AmountOverflowError, TruthcoinData, TruthcoinDataUpdates, GetAddress,
         GetBitcoinValue,
         address::Address,
         hashes::{
-            self, AssetId, BitAssetId, DutchAuctionId, Hash, M6id, MerkleRoot,
+            self, AssetId, TruthcoinId, DutchAuctionId, Hash, M6id, MerkleRoot,
             Txid,
         },
         serde_hexstr_human_readable,
@@ -316,18 +316,18 @@ pub struct DutchAuctionParams {
 pub enum TransactionData {
     /// Burn an AMM position
     AmmBurn {
-        /// Amount of the lexicographically ordered first BitAsset to receive
+        /// Amount of the lexicographically ordered first Truthcoin to receive
         amount0: u64,
-        /// Amount of the lexicographically ordered second BitAsset to receive
+        /// Amount of the lexicographically ordered second Truthcoin to receive
         amount1: u64,
         /// Amount of the LP token to burn
         lp_token_burn: u64,
     },
     /// Mint an AMM position
     AmmMint {
-        /// Amount of the lexicographically ordered first BitAsset to deposit
+        /// Amount of the lexicographically ordered first Truthcoin to deposit
         amount0: u64,
-        /// Amount of the lexicographically ordered second BitAsset to deposit
+        /// Amount of the lexicographically ordered second Truthcoin to deposit
         amount1: u64,
         /// Amount of the LP token to receive
         lp_token_mint: u64,
@@ -341,29 +341,29 @@ pub enum TransactionData {
         /// Pair asset to swap for
         pair_asset: AssetId,
     },
-    BitAssetReservation {
-        /// Commitment to the BitAsset that will be registered
+    TruthcoinReservation {
+        /// Commitment to the Truthcoin that will be registered
         #[serde(with = "serde_hexstr_human_readable")]
         #[schema(value_type = String)]
         commitment: Hash,
     },
-    BitAssetRegistration {
+    TruthcoinRegistration {
         /// Reveal of the name hash
         #[serde(with = "serde_hexstr_human_readable")]
         #[schema(value_type = String)]
         name_hash: Hash,
-        /// Reveal of the nonce used for the BitAsset reservation commitment
+        /// Reveal of the nonce used for the Truthcoin reservation commitment
         #[serde(with = "serde_hexstr_human_readable")]
         #[schema(value_type = String)]
         revealed_nonce: Hash,
-        /// Initial BitAsset data
-        bitasset_data: Box<BitAssetData>,
+        /// Initial Truthcoin data
+        truthcoin_data: Box<TruthcoinData>,
         /// Amount to mint
         initial_supply: u64,
     },
-    /// Mint more of a BitAsset
-    BitAssetMint(u64),
-    BitAssetUpdate(Box<BitAssetDataUpdates>),
+    /// Mint more of a Truthcoin
+    TruthcoinMint(u64),
+    TruthcoinUpdate(Box<TruthcoinDataUpdates>),
     DutchAuctionCreate(DutchAuctionParams),
     DutchAuctionBid {
         auction_id: DutchAuctionId,
@@ -421,17 +421,17 @@ impl TxData {
 
     /// `true` if the tx data corresponds to a registration
     pub fn is_registration(&self) -> bool {
-        matches!(self, Self::BitAssetRegistration { .. })
+        matches!(self, Self::TruthcoinRegistration { .. })
     }
 
     /// `true` if the tx data corresponds to a reservation
     pub fn is_reservation(&self) -> bool {
-        matches!(self, Self::BitAssetReservation { .. })
+        matches!(self, Self::TruthcoinReservation { .. })
     }
 
     /// `true` if the tx data corresponds to an update
     pub fn is_update(&self) -> bool {
-        matches!(self, Self::BitAssetUpdate(_))
+        matches!(self, Self::TruthcoinUpdate(_))
     }
 }
 
@@ -531,16 +531,16 @@ impl Transaction {
         })
     }
 
-    /// Return an iterator over BitAsset outputs
-    pub fn bitasset_outputs(&self) -> impl Iterator<Item = &Output> {
-        self.outputs.iter().filter(|output| output.is_bitasset())
+    /// Return an iterator over Truthcoin outputs
+    pub fn truthcoin_outputs(&self) -> impl Iterator<Item = &Output> {
+        self.outputs.iter().filter(|output| output.is_truthcoin())
     }
 
-    /// Return an iterator over BitAsset control outputs
-    pub fn bitasset_control_outputs(&self) -> impl Iterator<Item = &Output> {
+    /// Return an iterator over Truthcoin control outputs
+    pub fn truthcoin_control_outputs(&self) -> impl Iterator<Item = &Output> {
         self.outputs
             .iter()
-            .filter(|output| output.is_bitasset_control())
+            .filter(|output| output.is_truthcoin_control())
     }
 
     /// `true` if the tx data corresponds to an AMM burn
@@ -591,7 +591,7 @@ impl Transaction {
         }
     }
 
-    /// `true` if the tx data corresponds to a BitAsset registration
+    /// `true` if the tx data corresponds to a Truthcoin registration
     pub fn is_registration(&self) -> bool {
         match &self.data {
             Some(tx_data) => tx_data.is_registration(),
@@ -620,21 +620,21 @@ impl Transaction {
         }
     }
 
-    /// If the tx is a bitasset registration, returns the registered name hash
+    /// If the tx is a truthcoin registration, returns the registered name hash
     pub fn registration_name_hash(&self) -> Option<Hash> {
         match self.data {
-            Some(TxData::BitAssetRegistration { name_hash, .. }) => {
+            Some(TxData::TruthcoinRegistration { name_hash, .. }) => {
                 Some(name_hash)
             }
             _ => None,
         }
     }
 
-    /** If the tx is a bitasset registration, returns the implied reservation
+    /** If the tx is a truthcoin registration, returns the implied reservation
      * commitment */
     pub fn implied_reservation_commitment(&self) -> Option<Hash> {
         match self.data {
-            Some(TxData::BitAssetRegistration {
+            Some(TxData::TruthcoinRegistration {
                 name_hash,
                 revealed_nonce,
                 ..
@@ -658,10 +658,10 @@ impl Transaction {
         hashes::hash_with_scratch_buffer(self).into()
     }
 
-    /// If the tx is a bitasset reservation, returns the reservation commitment
+    /// If the tx is a truthcoin reservation, returns the reservation commitment
     pub fn reservation_commitment(&self) -> Option<Hash> {
         match self.data {
-            Some(TxData::BitAssetReservation { commitment }) => {
+            Some(TxData::TruthcoinReservation { commitment }) => {
                 Some(commitment)
             }
             _ => None,
@@ -676,14 +676,14 @@ pub struct FilledTransaction {
 }
 
 impl FilledTransaction {
-    // Return an iterator over BitAsset outputs
-    pub fn bitasset_outputs(&self) -> impl Iterator<Item = &Output> {
-        self.transaction.bitasset_outputs()
+    // Return an iterator over Truthcoin outputs
+    pub fn truthcoin_outputs(&self) -> impl Iterator<Item = &Output> {
+        self.transaction.truthcoin_outputs()
     }
 
-    // Return an iterator over BitAsset control outputs
-    pub fn bitasset_control_outputs(&self) -> impl Iterator<Item = &Output> {
-        self.transaction.bitasset_control_outputs()
+    // Return an iterator over Truthcoin control outputs
+    pub fn truthcoin_control_outputs(&self) -> impl Iterator<Item = &Output> {
+        self.transaction.truthcoin_control_outputs()
     }
 
     /// Accessor for tx data
@@ -691,7 +691,7 @@ impl FilledTransaction {
         &self.transaction.data
     }
 
-    /** If the tx is a bitasset registration, returns the implied reservation
+    /** If the tx is a truthcoin registration, returns the implied reservation
      * commitment */
     pub fn implied_reservation_commitment(&self) -> Option<Hash> {
         self.transaction.implied_reservation_commitment()
@@ -732,7 +732,7 @@ impl FilledTransaction {
         self.transaction.is_dutch_auction_collect()
     }
 
-    /// `true` if the tx data corresponds to a BitAsset registration
+    /// `true` if the tx data corresponds to a Truthcoin registration
     pub fn is_registration(&self) -> bool {
         self.transaction.is_registration()
     }
@@ -742,12 +742,12 @@ impl FilledTransaction {
         self.transaction.is_regular()
     }
 
-    /// `true` if the tx data corresponds to a BitAsset reservation
+    /// `true` if the tx data corresponds to a Truthcoin reservation
     pub fn is_reservation(&self) -> bool {
         self.transaction.is_reservation()
     }
 
-    /// `true` if the tx data corresponds to a BitAsset update
+    /// `true` if the tx data corresponds to a Truthcoin update
     pub fn is_update(&self) -> bool {
         self.transaction.is_update()
     }
@@ -826,15 +826,15 @@ impl FilledTransaction {
         }
     }
 
-    /** If the tx is a valid BitAsset mint,
-     *  returns the BitAsset ID and mint amount */
-    pub fn bitasset_mint(&self) -> Option<(BitAssetId, u64)> {
+    /** If the tx is a valid Truthcoin mint,
+     *  returns the Truthcoin ID and mint amount */
+    pub fn truthcoin_mint(&self) -> Option<(TruthcoinId, u64)> {
         match self.transaction.data {
-            Some(TransactionData::BitAssetMint(amount)) => {
+            Some(TransactionData::TruthcoinMint(amount)) => {
                 let (_, control_output) =
-                    self.spent_bitasset_controls().next_back()?;
-                let bitasset = control_output.get_bitasset()?;
-                Some((bitasset, amount))
+                    self.spent_truthcoin_controls().next_back()?;
+                let truthcoin = control_output.get_truthcoin()?;
+                Some((truthcoin, amount))
             }
             _ => None,
         }
@@ -903,17 +903,17 @@ impl FilledTransaction {
         }
     }
 
-    /// If the tx is a BitAsset registration, returns the registered name hash
+    /// If the tx is a Truthcoin registration, returns the registered name hash
     pub fn registration_name_hash(&self) -> Option<Hash> {
         self.transaction.registration_name_hash()
     }
 
-    /// Return an iterator over BitAsset reservation outputs
+    /// Return an iterator over Truthcoin reservation outputs
     pub fn reservation_outputs(&self) -> impl Iterator<Item = &Output> {
         self.transaction.reservation_outputs()
     }
 
-    /// If the tx is a BitAsset reservation, returns the reservation commitment
+    /// If the tx is a Truthcoin reservation, returns the reservation commitment
     pub fn reservation_commitment(&self) -> Option<Hash> {
         self.transaction.reservation_commitment()
     }
@@ -973,44 +973,44 @@ impl FilledTransaction {
             .filter(|(_, filled_output)| filled_output.is_reservation())
     }
 
-    /// Return an iterator over spent BitAssets
-    pub fn spent_bitassets(
+    /// Return an iterator over spent Truthcoin
+    pub fn spent_truthcoin(
         &self,
     ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
         self.spent_inputs()
-            .filter(|(_, filled_output)| filled_output.is_bitasset())
+            .filter(|(_, filled_output)| filled_output.is_truthcoin())
     }
 
-    /** Return an iterator over spent assets (Bitcoin, BitAssets,
-     * and BitAsset control coins) */
+    /** Return an iterator over spent assets (Bitcoin, Truthcoin,
+     * and Truthcoin control coins) */
     pub fn spent_assets(
         &self,
     ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
         self.spent_inputs().filter(|(_, filled_output)| {
             filled_output.is_bitcoin()
-                || filled_output.is_bitasset()
-                || filled_output.is_bitasset_control()
+                || filled_output.is_truthcoin()
+                || filled_output.is_truthcoin_control()
         })
     }
 
-    /** Return a vector of pairs consisting of a BitAsset and the combined
-     *  input value for that BitAsset.
-     *  The vector is ordered such that BitAssets occur in the same order
+    /** Return a vector of pairs consisting of a Truthcoin and the combined
+     *  input value for that Truthcoin.
+     *  The vector is ordered such that Truthcoin occur in the same order
      *  as they first occur in the inputs. */
-    pub fn unique_spent_bitassets(&self) -> Vec<(BitAssetId, u64)> {
-        // Combined value for each BitAsset
-        let mut combined_value = HashMap::<BitAssetId, u64>::new();
-        let spent_bitasset_values = || {
-            self.spent_bitassets()
-                .filter_map(|(_, output)| output.bitasset_value())
+    pub fn unique_spent_truthcoin(&self) -> Vec<(TruthcoinId, u64)> {
+        // Combined value for each Truthcoin
+        let mut combined_value = HashMap::<TruthcoinId, u64>::new();
+        let spent_truthcoin_values = || {
+            self.spent_truthcoin()
+                .filter_map(|(_, output)| output.truthcoin_value())
         };
-        // Increment combined value for the BitAsset
-        spent_bitasset_values().for_each(|(bitasset, value)| {
-            *combined_value.entry(bitasset).or_default() += value;
+        // Increment combined value for the Truthcoin
+        spent_truthcoin_values().for_each(|(truthcoin, value)| {
+            *combined_value.entry(truthcoin).or_default() += value;
         });
-        spent_bitasset_values()
-            .unique_by(|(bitasset, _)| *bitasset)
-            .map(|(bitasset, _)| (bitasset, combined_value[&bitasset]))
+        spent_truthcoin_values()
+            .unique_by(|(truthcoin, _)| *truthcoin)
+            .map(|(truthcoin, _)| (truthcoin, combined_value[&truthcoin]))
             .collect()
     }
 
@@ -1035,12 +1035,12 @@ impl FilledTransaction {
             .collect()
     }
 
-    /// Return an iterator over spent BitAsset control coins
-    pub fn spent_bitasset_controls(
+    /// Return an iterator over spent Truthcoin control coins
+    pub fn spent_truthcoin_controls(
         &self,
     ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
         self.spent_inputs()
-            .filter(|(_, filled_output)| filled_output.is_bitasset_control())
+            .filter(|(_, filled_output)| filled_output.is_truthcoin_control())
     }
 
     /// Return an iterator over spent Dutch auction receipts
@@ -1071,7 +1071,7 @@ impl FilledTransaction {
             self.spent_lp_tokens()
                 .filter_map(|(_, output)| output.lp_token_amount())
         };
-        // Increment combined amount for the BitAsset
+        // Increment combined amount for the Truthcoin
         spent_lp_token_amounts().for_each(|(asset0, asset1, amount)| {
             *combined_amounts.entry((asset0, asset1)).or_default() += amount;
         });
@@ -1091,26 +1091,26 @@ impl FilledTransaction {
     fn output_asset_total_values(
         &self,
     ) -> impl Iterator<Item = (AssetId, Option<u64>)> + '_ {
-        /* If this tx is a BitAsset registration, this is the BitAsset ID and
-         * value of the output corresponding to the newly created BitAsset,
+        /* If this tx is a Truthcoin registration, this is the Truthcoin ID and
+         * value of the output corresponding to the newly created Truthcoin,
          * which must be the second-to-last registration output.
          * ie. If there are `n >= 2` outputs `0..(n-1)`,
-         * output `(n-1)` is the BitAsset control coin,
-         * and output `(n-2)` is the BitAsset mint.
-         * Note that there may be no BitAsset mint,
+         * output `(n-1)` is the Truthcoin control coin,
+         * and output `(n-2)` is the Truthcoin mint.
+         * Note that there may be no Truthcoin mint,
          * in the case that the initial supply is zero. */
-        let new_bitasset_value: Option<(BitAssetId, u64)> =
+        let new_truthcoin_value: Option<(TruthcoinId, u64)> =
             match self.transaction.data {
-                Some(TransactionData::BitAssetRegistration {
+                Some(TransactionData::TruthcoinRegistration {
                     name_hash,
                     initial_supply,
                     ..
                 }) if initial_supply != 0 => {
-                    Some((BitAssetId(name_hash), initial_supply))
+                    Some((TruthcoinId(name_hash), initial_supply))
                 }
                 _ => None,
             };
-        let bitasset_mint = self.bitasset_mint();
+        let truthcoin_mint = self.truthcoin_mint();
         let (mut amm_burn0, mut amm_burn1) = match self.amm_burn() {
             Some(AmmBurn {
                 asset0,
@@ -1178,9 +1178,9 @@ impl FilledTransaction {
         self.unique_spent_assets()
             .into_iter()
             .map(move |(asset, total_value)| {
-                let total_value = if let Some((mint_bitasset, mint_amount)) =
-                    bitasset_mint
-                    && AssetId::BitAsset(mint_bitasset) == asset
+                let total_value = if let Some((mint_truthcoin, mint_amount)) =
+                    truthcoin_mint
+                    && AssetId::Truthcoin(mint_truthcoin) == asset
                 {
                     total_value.checked_add(mint_amount)
                 } else if let Some((burn_asset, burn_amount)) = amm_burn0
@@ -1258,15 +1258,15 @@ impl FilledTransaction {
                 (burn_asset, Some(burn_amount))
             }))
             .chain(amm_mint0.map(|(mint_asset, _)|
-                    /* If the BitAssets are not already accounted for,
+                    /* If the Truthcoin are not already accounted for,
                     * indicate an underflow */
                     (mint_asset, None)))
             .chain(amm_mint1.map(|(mint_asset, _)|
-                    /* If the BitAssets are not already accounted for,
+                    /* If the Truthcoin are not already accounted for,
                     * indicate an underflow */
                     (mint_asset, None)))
             .chain(amm_swap_spend.map(|(spend_asset, _)|
-                    /* If the BitAssets are not already accounted for,
+                    /* If the Truthcoin are not already accounted for,
                     * indicate an underflow */
                     (spend_asset, None)))
             .chain(amm_swap_receive.map(|(receive_asset, receive_amount)| {
@@ -1278,11 +1278,11 @@ impl FilledTransaction {
                 },
             ))
             .chain(dutch_auction_bid_spend.map(|(spend_asset, _)|
-                    /* If the BitAssets are not already accounted for,
+                    /* If the Truthcoin are not already accounted for,
                     * indicate an underflow */
                     (spend_asset, None)))
             .chain(dutch_auction_create_spend.map(|(spend_asset, _)|
-                    /* If the BitAssets are not already accounted for,
+                    /* If the Truthcoin are not already accounted for,
                     * indicate an underflow */
                     (spend_asset, None)))
             .chain(dutch_auction_collect0.map(
@@ -1295,25 +1295,25 @@ impl FilledTransaction {
                     (receive_asset, Some(receive_amount))
                 },
             ))
-            .chain(new_bitasset_value.map(|(bitasset, total_value)| {
-                (AssetId::BitAsset(bitasset), Some(total_value))
+            .chain(new_truthcoin_value.map(|(truthcoin, total_value)| {
+                (AssetId::Truthcoin(truthcoin), Some(total_value))
             }))
-            .chain(new_bitasset_value.map(|(bitasset, _)| {
-                (AssetId::BitAssetControl(bitasset), Some(1))
+            .chain(new_truthcoin_value.map(|(truthcoin, _)| {
+                (AssetId::TruthcoinControl(truthcoin), Some(1))
             }))
     }
 
-    /** Returns an iterator over total value for each BitAsset that must
+    /** Returns an iterator over total value for each Truthcoin that must
      *  appear in the outputs, in order.
      *  The total output value can possibly over/underflow in a transaction,
      *  so the total output values are [`Option<u64>`],
      *  where `None` indicates over/underflow. */
-    fn output_bitasset_total_values(
+    fn output_truthcoin_total_values(
         &self,
-    ) -> impl Iterator<Item = (BitAssetId, Option<u64>)> + '_ {
+    ) -> impl Iterator<Item = (TruthcoinId, Option<u64>)> + '_ {
         self.output_asset_total_values()
             .filter_map(|(asset_id, value)| match asset_id {
-                AssetId::BitAsset(bitasset_id) => Some((bitasset_id, value)),
+                AssetId::Truthcoin(truthcoin_id) => Some((truthcoin_id, value)),
                 _ => None,
             })
     }
@@ -1339,11 +1339,11 @@ impl FilledTransaction {
     fn output_lp_token_total_amounts(
         &self,
     ) -> impl Iterator<Item = (AssetId, AssetId, Option<u64>)> + '_ {
-        /* If this tx is an AMM burn, this is the corresponding BitAsset IDs
+        /* If this tx is an AMM burn, this is the corresponding Truthcoin IDs
         and token amount of the output corresponding to the newly created
         AMM LP position. */
         let mut amm_burn: Option<AmmBurn> = self.amm_burn();
-        /* If this tx is an AMM mint, this is the corresponding BitAsset IDs
+        /* If this tx is an AMM mint, this is the corresponding Truthcoin IDs
         and token amount of the output corresponding to the newly created
         AMM LP position. */
         let mut amm_mint: Option<AmmMint> = self.amm_mint();
@@ -1391,14 +1391,14 @@ impl FilledTransaction {
             }))
     }
 
-    /// Compute the filled content for BitAsset reservation outputs.
-    fn filled_bitasset_control_output_content(
+    /// Compute the filled content for Truthcoin reservation outputs.
+    fn filled_truthcoin_control_output_content(
         &self,
     ) -> impl Iterator<Item = FilledOutputContent> + '_ {
         self.output_asset_total_values()
             .filter_map(|(asset, _)| match asset {
-                AssetId::BitAssetControl(bitasset_id) => {
-                    Some(FilledOutputContent::BitAssetControl(bitasset_id))
+                AssetId::TruthcoinControl(truthcoin_id) => {
+                    Some(FilledOutputContent::TruthcoinControl(truthcoin_id))
                 }
                 _ => None,
             })
@@ -1432,17 +1432,17 @@ impl FilledTransaction {
             .chain(new_dutch_auction_receipt_content)
     }
 
-    /// compute the filled content for BitAsset reservation outputs
+    /// compute the filled content for Truthcoin reservation outputs
     /// WARNING: do not expose DoubleEndedIterator.
     fn filled_reservation_output_content(
         &self,
     ) -> impl Iterator<Item = FilledOutputContent> + '_ {
-        // If this tx is a BitAsset reservation, this is the content of the
-        // output corresponding to the newly created BitAsset reservation,
+        // If this tx is a Truthcoin reservation, this is the content of the
+        // output corresponding to the newly created Truthcoin reservation,
         // which must be the final reservation output.
         let new_reservation_content: Option<FilledOutputContent> =
             self.reservation_commitment().map(|commitment| {
-                FilledOutputContent::BitAssetReservation(
+                FilledOutputContent::TruthcoinReservation(
                     self.txid(),
                     commitment,
                 )
@@ -1459,7 +1459,7 @@ impl FilledTransaction {
                 if let Some(implied_commitment) = reservation_to_burn {
                     if matches!(
                         content,
-                        FilledOutputContent::BitAssetReservation(_, commitment)
+                        FilledOutputContent::TruthcoinReservation(_, commitment)
                             if *commitment == implied_commitment)
                     {
                         reservation_to_burn = None;
@@ -1480,12 +1480,12 @@ impl FilledTransaction {
     // FIXME: Invalidate tx if any iterator is incomplete
     pub fn filled_outputs(&self) -> Option<Vec<FilledOutput>> {
         let mut output_bitcoin_max_value = self.output_bitcoin_max_value()?;
-        let mut output_bitasset_total_values =
-            self.output_bitasset_total_values().peekable();
+        let mut output_truthcoin_total_values =
+            self.output_truthcoin_total_values().peekable();
         let mut output_lp_token_total_amounts =
             self.output_lp_token_total_amounts().peekable();
-        let mut filled_bitasset_control_output_content =
-            self.filled_bitasset_control_output_content();
+        let mut filled_truthcoin_control_output_content =
+            self.filled_truthcoin_control_output_content();
         let mut filled_dutch_auction_receipts =
             self.filled_dutch_auction_receipts();
         let mut filled_reservation_output_content =
@@ -1519,32 +1519,32 @@ impl FilledTransaction {
                         }
                         filled_content
                     }
-                    OutputContent::BitAsset(value) => {
-                        let (bitasset, remaining_value) =
-                            output_bitasset_total_values.peek_mut()?;
+                    OutputContent::Truthcoin(value) => {
+                        let (truthcoin, remaining_value) =
+                            output_truthcoin_total_values.peek_mut()?;
                         let remaining_value = remaining_value.as_mut()?;
                         let filled_content =
-                            FilledOutputContent::BitAsset(*bitasset, value);
+                            FilledOutputContent::Truthcoin(*truthcoin, value);
                         match value.cmp(remaining_value) {
                             Ordering::Greater => {
                                 // Invalid tx, return `None`
                                 return None;
                             }
                             Ordering::Equal => {
-                                // Advance the iterator to the next BitAsset
-                                let _ = output_bitasset_total_values.next()?;
+                                // Advance the iterator to the next Truthcoin
+                                let _ = output_truthcoin_total_values.next()?;
                             }
                             Ordering::Less => {
-                                // Decrement the remaining value for the current BitAsset
+                                // Decrement the remaining value for the current Truthcoin
                                 *remaining_value -= value;
                             }
                         }
                         filled_content
                     }
-                    OutputContent::BitAssetControl => {
-                        filled_bitasset_control_output_content.next()?.clone()
+                    OutputContent::TruthcoinControl => {
+                        filled_truthcoin_control_output_content.next()?.clone()
                     }
-                    OutputContent::BitAssetReservation => {
+                    OutputContent::TruthcoinReservation => {
                         filled_reservation_output_content.next()?.clone()
                     }
                     OutputContent::DutchAuctionReceipt => {

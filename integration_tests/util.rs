@@ -15,7 +15,7 @@ fn load_env_var_from_string(s: &str) -> Result<(), VarError> {
 
 #[derive(Clone, Debug)]
 pub struct BinPaths {
-    pub bitassets: PathBuf,
+    pub truthcoin: PathBuf,
     pub others: EnforcerBinPaths,
 }
 
@@ -25,14 +25,14 @@ impl BinPaths {
         let () = load_env_var_from_string("BITCOIN_UTIL=''")?;
         let () = load_env_var_from_string("SIGNET_MINER=''")?;
         Ok(Self {
-            bitassets: get_env_var("BITASSETS_APP")?.into(),
+            truthcoin: get_env_var("TRUTHCOIN_APP")?.into(),
             others: EnforcerBinPaths::from_env()?,
         })
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct BitAssetsApp {
+pub struct TruthcoinApp {
     pub path: PathBuf,
     pub data_dir: PathBuf,
     pub log_level: Option<tracing::Level>,
@@ -45,7 +45,7 @@ pub struct BitAssetsApp {
     pub zmq_port: u16,
 }
 
-impl BitAssetsApp {
+impl TruthcoinApp {
     pub fn spawn_command_with_args<Env, Arg, Envs, Args, F>(
         &self,
         envs: Envs,

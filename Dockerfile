@@ -8,13 +8,13 @@ RUN cargo build --locked --release
 # Runtime stage
 FROM debian:bookworm-slim
 
-COPY --from=builder /workspace/target/release/plain_bitassets_app /bin/plain_bitassets_app
-COPY --from=builder /workspace/target/release/plain_bitassets_app_cli /bin/plain_bitassets_app_cli
+COPY --from=builder /workspace/target/release/truthcoin_dc_app /bin/truthcoin_dc_app
+COPY --from=builder /workspace/target/release/truthcoin_dc_app_cli /bin/truthcoin_dc_app_cli
 
 # Verify we placed the binaries in the right place, 
 # and that it's executable.
-RUN plain_bitassets_app --help
-RUN plain_bitassets_app_cli --help
+RUN truthcoin_dc_app --help
+RUN truthcoin_dc_app_cli --help
 
-ENTRYPOINT ["plain_bitassets_app"]
+ENTRYPOINT ["truthcoin_dc_app"]
 

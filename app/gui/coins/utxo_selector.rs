@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use eframe::egui;
-use plain_bitassets::types::{
+use truthcoin_dc::types::{
     AssetId, AssetOutputContent, BitcoinOutput, BitcoinOutputContent,
     FilledOutput, OutPoint, Output, Transaction, WithdrawalOutputContent,
 };
@@ -18,9 +18,9 @@ use crate::{
 pub enum AssetKind {
     #[default]
     Bitcoin,
-    BitAsset,
-    #[strum(serialize = "BitAsset Control")]
-    BitAssetControl,
+    Truthcoin,
+    #[strum(serialize = "Truthcoin Control")]
+    TruthcoinControl,
 }
 
 #[derive(Debug, Default)]
@@ -34,7 +34,7 @@ impl PartialEq for AssetInput {
         self.asset_kind == other.asset_kind
             && match self.asset_kind {
                 AssetKind::Bitcoin => true,
-                AssetKind::BitAsset | AssetKind::BitAssetControl => {
+                AssetKind::Truthcoin | AssetKind::TruthcoinControl => {
                     self.hex_input == other.hex_input
                 }
             }
@@ -47,13 +47,13 @@ impl AssetInput {
     pub fn asset_id(&self) -> anyhow::Result<AssetId> {
         match self.asset_kind {
             AssetKind::Bitcoin => Ok(AssetId::Bitcoin),
-            AssetKind::BitAsset => {
+            AssetKind::Truthcoin => {
                 borsh_deserialize_hex(self.hex_input.as_str())
-                    .map(AssetId::BitAsset)
+                    .map(AssetId::Truthcoin)
             }
-            AssetKind::BitAssetControl => {
+            AssetKind::TruthcoinControl => {
                 borsh_deserialize_hex(self.hex_input.as_str())
-                    .map(AssetId::BitAssetControl)
+                    .map(AssetId::TruthcoinControl)
             }
         }
     }
@@ -72,7 +72,7 @@ impl AssetInput {
             });
         match self.asset_kind {
             AssetKind::Bitcoin => (),
-            AssetKind::BitAsset | AssetKind::BitAssetControl => {
+            AssetKind::Truthcoin | AssetKind::TruthcoinControl => {
                 ui.text_edit_singleline(&mut self.hex_input);
             }
         }
@@ -258,7 +258,7 @@ pub fn show_utxo(
             );
         }
         Some((
-            asset_id @ (AssetId::BitAsset(_) | AssetId::BitAssetControl(_)),
+            asset_id @ (AssetId::Truthcoin(_) | AssetId::TruthcoinControl(_)),
             value,
         )) => {
             if show_asset_id {
@@ -314,18 +314,18 @@ pub fn show_unconfirmed_utxo(
                 },
             );
         }
-        Some(AssetOutputContent::BitAsset(value)) => {
+        Some(AssetOutputContent::Truthcoin(value)) => {
             if show_asset_id {
-                ui.monospace_selectable_singleline(true, "BitAsset");
+                ui.monospace_selectable_singleline(true, "Truthcoin");
             }
             ui.monospace_selectable_singleline(
                 false,
                 format!("{value} (unconfirmed)"),
             );
         }
-        Some(AssetOutputContent::BitAssetControl) => {
+        Some(AssetOutputContent::TruthcoinControl) => {
             if show_asset_id {
-                ui.monospace_selectable_singleline(true, "BitAsset Control");
+                ui.monospace_selectable_singleline(true, "Truthcoin Control");
             }
             ui.monospace_selectable_singleline(false, "1 (unconfirmed)");
         }

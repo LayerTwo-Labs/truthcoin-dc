@@ -1,7 +1,7 @@
 use eframe::egui;
 use human_size::{Byte, Kibibyte, Mebibyte, SpecificSize};
 
-use plain_bitassets::types::{GetBitcoinValue, OutPoint};
+use truthcoin_dc::types::{GetBitcoinValue, OutPoint};
 
 use crate::app::App;
 

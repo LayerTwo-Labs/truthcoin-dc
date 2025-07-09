@@ -1,5 +1,5 @@
 [package]
-name = "plain_bitassets_app_cli"
+name = "truthcoin_dc_app_cli"
 authors.workspace = true
 edition.workspace = true
 license-file.workspace = true
@@ -13,8 +13,8 @@ clap = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
 http = { workspace = true }
 jsonrpsee = { workspace = true, features = ["http-client"] }
-plain_bitassets = { path = "../lib", features = ["clap"] }
-plain_bitassets_app_rpc_api = { path = "../rpc-api" }
+truthcoin_dc = { path = "../lib", features = ["clap"] }
+truthcoin_dc_app_rpc_api = { path = "../rpc-api" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -24,9 +24,9 @@ utoipa = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [lib]
-name = "plain_bitassets_app_cli_lib"
+name = "truthcoin_dc_app_cli_lib"
 path = "lib.rs"
 
 [[bin]]
-name = "plain_bitassets_app_cli"
+name = "truthcoin_dc_app_cli"
 path = "main.rs"

@@ -6,18 +6,18 @@ use fraction::Fraction;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use l2l_openapi::open_api;
 
-use plain_bitassets::{
+use truthcoin_dc::{
     authorization::{Dst, Signature},
     net::{Peer, PeerConnectionStatus},
-    state::{AmmPoolState, BitAssetSeqId, DutchAuctionState},
+    state::{AmmPoolState, TruthcoinSeqId, DutchAuctionState},
     types::{
-        Address, AssetId, Authorization, BitAssetData, BitAssetDataUpdates,
-        BitAssetId, BitcoinOutputContent, Block, BlockHash, Body,
+        Address, AssetId, Authorization, TruthcoinData, TruthcoinDataUpdates,
+        TruthcoinId, BitcoinOutputContent, Block, BlockHash, Body,
         DutchAuctionId, DutchAuctionParams, EncryptionPubKey,
         FilledOutputContent, Header, MerkleRoot, OutPoint, Output,
         OutputContent, PointedOutput, Transaction, TxData, TxIn, Txid,
         VerifyingKey, WithdrawalBundle, WithdrawalOutputContent,
-        schema as bitassets_schema,
+        schema as truthcoin_schema,
     },
     wallet::Balance,
 };
@@ -36,10 +36,10 @@ pub struct TxInfo {
 }
 
 #[open_api(ref_schemas[
-    bitassets_schema::BitcoinAddr, bitassets_schema::BitcoinBlockHash,
-    bitassets_schema::BitcoinTransaction, bitassets_schema::BitcoinOutPoint,
-    bitassets_schema::SocketAddr, Address, AssetId, Authorization,
-    BitAssetData, BitAssetDataUpdates, BitAssetId, BitcoinOutputContent,
+    truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash,
+    truthcoin_schema::BitcoinTransaction, truthcoin_schema::BitcoinOutPoint,
+    truthcoin_schema::SocketAddr, Address, AssetId, Authorization,
+    TruthcoinData, TruthcoinDataUpdates, TruthcoinId, BitcoinOutputContent,
     BlockHash, Body, DutchAuctionId, DutchAuctionParams, EncryptionPubKey,
     FilledOutputContent, Header, MerkleRoot, OutPoint, Output, OutputContent,
     PeerConnectionStatus, Signature, Transaction, TxData, Txid, TxIn,
@@ -75,21 +75,21 @@ pub trait Rpc {
         amount_spend: u64,
     ) -> RpcResult<u64>;
 
-    /// Retrieve data for a single BitAsset
-    #[method(name = "bitasset_data")]
-    async fn bitasset_data(
+    /// Retrieve data for a single Truthcoin
+    #[method(name = "truthcoin_data")]
+    async fn truthcoin_data(
         &self,
-        bitasset_id: BitAssetId,
-    ) -> RpcResult<BitAssetData>;
+        truthcoin_id: TruthcoinId,
+    ) -> RpcResult<TruthcoinData>;
 
-    /// List all BitAssets
+    /// List all Truthcoin
     #[open_api_method(output_schema(PartialSchema = "schema::Array<
-            schema::ArrayTuple3<BitAssetSeqId, BitAssetId, BitAssetData>
+            schema::ArrayTuple3<TruthcoinSeqId, TruthcoinId, TruthcoinData>
         >"))]
-    #[method(name = "bitassets")]
-    async fn bitassets(
+    #[method(name = "truthcoin")]
+    async fn truthcoin(
         &self,
-    ) -> RpcResult<Vec<(BitAssetSeqId, BitAssetId, BitAssetData)>>;
+    ) -> RpcResult<Vec<(TruthcoinSeqId, TruthcoinId, TruthcoinData)>>;
 
     /// Balance in sats
     #[open_api_method(output_schema(ToSchema))]
@@ -112,7 +112,7 @@ pub trait Rpc {
     async fn connect_peer(
         &self,
         #[open_api_method_arg(schema(
-            ToSchema = "bitassets_schema::SocketAddr"
+            ToSchema = "truthcoin_schema::SocketAddr"
         ))]
         addr: SocketAddr,
     ) -> RpcResult<()>;
@@ -220,24 +220,24 @@ pub trait Rpc {
 
     /// Get mainchain blocks that commit to a specified block hash
     #[open_api_method(output_schema(
-        PartialSchema = "bitassets_schema::BitcoinBlockHash"
+        PartialSchema = "truthcoin_schema::BitcoinBlockHash"
     ))]
     #[method(name = "get_bmm_inclusions")]
     async fn get_bmm_inclusions(
         &self,
-        block_hash: plain_bitassets::types::BlockHash,
+        block_hash: truthcoin_dc::types::BlockHash,
     ) -> RpcResult<Vec<bitcoin::BlockHash>>;
 
     /// Get the best mainchain block hash known by Thunder
     #[open_api_method(output_schema(
-        PartialSchema = "schema::Optional<bitassets_schema::BitcoinBlockHash>"
+        PartialSchema = "schema::Optional<truthcoin_schema::BitcoinBlockHash>"
     ))]
     #[method(name = "get_best_mainchain_block_hash")]
     async fn get_best_mainchain_block_hash(
         &self,
     ) -> RpcResult<Option<bitcoin::BlockHash>>;
 
-    /// Get the best sidechain block hash known by BitAssets
+    /// Get the best sidechain block hash known by Truthcoin
     #[open_api_method(output_schema(
         PartialSchema = "schema::Optional<BlockHash>"
     ))]
@@ -337,13 +337,13 @@ pub trait Rpc {
     #[method(name = "openapi_schema")]
     async fn openapi_schema(&self) -> RpcResult<utoipa::openapi::OpenApi>;
 
-    /// Register a BitAsset
-    #[method(name = "register_bitasset")]
-    async fn register_bitasset(
+    /// Register a Truthcoin
+    #[method(name = "register_truthcoin")]
+    async fn register_truthcoin(
         &self,
         plain_name: String,
         initial_supply: u64,
-        bitasset_data: Option<BitAssetData>,
+        truthcoin_data: Option<TruthcoinData>,
     ) -> RpcResult<Txid>;
 
     /// Remove a tx from the mempool
@@ -351,9 +351,9 @@ pub trait Rpc {
     #[method(name = "remove_from_mempool")]
     async fn remove_from_mempool(&self, txid: Txid) -> RpcResult<()>;
 
-    /// Reserve a BitAsset
-    #[method(name = "reserve_bitasset")]
-    async fn reserve_bitasset(&self, plain_name: String) -> RpcResult<Txid>;
+    /// Reserve a Truthcoin
+    #[method(name = "reserve_truthcoin")]
+    async fn reserve_truthcoin(&self, plain_name: String) -> RpcResult<Txid>;
 
     /// Set the wallet seed from a mnemonic seed phrase
     #[open_api_method(output_schema(ToSchema))]
@@ -394,12 +394,12 @@ pub trait Rpc {
         memo: Option<String>,
     ) -> RpcResult<Txid>;
 
-    /// Transfer bitassets to the specified address
-    #[method(name = "transfer_bitasset")]
-    async fn transfer_bitasset(
+    /// Transfer truthcoin to the specified address
+    #[method(name = "transfer_truthcoin")]
+    async fn transfer_truthcoin(
         &self,
         dest: Address,
-        asset_id: BitAssetId,
+        asset_id: TruthcoinId,
         amount: u64,
         fee_sats: u64,
         memo: Option<String>,
@@ -421,7 +421,7 @@ pub trait Rpc {
     async fn withdraw(
         &self,
         #[open_api_method_arg(schema(
-            PartialSchema = "bitassets_schema::BitcoinAddr"
+            PartialSchema = "truthcoin_schema::BitcoinAddr"
         ))]
         mainchain_address: bitcoin::Address<
             bitcoin::address::NetworkUnchecked,

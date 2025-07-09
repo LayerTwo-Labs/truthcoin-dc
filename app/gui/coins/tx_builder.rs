@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use eframe::egui;
 
-use plain_bitassets::types::{
-    AssetId, AssetOutputContent, BitAssetId, BitcoinOutputContent,
+use truthcoin_dc::types::{
+    AssetId, AssetOutputContent, TruthcoinId, BitcoinOutputContent,
     GetBitcoinValue, Transaction, WithdrawalOutputContent,
 };
 
@@ -37,8 +37,8 @@ impl TxBuilder {
             .filter(|(outpoint, _)| selected.contains(outpoint))
             .collect();
         let mut bitcoin_value_in = bitcoin::Amount::ZERO;
-        let mut bitasset_values_in = BTreeMap::<BitAssetId, u64>::new();
-        let mut bitasset_controls_in = BTreeSet::<BitAssetId>::new();
+        let mut truthcoin_values_in = BTreeMap::<TruthcoinId, u64>::new();
+        let mut truthcoin_controls_in = BTreeSet::<TruthcoinId>::new();
         spent_utxos
             .iter()
             .for_each(|(_, output)| match output.asset_value() {
@@ -46,13 +46,13 @@ impl TxBuilder {
                 Some((AssetId::Bitcoin, value)) => {
                     bitcoin_value_in += bitcoin::Amount::from_sat(value);
                 }
-                Some((AssetId::BitAsset(bitasset_id), value)) => {
-                    *bitasset_values_in.entry(bitasset_id).or_default() +=
+                Some((AssetId::Truthcoin(truthcoin_id), value)) => {
+                    *truthcoin_values_in.entry(truthcoin_id).or_default() +=
                         value;
                 }
-                Some((AssetId::BitAssetControl(bitasset_id), value)) => {
+                Some((AssetId::TruthcoinControl(truthcoin_id), value)) => {
                     assert_eq!(value, 1);
-                    bitasset_controls_in.insert(bitasset_id);
+                    truthcoin_controls_in.insert(truthcoin_id);
                 }
             });
         self.tx_creator.bitcoin_value_in = bitcoin_value_in;
@@ -73,22 +73,22 @@ impl TxBuilder {
                 );
                 ui.end_row();
 
-                for bitasset_control_id in bitasset_controls_in {
+                for truthcoin_control_id in truthcoin_controls_in {
                     ui.monospace_selectable_singleline(
                         true,
                         format!(
-                            "BitAsset Control {}",
-                            hex::encode(bitasset_control_id.0)
+                            "Truthcoin Control {}",
+                            hex::encode(truthcoin_control_id.0)
                         ),
                     );
                     ui.monospace_selectable_singleline(false, "1");
                     ui.end_row();
                 }
 
-                for (bitasset_id, value) in bitasset_values_in {
+                for (truthcoin_id, value) in truthcoin_values_in {
                     ui.monospace_selectable_singleline(
                         true,
-                        format!("BitAsset {}", hex::encode(bitasset_id.0)),
+                        format!("Truthcoin {}", hex::encode(truthcoin_id.0)),
                     );
                     ui.monospace_selectable_singleline(
                         false,
@@ -158,11 +158,11 @@ impl TxBuilder {
                             let bitcoin_value = format!("₿{value}");
                             ("Bitcoin", bitcoin_value)
                         }
-                        AssetOutputContent::BitAsset(value) => {
-                            ("BitAsset", format!("{value}"))
+                        AssetOutputContent::Truthcoin(value) => {
+                            ("Truthcoin", format!("{value}"))
                         }
-                        AssetOutputContent::BitAssetControl => {
-                            ("BitAsset Control", "1".to_owned())
+                        AssetOutputContent::TruthcoinControl => {
+                            ("Truthcoin Control", "1".to_owned())
                         }
                     };
                     ui.monospace_selectable_singleline(false, asset_kind);

@@ -1,5 +1,5 @@
 [package]
-name = "plain_bitassets_integration_tests"
+name = "truthcoin_dc_integration_tests"
 authors.workspace = true
 edition.workspace = true
 license-file.workspace = true
@@ -17,8 +17,8 @@ dotenvy = "0.15.7"
 futures = { workspace = true }
 jsonrpsee = { workspace = true }
 libtest-mimic = "0.8.1"
-plain_bitassets = { path = "../lib" }
-plain_bitassets_app_rpc_api = { path = "../rpc-api" }
+truthcoin_dc = { path = "../lib" }
+truthcoin_dc_app_rpc_api = { path = "../rpc-api" }
 reserve-port = "2.0.1"
 thiserror = { workspace = true }
 tracing = { workspace = true }

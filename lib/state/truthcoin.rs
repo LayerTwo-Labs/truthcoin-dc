@@ -1,4 +1,4 @@
-//! Functions and types related to BitAssets
+//! Functions and types related to Truthcoin
 
 use std::net::{SocketAddrV4, SocketAddrV6};
 
@@ -8,19 +8,19 @@ use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, db, env};
 
 use crate::{
     state::{
-        error::BitAsset as Error,
+        error::Truthcoin as Error,
         rollback::{RollBack, TxidStamped},
     },
     types::{
-        BitAssetDataUpdates, BitAssetId, EncryptionPubKey, FilledTransaction,
+        TruthcoinDataUpdates, TruthcoinId, EncryptionPubKey, FilledTransaction,
         Hash, Txid, Update, VerifyingKey,
     },
 };
 
-/// Representation of BitAsset data that supports rollbacks.
+/// Representation of Truthcoin data that supports rollbacks.
 /// The most recent datum is the element at the back of the vector.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BitAssetData {
+pub struct TruthcoinData {
     /// Commitment to arbitrary data
     pub(in crate::state) commitment: RollBack<TxidStamped<Option<Hash>>>,
     /// Optional ipv4 addr
@@ -39,37 +39,37 @@ pub struct BitAssetData {
     pub(in crate::state) total_supply: RollBack<TxidStamped<u64>>,
 }
 
-impl BitAssetData {
-    // initialize from BitAsset data provided during a registration
+impl TruthcoinData {
+    // initialize from Truthcoin data provided during a registration
     pub(in crate::state) fn init(
-        bitasset_data: crate::types::BitAssetData,
+        truthcoin_data: crate::types::TruthcoinData,
         initial_supply: u64,
         txid: Txid,
         height: u32,
     ) -> Self {
         Self {
             commitment: RollBack::<TxidStamped<_>>::new(
-                bitasset_data.commitment,
+                truthcoin_data.commitment,
                 txid,
                 height,
             ),
             socket_addr_v4: RollBack::<TxidStamped<_>>::new(
-                bitasset_data.socket_addr_v4,
+                truthcoin_data.socket_addr_v4,
                 txid,
                 height,
             ),
             socket_addr_v6: RollBack::<TxidStamped<_>>::new(
-                bitasset_data.socket_addr_v6,
+                truthcoin_data.socket_addr_v6,
                 txid,
                 height,
             ),
             encryption_pubkey: RollBack::<TxidStamped<_>>::new(
-                bitasset_data.encryption_pubkey,
+                truthcoin_data.encryption_pubkey,
                 txid,
                 height,
             ),
             signing_pubkey: RollBack::<TxidStamped<_>>::new(
-                bitasset_data.signing_pubkey,
+                truthcoin_data.signing_pubkey,
                 txid,
                 height,
             ),
@@ -81,10 +81,10 @@ impl BitAssetData {
         }
     }
 
-    // apply bitasset data updates
+    // apply truthcoin data updates
     pub(in crate::state) fn apply_updates(
         &mut self,
-        updates: BitAssetDataUpdates,
+        updates: TruthcoinDataUpdates,
         txid: Txid,
         height: u32,
     ) {
@@ -139,10 +139,10 @@ impl BitAssetData {
         );
     }
 
-    // revert BitAsset data updates
+    // revert Truthcoin data updates
     pub(in crate::state) fn revert_updates(
         &mut self,
-        updates: BitAssetDataUpdates,
+        updates: TruthcoinDataUpdates,
         txid: Txid,
         height: u32,
     ) {
@@ -212,7 +212,7 @@ impl BitAssetData {
         revert_field_update(commitment, updates.commitment, txid, height);
     }
 
-    /** Returns the Bitasset data as it was, at the specified block height.
+    /** Returns the Truthcoin data as it was, at the specified block height.
      *  If a value was updated several times in the block, returns the
      *  last value seen in the block.
      *  Returns `None` if the data did not exist at the specified block
@@ -220,8 +220,8 @@ impl BitAssetData {
     pub fn at_block_height(
         &self,
         height: u32,
-    ) -> Option<crate::types::BitAssetData> {
-        Some(crate::types::BitAssetData {
+    ) -> Option<crate::types::TruthcoinData> {
+        Some(crate::types::TruthcoinData {
             commitment: self.commitment.at_block_height(height)?.data,
             socket_addr_v4: self.socket_addr_v4.at_block_height(height)?.data,
             socket_addr_v6: self.socket_addr_v6.at_block_height(height)?.data,
@@ -233,9 +233,9 @@ impl BitAssetData {
         })
     }
 
-    /// get the current bitasset data
-    pub fn current(&self) -> crate::types::BitAssetData {
-        crate::types::BitAssetData {
+    /// get the current truthcoin data
+    pub fn current(&self) -> crate::types::TruthcoinData {
+        crate::types::TruthcoinData {
             commitment: self.commitment.latest().data,
             socket_addr_v4: self.socket_addr_v4.latest().data,
             socket_addr_v6: self.socket_addr_v6.latest().data,
@@ -245,7 +245,7 @@ impl BitAssetData {
     }
 }
 
-/// BitAsset sequence ID
+/// Truthcoin sequence ID
 #[derive(
     utoipa::ToSchema,
     Clone,
@@ -263,22 +263,22 @@ impl BitAssetData {
 #[serde(transparent)]
 pub struct SeqId(pub u32);
 
-/// BitAsset databases
+/// Truthcoin databases
 #[derive(Clone)]
 pub struct Dbs {
-    /// Associates BitAsset IDs (name hashes) with BitAsset sequence numbers
-    bitasset_to_seq:
-        DatabaseUnique<SerdeBincode<BitAssetId>, SerdeBincode<SeqId>>,
-    /// Associates BitAsset IDs (name hashes) with BitAsset data
+    /// Associates Truthcoin IDs (name hashes) with Truthcoin sequence numbers
+    truthcoin_to_seq:
+        DatabaseUnique<SerdeBincode<TruthcoinId>, SerdeBincode<SeqId>>,
+    /// Associates Truthcoin IDs (name hashes) with Truthcoin data
     // TODO: make this read-only
-    bitassets:
-        DatabaseUnique<SerdeBincode<BitAssetId>, SerdeBincode<BitAssetData>>,
-    /// Associates tx hashes with BitAsset reservation commitments
+    truthcoin:
+        DatabaseUnique<SerdeBincode<TruthcoinId>, SerdeBincode<TruthcoinData>>,
+    /// Associates tx hashes with Truthcoin reservation commitments
     reservations: DatabaseUnique<SerdeBincode<Txid>, SerdeBincode<Hash>>,
-    /// Associates BitAsset sequence numbers with BitAsset IDs (name hashes)
+    /// Associates Truthcoin sequence numbers with Truthcoin IDs (name hashes)
     // TODO: make this read-only
-    seq_to_bitasset:
-        DatabaseUnique<SerdeBincode<SeqId>, SerdeBincode<BitAssetId>>,
+    seq_to_truthcoin:
+        DatabaseUnique<SerdeBincode<SeqId>, SerdeBincode<TruthcoinId>>,
 }
 
 impl Dbs {
@@ -289,47 +289,47 @@ impl Dbs {
         env: &sneed::Env,
         rwtxn: &mut RwTxn,
     ) -> Result<Self, env::error::CreateDb> {
-        let bitasset_to_seq =
-            DatabaseUnique::create(env, rwtxn, "bitasset_to_bitasset_seq")?;
-        let bitassets = DatabaseUnique::create(env, rwtxn, "bitassets")?;
+        let truthcoin_to_seq =
+            DatabaseUnique::create(env, rwtxn, "truthcoin_to_truthcoin_seq")?;
+        let truthcoin = DatabaseUnique::create(env, rwtxn, "truthcoin")?;
         let reservations =
-            DatabaseUnique::create(env, rwtxn, "bitasset_reservations")?;
-        let seq_to_bitasset =
-            DatabaseUnique::create(env, rwtxn, "bitasset_seq_to_bitasset")?;
+            DatabaseUnique::create(env, rwtxn, "truthcoin_reservations")?;
+        let seq_to_truthcoin =
+            DatabaseUnique::create(env, rwtxn, "truthcoin_seq_to_truthcoin")?;
         Ok(Self {
             reservations,
-            seq_to_bitasset,
-            bitasset_to_seq,
-            bitassets,
+            seq_to_truthcoin,
+            truthcoin_to_seq,
+            truthcoin,
         })
     }
 
-    pub fn bitassets(
+    pub fn truthcoin(
         &self,
-    ) -> &RoDatabaseUnique<SerdeBincode<BitAssetId>, SerdeBincode<BitAssetData>>
+    ) -> &RoDatabaseUnique<SerdeBincode<TruthcoinId>, SerdeBincode<TruthcoinData>>
     {
-        &self.bitassets
+        &self.truthcoin
     }
 
-    pub fn seq_to_bitasset(
+    pub fn seq_to_truthcoin(
         &self,
-    ) -> &RoDatabaseUnique<SerdeBincode<SeqId>, SerdeBincode<BitAssetId>> {
-        &self.seq_to_bitasset
+    ) -> &RoDatabaseUnique<SerdeBincode<SeqId>, SerdeBincode<TruthcoinId>> {
+        &self.seq_to_truthcoin
     }
 
-    /// The sequence number of the last registered BitAsset.
-    /// Returns `None` if no BitAssets have been registered.
+    /// The sequence number of the last registered Truthcoin.
+    /// Returns `None` if no Truthcoin have been registered.
     pub(in crate::state) fn last_seq(
         &self,
         rotxn: &RoTxn,
     ) -> Result<Option<SeqId>, db::error::Last> {
-        match self.seq_to_bitasset.last(rotxn)? {
+        match self.seq_to_truthcoin.last(rotxn)? {
             Some((seq, _)) => Ok(Some(seq)),
             None => Ok(None),
         }
     }
 
-    /// The sequence number that the next registered BitAsset will take.
+    /// The sequence number that the next registered Truthcoin will take.
     pub(in crate::state) fn next_seq(
         &self,
         rotxn: &RoTxn,
@@ -340,85 +340,85 @@ impl Dbs {
         }
     }
 
-    /// Return the Bitasset data, if it exists
-    pub fn try_get_bitasset(
+    /// Return the Truthcoin data, if it exists
+    pub fn try_get_truthcoin(
         &self,
         rotxn: &RoTxn,
-        bitasset: &BitAssetId,
-    ) -> Result<Option<BitAssetData>, db::error::TryGet> {
-        self.bitassets.try_get(rotxn, bitasset)
+        truthcoin: &TruthcoinId,
+    ) -> Result<Option<TruthcoinData>, db::error::TryGet> {
+        self.truthcoin.try_get(rotxn, truthcoin)
     }
 
-    /// Return the Bitasset data. Returns an error if it does not exist.
-    pub fn get_bitasset(
+    /// Return the Truthcoin data. Returns an error if it does not exist.
+    pub fn get_truthcoin(
         &self,
         rotxn: &RoTxn,
-        bitasset: &BitAssetId,
-    ) -> Result<BitAssetData, Error> {
-        self.try_get_bitasset(rotxn, bitasset)?
+        truthcoin: &TruthcoinId,
+    ) -> Result<TruthcoinData, Error> {
+        self.try_get_truthcoin(rotxn, truthcoin)?
             .ok_or(Error::Missing {
-                bitasset: *bitasset,
+                truthcoin: *truthcoin,
             })
     }
 
-    /// Resolve bitasset data at the specified block height, if it exists.
-    pub fn try_get_bitasset_data_at_block_height(
+    /// Resolve truthcoin data at the specified block height, if it exists.
+    pub fn try_get_truthcoin_data_at_block_height(
         &self,
         rotxn: &RoTxn,
-        bitasset: &BitAssetId,
+        truthcoin: &TruthcoinId,
         height: u32,
-    ) -> Result<Option<crate::types::BitAssetData>, db::error::TryGet> {
+    ) -> Result<Option<crate::types::TruthcoinData>, db::error::TryGet> {
         let res = self
-            .bitassets
-            .try_get(rotxn, bitasset)?
-            .and_then(|bitasset_data| bitasset_data.at_block_height(height));
+            .truthcoin
+            .try_get(rotxn, truthcoin)?
+            .and_then(|truthcoin_data| truthcoin_data.at_block_height(height));
         Ok(res)
     }
 
-    /** Resolve bitasset data at the specified block height.
+    /** Resolve truthcoin data at the specified block height.
      * Returns an error if it does not exist. */
-    pub fn get_bitasset_data_at_block_height(
+    pub fn get_truthcoin_data_at_block_height(
         &self,
         rotxn: &RoTxn,
-        bitasset: &BitAssetId,
+        truthcoin: &TruthcoinId,
         height: u32,
-    ) -> Result<crate::types::BitAssetData, Error> {
-        self.get_bitasset(rotxn, bitasset)?
+    ) -> Result<crate::types::TruthcoinData, Error> {
+        self.get_truthcoin(rotxn, truthcoin)?
             .at_block_height(height)
             .ok_or(Error::MissingData {
-                name_hash: bitasset.0,
+                name_hash: truthcoin.0,
                 block_height: height,
             })
     }
 
-    /// resolve current bitasset data, if it exists
-    pub fn try_get_current_bitasset_data(
+    /// resolve current truthcoin data, if it exists
+    pub fn try_get_current_truthcoin_data(
         &self,
         rotxn: &RoTxn,
-        bitasset: &BitAssetId,
-    ) -> Result<Option<crate::types::BitAssetData>, Error> {
+        truthcoin: &TruthcoinId,
+    ) -> Result<Option<crate::types::TruthcoinData>, Error> {
         let res = self
-            .bitassets
-            .try_get(rotxn, bitasset)?
-            .map(|bitasset_data| bitasset_data.current());
+            .truthcoin
+            .try_get(rotxn, truthcoin)?
+            .map(|truthcoin_data| truthcoin_data.current());
         Ok(res)
     }
 
-    /// Resolve current bitasset data. Returns an error if it does not exist.
-    pub fn get_current_bitasset_data(
+    /// Resolve current truthcoin data. Returns an error if it does not exist.
+    pub fn get_current_truthcoin_data(
         &self,
         rotxn: &RoTxn,
-        bitasset: &BitAssetId,
-    ) -> Result<crate::types::BitAssetData, Error> {
-        self.try_get_current_bitasset_data(rotxn, bitasset)?.ok_or(
+        truthcoin: &TruthcoinId,
+    ) -> Result<crate::types::TruthcoinData, Error> {
+        self.try_get_current_truthcoin_data(rotxn, truthcoin)?.ok_or(
             Error::Missing {
-                bitasset: *bitasset,
+                truthcoin: *truthcoin,
             },
         )
     }
 
-    /// Delete a BitAsset reservation.
-    /// Returns `true` if a BitAsset reservation was deleted.
+    /// Delete a Truthcoin reservation.
+    /// Returns `true` if a Truthcoin reservation was deleted.
     pub(in crate::state) fn delete_reservation(
         &self,
         rwtxn: &mut RwTxn,
@@ -427,7 +427,7 @@ impl Dbs {
         self.reservations.delete(rwtxn, txid)
     }
 
-    /// Store a BitAsset reservation
+    /// Store a Truthcoin reservation
     pub(in crate::state) fn put_reservation(
         &self,
         rwtxn: &mut RwTxn,
@@ -437,84 +437,84 @@ impl Dbs {
         self.reservations.put(rwtxn, txid, commitment)
     }
 
-    /// Apply BitAsset updates
+    /// Apply Truthcoin updates
     pub(in crate::state) fn apply_updates(
         &self,
         rwtxn: &mut RwTxn,
         filled_tx: &FilledTransaction,
-        bitasset_updates: BitAssetDataUpdates,
+        truthcoin_updates: TruthcoinDataUpdates,
         height: u32,
     ) -> Result<(), Error> {
-        /* The updated BitAsset is the BitAsset that corresponds to the last
-         * bitasset output, or equivalently, the BitAsset corresponding to the
-         * last BitAsset input */
-        let updated_bitasset = filled_tx
-            .spent_bitassets()
+        /* The updated Truthcoin is the Truthcoin that corresponds to the last
+         * truthcoin output, or equivalently, the Truthcoin corresponding to the
+         * last Truthcoin input */
+        let updated_truthcoin = filled_tx
+            .spent_truthcoin()
             .next_back()
-            .ok_or(Error::NoBitAssetsToUpdate)?
+            .ok_or(Error::NoTruthcoinToUpdate)?
             .1
-            .bitasset()
-            .expect("should only contain BitAsset outputs");
-        let mut bitasset_data = self
-            .bitassets
-            .try_get(rwtxn, updated_bitasset)?
+            .truthcoin()
+            .expect("should only contain Truthcoin outputs");
+        let mut truthcoin_data = self
+            .truthcoin
+            .try_get(rwtxn, updated_truthcoin)?
             .ok_or(Error::Missing {
-                bitasset: *updated_bitasset,
+                truthcoin: *updated_truthcoin,
             })?;
-        bitasset_data.apply_updates(bitasset_updates, filled_tx.txid(), height);
-        self.bitassets
-            .put(rwtxn, updated_bitasset, &bitasset_data)?;
+        truthcoin_data.apply_updates(truthcoin_updates, filled_tx.txid(), height);
+        self.truthcoin
+            .put(rwtxn, updated_truthcoin, &truthcoin_data)?;
         Ok(())
     }
 
-    /// Revert BitAsset updates
+    /// Revert Truthcoin updates
     pub(in crate::state) fn revert_updates(
         &self,
         rwtxn: &mut RwTxn,
         filled_tx: &FilledTransaction,
-        bitasset_updates: BitAssetDataUpdates,
+        truthcoin_updates: TruthcoinDataUpdates,
         height: u32,
     ) -> Result<(), Error> {
-        /* The updated BitAsset is the BitAsset that corresponds to the last
-         * bitasset output, or equivalently, the BitAsset corresponding to the
-         * last BitAsset input */
-        let updated_bitasset = filled_tx
-            .spent_bitassets()
+        /* The updated Truthcoin is the Truthcoin that corresponds to the last
+         * truthcoin output, or equivalently, the Truthcoin corresponding to the
+         * last Truthcoin input */
+        let updated_truthcoin = filled_tx
+            .spent_truthcoin()
             .next_back()
-            .ok_or(Error::NoBitAssetsToUpdate)?
+            .ok_or(Error::NoTruthcoinToUpdate)?
             .1
-            .bitasset()
-            .expect("should only contain BitAsset outputs");
-        let mut bitasset_data = self
-            .bitassets
-            .try_get(rwtxn, updated_bitasset)?
+            .truthcoin()
+            .expect("should only contain Truthcoin outputs");
+        let mut truthcoin_data = self
+            .truthcoin
+            .try_get(rwtxn, updated_truthcoin)?
             .ok_or(Error::Missing {
-                bitasset: *updated_bitasset,
+                truthcoin: *updated_truthcoin,
             })?;
-        bitasset_data.revert_updates(
-            bitasset_updates,
+        truthcoin_data.revert_updates(
+            truthcoin_updates,
             filled_tx.txid(),
             height,
         );
-        self.bitassets
-            .put(rwtxn, updated_bitasset, &bitasset_data)?;
+        self.truthcoin
+            .put(rwtxn, updated_truthcoin, &truthcoin_data)?;
         Ok(())
     }
 
-    /// Apply BitAsset registration
+    /// Apply Truthcoin registration
     pub(in crate::state) fn apply_registration(
         &self,
         rwtxn: &mut RwTxn,
         filled_tx: &FilledTransaction,
         name_hash: Hash,
-        bitasset_data: &crate::types::BitAssetData,
+        truthcoin_data: &crate::types::TruthcoinData,
         initial_supply: u64,
         height: u32,
     ) -> Result<(), Error> {
         // Find the reservation to burn
         let implied_commitment =
             filled_tx.implied_reservation_commitment().expect(
-                "A BitAsset registration tx should have an implied commitment",
+                "A Truthcoin registration tx should have an implied commitment",
             );
         let burned_reservation_txid =
             filled_tx.spent_reservations().find_map(|(_, filled_output)| {
@@ -525,50 +525,50 @@ impl Dbs {
                 } else {
                     None
                 }
-            }).expect("A BitAsset registration tx should correspond to a burned reservation");
+            }).expect("A Truthcoin registration tx should correspond to a burned reservation");
         if !self.reservations.delete(rwtxn, burned_reservation_txid)? {
             return Err(Error::MissingReservation {
                 txid: *burned_reservation_txid,
             });
         }
-        let bitasset_id = BitAssetId(name_hash);
+        let truthcoin_id = TruthcoinId(name_hash);
         // Assign a sequence number
         {
             let seq = self.next_seq(rwtxn)?;
-            self.seq_to_bitasset.put(rwtxn, &seq, &bitasset_id)?;
-            self.bitasset_to_seq.put(rwtxn, &bitasset_id, &seq)?;
+            self.seq_to_truthcoin.put(rwtxn, &seq, &truthcoin_id)?;
+            self.truthcoin_to_seq.put(rwtxn, &truthcoin_id, &seq)?;
         }
-        let bitasset_data = BitAssetData::init(
-            bitasset_data.clone(),
+        let truthcoin_data = TruthcoinData::init(
+            truthcoin_data.clone(),
             initial_supply,
             filled_tx.txid(),
             height,
         );
-        self.bitassets.put(rwtxn, &bitasset_id, &bitasset_data)?;
+        self.truthcoin.put(rwtxn, &truthcoin_id, &truthcoin_data)?;
         Ok(())
     }
 
-    /// Revert BitAsset registration
+    /// Revert Truthcoin registration
     pub(in crate::state) fn revert_registration(
         &self,
         rwtxn: &mut RwTxn,
         filled_tx: &FilledTransaction,
-        bitasset: BitAssetId,
+        truthcoin: TruthcoinId,
     ) -> Result<(), Error> {
-        let Some(seq) = self.bitasset_to_seq.try_get(rwtxn, &bitasset)? else {
-            return Err(Error::Missing { bitasset });
+        let Some(seq) = self.truthcoin_to_seq.try_get(rwtxn, &truthcoin)? else {
+            return Err(Error::Missing { truthcoin });
         };
-        self.bitasset_to_seq.delete(rwtxn, &bitasset)?;
-        if !self.seq_to_bitasset.delete(rwtxn, &seq)? {
-            return Err(Error::Missing { bitasset });
+        self.truthcoin_to_seq.delete(rwtxn, &truthcoin)?;
+        if !self.seq_to_truthcoin.delete(rwtxn, &seq)? {
+            return Err(Error::Missing { truthcoin });
         }
-        if !self.bitassets.delete(rwtxn, &bitasset)? {
-            return Err(Error::Missing { bitasset });
+        if !self.truthcoin.delete(rwtxn, &truthcoin)? {
+            return Err(Error::Missing { truthcoin });
         }
         // Find the reservation to restore
         let implied_commitment =
             filled_tx.implied_reservation_commitment().expect(
-                "A BitAsset registration tx should have an implied commitment",
+                "A Truthcoin registration tx should have an implied commitment",
             );
         let burned_reservation_txid =
             filled_tx.spent_reservations().find_map(|(_, filled_output)| {
@@ -579,7 +579,7 @@ impl Dbs {
                 } else {
                     None
                 }
-            }).expect("A BitAsset registration tx should correspond to a burned reservation");
+            }).expect("A Truthcoin registration tx should correspond to a burned reservation");
         self.reservations.put(
             rwtxn,
             burned_reservation_txid,
@@ -588,7 +588,7 @@ impl Dbs {
         Ok(())
     }
 
-    /// Apply BitAsset mint
+    /// Apply Truthcoin mint
     pub(in crate::state) fn apply_mint(
         &self,
         rwtxn: &mut RwTxn,
@@ -596,73 +596,73 @@ impl Dbs {
         mint_amount: u64,
         height: u32,
     ) -> Result<(), Error> {
-        /* The updated BitAsset is the BitAsset that corresponds to the last
-         * BitAsset control coin output, or equivalently, the BitAsset corresponding to the
-         * last BitAsset control coin input */
-        let minted_bitasset = filled_tx
-            .spent_bitasset_controls()
+        /* The updated Truthcoin is the Truthcoin that corresponds to the last
+         * Truthcoin control coin output, or equivalently, the Truthcoin corresponding to the
+         * last Truthcoin control coin input */
+        let minted_truthcoin = filled_tx
+            .spent_truthcoin_controls()
             .next_back()
-            .ok_or(Error::NoBitAssetsToMint)?
+            .ok_or(Error::NoTruthcoinToMint)?
             .1
-            .get_bitasset()
-            .expect("should only contain BitAsset outputs");
-        let mut bitasset_data = self
-            .bitassets
-            .try_get(rwtxn, &minted_bitasset)?
+            .get_truthcoin()
+            .expect("should only contain Truthcoin outputs");
+        let mut truthcoin_data = self
+            .truthcoin
+            .try_get(rwtxn, &minted_truthcoin)?
             .ok_or(Error::Missing {
-                bitasset: minted_bitasset,
+                truthcoin: minted_truthcoin,
             })?;
-        let new_total_supply = bitasset_data
+        let new_total_supply = truthcoin_data
             .total_supply
             .0
             .first()
             .data
             .checked_add(mint_amount)
             .ok_or(Error::TotalSupplyOverflow)?;
-        bitasset_data.total_supply.push(
+        truthcoin_data.total_supply.push(
             new_total_supply,
             filled_tx.txid(),
             height,
         );
-        self.bitassets
-            .put(rwtxn, &minted_bitasset, &bitasset_data)?;
+        self.truthcoin
+            .put(rwtxn, &minted_truthcoin, &truthcoin_data)?;
         Ok(())
     }
 
-    /// Revert BitAsset mint
+    /// Revert Truthcoin mint
     pub(in crate::state) fn revert_mint(
         &self,
         rwtxn: &mut RwTxn,
         filled_tx: &FilledTransaction,
         mint_amount: u64,
     ) -> Result<(), Error> {
-        /* The updated BitAsset is the BitAsset that corresponds to the last
-         * BitAsset control coin output, or equivalently, the BitAsset corresponding to the
-         * last BitAsset control coin input */
-        let minted_bitasset = filled_tx
-            .spent_bitasset_controls()
+        /* The updated Truthcoin is the Truthcoin that corresponds to the last
+         * Truthcoin control coin output, or equivalently, the Truthcoin corresponding to the
+         * last Truthcoin control coin input */
+        let minted_truthcoin = filled_tx
+            .spent_truthcoin_controls()
             .next_back()
-            .ok_or(Error::NoBitAssetsToMint)?
+            .ok_or(Error::NoTruthcoinToMint)?
             .1
-            .get_bitasset()
-            .expect("should only contain BitAsset outputs");
-        let mut bitasset_data = self
-            .bitassets
-            .try_get(rwtxn, &minted_bitasset)?
+            .get_truthcoin()
+            .expect("should only contain Truthcoin outputs");
+        let mut truthcoin_data = self
+            .truthcoin
+            .try_get(rwtxn, &minted_truthcoin)?
             .ok_or(Error::Missing {
-                bitasset: minted_bitasset,
+                truthcoin: minted_truthcoin,
             })?;
-        let total_supply = bitasset_data.total_supply.0.first().data;
-        let _ = bitasset_data.total_supply.pop();
-        let new_total_supply = bitasset_data.total_supply.0.first().data;
+        let total_supply = truthcoin_data.total_supply.0.first().data;
+        let _ = truthcoin_data.total_supply.pop();
+        let new_total_supply = truthcoin_data.total_supply.0.first().data;
         assert_eq!(
             new_total_supply,
             total_supply
                 .checked_sub(mint_amount)
                 .ok_or(Error::TotalSupplyUnderflow)?
         );
-        self.bitassets
-            .put(rwtxn, &minted_bitasset, &bitasset_data)?;
+        self.truthcoin
+            .put(rwtxn, &minted_truthcoin, &truthcoin_data)?;
         Ok(())
     }
 }

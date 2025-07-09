@@ -4951,177 +4951,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
-name = "plain_bitassets"
-version = "0.13.1"
-dependencies = [
- "addr",
- "anyhow",
- "async-lock",
- "bech32",
- "bincode",
- "bitcoin",
- "blake3",
- "borsh",
- "byteorder",
- "bytes",
- "clap",
- "ed25519-dalek",
- "educe",
- "fallible-iterator",
- "fatality",
- "fraction",
- "futures",
- "governor",
- "hashlink 0.10.0",
- "heed",
- "hex 0.4.3",
- "hex-literal",
- "itertools 0.14.0",
- "jsonrpsee",
- "libes",
- "nonempty",
- "num",
- "parking_lot",
- "prost",
- "prost-build",
- "prost-types",
- "protox",
- "quinn",
- "rayon",
- "rcgen",
- "rustls",
- "semver",
- "serde",
- "serde_json",
- "serde_with",
- "smallvec",
- "sneed",
- "strum 0.27.2",
- "thiserror 2.0.16",
- "tiny-bip39",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
- "transitive",
- "utoipa",
- "x25519-dalek",
- "zeromq",
-]
-
-[[package]]
-name = "plain_bitassets_app"
-version = "0.13.1"
-dependencies = [
- "anyhow",
- "bincode",
- "bitcoin",
- "blake3",
- "borsh",
- "clap",
- "dirs",
- "eframe",
- "either",
- "fallible-iterator",
- "fraction",
- "futures",
- "hex 0.4.3",
- "http",
- "human-size",
- "include_path",
- "itertools 0.14.0",
- "jsonrpsee",
- "libes",
- "mimalloc",
- "parking_lot",
- "plain_bitassets",
- "plain_bitassets_app_cli",
- "plain_bitassets_app_rpc_api",
- "poll-promise",
- "serde",
- "shlex",
- "strum 0.27.2",
- "thiserror 2.0.16",
- "tiny-bip39",
- "tokio",
- "tokio-util",
- "tonic",
- "tonic-health",
- "tower",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "url",
- "utoipa",
- "uuid",
-]
-
-[[package]]
-name = "plain_bitassets_app_cli"
-version = "0.13.1"
-dependencies = [
- "anyhow",
- "bitcoin",
- "clap",
- "hex 0.4.3",
- "http",
- "jsonrpsee",
- "plain_bitassets",
- "plain_bitassets_app_rpc_api",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "utoipa",
- "uuid",
-]
-
-[[package]]
-name = "plain_bitassets_app_rpc_api"
-version = "0.13.1"
-dependencies = [
- "anyhow",
- "bitcoin",
- "fraction",
- "jsonrpsee",
- "l2l-openapi",
- "plain_bitassets",
- "serde",
- "serde_json",
- "serde_with",
- "utoipa",
-]
-
-[[package]]
-name = "plain_bitassets_integration_tests"
-version = "0.13.1"
-dependencies = [
- "anyhow",
- "bip300301_enforcer_integration_tests",
- "bip300301_enforcer_lib",
- "bitcoin",
- "blake3",
- "clap",
- "dotenvy",
- "futures",
- "jsonrpsee",
- "libtest-mimic",
- "plain_bitassets",
- "plain_bitassets_app_rpc_api",
- "reserve-port",
- "thiserror 2.0.16",
- "tokio",
- "tracing",
- "tracing-indicatif",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "png"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7114,6 +6943,173 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "truthcoin_dc"
+version = "0.12.4"
+dependencies = [
+ "addr",
+ "anyhow",
+ "async-lock",
+ "bech32",
+ "bincode",
+ "bitcoin",
+ "blake3",
+ "borsh",
+ "byteorder",
+ "bytes",
+ "clap",
+ "ed25519-dalek",
+ "educe",
+ "fallible-iterator",
+ "fatality",
+ "fraction",
+ "futures",
+ "governor",
+ "hashlink 0.10.0",
+ "heed",
+ "hex 0.4.3",
+ "hex-literal",
+ "itertools 0.14.0",
+ "jsonrpsee 0.24.9",
+ "libes",
+ "nonempty",
+ "num",
+ "parking_lot",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protox",
+ "quinn",
+ "rayon",
+ "rcgen",
+ "rustls 0.23.26",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "sneed",
+ "strum 0.26.3",
+ "thiserror 2.0.12",
+ "tiny-bip39",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic 0.12.3",
+ "tonic-build 0.12.3",
+ "tracing",
+ "transitive",
+ "utoipa",
+ "x25519-dalek",
+ "zeromq",
+]
+
+[[package]]
+name = "truthcoin_dc_app"
+version = "0.12.4"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "bitcoin",
+ "blake3",
+ "borsh",
+ "clap",
+ "dirs",
+ "eframe",
+ "either",
+ "fraction",
+ "futures",
+ "hex 0.4.3",
+ "http 1.3.1",
+ "human-size",
+ "include_path",
+ "itertools 0.14.0",
+ "jsonrpsee 0.24.9",
+ "libes",
+ "parking_lot",
+ "poll-promise",
+ "serde",
+ "shlex",
+ "strum 0.26.3",
+ "thiserror 2.0.12",
+ "tiny-bip39",
+ "tokio",
+ "tokio-util",
+ "tonic 0.12.3",
+ "tonic-health",
+ "tower 0.4.13",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "truthcoin_dc",
+ "truthcoin_dc_app_cli",
+ "truthcoin_dc_app_rpc_api",
+ "url",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "truthcoin_dc_app_cli"
+version = "0.12.4"
+dependencies = [
+ "anyhow",
+ "bitcoin",
+ "clap",
+ "hex 0.4.3",
+ "http 1.3.1",
+ "jsonrpsee 0.24.9",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "truthcoin_dc",
+ "truthcoin_dc_app_rpc_api",
+ "url",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "truthcoin_dc_app_rpc_api"
+version = "0.12.4"
+dependencies = [
+ "anyhow",
+ "bitcoin",
+ "fraction",
+ "jsonrpsee 0.24.9",
+ "l2l-openapi",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "truthcoin_dc",
+ "utoipa",
+]
+
+[[package]]
+name = "truthcoin_dc_integration_tests"
+version = "0.12.4"
+dependencies = [
+ "anyhow",
+ "bip300301_enforcer_integration_tests",
+ "bip300301_enforcer_lib",
+ "bitcoin",
+ "blake3",
+ "clap",
+ "dotenvy",
+ "futures",
+ "jsonrpsee 0.24.9",
+ "libtest-mimic",
+ "reserve-port",
+ "thiserror 2.0.12",
+ "tokio",
+ "tracing",
+ "tracing-indicatif",
+ "tracing-subscriber",
+ "truthcoin_dc",
+ "truthcoin_dc_app_rpc_api",
 ]
 
 [[package]]

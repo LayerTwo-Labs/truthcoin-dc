@@ -105,7 +105,7 @@ jobs:
           export BITCOIND='../bitcoin-patched-bins/bitcoind'
           export BITCOIN_CLI='../bitcoin-patched-bins/bitcoin-cli'
           export ELECTRS='../electrs/target/release/electrs'
-          export BITASSETS_APP='target/debug/plain_bitassets_app'
+          export TRUTHCOIN_APP='target/debug/truthcoin_dc_app'
           cargo run --example integration_tests
 
   build-release:
@@ -157,37 +157,37 @@ jobs:
 
       - name: 'Set environment variables: version number and output filenames'
         run: |
-          BITASSETS_APP_VERSION=$(cargo metadata --format-version 1 | \
-            jq -er '.packages | map(select(.name == "plain_bitassets_app") | .version) | .[0]')
-          BITASSETS_APP_FILENAME="bitassets-${BITASSETS_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
-          BITASSETS_CLI_FILENAME="bitassets-cli-${BITASSETS_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
-          echo "BITASSETS_APP_VERSION=$BITASSETS_APP_VERSION" >> "$GITHUB_ENV"
-          echo "BITASSETS_APP_FILENAME=$BITASSETS_APP_FILENAME" >> "$GITHUB_ENV"
-          echo "BITASSETS_CLI_FILENAME=$BITASSETS_CLI_FILENAME" >> "$GITHUB_ENV"
+          TRUTHCOIN_APP_VERSION=$(cargo metadata --format-version 1 | \
+            jq -er '.packages | map(select(.name == "truthcoin_dc_app") | .version) | .[0]')
+          TRUTHCOIN_APP_FILENAME="truthcoin-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
+          TRUTHCOIN_CLI_FILENAME="truthcoin-cli-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
+          echo "TRUTHCOIN_APP_VERSION=$TRUTHCOIN_APP_VERSION" >> "$GITHUB_ENV"
+          echo "TRUTHCOIN_APP_FILENAME=$TRUTHCOIN_APP_FILENAME" >> "$GITHUB_ENV"
+          echo "TRUTHCOIN_CLI_FILENAME=$TRUTHCOIN_CLI_FILENAME" >> "$GITHUB_ENV"
 
       - name: 'Set filenames for release binaries'
         run: |
           pushd "target/${{ matrix.name }}/release/"
-          ln -fs "plain_bitassets_app${{ matrix.binary-suffix }}" "${BITASSETS_APP_FILENAME}"
-          ln -fs "plain_bitassets_app_cli${{ matrix.binary-suffix }}" "${BITASSETS_CLI_FILENAME}"
+          ln -fs "truthcoin_dc_app${{ matrix.binary-suffix }}" "${TRUTHCOIN_APP_FILENAME}"
+          ln -fs "truthcoin_dc_app_cli${{ matrix.binary-suffix }}" "${TRUTHCOIN_CLI_FILENAME}"
           popd
 
-      - name: 'Upload Artifacts (bitassets)'
+      - name: 'Upload Artifacts (truthcoin)'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BITASSETS_APP_FILENAME }}
+          name: ${{ env.TRUTHCOIN_APP_FILENAME }}
           if-no-files-found: error
           path: |
-            target/${{ matrix.name }}/release/${{ env.BITASSETS_APP_FILENAME }}
-            target/${{ matrix.name }}/release/${{ env.BITASSETS_CLI_FILENAME }}
+            target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_APP_FILENAME }}
+            target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_CLI_FILENAME }}
 
       - name: Release
         uses: softprops/action-gh-release@v2.0.2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            target/${{ matrix.name }}/release/${{ env.BITASSETS_APP_FILENAME }}
-            target/${{ matrix.name }}/release/${{ env.BITASSETS_CLI_FILENAME }}
+            target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_APP_FILENAME }}
+            target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_CLI_FILENAME }}
           fail_on_unmatched_files: true
 
   upload-releases-to-releases-drivechain-info:
@@ -204,21 +204,21 @@ jobs:
       - name: Create zip files for releases.drivechain.info
         run: |
           shopt -s extglob
-          mv bitassets-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin bitassets-latest-x86_64-apple-darwin
-          mv bitassets-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin bitassets-cli-latest-x86_64-apple-darwin
-          zip L2-S4-BitAssets-latest-x86_64-apple-darwin.zip \
-            bitassets-latest-x86_64-apple-darwin \
-            bitassets-cli-latest-x86_64-apple-darwin
-          mv bitassets-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe bitassets-latest-x86_64-pc-windows-gnu.exe
-          mv bitassets-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe bitassets-cli-latest-x86_64-pc-windows-gnu.exe
-          zip L2-S4-BitAssets-latest-x86_64-pc-windows-gnu.zip \
-            bitassets-latest-x86_64-pc-windows-gnu.exe \
-            bitassets-cli-latest-x86_64-pc-windows-gnu.exe
-          mv bitassets-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu bitassets-latest-x86_64-unknown-linux-gnu
-          mv bitassets-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu bitassets-cli-latest-x86_64-unknown-linux-gnu
-          zip L2-S4-BitAssets-latest-x86_64-unknown-linux-gnu.zip \
-            bitassets-latest-x86_64-unknown-linux-gnu \
-            bitassets-cli-latest-x86_64-unknown-linux-gnu
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-latest-x86_64-apple-darwin
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-cli-latest-x86_64-apple-darwin
+          zip L2-S4-Truthcoin-latest-x86_64-apple-darwin.zip \
+            truthcoin-latest-x86_64-apple-darwin \
+            truthcoin-cli-latest-x86_64-apple-darwin
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-latest-x86_64-pc-windows-gnu.exe
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
+          zip L2-S4-Truthcoin-latest-x86_64-pc-windows-gnu.zip \
+            truthcoin-latest-x86_64-pc-windows-gnu.exe \
+            truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-latest-x86_64-unknown-linux-gnu
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-cli-latest-x86_64-unknown-linux-gnu
+          zip L2-S4-Truthcoin-latest-x86_64-unknown-linux-gnu.zip \
+            truthcoin-latest-x86_64-unknown-linux-gnu \
+            truthcoin-cli-latest-x86_64-unknown-linux-gnu
 
       - name: Upload release assets to releases.drivechain.info
         uses: appleboy/scp-action@v1
@@ -227,5 +227,5 @@ jobs:
           username: root
           password: ${{ secrets.RELEASES_SERVER_PW }}
           port: 22
-          source: 'L2-S4-BitAssets-latest-*.zip'
-          target: '/var/www/html/'
+          scp: |
+            'L2-S4-Truthcoin-latest-*.zip' => '/var/www/html/'

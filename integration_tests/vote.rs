@@ -15,11 +15,11 @@ use bip300301_enforcer_integration_tests::{
 use futures::{
     FutureExt as _, StreamExt as _, channel::mpsc, future::BoxFuture,
 };
-use plain_bitassets::{
+use truthcoin_dc::{
     authorization::{Dst, Signature},
-    types::{Address, BitAssetData, BitAssetId, GetAddress as _, Txid},
+    types::{Address, TruthcoinData, TruthcoinId, GetAddress as _, Txid},
 };
-use plain_bitassets_app_rpc_api::RpcClient as _;
+use truthcoin_dc_app_rpc_api::RpcClient as _;
 use tokio::time::sleep;
 use tracing::Instrument as _;
 
@@ -29,8 +29,8 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct BitAssetsNodes {
-    /// Sidechain process that will be issuing a BitAsset
+struct TruthcoinNodes {
+    /// Sidechain process that will be issuing a Truthcoin
     issuer: PostSetup,
     /// Sidechain process that will be voting
     voter_0: PostSetup,
@@ -38,7 +38,7 @@ struct BitAssetsNodes {
     voter_1: PostSetup,
 }
 
-impl BitAssetsNodes {
+impl TruthcoinNodes {
     async fn setup(
         bin_paths: &BinPaths,
         res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
@@ -48,7 +48,7 @@ impl BitAssetsNodes {
         let setup_single = |suffix: &str| {
             PostSetup::setup(
                 Init {
-                    bitassets_app: bin_paths.bitassets.clone(),
+                    truthcoin_app: bin_paths.truthcoin.clone(),
                     data_dir_suffix: Some(suffix.to_owned()),
                 },
                 enforcer_post_setup,
@@ -89,7 +89,7 @@ const DEPOSIT_FEE: bitcoin::Amount = bitcoin::Amount::from_sat(1_000_000);
 async fn setup(
     bin_paths: &BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
-) -> anyhow::Result<(EnforcerPostSetup, BitAssetsNodes)> {
+) -> anyhow::Result<(EnforcerPostSetup, TruthcoinNodes)> {
     let mut enforcer_post_setup = setup_enforcer(
         &bin_paths.others,
         Network::Regtest,
@@ -102,116 +102,116 @@ async fn setup(
     let () = activate_sidechain::<PostSetup>(&mut enforcer_post_setup).await?;
     tracing::info!("Activated sidechain successfully");
     let () = fund_enforcer::<PostSetup>(&mut enforcer_post_setup).await?;
-    let mut bitassets_nodes =
-        BitAssetsNodes::setup(bin_paths, res_tx, &enforcer_post_setup).await?;
+    let mut truthcoin_nodes =
+        TruthcoinNodes::setup(bin_paths, res_tx, &enforcer_post_setup).await?;
     let issuer_deposit_address =
-        bitassets_nodes.issuer.get_deposit_address().await?;
+        truthcoin_nodes.issuer.get_deposit_address().await?;
     let () = deposit(
         &mut enforcer_post_setup,
-        &mut bitassets_nodes.issuer,
+        &mut truthcoin_nodes.issuer,
         &issuer_deposit_address,
         DEPOSIT_AMOUNT,
         DEPOSIT_FEE,
     )
     .await?;
     tracing::info!("Deposited to sidechain successfully");
-    Ok((enforcer_post_setup, bitassets_nodes))
+    Ok((enforcer_post_setup, truthcoin_nodes))
 }
 
-const PLAINTEXT_NAME: &str = "test-bitasset";
+const PLAINTEXT_NAME: &str = "test-truthcoin";
 const VOTE_CALL_MSG: &str = "test vote call";
 const VOTE_YES_MSG: &str = "test vote call YES";
 const VOTE_NO_MSG: &str = "test vote call NO";
 const INITIAL_SUPPLY: u64 = 100;
-/// BitAssets allocated to voter 0
+/// Truthcoin allocated to voter 0
 const VOTER_ALLOCATION_0: u64 = 60;
-/// BitAssets allocated to voter 1
+/// Truthcoin allocated to voter 1
 const VOTER_ALLOCATION_1: u64 = 40;
 
 async fn vote_task(
     bin_paths: BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let (mut enforcer_post_setup, bitassets_nodes) =
+    let (mut enforcer_post_setup, truthcoin_nodes) =
         setup(&bin_paths, res_tx.clone()).await?;
-    tracing::info!("Reserving BitAsset");
-    let _: Txid = bitassets_nodes
+    tracing::info!("Reserving Truthcoin");
+    let _: Txid = truthcoin_nodes
         .issuer
         .rpc_client
-        .reserve_bitasset(PLAINTEXT_NAME.to_owned())
+        .reserve_truthcoin(PLAINTEXT_NAME.to_owned())
         .await?;
-    let bitasset_id =
-        BitAssetId(blake3::hash(PLAINTEXT_NAME.as_bytes()).into());
-    bitassets_nodes
+    let truthcoin_id =
+        TruthcoinId(blake3::hash(PLAINTEXT_NAME.as_bytes()).into());
+    truthcoin_nodes
         .issuer
         .bmm_single(&mut enforcer_post_setup)
         .await?;
     tracing::info!("Generating issuer verifying key");
-    let issuer_vk = bitassets_nodes
+    let issuer_vk = truthcoin_nodes
         .issuer
         .rpc_client
         .get_new_verifying_key()
         .await?;
-    tracing::info!("Registering BitAsset");
-    let _: Txid = bitassets_nodes
+    tracing::info!("Registering Truthcoin");
+    let _: Txid = truthcoin_nodes
         .issuer
         .rpc_client
-        .register_bitasset(
+        .register_truthcoin(
             PLAINTEXT_NAME.to_owned(),
             INITIAL_SUPPLY,
-            Some(BitAssetData {
+            Some(TruthcoinData {
                 signing_pubkey: Some(issuer_vk),
                 ..Default::default()
             }),
         )
         .await?;
-    bitassets_nodes
+    truthcoin_nodes
         .issuer
         .bmm_single(&mut enforcer_post_setup)
         .await?;
-    tracing::info!("Sending BitAsset to voters");
+    tracing::info!("Sending Truthcoin to voters");
     let voter_addr_0 =
-        bitassets_nodes.voter_0.rpc_client.get_new_address().await?;
+        truthcoin_nodes.voter_0.rpc_client.get_new_address().await?;
     let voter_addr_1 =
-        bitassets_nodes.voter_1.rpc_client.get_new_address().await?;
-    let _: Txid = bitassets_nodes
+        truthcoin_nodes.voter_1.rpc_client.get_new_address().await?;
+    let _: Txid = truthcoin_nodes
         .issuer
         .rpc_client
-        .transfer_bitasset(
+        .transfer_truthcoin(
             voter_addr_0,
-            bitasset_id,
+            truthcoin_id,
             VOTER_ALLOCATION_0,
             0,
             None,
         )
         .await?;
-    bitassets_nodes
+    truthcoin_nodes
         .issuer
         .bmm_single(&mut enforcer_post_setup)
         .await?;
-    let _: Txid = bitassets_nodes
+    let _: Txid = truthcoin_nodes
         .issuer
         .rpc_client
-        .transfer_bitasset(
+        .transfer_truthcoin(
             voter_addr_1,
-            bitasset_id,
+            truthcoin_id,
             VOTER_ALLOCATION_1,
             0,
             None,
         )
         .await?;
-    bitassets_nodes
+    truthcoin_nodes
         .issuer
         .bmm_single(&mut enforcer_post_setup)
         .await?;
     tracing::info!("Signing vote call message");
-    let vote_call_msg_sig: Signature = bitassets_nodes
+    let vote_call_msg_sig: Signature = truthcoin_nodes
         .issuer
         .rpc_client
         .sign_arbitrary_msg(issuer_vk, VOTE_CALL_MSG.to_owned())
         .await?;
     tracing::info!("Verifying vote call message signature");
-    for voter in [&bitassets_nodes.voter_0, &bitassets_nodes.voter_1] {
+    for voter in [&truthcoin_nodes.voter_0, &truthcoin_nodes.voter_1] {
         anyhow::ensure!(
             voter
                 .rpc_client
@@ -224,27 +224,27 @@ async fn vote_task(
                 .await?
         )
     }
-    tracing::info!("Taking snapshot of BitAsset holders");
+    tracing::info!("Taking snapshot of Truthcoin holders");
     let vote_weights: HashMap<Address, u64> = {
         let mut weights = HashMap::new();
-        let utxos = bitassets_nodes.issuer.rpc_client.list_utxos().await?;
+        let utxos = truthcoin_nodes.issuer.rpc_client.list_utxos().await?;
         for utxo in utxos {
-            if let Some((asset_id, value)) = utxo.output.bitasset_value()
-                && asset_id == bitasset_id
-            {
-                *weights.entry(utxo.output.address).or_default() += value;
+            if let Some((asset_id, value)) = utxo.output.truthcoin_value() {
+                if asset_id == truthcoin_id {
+                    *weights.entry(utxo.output.address).or_default() += value;
+                }
             }
         }
         weights
     };
     anyhow::ensure!(vote_weights.len() >= 2);
     tracing::info!("Signing votes");
-    let vote_auth_0 = bitassets_nodes
+    let vote_auth_0 = truthcoin_nodes
         .voter_0
         .rpc_client
         .sign_arbitrary_msg_as_addr(voter_addr_0, VOTE_YES_MSG.to_owned())
         .await?;
-    let vote_auth_1 = bitassets_nodes
+    let vote_auth_1 = truthcoin_nodes
         .voter_1
         .rpc_client
         .sign_arbitrary_msg_as_addr(voter_addr_1, VOTE_NO_MSG.to_owned())
@@ -255,7 +255,7 @@ async fn vote_task(
         let mut vote_weights = vote_weights;
         for vote_auth in [vote_auth_0, vote_auth_1] {
             let voter_addr = vote_auth.get_address();
-            if bitassets_nodes
+            if truthcoin_nodes
                 .issuer
                 .rpc_client
                 .verify_signature(
@@ -269,7 +269,7 @@ async fn vote_task(
                 if let Some(weight) = vote_weights.remove(&voter_addr) {
                     total_yes += weight;
                 }
-            } else if bitassets_nodes
+            } else if truthcoin_nodes
                 .issuer
                 .rpc_client
                 .verify_signature(
@@ -279,9 +279,10 @@ async fn vote_task(
                     VOTE_NO_MSG.to_owned(),
                 )
                 .await?
-                && let Some(weight) = vote_weights.remove(&voter_addr)
             {
-                total_no += weight;
+                if let Some(weight) = vote_weights.remove(&voter_addr) {
+                    total_no += weight;
+                }
             }
         }
         (total_yes, total_no)
@@ -290,7 +291,7 @@ async fn vote_task(
     anyhow::ensure!(total_no == VOTER_ALLOCATION_1);
     // Cleanup
     {
-        drop(bitassets_nodes);
+        drop(truthcoin_nodes);
         tracing::info!(
             "Removing {}",
             enforcer_post_setup.directories.base_dir.path().display()

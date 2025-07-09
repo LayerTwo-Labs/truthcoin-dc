@@ -23,7 +23,7 @@ use crate::types::{EncryptionPubKey, Hash, VerifyingKey};
 )]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
 #[cfg_attr(feature = "clap", group(required = false, multiple = true))]
-pub struct BitAssetData {
+pub struct TruthcoinData {
     /// Commitment to arbitrary data
     #[cfg_attr(feature = "clap", arg(
         long,
@@ -149,9 +149,9 @@ impl ToSchema for Update<u64> {
     }
 }
 
-/// Updates to the data associated with a BitAsset
+/// Updates to the data associated with a Truthcoin
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct BitAssetDataUpdates {
+pub struct TruthcoinDataUpdates {
     /// Commitment to arbitrary data
     #[schema(schema_with = <Update<Hash> as PartialSchema>::schema)]
     pub commitment: Update<Hash>,

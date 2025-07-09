@@ -6,15 +6,15 @@ use std::{
 use clap::{Parser, Subcommand};
 use http::HeaderMap;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder};
-use plain_bitassets::{
+use truthcoin_dc::{
     authorization::{Dst, Signature},
     types::{
-        Address, AssetId, BitAssetData, BitAssetId, BlockHash, DutchAuctionId,
+        Address, AssetId, TruthcoinData, TruthcoinId, BlockHash, DutchAuctionId,
         DutchAuctionParams, EncryptionPubKey, THIS_SIDECHAIN, Txid,
         VerifyingKey,
     },
 };
-use plain_bitassets_app_rpc_api::RpcClient;
+use truthcoin_dc_app_rpc_api::RpcClient;
 use tracing_subscriber::layer::SubscriberExt as _;
 use url::{Host, Url};
 
@@ -50,13 +50,13 @@ pub enum Command {
         #[arg(long)]
         amount_spend: u64,
     },
-    /// Retrieve data for a single BitAsset
-    #[command(name = "bitasset-data")]
-    BitAssetData {
-        bitasset_id: BitAssetId,
+    /// Retrieve data for a single Truthcoin
+    #[command(name = "truthcoin-data")]
+    TruthcoinData {
+        truthcoin_id: TruthcoinId,
     },
-    /// List all BitAssets
-    Bitassets,
+    /// List all Truthcoin
+    Truthcoin,
     /// Get Bitcoin balance in sats
     BitcoinBalance,
     /// Connect to a peer
@@ -145,7 +145,7 @@ pub enum Command {
     GetBlockcount,
     /// Get mainchain blocks that commit to a specified block hash
     GetBmmInclusions {
-        block_hash: plain_bitassets::types::BlockHash,
+        block_hash: truthcoin_dc::types::BlockHash,
     },
     /// Get a new address
     GetNewAddress,
@@ -185,20 +185,20 @@ pub enum Command {
     OpenApiSchema,
     /// Get pending withdrawal bundle
     PendingWithdrawalBundle,
-    /// Register a BitAsset
-    RegisterBitasset {
+    /// Register a Truthcoin
+    RegisterTruthcoin {
         plaintext_name: String,
         #[arg(long)]
         initial_supply: u64,
         #[command(flatten)]
-        bitasset_data: Box<BitAssetData>,
+        truthcoin_data: Box<TruthcoinData>,
     },
     /// Remove a tx from the mempool
     RemoveFromMempool {
         txid: Txid,
     },
-    /// Reserve a BitAsset
-    ReserveBitasset {
+    /// Reserve a Truthcoin
+    ReserveTruthcoin {
         plaintext_name: String,
     },
     /// Set the wallet seed from a mnemonic seed phrase
@@ -231,11 +231,11 @@ pub enum Command {
         #[arg(long)]
         fee_sats: u64,
     },
-    /// Transfer bitassets to the specified address
-    TransferBitasset {
+    /// Transfer truthcoin to the specified address
+    TransferTruthcoin {
         dest: Address,
         #[arg(long)]
-        asset_id: BitAssetId,
+        asset_id: TruthcoinId,
         #[arg(long)]
         amount: u64,
         #[arg(long)]
@@ -350,13 +350,13 @@ where
                 .await?;
             format!("{amount}")
         }
-        Command::BitAssetData { bitasset_id } => {
-            let bitasset_data = rpc_client.bitasset_data(bitasset_id).await?;
-            serde_json::to_string_pretty(&bitasset_data)?
+        Command::TruthcoinData { truthcoin_id } => {
+            let truthcoin_data = rpc_client.truthcoin_data(truthcoin_id).await?;
+            serde_json::to_string_pretty(&truthcoin_data)?
         }
-        Command::Bitassets => {
-            let bitassets = rpc_client.bitassets().await?;
-            serde_json::to_string_pretty(&bitassets)?
+        Command::Truthcoin => {
+            let truthcoin = rpc_client.truthcoin().await?;
+            serde_json::to_string_pretty(&truthcoin)?
         }
         Command::BitcoinBalance => {
             let balance = rpc_client.bitcoin_balance().await?;
@@ -511,7 +511,7 @@ where
         }
         Command::OpenApiSchema => {
             let openapi =
-                <plain_bitassets_app_rpc_api::RpcDoc as utoipa::OpenApi>::openapi();
+                <truthcoin_dc_app_rpc_api::RpcDoc as utoipa::OpenApi>::openapi();
             openapi.to_pretty_json()?
         }
         Command::PendingWithdrawalBundle => {
@@ -519,16 +519,16 @@ where
                 rpc_client.pending_withdrawal_bundle().await?;
             serde_json::to_string_pretty(&withdrawal_bundle)?
         }
-        Command::RegisterBitasset {
+        Command::RegisterTruthcoin {
             plaintext_name,
             initial_supply,
-            bitasset_data,
+            truthcoin_data,
         } => {
             let txid = rpc_client
-                .register_bitasset(
+                .register_truthcoin(
                     plaintext_name,
                     initial_supply,
-                    Some(*bitasset_data),
+                    Some(*truthcoin_data),
                 )
                 .await?;
             format!("{txid}")
@@ -537,8 +537,8 @@ where
             let () = rpc_client.remove_from_mempool(txid).await?;
             String::default()
         }
-        Command::ReserveBitasset { plaintext_name } => {
-            let txid = rpc_client.reserve_bitasset(plaintext_name).await?;
+        Command::ReserveTruthcoin { plaintext_name } => {
+            let txid = rpc_client.reserve_truthcoin(plaintext_name).await?;
             format!("{txid}")
         }
         Command::SetSeedFromMnemonic { mnemonic } => {
@@ -572,14 +572,14 @@ where
                 .await?;
             format!("{txid}")
         }
-        Command::TransferBitasset {
+        Command::TransferTruthcoin {
             dest,
             asset_id,
             amount,
             fee_sats,
         } => {
             let txid = rpc_client
-                .transfer_bitasset(dest, asset_id, amount, fee_sats, None)
+                .transfer_truthcoin(dest, asset_id, amount, fee_sats, None)
                 .await?;
             format!("{txid}")
         }

@@ -6,7 +6,7 @@ use sneed::{RoTxn, RwTxn};
 use crate::{
     state::{Error, PrevalidatedBlock, State, amm, dutch_auction, error},
     types::{
-        AmountOverflowError, Authorization, BitAssetId, BlockHash, Body,
+        AmountOverflowError, Authorization, TruthcoinId, BlockHash, Body,
         FilledOutput, FilledOutputContent, GetAddress as _,
         GetBitcoinValue as _, Hash, Header, InPoint, OutPoint, OutPointKey,
         OutputContent, SpentOutput, TxData, Verify as _,
@@ -228,9 +228,9 @@ pub fn connect_prevalidated(
                 FilledOutputContent::BitcoinWithdrawal(withdrawal)
             }
             OutputContent::AmmLpToken(_)
-            | OutputContent::BitAsset(_)
-            | OutputContent::BitAssetControl
-            | OutputContent::BitAssetReservation
+            | OutputContent::Truthcoin(_)
+            | OutputContent::TruthcoinControl
+            | OutputContent::TruthcoinReservation
             | OutputContent::DutchAuctionReceipt => {
                 return Err(Error::BadCoinbaseOutputContent);
             }
@@ -477,39 +477,39 @@ pub fn connect(
             Some(TxData::AmmSwap { .. }) => {
                 let () = amm::apply_swap(&state.amm_pools, rwtxn, &filled_tx)?;
             }
-            Some(TxData::BitAssetReservation { commitment }) => {
+            Some(TxData::TruthcoinReservation { commitment }) => {
                 let () = state
-                    .bitassets
+                    .truthcoin
                     .put_reservation(rwtxn, &txid, commitment)?;
             }
-            Some(TxData::BitAssetRegistration {
+            Some(TxData::TruthcoinRegistration {
                 name_hash,
                 revealed_nonce: _,
-                bitasset_data,
+                truthcoin_data,
                 initial_supply,
             }) => {
-                let () = state.bitassets.apply_registration(
+                let () = state.truthcoin.apply_registration(
                     rwtxn,
                     &filled_tx,
                     *name_hash,
-                    bitasset_data,
+                    truthcoin_data,
                     *initial_supply,
                     height,
                 )?;
             }
-            Some(TxData::BitAssetMint(mint_amount)) => {
-                let () = state.bitassets.apply_mint(
+            Some(TxData::TruthcoinMint(mint_amount)) => {
+                let () = state.truthcoin.apply_mint(
                     rwtxn,
                     &filled_tx,
                     *mint_amount,
                     height,
                 )?;
             }
-            Some(TxData::BitAssetUpdate(bitasset_updates)) => {
-                let () = state.bitassets.apply_updates(
+            Some(TxData::TruthcoinUpdate(truthcoin_updates)) => {
+                let () = state.truthcoin.apply_updates(
                     rwtxn,
                     &filled_tx,
-                    (**bitasset_updates).clone(),
+                    (**truthcoin_updates).clone(),
                     height,
                 )?;
             }
@@ -588,36 +588,36 @@ pub fn disconnect_tip(
             Some(TxData::AmmSwap { .. }) => {
                 let () = amm::revert_swap(&state.amm_pools, rwtxn, &filled_tx)?;
             }
-            Some(TxData::BitAssetMint(mint_amount)) => {
-                let () = state.bitassets.revert_mint(
+            Some(TxData::TruthcoinMint(mint_amount)) => {
+                let () = state.truthcoin.revert_mint(
                     rwtxn,
                     &filled_tx,
                     *mint_amount,
                 )?;
             }
-            Some(TxData::BitAssetRegistration {
+            Some(TxData::TruthcoinRegistration {
                 name_hash,
                 revealed_nonce: _,
-                bitasset_data: _,
+                truthcoin_data: _,
                 initial_supply: _,
             }) => {
-                let () = state.bitassets.revert_registration(
+                let () = state.truthcoin.revert_registration(
                     rwtxn,
                     &filled_tx,
-                    BitAssetId(*name_hash),
+                    TruthcoinId(*name_hash),
                 )?;
             }
-            Some(TxData::BitAssetReservation { commitment: _ }) => {
-                if !state.bitassets.delete_reservation(rwtxn, &txid)? {
-                    let err = error::BitAsset::MissingReservation { txid };
+            Some(TxData::TruthcoinReservation { commitment: _ }) => {
+                if !state.truthcoin.delete_reservation(rwtxn, &txid)? {
+                    let err = error::Truthcoin::MissingReservation { txid };
                     return Err(err.into());
                 }
             }
-            Some(TxData::BitAssetUpdate(bitasset_updates)) => {
-                let () = state.bitassets.revert_updates(
+            Some(TxData::TruthcoinUpdate(truthcoin_updates)) => {
+                let () = state.truthcoin.revert_updates(
                     rwtxn,
                     &filled_tx,
-                    (**bitasset_updates).clone(),
+                    (**truthcoin_updates).clone(),
                     height - 1,
                 )?;
             }

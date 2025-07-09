@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::{Arg, Parser};
-use plain_bitassets::types::{Network, THIS_SIDECHAIN};
+use truthcoin_dc::types::{Network, THIS_SIDECHAIN};
 use url::{Host, Url};
 
 use crate::util::saturating_pred_level;
@@ -23,7 +23,7 @@ static DEFAULT_DATA_DIR: LazyLock<Option<PathBuf>> =
             tracing::warn!("Failed to resolve default data dir");
             None
         }
-        Some(data_dir) => Some(data_dir.join("plain_bitassets")),
+        Some(data_dir) => Some(data_dir.join("truthcoin_dc")),
     });
 
 const DEFAULT_MAIN_HOST: Host = Host::Ipv4(Ipv4Addr::LOCALHOST);
@@ -119,7 +119,7 @@ pub(super) struct Cli {
     headless: bool,
     /// Directory in which to store log files.
     /// Defaults to `<DATADIR>/logs/v<VERSION>`, where `<DATADIR>` is
-    /// BitAssets's data directory, and `<VERSION>` is the BitAssets app version.
+    /// Truthcoin's data directory, and `<VERSION>` is the Truthcoin app version.
     /// By default, only logs at the WARN level and above are logged to file.
     /// If set to the empty string, logging to file will be disabled.
     #[arg(long)]

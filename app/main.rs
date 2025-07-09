@@ -122,8 +122,8 @@ fn set_tracing_subscriber(
                 "h2::codec::framed_write",
                 saturating_pred_level(saturating_pred_level(log_level)),
             ),
-            ("plain_bitassets", log_level),
-            ("plain_bitassets_app", log_level),
+            ("truthcoin_dc", log_level),
+            ("truthcoin_dc_app", log_level),
             (
                 "tower::buffer::worker",
                 saturating_pred_level(saturating_pred_level(log_level)),
@@ -180,7 +180,7 @@ fn run_egui_app(
 ) -> Result<(), eframe::Error> {
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
-        "Plain Bitassets",
+        "Plain Truthcoin",
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(gui::EguiApp::new(

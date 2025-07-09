@@ -14,7 +14,7 @@ use utoipa::ToSchema;
 pub use crate::authorization::Authorization;
 
 mod address;
-pub mod bitasset_data;
+pub mod truthcoin_data;
 pub mod hashes;
 pub mod keys;
 pub mod proto;
@@ -22,9 +22,9 @@ pub mod schema;
 mod transaction;
 
 pub use address::Address;
-pub use bitasset_data::{BitAssetData, BitAssetDataUpdates, Update};
+pub use truthcoin_data::{TruthcoinData, TruthcoinDataUpdates, Update};
 pub use hashes::{
-    AssetId, BitAssetId, BlockHash, DutchAuctionId, Hash, M6id, MerkleRoot,
+    AssetId, TruthcoinId, BlockHash, DutchAuctionId, Hash, M6id, MerkleRoot,
     Txid,
 };
 pub use keys::{EncryptionPubKey, VerifyingKey};
@@ -37,7 +37,7 @@ pub use transaction::{
     TxInputs, WithdrawalOutputContent,
 };
 
-pub const THIS_SIDECHAIN: u8 = 4;
+pub const THIS_SIDECHAIN: u8 = 13;
 
 #[derive(Debug, Error)]
 #[error("Bitcoin amount overflow")]
