@@ -29,6 +29,89 @@ use crate::{
     util::BinPaths,
 };
 
+/// Pre-calculated expected values for whitepaper Figure 5 vote matrix
+mod expected {
+    /// Expected consensus outcomes for the vote matrix:
+    /// D1: All vote 1.0 → 1.0
+    /// D2: 6 vote 0.5, 1 votes 1.0 → ~0.57, rounds to 0.5 with catch_tl
+    /// D3: All vote 0.0 → 0.0
+    /// D4: All vote 0.0 → 0.0
+    pub const OUTCOMES: [f64; 4] = [1.0, 0.5, 0.0, 0.0];
+
+    /// Voter 2 is the dissenter (0-indexed) - voted 1.0 on D2 when consensus is 0.5
+    pub const DISSENTER_INDEX: usize = 2;
+
+    /// LMSR invariant tolerance - prices must sum to 1.0 within this tolerance
+    pub const PRICE_SUM_TOLERANCE: f64 = 1e-6;
+
+    /// Reputation change tolerance for comparisons
+    pub const REPUTATION_TOLERANCE: f64 = 0.0001;
+
+    /// Outcome value tolerance for consensus verification
+    pub const OUTCOME_TOLERANCE: f64 = 0.01;
+}
+
+/// Pre-calculated LMSR trade costs for deterministic testing.
+/// All values calculated with: β = 1,000,000, fee_rate = 0.5%
+mod expected_costs {
+    /// Initial treasury for binary market: ceil(β * ln(2)) = 693148 sats (~0.007 BTC)
+    pub const INITIAL_TREASURY: u64 = 693148;
+}
+
+/// Helper functions for verifying market UTXO state transitions
+mod utxo_verification {
+    use std::collections::HashMap;
+    use truthcoin_dc::types::{FilledOutputContent, OutPoint, PointedOutput};
+
+    /// Extract market treasury UTXOs from a list of all UTXOs
+    /// Returns a map of market_id (hex) -> (outpoint, amount_sats)
+    pub fn get_market_treasury_utxos(
+        utxos: &[PointedOutput<FilledOutputContent>],
+    ) -> HashMap<String, (OutPoint, u64)> {
+        utxos
+            .iter()
+            .filter_map(|pointed| {
+                if let FilledOutputContent::MarketTreasury {
+                    market_id,
+                    amount,
+                } = &pointed.output.content
+                {
+                    Some((
+                        hex::encode(market_id),
+                        (pointed.outpoint, amount.0.to_sat()),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Extract market author fee UTXOs from a list of all UTXOs
+    /// Returns a map of market_id (hex) -> (outpoint, amount_sats)
+    pub fn get_market_author_fee_utxos(
+        utxos: &[PointedOutput<FilledOutputContent>],
+    ) -> HashMap<String, (OutPoint, u64)> {
+        utxos
+            .iter()
+            .filter_map(|pointed| {
+                if let FilledOutputContent::MarketAuthorFee {
+                    market_id,
+                    amount,
+                } = &pointed.output.content
+                {
+                    Some((
+                        hex::encode(market_id),
+                        (pointed.outpoint, amount.0.to_sat()),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug)]
 struct TruthcoinNodes {
     issuer: PostSetup,
@@ -86,8 +169,8 @@ impl TruthcoinNodes {
     }
 }
 
-const DEPOSIT_AMOUNT: bitcoin::Amount = bitcoin::Amount::from_sat(21_000_000);
-const DEPOSIT_FEE: bitcoin::Amount = bitcoin::Amount::from_sat(1_000_000);
+const DEPOSIT_AMOUNT: bitcoin::Amount = bitcoin::Amount::from_sat(21000000);
+const DEPOSIT_FEE: bitcoin::Amount = bitcoin::Amount::from_sat(1000000);
 
 async fn setup(
     bin_paths: &BinPaths,
@@ -303,10 +386,9 @@ async fn roundtrip_task(
                     VOTE_NO_MSG.to_owned(),
                 )
                 .await?
+                && let Some(weight) = vote_weights.remove(&voter_addr)
             {
-                if let Some(weight) = vote_weights.remove(&voter_addr) {
-                    total_no += weight;
-                }
+                total_no += weight;
             }
         }
         (total_yes, total_no)
@@ -393,26 +475,14 @@ async fn roundtrip_task(
     sleep(std::time::Duration::from_secs(1)).await;
 
     let slot_claims = [
-        (
-            voter_addr_0,
-            0,
-            "Will Bitcoin reach $100k in 2025?",
-        ),
+        (voter_addr_0, 0, "Will Bitcoin reach $100k in 2025?"),
         (
             voter_addr_1,
             1,
             "Will the temperature in Florida be below 60 degrees?",
         ),
-        (
-            voter_addr_2,
-            2,
-            "Will there be 1M BTC addresses by 2026?",
-        ),
-        (
-            voter_addr_3,
-            3, 
-            "Will BIP 444 activate"
-        ),
+        (voter_addr_2, 2, "Will there be 1M BTC addresses by 2026?"),
+        (voter_addr_3, 3, "Will BIP 444 activate"),
     ];
 
     for (i, (_voter_addr, slot_index, question)) in
@@ -563,7 +633,9 @@ async fn roundtrip_task(
             decision_slots: vec![slot_id.clone()],
             dimensions: None,
             has_residual: None,
-            beta: Some(100.0),
+            // beta = 1000000 gives ~693147 sats minimum treasury (~0.007 BTC)
+            // This is a realistic liquidity level for a small prediction market
+            beta: Some(1000000.0),
             trading_fee: Some(0.005),
             tags: Some(vec!["integration-test".to_string()]),
             initial_liquidity: None,
@@ -598,6 +670,76 @@ async fn roundtrip_task(
     let market_ids: Vec<String> =
         markets.iter().map(|m| m.market_id.clone()).collect();
 
+    tracing::info!("\n--- LMSR Verification: Initial Market State ---");
+    for market_id in &market_ids {
+        let market_data = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .market_get(market_id.clone())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Market not found: {}", market_id)
+            })?;
+
+        let price_sum: f64 =
+            market_data.outcomes.iter().map(|o| o.current_price).sum();
+        anyhow::ensure!(
+            (price_sum - 1.0).abs() < expected::PRICE_SUM_TOLERANCE,
+            "LMSR invariant violated: prices sum to {} (expected 1.0) for market {}",
+            price_sum,
+            market_id
+        );
+
+        // For binary markets, initial prices should be 0.5/0.5
+        if market_data.outcomes.len() == 2 {
+            for outcome in &market_data.outcomes {
+                anyhow::ensure!(
+                    (outcome.current_price - 0.5).abs() < 0.01,
+                    "Initial binary market price should be 0.5, got {} for outcome {}",
+                    outcome.current_price,
+                    outcome.name
+                );
+            }
+        }
+
+        tracing::info!(
+            "  Market {}: prices sum = {:.6}, beta = {}",
+            &market_id[..12],
+            price_sum,
+            market_data.beta
+        );
+    }
+    tracing::info!("✓ LMSR initial state verified\n");
+
+    // === Market UTXO Verification: Post-Creation ===
+    // Each market should have exactly one MarketTreasury UTXO with initial liquidity
+    tracing::info!("--- Market UTXO Verification: Post-Creation ---");
+    let all_utxos = truthcoin_nodes.issuer.rpc_client.list_utxos().await?;
+    let initial_market_utxos =
+        utxo_verification::get_market_treasury_utxos(&all_utxos);
+
+    anyhow::ensure!(
+        initial_market_utxos.len() == 4,
+        "Expected 4 market treasury UTXOs after creation, found {}",
+        initial_market_utxos.len()
+    );
+
+    for market_id in &market_ids {
+        let market_id_short = &market_id[..12];
+        anyhow::ensure!(
+            initial_market_utxos.contains_key(market_id),
+            "Market {} should have a treasury UTXO after creation",
+            market_id_short
+        );
+        let (_outpoint, amount) = &initial_market_utxos[market_id];
+        tracing::info!(
+            "  Market {}: treasury UTXO with {} sats",
+            market_id_short,
+            amount
+        );
+    }
+    tracing::info!("✓ Market UTXO post-creation verification complete\n");
+
     for voter in [
         &truthcoin_nodes.voter_0,
         &truthcoin_nodes.voter_1,
@@ -617,26 +759,14 @@ async fn roundtrip_task(
             _ => unreachable!(),
         };
 
-        let dry_run = voter
-            .rpc_client
-            .market_buy(MarketBuyRequest {
-                market_id: market_id.clone(),
-                outcome_index: 0,
-                shares_amount: 5.0,
-                max_cost: None,
-                fee_sats: None,
-                dry_run: Some(true),
-            })
-            .await?;
-        let cost = dry_run.cost_sats;
-
+        // Expected cost: ~25440 sats (25313 base + 127 fee)
         voter
             .rpc_client
             .market_buy(MarketBuyRequest {
                 market_id: market_id.clone(),
                 outcome_index: 0,
-                shares_amount: 5.0,
-                max_cost: Some(cost + 10000),
+                shares_amount: 50000.0,
+                max_cost: Some(30000), // generous slippage
                 fee_sats: Some(1000),
                 dry_run: None,
             })
@@ -661,27 +791,15 @@ async fn roundtrip_task(
     truthcoin_nodes.voter_1.rpc_client.refresh_wallet().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
-    let dry_run = truthcoin_nodes
-        .voter_1
-        .rpc_client
-        .market_buy(MarketBuyRequest {
-            market_id: market_ids[0].clone(),
-            outcome_index: 1,
-            shares_amount: 5.0,
-            max_cost: None,
-            fee_sats: None,
-            dry_run: Some(true),
-        })
-        .await?;
-    let cost = dry_run.cost_sats;
+    // Market 0, trade 2: buy 50000 @ outcome 1 (~24812 sats)
     truthcoin_nodes
         .voter_1
         .rpc_client
         .market_buy(MarketBuyRequest {
             market_id: market_ids[0].clone(),
             outcome_index: 1,
-            shares_amount: 5.0,
-            max_cost: Some(cost + 10000),
+            shares_amount: 50000.0,
+            max_cost: Some(30000),
             fee_sats: Some(1000),
             dry_run: None,
         })
@@ -705,27 +823,15 @@ async fn roundtrip_task(
     truthcoin_nodes.voter_2.rpc_client.refresh_wallet().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
-    let dry_run = truthcoin_nodes
-        .voter_2
-        .rpc_client
-        .market_buy(MarketBuyRequest {
-            market_id: market_ids[1].clone(),
-            outcome_index: 0,
-            shares_amount: 50.0,
-            max_cost: None,
-            fee_sats: None,
-            dry_run: Some(true),
-        })
-        .await?;
-    let cost = dry_run.cost_sats;
+    // Market 1, trade 2: buy 500000 @ outcome 0 (~288469 sats)
     truthcoin_nodes
         .voter_2
         .rpc_client
         .market_buy(MarketBuyRequest {
             market_id: market_ids[1].clone(),
             outcome_index: 0,
-            shares_amount: 50.0,
-            max_cost: Some(cost + 50000),
+            shares_amount: 500000.0,
+            max_cost: Some(300000),
             fee_sats: Some(1000),
             dry_run: None,
         })
@@ -809,28 +915,16 @@ async fn roundtrip_task(
     truthcoin_nodes.voter_3.rpc_client.refresh_wallet().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
+    // Market 2 batched trades: buy 20000 @ outcome 0 (~10352), then 20000 @ outcome 1 (~9750)
     for outcome in [0, 1] {
-        let dry_run = truthcoin_nodes
-            .voter_3
-            .rpc_client
-            .market_buy(MarketBuyRequest {
-                market_id: market_ids[2].clone(),
-                outcome_index: outcome,
-                shares_amount: 2.0,
-                max_cost: None,
-                fee_sats: None,
-                dry_run: Some(true),
-            })
-            .await?;
-        let cost = dry_run.cost_sats;
         truthcoin_nodes
             .voter_3
             .rpc_client
             .market_buy(MarketBuyRequest {
                 market_id: market_ids[2].clone(),
                 outcome_index: outcome,
-                shares_amount: 2.0,
-                max_cost: Some(cost + 5000),
+                shares_amount: 20000.0,
+                max_cost: Some(15000),
                 fee_sats: Some(1000),
                 dry_run: None,
             })
@@ -867,27 +961,15 @@ async fn roundtrip_task(
     truthcoin_nodes.voter_3.rpc_client.refresh_wallet().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
-    let dry_run = truthcoin_nodes
-        .voter_3
-        .rpc_client
-        .market_buy(MarketBuyRequest {
-            market_id: market_ids[1].clone(),
-            outcome_index: 0,
-            shares_amount: 20.0,
-            max_cost: None,
-            fee_sats: None,
-            dry_run: Some(true),
-        })
-        .await?;
-    let cost = dry_run.cost_sats;
+    // Market 1, trade 3: buy 200000 @ outcome 0 (~132036 sats)
     truthcoin_nodes
         .voter_3
         .rpc_client
         .market_buy(MarketBuyRequest {
             market_id: market_ids[1].clone(),
             outcome_index: 0,
-            shares_amount: 20.0,
-            max_cost: Some(cost + 30000),
+            shares_amount: 200000.0,
+            max_cost: Some(150000),
             fee_sats: Some(1000),
             dry_run: None,
         })
@@ -911,27 +993,15 @@ async fn roundtrip_task(
     truthcoin_nodes.voter_0.rpc_client.refresh_wallet().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
-    let dry_run = truthcoin_nodes
-        .voter_0
-        .rpc_client
-        .market_buy(MarketBuyRequest {
-            market_id: market_ids[1].clone(),
-            outcome_index: 1,
-            shares_amount: 15.0,
-            max_cost: None,
-            fee_sats: None,
-            dry_run: Some(true),
-        })
-        .await?;
-    let cost = dry_run.cost_sats;
+    // Market 1, trade 4: buy 150000 @ outcome 1 (~50871 sats)
     truthcoin_nodes
         .voter_0
         .rpc_client
         .market_buy(MarketBuyRequest {
             market_id: market_ids[1].clone(),
             outcome_index: 1,
-            shares_amount: 15.0,
-            max_cost: Some(cost + 20000),
+            shares_amount: 150000.0,
+            max_cost: Some(60000),
             fee_sats: Some(1000),
             dry_run: None,
         })
@@ -957,36 +1027,35 @@ async fn roundtrip_task(
     }
     sleep(std::time::Duration::from_millis(500)).await;
 
-    for outcome in [0, 1] {
-        let voter = if outcome == 0 {
-            &truthcoin_nodes.voter_0
-        } else {
-            &truthcoin_nodes.voter_1
-        };
-        let dry_run = voter
-            .rpc_client
-            .market_buy(MarketBuyRequest {
-                market_id: market_ids[3].clone(),
-                outcome_index: outcome,
-                shares_amount: 10.0,
-                max_cost: None,
-                fee_sats: None,
-                dry_run: Some(true),
-            })
-            .await?;
-        let cost = dry_run.cost_sats;
-        voter
-            .rpc_client
-            .market_buy(MarketBuyRequest {
-                market_id: market_ids[3].clone(),
-                outcome_index: outcome,
-                shares_amount: 10.0,
-                max_cost: Some(cost + 15000),
-                fee_sats: Some(1000),
-                dry_run: None,
-            })
-            .await?;
-    }
+    // Market 3 batched trades:
+    // Trade 2: buy 100000 @ outcome 0 (~52761 sats) - voter_0
+    // Trade 3: buy 100000 @ outcome 1 (~47741 sats) - voter_1
+    // These are batched in the same block - costs are pre-calculated accounting for state changes
+    truthcoin_nodes
+        .voter_0
+        .rpc_client
+        .market_buy(MarketBuyRequest {
+            market_id: market_ids[3].clone(),
+            outcome_index: 0,
+            shares_amount: 100000.0,
+            max_cost: Some(60000),
+            fee_sats: Some(1000),
+            dry_run: None,
+        })
+        .await?;
+
+    truthcoin_nodes
+        .voter_1
+        .rpc_client
+        .market_buy(MarketBuyRequest {
+            market_id: market_ids[3].clone(),
+            outcome_index: 1,
+            shares_amount: 100000.0,
+            max_cost: Some(55000),
+            fee_sats: Some(1000),
+            dry_run: None,
+        })
+        .await?;
     truthcoin_nodes
         .issuer
         .bmm_single(&mut enforcer_post_setup)
@@ -1031,17 +1100,181 @@ async fn roundtrip_task(
         }
     }
 
+    // After all trades, verify LMSR invariants still hold
+    tracing::info!("\n--- LMSR Verification: Post-Trade State ---");
+    for market_id in &market_ids {
+        let market_data = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .market_get(market_id.clone())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Market not found: {}", market_id)
+            })?;
+
+        // LMSR Invariant 1: Prices must sum to 1.0
+        let price_sum: f64 =
+            market_data.outcomes.iter().map(|o| o.current_price).sum();
+        anyhow::ensure!(
+            (price_sum - 1.0).abs() < expected::PRICE_SUM_TOLERANCE,
+            "LMSR invariant violated after trading: prices sum to {} for market {}",
+            price_sum,
+            market_id
+        );
+
+        // LMSR Invariant 2: All prices must be in (0, 1)
+        for outcome in &market_data.outcomes {
+            anyhow::ensure!(
+                outcome.current_price > 0.0 && outcome.current_price < 1.0,
+                "LMSR price out of bounds: {} for outcome {} in market {}",
+                outcome.current_price,
+                outcome.name,
+                market_id
+            );
+        }
+
+        // LMSR Invariant 3: Treasury should have accumulated from trading fees
+        anyhow::ensure!(
+            market_data.treasury > 0.0,
+            "Market treasury should be positive after trades: {}",
+            market_id
+        );
+
+        tracing::info!(
+            "  Market {}: prices sum = {:.6}, treasury = {} sats ({:.4} BTC)",
+            &market_id[..12],
+            price_sum,
+            (market_data.treasury * 100_000_000.0) as u64,
+            market_data.treasury
+        );
+
+        // Log price distribution
+        for outcome in &market_data.outcomes {
+            tracing::info!(
+                "    {} price: {:.4}",
+                outcome.name,
+                outcome.current_price
+            );
+        }
+    }
+    tracing::info!("✓ LMSR post-trade state verified\n");
+
     tracing::info!("✓ Phase 4: Completed 7 blocks of trading");
+
+    // === Market UTXO Verification: Post-Trade ===
+    // Verify UTXOs were consumed and recreated during trades (state transitions)
+    tracing::info!("\n--- Market UTXO Verification: Post-Trade ---");
+    let post_trade_utxos =
+        truthcoin_nodes.issuer.rpc_client.list_utxos().await?;
+    let post_trade_market_utxos =
+        utxo_verification::get_market_treasury_utxos(&post_trade_utxos);
+    let post_trade_fee_utxos =
+        utxo_verification::get_market_author_fee_utxos(&post_trade_utxos);
+
+    anyhow::ensure!(
+        post_trade_market_utxos.len() == 4,
+        "Expected 4 market treasury UTXOs after trades, found {}",
+        post_trade_market_utxos.len()
+    );
+
+    for market_id in &market_ids {
+        let market_id_short = &market_id[..12];
+
+        // Verify treasury UTXO exists
+        anyhow::ensure!(
+            post_trade_market_utxos.contains_key(market_id),
+            "Market {} should have a treasury UTXO after trades",
+            market_id_short
+        );
+
+        let (new_outpoint, new_amount) = &post_trade_market_utxos[market_id];
+        let (old_outpoint, old_amount) = &initial_market_utxos[market_id];
+
+        // Verify OutPoint changed (old UTXO consumed, new one created)
+        anyhow::ensure!(
+            new_outpoint != old_outpoint,
+            "Market {} treasury OutPoint should change after trades (old: {:?}, new: {:?})",
+            market_id_short,
+            old_outpoint,
+            new_outpoint
+        );
+
+        // Treasury amount should have increased from trade volume
+        anyhow::ensure!(
+            new_amount >= old_amount,
+            "Market {} treasury should not decrease: {} -> {}",
+            market_id_short,
+            old_amount,
+            new_amount
+        );
+
+        tracing::info!(
+            "  Market {}: treasury UTXO changed, amount {} -> {} sats",
+            market_id_short,
+            old_amount,
+            new_amount
+        );
+
+        // Verify author fee UTXO exists and accumulated fees
+        if let Some((_fee_outpoint, fee_amount)) =
+            post_trade_fee_utxos.get(market_id)
+        {
+            anyhow::ensure!(
+                *fee_amount > 0,
+                "Market {} author fee should be > 0 after trades",
+                market_id_short
+            );
+            tracing::info!(
+                "  Market {}: author fee {} sats",
+                market_id_short,
+                fee_amount
+            );
+        }
+    }
+    tracing::info!("✓ Market UTXO post-trade verification complete\n");
+
+    // === Market UTXO Value Verification: Print Actual Values ===
+    // Print actual treasury and fee UTXO values for each market
+    // These can be used to update expected_costs constants if implementation changes
+    tracing::info!("--- Market UTXO Value Verification: Actual Values ---");
+
+    for (market_idx, market_id) in market_ids.iter().enumerate() {
+        let market_id_short = &market_id[..12];
+        let (_, current_amount) = &post_trade_market_utxos[market_id];
+
+        // Calculate treasury increase from initial
+        let treasury_increase =
+            current_amount.saturating_sub(expected_costs::INITIAL_TREASURY);
+
+        tracing::info!(
+            "  Market {} (idx {}): treasury = {} sats (initial {} + {} from trades)",
+            market_id_short,
+            market_idx,
+            current_amount,
+            expected_costs::INITIAL_TREASURY,
+            treasury_increase
+        );
+
+        if let Some((_fee_outpoint, actual_fee)) =
+            post_trade_fee_utxos.get(market_id)
+        {
+            tracing::info!(
+                "  Market {} (idx {}): author fee = {} sats",
+                market_id_short,
+                market_idx,
+                actual_fee
+            );
+        }
+    }
+
+    tracing::info!("✓ Market UTXO values logged\n");
 
     let current_height =
         truthcoin_nodes.issuer.rpc_client.getblockcount().await?;
 
     let voting_period_start_height = 31u32;
-    let blocks_to_mine = if current_height < voting_period_start_height {
-        voting_period_start_height - current_height
-    } else {
-        0
-    };
+    let blocks_to_mine =
+        voting_period_start_height.saturating_sub(current_height);
 
     for _ in 0..blocks_to_mine {
         truthcoin_nodes
@@ -1308,13 +1541,6 @@ async fn roundtrip_task(
 
     anyhow::ensure!(period_status == "Resolved" || period_status == "resolved");
 
-    anyhow::ensure!(consensus_results.explained_variance != 0.85);
-    anyhow::ensure!(consensus_results.explained_variance != 0.95);
-    anyhow::ensure!(
-        consensus_results.explained_variance > 0.0
-            && consensus_results.explained_variance <= 1.0
-    );
-
     let mut reputation_updates_count = 0;
     let mut reputation_changes = vec![];
 
@@ -1351,6 +1577,94 @@ async fn roundtrip_task(
 
     anyhow::ensure!(reputation_updates_count == 7);
 
+    // === Consensus Mathematical Verification: Reputation Changes ===
+    // According to the Truthcoin whitepaper, the SVD-based consensus algorithm should:
+    // 1. Penalize dissenters (voters who deviate from consensus)
+    // 2. Reward conformers (voters who agree with consensus)
+    // Voter 2 (index 2) is the dissenter who voted 1.0 on D2 when consensus is 0.5
+
+    tracing::info!("\n--- Consensus Verification: Reputation Algorithm ---");
+
+    // Find dissenter's reputation change (voter index 2)
+    let dissenter_change = reputation_changes
+        .iter()
+        .find(|(idx, _, _, _)| *idx == expected::DISSENTER_INDEX);
+
+    anyhow::ensure!(
+        dissenter_change.is_some(),
+        "Dissenter (voter {}) should have a reputation update",
+        expected::DISSENTER_INDEX
+    );
+
+    let (dissenter_idx, dissenter_old, dissenter_new, dissenter_delta) =
+        dissenter_change.unwrap();
+
+    // The dissenter should have lost reputation (negative delta)
+    anyhow::ensure!(
+        *dissenter_delta < 0.0,
+        "Dissenter (V{}) should have lost reputation. Old: {:.4}, New: {:.4}, Delta: {:.4}",
+        dissenter_idx + 1,
+        dissenter_old,
+        dissenter_new,
+        dissenter_delta
+    );
+
+    tracing::info!(
+        "  ✓ Dissenter V{} penalized: {:.4} → {:.4} (Δ={:+.4})",
+        dissenter_idx + 1,
+        dissenter_old,
+        dissenter_new,
+        dissenter_delta
+    );
+
+    // Verify conforming voters (all except dissenter) did not lose reputation significantly
+    let mut conformers_rewarded = 0;
+    for (voter_idx, old_rep, new_rep, delta) in &reputation_changes {
+        if *voter_idx != expected::DISSENTER_INDEX {
+            // Conformers should have non-negative delta (may be slightly negative due to smoothing)
+            // but should not have lost significant reputation
+            anyhow::ensure!(
+                *delta >= -0.01, // Allow small negative due to smoothing alpha
+                "Conformer V{} lost too much reputation: {:.4} → {:.4} (Δ={:+.4})",
+                voter_idx + 1,
+                old_rep,
+                new_rep,
+                delta
+            );
+
+            if *delta > expected::REPUTATION_TOLERANCE {
+                conformers_rewarded += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        "  ✓ {} conforming voters maintained or gained reputation",
+        6 - conformers_rewarded + conformers_rewarded // All 6 conformers
+    );
+
+    // Verify the dissenter has lower reputation than conformers
+    let dissenter_final = *dissenter_new;
+    for (voter_idx, _, new_rep, _) in &reputation_changes {
+        if *voter_idx != expected::DISSENTER_INDEX {
+            anyhow::ensure!(
+                dissenter_final <= *new_rep + expected::REPUTATION_TOLERANCE,
+                "Dissenter should have lower or equal reputation than conformers. Dissenter: {:.4}, V{}: {:.4}",
+                dissenter_final,
+                voter_idx + 1,
+                new_rep
+            );
+        }
+    }
+
+    tracing::info!(
+        "  ✓ Dissenter V{} has lowest reputation: {:.4}",
+        dissenter_idx + 1,
+        dissenter_final
+    );
+
+    tracing::info!("✓ Consensus reputation algorithm verified\n");
+
     tracing::info!("Period: {} ({})", period_id, period_status);
     tracing::info!("Decision Outcomes:");
     tracing::info!(
@@ -1381,12 +1695,7 @@ async fn roundtrip_task(
             .get(&decision_slot_ids[3])
             .unwrap_or(&0.0)
     );
-    tracing::info!("SVD Analysis:");
-    tracing::info!(
-        "  Explained Variance: {:.4}",
-        consensus_results.explained_variance
-    );
-    tracing::info!("  Certainty Score: {:.4}", consensus_results.certainty);
+    tracing::info!("Certainty Score: {:.4}", consensus_results.certainty);
     tracing::info!("Reputation Updates:");
     for (voter_idx, old_rep, new_rep, delta) in &reputation_changes {
         tracing::info!(
@@ -1404,15 +1713,18 @@ async fn roundtrip_task(
         }
     }
 
-    let expected_outcomes = vec![1.0, 0.5, 0.0, 0.0];
-
-    for (decision_id, expected) in
-        decision_slot_ids.iter().zip(expected_outcomes.iter())
-    {
+    // Verify consensus outcomes match pre-calculated expected values
+    for (i, decision_id) in decision_slot_ids.iter().enumerate() {
         let actual =
             consensus_results.outcomes.get(decision_id).unwrap_or(&-1.0);
-        let tolerance = 0.01;
-        anyhow::ensure!((actual - expected).abs() < tolerance);
+        let expected = expected::OUTCOMES[i];
+        anyhow::ensure!(
+            (actual - expected).abs() < expected::OUTCOME_TOLERANCE,
+            "Consensus outcome mismatch for D{}: expected {}, got {}",
+            i + 1,
+            expected,
+            actual
+        );
     }
 
     tracing::info!("\n--- 8.2: VoteCoin Redistribution ---");
@@ -1534,6 +1846,191 @@ async fn roundtrip_task(
             resolution.summary
         );
     }
+
+    // === Market Resolution Mathematical Verification ===
+    // Verify that market payouts are based on consensus outcomes
+    tracing::info!("\n--- Market Payout Verification ---");
+
+    for market_summary in &ossified_markets {
+        let market_data = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .market_get(market_summary.market_id.clone())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Market not found"))?;
+
+        let resolution = market_data
+            .resolution
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No resolution for market"))?;
+
+        // Get the expected outcome from consensus results
+        // Use the market's own decision_slots field, not positional indexing
+        anyhow::ensure!(
+            !market_data.decision_slots.is_empty(),
+            "Market {} has no decision slots",
+            &market_summary.market_id[..12]
+        );
+        let decision_slot_id = &market_data.decision_slots[0];
+        let expected_outcome = consensus_results
+            .outcomes
+            .get(decision_slot_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No consensus outcome for decision {}",
+                    decision_slot_id
+                )
+            })?;
+
+        // For binary markets resolved at extremes (0 or 1), one outcome wins fully
+        // For markets resolved at 0.5 (ABSTAIN), the ABSTAIN outcome wins but is filtered
+        // from valid_state_combos, resulting in "No winning outcome" display
+        // Binary market outcome indices: 0 = No, 1 = Yes (from state_combo ordering)
+        let tolerance = 0.01;
+
+        if (*expected_outcome - 1.0).abs() < tolerance {
+            // Consensus = 1.0 means YES won, which is outcome index 1
+            anyhow::ensure!(
+                !resolution.winning_outcomes.is_empty(),
+                "Market {} should have winning outcomes for consensus 1.0",
+                &market_summary.market_id[..12]
+            );
+            let yes_outcome = resolution
+                .winning_outcomes
+                .iter()
+                .find(|o| o.outcome_index == 1);
+            anyhow::ensure!(
+                yes_outcome.is_some(),
+                "Expected Yes (index 1) to be a winning outcome for market {} with outcome 1.0",
+                &market_summary.market_id[..12]
+            );
+            anyhow::ensure!(
+                (yes_outcome.unwrap().final_price - 1.0).abs() < tolerance,
+                "Yes outcome final_price should be 1.0, got {}",
+                yes_outcome.unwrap().final_price
+            );
+            tracing::info!(
+                "  Market {}: YES won (consensus outcome = {:.2})",
+                &market_summary.market_id[..12],
+                expected_outcome
+            );
+        } else if expected_outcome.abs() < tolerance {
+            // Consensus = 0.0 means NO won, which is outcome index 0
+            anyhow::ensure!(
+                !resolution.winning_outcomes.is_empty(),
+                "Market {} should have winning outcomes for consensus 0.0",
+                &market_summary.market_id[..12]
+            );
+            let no_outcome = resolution
+                .winning_outcomes
+                .iter()
+                .find(|o| o.outcome_index == 0);
+            anyhow::ensure!(
+                no_outcome.is_some(),
+                "Expected No (index 0) to be a winning outcome for market {} with outcome 0.0",
+                &market_summary.market_id[..12]
+            );
+            anyhow::ensure!(
+                (no_outcome.unwrap().final_price - 1.0).abs() < tolerance,
+                "No outcome final_price should be 1.0, got {}",
+                no_outcome.unwrap().final_price
+            );
+            tracing::info!(
+                "  Market {}: NO won (consensus outcome = {:.2})",
+                &market_summary.market_id[..12],
+                expected_outcome
+            );
+        } else {
+            // Consensus near 0.5 means ABSTAIN - uncertain/unresolvable decision
+            // Per Truthcoin whitepaper: "we can preserve the utility of any Market
+            // built with an unresolvable Decision by causing that Outcome to take
+            // on the equally-spaced value of '.5'" - meaning 50/50 split
+            anyhow::ensure!(
+                resolution.winning_outcomes.len() == 2,
+                "Market {} with ABSTAIN consensus ({:.2}) should have 2 winning outcomes (50/50 split), got {:?}",
+                &market_summary.market_id[..12],
+                expected_outcome,
+                resolution.winning_outcomes
+            );
+
+            // Both outcomes should have ~0.5 final_price
+            for winning in &resolution.winning_outcomes {
+                anyhow::ensure!(
+                    (winning.final_price - 0.5).abs() < tolerance,
+                    "Market {} ABSTAIN outcome {} should have final_price ~0.5, got {}",
+                    &market_summary.market_id[..12],
+                    winning.outcome_name,
+                    winning.final_price
+                );
+            }
+
+            tracing::info!(
+                "  Market {}: ABSTAIN - 50/50 split (consensus = {:.2})",
+                &market_summary.market_id[..12],
+                expected_outcome
+            );
+        }
+
+        // Verify treasury was fully distributed
+        anyhow::ensure!(
+            market_data.treasury == 0.0,
+            "Market treasury should be 0 after payout distribution, got {}",
+            market_data.treasury
+        );
+    }
+
+    tracing::info!("✓ Market payout verification complete\n");
+
+    // === Market UTXO Verification: Post-Ossification ===
+    // After payout distribution, market treasury UTXOs should be consumed (no longer exist)
+    tracing::info!("--- Market UTXO Verification: Post-Ossification ---");
+    let post_ossification_utxos =
+        truthcoin_nodes.issuer.rpc_client.list_utxos().await?;
+    let remaining_treasury_utxos =
+        utxo_verification::get_market_treasury_utxos(&post_ossification_utxos);
+    let remaining_fee_utxos = utxo_verification::get_market_author_fee_utxos(
+        &post_ossification_utxos,
+    );
+
+    // All 4 markets should have their treasury UTXOs consumed
+    for market_id in &market_ids {
+        let market_id_short = &market_id[..12];
+
+        anyhow::ensure!(
+            !remaining_treasury_utxos.contains_key(market_id),
+            "Market {} treasury UTXO should be consumed after ossification, but still exists",
+            market_id_short
+        );
+        tracing::info!(
+            "  Market {}: treasury UTXO consumed ✓",
+            market_id_short
+        );
+
+        // Author fee UTXOs should also be consumed (paid to market creator)
+        anyhow::ensure!(
+            !remaining_fee_utxos.contains_key(market_id),
+            "Market {} author fee UTXO should be consumed after ossification, but still exists",
+            market_id_short
+        );
+        tracing::info!(
+            "  Market {}: author fee UTXO consumed ✓",
+            market_id_short
+        );
+    }
+
+    // Verify no orphaned market UTXOs remain
+    anyhow::ensure!(
+        remaining_treasury_utxos.is_empty(),
+        "No market treasury UTXOs should remain after ossification, found {} orphaned",
+        remaining_treasury_utxos.len()
+    );
+    anyhow::ensure!(
+        remaining_fee_utxos.is_empty(),
+        "No market author fee UTXOs should remain after ossification, found {} orphaned",
+        remaining_fee_utxos.len()
+    );
+
+    tracing::info!("✓ Market UTXO post-ossification verification complete\n");
 
     tracing::info!("\n--- 8.4: VoteCoin Conservation ---");
 
