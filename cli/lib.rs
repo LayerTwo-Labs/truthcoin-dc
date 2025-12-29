@@ -33,7 +33,7 @@ pub fn validate_non_empty_list(
     name: &str,
 ) -> Result<(), String> {
     if list.is_empty() {
-        Err(format!("Error: At least one {} is required", name))
+        Err(format!("Error: At least one {name} is required"))
     } else {
         Ok(())
     }
@@ -54,7 +54,7 @@ pub fn extract_slots_from_dimensions(
 
     // Extract all slot IDs using regex pattern
     let slot_pattern = Regex::new(r"[a-fA-F0-9]{6}")
-        .map_err(|e| format!("Regex error: {}", e))?;
+        .map_err(|e| format!("Regex error: {e}"))?;
     let slots: Vec<String> = slot_pattern
         .find_iter(cleaned)
         .map(|m| m.as_str().to_string())
@@ -78,9 +78,9 @@ pub fn format_tx_success(
 ) -> String {
     match details {
         Some(details) => {
-            format!("{} successful ({}): {}", operation, details, txid)
+            format!("{operation} successful ({details}): {txid}")
         }
-        None => format!("{} successful: {}", operation, txid),
+        None => format!("{operation} successful: {txid}"),
     }
 }
 
@@ -95,7 +95,7 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
 
 /// Format slot display consistently
 pub fn format_slot_info(slot_id: &str, period: u32, index: u32) -> String {
-    format!("Slot {} (Period {}, Index {})", slot_id, period, index)
+    format!("Slot {slot_id} (Period {period}, Index {index})")
 }
 
 pub fn json_response<T>(data: &T) -> anyhow::Result<String>
@@ -617,7 +617,7 @@ where
         }
         Command::Mine { fee_sats } => {
             let () = rpc_client.mine(Some(fee_sats)).await?;
-            format!("Mining block with fee {} sats", fee_sats)
+            format!("Mining block with fee {fee_sats} sats")
         }
         Command::OpenApiSchema => {
             let openapi =
@@ -746,13 +746,13 @@ where
         }
         Command::RemoveFromMempool { txid } => {
             let () = rpc_client.remove_from_mempool(txid).await?;
-            format!("Transaction {} removed from mempool", txid)
+            format!("Transaction {txid} removed from mempool")
         }
 
         // === NETWORK COMMANDS ===
         Command::ConnectPeer { addr } => {
             let () = rpc_client.connect_peer(addr).await?;
-            format!("Connected to peer: {}", addr)
+            format!("Connected to peer: {addr}")
         }
         Command::ListPeers => {
             let peers = rpc_client.list_peers().await?;
@@ -859,7 +859,7 @@ where
                     fee_sats,
                 )
                 .await?;
-            format!("Slot claimed: {}", txid)
+            format!("Slot claimed: {txid}")
         }
 
         // === MARKET COMMANDS (market_*) ===
@@ -892,7 +892,7 @@ where
                 fee_sats,
             };
             let txid = rpc_client.market_create(request).await?;
-            format!("Market '{}' created: {}", title, txid)
+            format!("Market '{title}' created: {txid}")
         }
         Command::MarketList => {
             let markets = rpc_client.market_list().await?;
@@ -1086,7 +1086,7 @@ where
                 fee_sats,
             };
             let txid = rpc_client.vote_register(request).await?;
-            format!("Voter registered: {}", txid)
+            format!("Voter registered: {txid}")
         }
         Command::VoteVoter { address } => {
             let voter = rpc_client.vote_voter(address).await?;
@@ -1132,7 +1132,7 @@ where
                 );
             };
             let txid = rpc_client.vote_submit(vote_items, fee_sats).await?;
-            format!("Vote submitted: {}", txid)
+            format!("Vote submitted: {txid}")
         }
         Command::VoteList {
             voter,
@@ -1162,11 +1162,11 @@ where
             let txid = rpc_client
                 .votecoin_transfer(dest, amount, fee_sats, None)
                 .await?;
-            format!("Votecoin transferred: {}", txid)
+            format!("Votecoin transferred: {txid}")
         }
         Command::VotecoinBalance { address } => {
             let balance = rpc_client.votecoin_balance(address).await?;
-            format!("{}", balance)
+            format!("{balance}")
         }
     })
 }

@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::net::SocketAddr;
 
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
@@ -69,7 +71,12 @@ pub struct MarketBuyRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct MarketBuyResponse {
     pub txid: Option<String>,
+    /// Total cost in satoshis (base_cost_sats + trading_fee_sats)
     pub cost_sats: u64,
+    /// Base LMSR cost that goes to market treasury
+    pub base_cost_sats: u64,
+    /// Trading fee that goes to market author
+    pub trading_fee_sats: u64,
     pub new_price: f64,
 }
 
@@ -114,7 +121,6 @@ pub struct PeriodStats {
 pub struct ConsensusResults {
     pub outcomes: std::collections::HashMap<String, f64>,
     pub first_loading: Vec<f64>,
-    pub explained_variance: f64,
     pub certainty: f64,
     pub reputation_updates: std::collections::HashMap<String, ReputationUpdate>,
     pub outliers: Vec<String>,
@@ -420,7 +426,6 @@ pub struct VotingConsensusResults {
     pub status: String,
     pub outcomes: std::collections::HashMap<String, f64>,
     pub first_loading: Vec<f64>,
-    pub explained_variance: f64,
     pub certainty: f64,
     pub reputation_updates: std::collections::HashMap<String, ReputationUpdate>,
     pub outliers: Vec<String>,
