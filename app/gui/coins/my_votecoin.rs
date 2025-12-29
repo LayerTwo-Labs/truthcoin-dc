@@ -39,7 +39,7 @@ impl MyVotecoin {
                 ui.monospace("Total Votecoin: ");
                 ui.monospace_selectable_singleline(
                     false,
-                    format!("{}", total_votecoin),
+                    format!("{total_votecoin}"),
                 );
             });
 
@@ -58,13 +58,13 @@ impl MyVotecoin {
                     for (outpoint, amount) in votecoin_utxos {
                         ui.monospace_selectable_singleline(
                             false,
-                            format!("{}", outpoint),
+                            format!("{outpoint}"),
                         );
                         ui.monospace_selectable_singleline(
                             false,
-                            format!("{}", amount),
+                            format!("{amount}"),
                         );
-                        let outpoint_str = format!("{}", outpoint);
+                        let outpoint_str = format!("{outpoint}");
                         let hash_part = if outpoint_str.len() > 16 {
                             &outpoint_str[..16]
                         } else {
@@ -72,7 +72,7 @@ impl MyVotecoin {
                         };
                         ui.monospace_selectable_singleline(
                             true,
-                            format!("{}...", hash_part),
+                            format!("{hash_part}..."),
                         );
                         ui.end_row();
                     }

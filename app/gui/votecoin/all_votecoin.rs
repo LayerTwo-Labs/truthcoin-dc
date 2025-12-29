@@ -14,7 +14,7 @@ impl AllVotecoin {
             ui.monospace("Total Votecoin: ");
             ui.monospace_selectable_singleline(
                 false,
-                format!("{}", total_votecoin),
+                format!("{total_votecoin}"),
             );
         });
 

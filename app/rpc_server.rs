@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 
-use bip39;
 use bitcoin::Amount;
 use jsonrpsee::{
     core::{RpcResult, async_trait},
@@ -16,7 +15,7 @@ use tower_http::{
 };
 use truthcoin_dc::{
     authorization::{self, Dst, Signature},
-    math::satoshi::{self, Rounding},
+    math::safe_math::{self, Rounding},
     net::Peer,
     node::Node,
     state::{period_to_name, timestamp_to_period},
@@ -26,7 +25,7 @@ use truthcoin_dc::{
         WithdrawalBundle,
     },
     validation::SlotValidator,
-    wallet::Balance,
+    wallet::{Balance, CreateMarketInput, SlotClaimInput},
 };
 use truthcoin_dc_app_rpc_api::{
     ConsensusResults, DecisionSummary, MarketBuyRequest, MarketBuyResponse,
@@ -113,6 +112,7 @@ impl RpcServerImpl {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn claim_decision_slot(
         &self,
         period_index: u32,
@@ -126,7 +126,7 @@ impl RpcServerImpl {
     ) -> RpcResult<Txid> {
         use truthcoin_dc::state::slots::SlotId;
 
-        if question.as_bytes().len() >= 1000 {
+        if question.len() >= 1000 {
             return Err(custom_err_msg(
                 "Question must be less than 1000 bytes",
             ));
@@ -140,12 +140,14 @@ impl RpcServerImpl {
             .app
             .wallet
             .claim_decision_slot(
-                slot_id_bytes,
-                is_standard,
-                is_scaled,
-                question,
-                min,
-                max,
+                SlotClaimInput {
+                    slot_id_bytes,
+                    is_standard,
+                    is_scaled,
+                    question,
+                    min,
+                    max,
+                },
                 fee,
             )
             .map_err(custom_err)?;
@@ -221,7 +223,7 @@ impl RpcServerImpl {
                         market.description.clone()
                     },
                     outcome_count: market.get_outcome_count(),
-                    state: format!("{:?}", computed_state),
+                    state: format!("{computed_state:?}"),
                     volume: volume_btc,
                     created_at_height: market.created_at_height,
                 }
@@ -285,7 +287,7 @@ impl RpcServerImpl {
                 .describe_outcome_by_state(*state_idx, &decisions)
             {
                 Ok(description) => description,
-                Err(_) => format!("Outcome {}", state_idx),
+                Err(_) => format!("Outcome {state_idx}"),
             };
 
             let current_price = prices[i];
@@ -326,7 +328,7 @@ impl RpcServerImpl {
                         .describe_outcome_by_state(*state_idx, &decisions)
                     {
                         Ok(description) => description,
-                        Err(_) => format!("Outcome {}", state_idx),
+                        Err(_) => format!("Outcome {state_idx}"),
                     };
                     winning_outcomes.push(
                         truthcoin_dc_app_rpc_api::WinningOutcome {
@@ -376,7 +378,7 @@ impl RpcServerImpl {
             title: market.title.clone(),
             description: market.description.clone(),
             outcomes,
-            state: format!("{:?}", computed_state),
+            state: format!("{computed_state:?}"),
             market_maker: market.creator_address.to_string(),
             expires_at: market.expires_at_height,
             beta: market.b(),
@@ -401,20 +403,22 @@ impl RpcServerImpl {
             .app
             .wallet
             .create_market(
-                request.title,
-                request.description,
-                request.market_type,
-                if request.decision_slots.is_empty() {
-                    None
-                } else {
-                    Some(request.decision_slots)
+                CreateMarketInput {
+                    title: request.title,
+                    description: request.description,
+                    market_type: request.market_type,
+                    decision_slots: if request.decision_slots.is_empty() {
+                        None
+                    } else {
+                        Some(request.decision_slots)
+                    },
+                    dimensions: request.dimensions,
+                    has_residual: request.has_residual,
+                    beta: request.beta,
+                    trading_fee: request.trading_fee,
+                    tags: request.tags,
+                    initial_liquidity: request.initial_liquidity,
                 },
-                request.dimensions,
-                request.has_residual,
-                request.beta,
-                request.trading_fee,
-                request.tags,
-                request.initial_liquidity,
                 bitcoin::Amount::from_sat(request.fee_sats),
             )
             .map_err(custom_err)?;
@@ -473,16 +477,16 @@ impl RpcServerImpl {
                 let outcome_name = if let Some(combo) =
                     market.state_combos.get(outcome_index as usize)
                 {
-                    format!("Outcome {}: {:?}", outcome_index, combo)
+                    format!("Outcome {outcome_index}: {combo:?}")
                 } else {
-                    format!("Outcome {}", outcome_index)
+                    format!("Outcome {outcome_index}")
                 };
 
                 positions.push(truthcoin_dc_app_rpc_api::SharePosition {
                     market_id: market_id.to_string(),
                     outcome_index: outcome_index as usize,
                     outcome_name,
-                    shares_held: shares_held,
+                    shares_held,
                     avg_purchase_price: outcome_price,
                     current_price: outcome_price,
                     current_value,
@@ -538,16 +542,16 @@ impl RpcServerImpl {
                 let outcome_name = if let Some(combo) =
                     market.state_combos.get(outcome_index as usize)
                 {
-                    format!("Outcome {}: {:?}", outcome_index, combo)
+                    format!("Outcome {outcome_index}: {combo:?}")
                 } else {
-                    format!("Outcome {}", outcome_index)
+                    format!("Outcome {outcome_index}")
                 };
 
                 positions.push(truthcoin_dc_app_rpc_api::SharePosition {
                     market_id: market_id.clone(),
                     outcome_index: outcome_index as usize,
                     outcome_name,
-                    shares_held: shares_held,
+                    shares_held,
                     avg_purchase_price: outcome_price,
                     current_price: outcome_price,
                     current_value,
@@ -572,7 +576,7 @@ impl RpcServerImpl {
 
         self.app.sign_and_send(tx).map_err(custom_err)?;
 
-        Ok(format!("{}", txid))
+        Ok(format!("{txid}"))
     }
 
     async fn submit_vote_batch_impl(
@@ -592,7 +596,7 @@ impl RpcServerImpl {
             let slot_id =
                 SlotValidator::parse_slot_id_from_hex(&vote.decision_id)
                     .map_err(|e| {
-                        custom_err_msg(format!("Invalid decision ID: {}", e))
+                        custom_err_msg(format!("Invalid decision ID: {e}"))
                     })?;
 
             let vote_period = slot_id.voting_period();
@@ -627,7 +631,7 @@ impl RpcServerImpl {
 
         self.app.sign_and_send(tx).map_err(custom_err)?;
 
-        Ok(format!("{}", txid))
+        Ok(format!("{txid}"))
     }
 
     async fn list_voters_impl(&self) -> RpcResult<Vec<VoterInfo>> {
@@ -1045,8 +1049,7 @@ impl RpcServer for RpcServerImpl {
 
         if beta <= 0.0 {
             return Err(custom_err_msg(format!(
-                "Beta parameter must be positive, got: {}",
-                beta
+                "Beta parameter must be positive, got: {beta}",
             )));
         }
         let (num_outcomes, market_config, outcome_breakdown) = if let Some(
@@ -1061,8 +1064,8 @@ impl RpcServer for RpcServerImpl {
             }
             (
                 num,
-                format!("Preview: {} outcomes", num),
-                format!("{} outcomes specified", num),
+                format!("Preview: {num} outcomes"),
+                format!("{num} outcomes specified"),
             )
         } else if let Some(ref decision_slots) = request.decision_slots {
             match request.market_type.as_str() {
@@ -1142,8 +1145,11 @@ impl RpcServer for RpcServerImpl {
 
         let initial_liquidity_f64 = beta * (num_outcomes as f64).ln();
         let initial_liquidity_sats =
-            satoshi::to_sats(initial_liquidity_f64, Rounding::Up)
-                .map_err(|e| custom_err_msg(format!("Liquidity calculation failed: {}", e)))?;
+            safe_math::to_sats(initial_liquidity_f64, Rounding::Up).map_err(
+                |e| {
+                    custom_err_msg(format!("Liquidity calculation failed: {e}"))
+                },
+            )?;
 
         Ok(truthcoin_dc_app_rpc_api::InitialLiquidityCalculation {
             beta,
@@ -1227,7 +1233,7 @@ impl RpcServer for RpcServerImpl {
         &self,
         address: Address,
     ) -> RpcResult<String> {
-        Ok(format!("{}", address))
+        Ok(format!("{address}"))
     }
 
     async fn generate_mnemonic(&self) -> RpcResult<String> {
@@ -1301,12 +1307,11 @@ impl RpcServer for RpcServerImpl {
                 let state = SlotState::Available;
 
                 // Apply filter
-                if let Some(ref f) = filter {
-                    if let Some(ref status) = f.status {
-                        if !matches!(status, SlotState::Available) {
-                            continue;
-                        }
-                    }
+                if let Some(ref f) = filter
+                    && let Some(ref status) = f.status
+                    && !matches!(status, SlotState::Available)
+                {
+                    continue;
                 }
 
                 results.push(SlotListItem {
@@ -1338,21 +1343,17 @@ impl RpcServer for RpcServerImpl {
                 };
 
                 // Apply filter
-                if let Some(ref f) = filter {
-                    if let Some(ref status) = f.status {
-                        let matches = match (status, &state) {
-                            (SlotState::Available, SlotState::Available) => {
-                                true
-                            }
-                            (SlotState::Claimed, SlotState::Claimed) => true,
-                            (SlotState::Voting, SlotState::Voting) => true,
-                            (SlotState::Ossified, SlotState::Ossified) => true,
-                            _ => false,
-                        };
-                        if !matches {
-                            continue;
-                        }
-                    }
+                if let Some(ref f) = filter
+                    && let Some(ref status) = f.status
+                    && !matches!(
+                        (status, &state),
+                        (SlotState::Available, SlotState::Available)
+                            | (SlotState::Claimed, SlotState::Claimed)
+                            | (SlotState::Voting, SlotState::Voting)
+                            | (SlotState::Ossified, SlotState::Ossified)
+                    )
+                {
+                    continue;
                 }
 
                 let decision = slot.decision.map(|d| {
@@ -1454,10 +1455,14 @@ impl RpcServer for RpcServerImpl {
         let trade_cost =
             market.query_update_cost(new_shares).map_err(custom_err)?;
         let fee_amount = trade_cost * market.trading_fee();
-        let base_cost_sats = satoshi::to_sats(trade_cost, Rounding::Up)
-            .map_err(|e| custom_err_msg(format!("Cost calculation failed: {}", e)))?;
-        let trading_fee_sats = satoshi::to_sats(fee_amount, Rounding::Up)
-            .map_err(|e| custom_err_msg(format!("Fee calculation failed: {}", e)))?;
+        let base_cost_sats = safe_math::to_sats(trade_cost, Rounding::Up)
+            .map_err(|e| {
+                custom_err_msg(format!("Cost calculation failed: {e}"))
+            })?;
+        let trading_fee_sats = safe_math::to_sats(fee_amount, Rounding::Up)
+            .map_err(|e| {
+                custom_err_msg(format!("Fee calculation failed: {e}"))
+            })?;
         let cost_sats = base_cost_sats + trading_fee_sats;
 
         // Calculate new price after trade
@@ -1470,6 +1475,8 @@ impl RpcServer for RpcServerImpl {
             return Ok(MarketBuyResponse {
                 txid: None,
                 cost_sats,
+                base_cost_sats,
+                trading_fee_sats,
                 new_price,
             });
         }
@@ -1485,8 +1492,7 @@ impl RpcServer for RpcServerImpl {
         // Slippage check
         if cost_sats > max_cost {
             return Err(custom_err_msg(format!(
-                "Share cost {} exceeds maximum cost {} (slippage protection)",
-                cost_sats, max_cost
+                "Share cost {cost_sats} exceeds maximum cost {max_cost} (slippage protection)",
             )));
         }
 
@@ -1510,6 +1516,8 @@ impl RpcServer for RpcServerImpl {
         Ok(MarketBuyResponse {
             txid: Some(txid.to_string()),
             cost_sats,
+            base_cost_sats,
+            trading_fee_sats,
             new_price,
         })
     }
@@ -1521,9 +1529,8 @@ impl RpcServer for RpcServerImpl {
     ) -> RpcResult<truthcoin_dc_app_rpc_api::UserHoldings> {
         if let Some(mid) = market_id {
             // Filter by market - get positions for specific market
-            let positions = self
-                .get_market_share_positions_impl(address.clone(), mid)
-                .await?;
+            let positions =
+                self.get_market_share_positions_impl(address, mid).await?;
 
             let total_value: f64 =
                 positions.iter().map(|p| p.current_value).sum();
@@ -1701,34 +1708,37 @@ impl RpcServer for RpcServerImpl {
 
             for (vote_key, vote_entry) in all_votes {
                 // Apply period filter
-                if let Some(pid) = filter.period_id {
-                    if vote_key.period_id != VotingPeriodId::new(pid) {
-                        continue;
-                    }
+                if let Some(pid) = filter.period_id
+                    && vote_key.period_id != VotingPeriodId::new(pid)
+                {
+                    continue;
                 }
 
                 // Apply decision filter
-                if let Some(ref did) = filter.decision_id {
-                    if vote_key.decision_id.to_hex() != *did {
-                        continue;
-                    }
+                if let Some(ref did) = filter.decision_id
+                    && vote_key.decision_id.to_hex() != *did
+                {
+                    continue;
                 }
 
-                vote_infos.push(VoteInfo {
-                    voter_address: voter_address.to_string(),
-                    decision_id: vote_key.decision_id.to_hex(),
-                    vote_value: vote_entry.to_f64(),
-                    period_id: vote_key.period_id.as_u32(),
-                    block_height: vote_entry.block_height,
-                    txid: String::from(""),
-                    is_batch_vote: false,
-                });
+                // Skip abstentions - they don't have a meaningful vote value
+                if let Some(vote_value) = vote_entry.to_float_opt() {
+                    vote_infos.push(VoteInfo {
+                        voter_address: voter_address.to_string(),
+                        decision_id: vote_key.decision_id.to_hex(),
+                        vote_value,
+                        period_id: vote_key.period_id.as_u32(),
+                        block_height: vote_entry.block_height,
+                        txid: String::from(""),
+                        is_batch_vote: false,
+                    });
+                }
             }
         } else if let Some(ref decision_id) = filter.decision_id {
             // If filtering by decision
             let slot_id = SlotValidator::parse_slot_id_from_hex(decision_id)
                 .map_err(|e| {
-                    custom_err_msg(format!("Invalid decision ID: {}", e))
+                    custom_err_msg(format!("Invalid decision ID: {e}"))
                 })?;
 
             let votes = self
@@ -1740,21 +1750,24 @@ impl RpcServer for RpcServerImpl {
                 .map_err(custom_err)?;
 
             for (vote_key, vote_entry) in votes {
-                if let Some(pid) = filter.period_id {
-                    if vote_key.period_id != VotingPeriodId::new(pid) {
-                        continue;
-                    }
+                if let Some(pid) = filter.period_id
+                    && vote_key.period_id != VotingPeriodId::new(pid)
+                {
+                    continue;
                 }
 
-                vote_infos.push(VoteInfo {
-                    voter_address: vote_key.voter_address.to_string(),
-                    decision_id: decision_id.clone(),
-                    vote_value: vote_entry.to_f64(),
-                    period_id: vote_key.period_id.as_u32(),
-                    block_height: vote_entry.block_height,
-                    txid: String::from(""),
-                    is_batch_vote: false,
-                });
+                // Skip abstentions - they don't have a meaningful vote value
+                if let Some(vote_value) = vote_entry.to_float_opt() {
+                    vote_infos.push(VoteInfo {
+                        voter_address: vote_key.voter_address.to_string(),
+                        decision_id: decision_id.clone(),
+                        vote_value,
+                        period_id: vote_key.period_id.as_u32(),
+                        block_height: vote_entry.block_height,
+                        txid: String::from(""),
+                        is_batch_vote: false,
+                    });
+                }
             }
         } else if let Some(period_id) = filter.period_id {
             // If filtering by period only
@@ -1768,15 +1781,18 @@ impl RpcServer for RpcServerImpl {
                 .map_err(custom_err)?;
 
             for (vote_key, vote_entry) in votes {
-                vote_infos.push(VoteInfo {
-                    voter_address: vote_key.voter_address.to_string(),
-                    decision_id: vote_key.decision_id.to_hex(),
-                    vote_value: vote_entry.to_f64(),
-                    period_id: vote_key.period_id.as_u32(),
-                    block_height: vote_entry.block_height,
-                    txid: String::from(""),
-                    is_batch_vote: false,
-                });
+                // Skip abstentions - they don't have a meaningful vote value
+                if let Some(vote_value) = vote_entry.to_float_opt() {
+                    vote_infos.push(VoteInfo {
+                        voter_address: vote_key.voter_address.to_string(),
+                        decision_id: vote_key.decision_id.to_hex(),
+                        vote_value,
+                        period_id: vote_key.period_id.as_u32(),
+                        block_height: vote_entry.block_height,
+                        txid: String::from(""),
+                        is_batch_vote: false,
+                    });
+                }
             }
         }
 
@@ -1807,9 +1823,7 @@ impl RpcServer for RpcServerImpl {
             let rotxn = self.node().read_txn().map_err(custom_err)?;
             let current_timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| {
-                    custom_err_msg(format!("System time error: {}", e))
-                })?
+                .map_err(|e| custom_err_msg(format!("System time error: {e}")))?
                 .as_secs();
 
             let active_period_opt = self
@@ -1944,18 +1958,18 @@ impl RpcServer for RpcServerImpl {
                 .map_err(custom_err)?;
 
             let mut reputation_updates = std::collections::HashMap::new();
-            let (first_loading, explained_variance, certainty) =
-                if let Some(ref ps) = period_stats {
-                    if let Some(ref rep_changes) = ps.reputation_changes {
-                        for (voter_id, (old_rep, new_rep)) in rep_changes {
-                            if let Some(reputation) = self
-                                .node()
-                                .voting_state()
-                                .databases()
-                                .get_voter_reputation(&rotxn, *voter_id)
-                                .map_err(custom_err)?
-                            {
-                                let rep_update =
+            let (first_loading, certainty) = if let Some(ref ps) = period_stats
+            {
+                if let Some(ref rep_changes) = ps.reputation_changes {
+                    for (voter_id, (old_rep, new_rep)) in rep_changes {
+                        if let Some(reputation) = self
+                            .node()
+                            .voting_state()
+                            .databases()
+                            .get_voter_reputation(&rotxn, *voter_id)
+                            .map_err(custom_err)?
+                        {
+                            let rep_update =
                                 truthcoin_dc_app_rpc_api::ReputationUpdate {
                                     old_reputation: *old_rep,
                                     new_reputation: *new_rep,
@@ -1963,24 +1977,22 @@ impl RpcServer for RpcServerImpl {
                                         .votecoin_proportion,
                                     compliance_score: 0.0,
                                 };
-                                reputation_updates
-                                    .insert(voter_id.to_string(), rep_update);
-                            }
+                            reputation_updates
+                                .insert(voter_id.to_string(), rep_update);
                         }
                     }
-                    (
-                        ps.first_loading.clone().unwrap_or_default(),
-                        ps.explained_variance.unwrap_or(0.0),
-                        ps.certainty.unwrap_or(0.0),
-                    )
-                } else {
-                    (Vec::new(), 0.0, 0.0)
-                };
+                }
+                (
+                    ps.first_loading.clone().unwrap_or_default(),
+                    ps.certainty.unwrap_or(0.0),
+                )
+            } else {
+                (Vec::new(), 0.0)
+            };
 
             Some(ConsensusResults {
                 outcomes,
                 first_loading,
-                explained_variance,
                 certainty,
                 reputation_updates,
                 outliers: Vec::new(),

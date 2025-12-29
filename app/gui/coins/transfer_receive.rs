@@ -199,10 +199,9 @@ impl Receive {
             if ui
                 .add_enabled(has_valid_address, Button::new("copy"))
                 .clicked()
+                && let Some(Ok(address)) = &self.address
             {
-                if let Some(Ok(address)) = &self.address {
-                    ui.ctx().copy_text(address.to_string());
-                }
+                ui.ctx().copy_text(address.to_string());
             }
         });
     }

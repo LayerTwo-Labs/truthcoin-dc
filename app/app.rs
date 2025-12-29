@@ -64,7 +64,7 @@ fn update_wallet(node: &Node, wallet: &Wallet) -> Result<(), Error> {
 
     // Find UTXOs that are in wallet but NOT in state (these were removed, e.g., by redistribution)
     let mut utxos_to_remove = Vec::new();
-    for (outpoint, _) in &wallet_utxos {
+    for outpoint in wallet_utxos.keys() {
         if !utxos_from_state.contains_key(outpoint) {
             utxos_to_remove.push(*outpoint);
         }

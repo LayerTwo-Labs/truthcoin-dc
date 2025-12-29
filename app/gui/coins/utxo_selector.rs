@@ -137,7 +137,7 @@ impl UtxoSelector {
                 ));
             }
         } else if asset_id == AssetId::Votecoin {
-            ui.monospace(format!("Total: {} VOT", total_confirmed_value));
+            ui.monospace(format!("Total: {total_confirmed_value} VOT"));
         } else {
             ui.monospace(format!("Total: {total_confirmed_value}"));
         }
