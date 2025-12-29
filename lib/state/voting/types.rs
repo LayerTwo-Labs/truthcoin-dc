@@ -93,12 +93,13 @@ pub enum VoteValue {
 }
 
 impl VoteValue {
-    pub fn to_f64(&self) -> f64 {
+    /// Convert vote to Option<f64>, returning None for Abstain.
+    pub fn to_float_opt(&self) -> Option<f64> {
         match self {
-            VoteValue::Binary(false) => 0.0,
-            VoteValue::Binary(true) => 1.0,
-            VoteValue::Scalar(value) => *value,
-            VoteValue::Abstain => f64::NAN,
+            VoteValue::Binary(false) => Some(0.0),
+            VoteValue::Binary(true) => Some(1.0),
+            VoteValue::Scalar(value) => Some(*value),
+            VoteValue::Abstain => None,
         }
     }
 
@@ -413,6 +414,7 @@ pub struct DecisionOutcome {
 }
 
 impl DecisionOutcome {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         decision_id: SlotId,
         period_id: VotingPeriodId,
@@ -441,50 +443,6 @@ impl DecisionOutcome {
             is_consensus,
             resolution,
         }
-    }
-
-    pub fn new_resolved(
-        decision_id: SlotId,
-        period_id: VotingPeriodId,
-        outcome_value: f64,
-        min: f64,
-        max: f64,
-        confidence: f64,
-        total_votes: u64,
-        total_reputation_weight: f64,
-        finalized_at: u64,
-        block_height: u64,
-    ) -> Self {
-        let mut resolution = DecisionResolution::new(
-            decision_id,
-            period_id,
-            finalized_at,
-            1,
-            finalized_at,
-            block_height,
-        );
-        resolution.update_status(
-            DecisionResolutionStatus::Resolved,
-            finalized_at,
-            block_height,
-            Some("Consensus reached".to_string()),
-        );
-        resolution.mark_outcome_ready();
-
-        Self::new(
-            decision_id,
-            period_id,
-            outcome_value,
-            min,
-            max,
-            confidence,
-            total_votes,
-            total_reputation_weight,
-            finalized_at,
-            block_height,
-            true,
-            resolution,
-        )
     }
 }
 
@@ -536,8 +494,8 @@ impl VoteMatrixEntry {
         }
     }
 
-    pub fn to_f64(&self) -> f64 {
-        self.value.to_f64()
+    pub fn to_float_opt(&self) -> Option<f64> {
+        self.value.to_float_opt()
     }
 }
 
@@ -587,12 +545,19 @@ pub struct VotingPeriodStats {
     pub consensus_decisions: u64,
     pub calculated_at: u64,
     pub first_loading: Option<Vec<f64>>,
-    pub explained_variance: Option<f64>,
     pub certainty: Option<f64>,
     pub reputation_changes: Option<HashMap<Address, (f64, f64)>>,
 }
 
 impl VotingPeriodStats {
+    /// Returns the absolute slot ids referenced in the reputation_changes field.
+    pub fn get_changed_addresses(&self) -> Vec<Address> {
+        self.reputation_changes
+            .as_ref()
+            .map(|changes| changes.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     pub fn new(period_id: VotingPeriodId, calculated_at: u64) -> Self {
         Self {
             period_id,
@@ -604,7 +569,6 @@ impl VotingPeriodStats {
             consensus_decisions: 0,
             calculated_at,
             first_loading: None,
-            explained_variance: None,
             certainty: None,
             reputation_changes: None,
         }
@@ -628,6 +592,62 @@ impl VotingPeriodStats {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SlotResolution {
+    pub slot_id: SlotId,
+    pub outcome_value: f64,
+}
+
+/// Holds all pending changes from consensus calculation for atomic commit.
+#[derive(Clone, Debug)]
+pub struct ConsensusResult {
+    pub period_id: VotingPeriodId,
+    pub voter_reputations: Vec<VoterReputation>,
+    pub period_stats: VotingPeriodStats,
+    pub decision_outcomes: Vec<DecisionOutcome>,
+    pub slot_resolutions: Vec<SlotResolution>,
+    pub period_redistribution:
+        Option<super::redistribution::PeriodRedistribution>,
+    pub redistribution_summary:
+        Option<super::redistribution::RedistributionSummary>,
+    pub block_height: u64,
+    pub timestamp: u64,
+}
+
+impl ConsensusResult {
+    pub fn new(
+        period_id: VotingPeriodId,
+        block_height: u64,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            period_id,
+            voter_reputations: Vec::new(),
+            period_stats: VotingPeriodStats::new(period_id, timestamp),
+            decision_outcomes: Vec::new(),
+            slot_resolutions: Vec::new(),
+            period_redistribution: None,
+            redistribution_summary: None,
+            block_height,
+            timestamp,
+        }
+    }
+
+    pub fn has_outcomes(&self) -> bool {
+        !self.decision_outcomes.is_empty()
+    }
+
+    pub fn resolved_slot_count(&self) -> usize {
+        self.slot_resolutions.len()
+    }
+
+    pub fn abstained_slot_count(&self) -> usize {
+        self.decision_outcomes
+            .len()
+            .saturating_sub(self.slot_resolutions.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,18 +666,18 @@ mod tests {
     #[test]
     fn test_vote_value() {
         let binary_true = VoteValue::binary(true);
-        assert_eq!(binary_true.to_f64(), 1.0);
+        assert_eq!(binary_true.to_float_opt(), Some(1.0));
         assert!(!binary_true.is_abstain());
 
         let binary_false = VoteValue::binary(false);
-        assert_eq!(binary_false.to_f64(), 0.0);
+        assert_eq!(binary_false.to_float_opt(), Some(0.0));
 
         let scalar = VoteValue::scalar(0.75);
-        assert_eq!(scalar.to_f64(), 0.75);
+        assert_eq!(scalar.to_float_opt(), Some(0.75));
 
         let abstain = VoteValue::abstain();
         assert!(abstain.is_abstain());
-        assert!(abstain.to_f64().is_nan());
+        assert_eq!(abstain.to_float_opt(), None);
     }
 
     #[test]
@@ -743,5 +763,13 @@ mod tests {
 
         assert_eq!(stats.participation_rate(), 0.8);
         assert_eq!(stats.consensus_rate(), 0.8);
+    }
+
+    #[test]
+    fn test_vote_value_to_float_opt() {
+        assert_eq!(VoteValue::binary(true).to_float_opt(), Some(1.0));
+        assert_eq!(VoteValue::binary(false).to_float_opt(), Some(0.0));
+        assert_eq!(VoteValue::scalar(0.75).to_float_opt(), Some(0.75));
+        assert_eq!(VoteValue::abstain().to_float_opt(), None);
     }
 }

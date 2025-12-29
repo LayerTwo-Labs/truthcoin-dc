@@ -1,14 +1,18 @@
 //! Bitcoin Hivemind Voting Database Operations
 //!
-//! Database schema optimized for sparse matrix voting data:
-//! - `votes`: VoteMatrixKey -> VoteMatrixEntry
-//! - `vote_batches`: (VotingPeriodId, u32) -> VoteBatch
-//! - `voter_reputation`: Address -> VoterReputation
-//! - `decision_outcomes`: SlotId -> DecisionOutcome
-//! - `period_stats`: VotingPeriodId -> VotingPeriodStats
-//! - `consensus_outcomes`: Derived from DecisionOutcome on-demand
+//! The `VoteMatrixKey` structure is ordered as `(period_id, voter_address, decision_id)`.
+//! This ordering enables efficient period-based queries using early termination.
+//!
+//! TODO: Fork sneed to expose heed's `range()` method for O(log n + k) queries.
 
-use crate::state::{Error, voting::types::*};
+use crate::math::safe_math::safe_cmp_f64;
+use crate::state::{
+    Error,
+    voting::types::{
+        DecisionOutcome, Vote, VoteBatch, VoteMatrixEntry, VoteMatrixKey,
+        VoterReputation, VotingPeriodId, VotingPeriodStats,
+    },
+};
 use fallible_iterator::FallibleIterator;
 use heed::types::SerdeBincode;
 use sneed::{DatabaseUnique, Env, RoTxn, RwTxn};
@@ -119,24 +123,36 @@ impl VotingDatabases {
         let mut votes = HashMap::new();
         let mut iter = self.votes.iter(rotxn)?;
         let mut total_votes_scanned = 0;
-        let mut periods_seen = HashSet::new();
 
         while let Some((key, entry)) = iter.next()? {
             total_votes_scanned += 1;
-            periods_seen.insert(key.period_id.0);
 
-            if key.period_id == period_id {
-                votes.insert(key, entry);
+            match key.period_id.cmp(&period_id) {
+                std::cmp::Ordering::Less => {
+                    continue;
+                }
+                std::cmp::Ordering::Equal => {
+                    votes.insert(key, entry);
+                }
+                std::cmp::Ordering::Greater => {
+                    tracing::debug!(
+                        "get_votes_for_period: Early termination at period {} (target: {}), \
+                        scanned {} votes, found {} matches",
+                        key.period_id.0,
+                        period_id.0,
+                        total_votes_scanned,
+                        votes.len()
+                    );
+                    break;
+                }
             }
         }
 
         tracing::debug!(
-            "get_votes_for_period: Looking for period {}, found {} votes. \
-            Total votes scanned: {}, Unique periods seen: {:?}",
+            "get_votes_for_period: Period {}, found {} votes after scanning {} entries",
             period_id.0,
             votes.len(),
-            total_votes_scanned,
-            periods_seen
+            total_votes_scanned
         );
 
         Ok(votes)
@@ -244,21 +260,40 @@ impl VotingDatabases {
         Ok(self.voter_reputation.try_get(rotxn, &address)?)
     }
 
-    pub fn get_voters_above_reputation(
+    pub fn get_voter_reputations_batch(
         &self,
         rotxn: &RoTxn,
-        min_reputation: f64,
-    ) -> Result<Vec<VoterReputation>, Error> {
-        let mut voters = Vec::new();
-        let mut iter = self.voter_reputation.iter(rotxn)?;
+        addresses: &HashSet<crate::types::Address>,
+    ) -> Result<HashMap<crate::types::Address, VoterReputation>, Error> {
+        let mut reputations = HashMap::with_capacity(addresses.len());
 
-        while let Some((_voter_address, reputation)) = iter.next()? {
-            if reputation.reputation >= min_reputation {
-                voters.push(reputation);
+        if addresses.is_empty() {
+            return Ok(reputations);
+        }
+
+        // For small sets, individual lookups are faster due to B-tree efficiency
+        if addresses.len() < 10 {
+            for &addr in addresses {
+                if let Some(rep) =
+                    self.voter_reputation.try_get(rotxn, &addr)?
+                {
+                    reputations.insert(addr, rep);
+                }
+            }
+        } else {
+            // For larger sets, single scan of reputation table is more efficient
+            let mut iter = self.voter_reputation.iter(rotxn)?;
+            while let Some((addr, rep)) = iter.next()? {
+                if addresses.contains(&addr) {
+                    reputations.insert(addr, rep);
+                    if reputations.len() == addresses.len() {
+                        break;
+                    }
+                }
             }
         }
 
-        Ok(voters)
+        Ok(reputations)
     }
 
     pub fn get_reputation_stats(
@@ -280,8 +315,8 @@ impl VotingDatabases {
         let total_weight: f64 = reputations.iter().sum();
         let avg_reputation = total_weight / total_voters as f64;
 
-        reputations.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median_reputation = if reputations.len() % 2 == 0 {
+        reputations.sort_by(|a, b| safe_cmp_f64(*a, *b));
+        let median_reputation = if reputations.len().is_multiple_of(2) {
             let mid = reputations.len() / 2;
             (reputations[mid - 1] + reputations[mid]) / 2.0
         } else {
@@ -322,22 +357,23 @@ impl VotingDatabases {
     {
         let mut outcomes = HashMap::new();
         let mut iter = self.decision_outcomes.iter(rotxn)?;
+        let target_period_index = period_id.0.saturating_sub(1);
 
         while let Some((decision_id, outcome)) = iter.next()? {
-            if outcome.period_id == period_id {
-                outcomes.insert(decision_id, outcome);
+            let slot_period_index = decision_id.period_index();
+
+            if slot_period_index < target_period_index {
+                continue;
+            } else if slot_period_index == target_period_index {
+                if outcome.period_id == period_id {
+                    outcomes.insert(decision_id, outcome);
+                }
+            } else {
+                break;
             }
         }
 
         Ok(outcomes)
-    }
-
-    pub fn get_outcome_for_decision(
-        &self,
-        rotxn: &RoTxn,
-        decision_id: crate::state::slots::SlotId,
-    ) -> Result<Option<DecisionOutcome>, Error> {
-        Ok(self.decision_outcomes.try_get(rotxn, &decision_id)?)
     }
 
     pub fn put_period_stats(
@@ -355,25 +391,6 @@ impl VotingDatabases {
         period_id: VotingPeriodId,
     ) -> Result<Option<VotingPeriodStats>, Error> {
         Ok(self.period_stats.try_get(rotxn, &period_id)?)
-    }
-
-    pub fn get_stats_range(
-        &self,
-        rotxn: &RoTxn,
-        start_period: VotingPeriodId,
-        end_period: VotingPeriodId,
-    ) -> Result<Vec<VotingPeriodStats>, Error> {
-        let mut stats = Vec::new();
-        let mut iter = self.period_stats.iter(rotxn)?;
-
-        while let Some((period_id, period_stats)) = iter.next()? {
-            if period_id >= start_period && period_id <= end_period {
-                stats.push(period_stats);
-            }
-        }
-
-        stats.sort_by_key(|s| s.period_id.as_u32());
-        Ok(stats)
     }
 
     pub fn count_total_votes(&self, rotxn: &RoTxn) -> Result<u64, Error> {
@@ -431,21 +448,11 @@ impl VotingDatabases {
 
         if issues.is_empty() {
             issues.push(format!(
-                "Database consistent: {} votes, {} outcomes",
-                vote_count, outcome_count
+                "Database consistent: {vote_count} votes, {outcome_count} outcomes"
             ));
         }
 
         Ok(issues)
-    }
-
-    pub fn clear_all_data(&self, rwtxn: &mut RwTxn) -> Result<(), Error> {
-        self.votes.clear(rwtxn)?;
-        self.vote_batches.clear(rwtxn)?;
-        self.voter_reputation.clear(rwtxn)?;
-        self.decision_outcomes.clear(rwtxn)?;
-        self.period_stats.clear(rwtxn)?;
-        Ok(())
     }
 
     pub fn get_consensus_outcome(
@@ -470,10 +477,19 @@ impl VotingDatabases {
     ) -> Result<HashMap<crate::state::slots::SlotId, f64>, Error> {
         let mut outcomes = HashMap::new();
         let mut iter = self.decision_outcomes.iter(rotxn)?;
+        let target_period_index = period_id.0.saturating_sub(1);
 
         while let Some((decision_id, outcome)) = iter.next()? {
-            if outcome.period_id == period_id {
-                outcomes.insert(decision_id, outcome.outcome_value);
+            let slot_period_index = decision_id.period_index();
+
+            if slot_period_index < target_period_index {
+                continue;
+            } else if slot_period_index == target_period_index {
+                if outcome.period_id == period_id {
+                    outcomes.insert(decision_id, outcome.outcome_value);
+                }
+            } else {
+                break;
             }
         }
 
@@ -488,18 +504,6 @@ impl VotingDatabases {
         let outcomes =
             self.get_consensus_outcomes_for_period(rotxn, period_id)?;
         Ok(!outcomes.is_empty())
-    }
-
-    pub fn get_period_consensus(
-        &self,
-        rotxn: &RoTxn,
-        period_id: VotingPeriodId,
-    ) -> Result<Option<String>, Error> {
-        if self.has_consensus(rotxn, period_id)? {
-            Ok(Some("Resolved".to_string()))
-        } else {
-            Ok(None)
-        }
     }
 
     pub fn put_pending_redistribution(
@@ -589,16 +593,6 @@ impl VotingDatabases {
                 &redistribution,
             )?;
         }
-        Ok(())
-    }
-
-    pub fn delete_period_redistribution(
-        &self,
-        rwtxn: &mut RwTxn,
-        period_id: VotingPeriodId,
-    ) -> Result<(), Error> {
-        self.pending_period_redistributions
-            .delete(rwtxn, &period_id)?;
         Ok(())
     }
 }

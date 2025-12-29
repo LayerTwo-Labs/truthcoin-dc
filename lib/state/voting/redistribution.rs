@@ -1,3 +1,4 @@
+use crate::math::safe_math::BasisPoints;
 use crate::math::voting::constants::round_reputation;
 use crate::state::{
     Error, State, UtxoManager, slots::SlotId, voting::types::VotingPeriodId,
@@ -39,7 +40,7 @@ pub struct RedistributionTransfer {
     pub period_id: VotingPeriodId,
     pub from_address: Address,
     pub to_address: Address,
-    pub amount: i32,
+    pub amount: i64,
     pub reputation: f64,
     pub timestamp: u64,
     pub block_height: u64,
@@ -104,10 +105,10 @@ impl PeriodRedistribution {
 fn calculate_votecoin_deltas(
     reputation_changes: &HashMap<Address, (f64, f64)>,
     votecoin_at_stake: u64,
-    redistribution_rate: f64,
 ) -> Result<HashMap<Address, i64>, Error> {
     let mut deltas = HashMap::new();
 
+    // Calculate reputation deltas
     let mut reputation_deltas: HashMap<Address, f64> = HashMap::new();
     let mut total_reputation_change = 0.0;
 
@@ -130,6 +131,7 @@ fn calculate_votecoin_deltas(
         total_reputation_change
     );
 
+    // Early exit: no significant reputation changes
     if total_reputation_change < 1e-10 {
         debug!(
             "No reputation changes detected (below threshold), skipping VoteCoin redistribution"
@@ -140,8 +142,9 @@ fn calculate_votecoin_deltas(
         return Ok(deltas);
     }
 
+    // Calculate redistribution pool using integer arithmetic via BasisPoints
     let redistribution_pool =
-        (votecoin_at_stake as f64 * redistribution_rate).floor() as i64;
+        BasisPoints::REDISTRIBUTION_RATE.apply_to_u64(votecoin_at_stake) as i64;
 
     if redistribution_pool == 0 {
         debug!("Redistribution pool is zero, skipping VoteCoin redistribution");
@@ -151,8 +154,9 @@ fn calculate_votecoin_deltas(
         return Ok(deltas);
     }
 
-    let mut winners = Vec::new();
-    let mut losers = Vec::new();
+    // Separate winners and losers
+    let mut winners: Vec<(Address, f64)> = Vec::new();
+    let mut losers: Vec<(Address, f64)> = Vec::new();
     let mut total_win = 0.0;
     let mut total_loss = 0.0;
 
@@ -161,7 +165,7 @@ fn calculate_votecoin_deltas(
             winners.push((address, rep_delta));
             total_win += rep_delta;
         } else if rep_delta < 0.0 {
-            losers.push((address, rep_delta));
+            losers.push((address, rep_delta.abs()));
             total_loss += rep_delta.abs();
         }
     }
@@ -177,17 +181,17 @@ fn calculate_votecoin_deltas(
         total_loss
     );
 
+    // Calculate amount to redistribute
     let effective_change = total_win.min(total_loss);
     let amount_to_redistribute =
-        (votecoin_at_stake as f64 * redistribution_rate * effective_change)
-            .floor() as i64;
+        ((redistribution_pool as f64) * effective_change).floor() as i64;
 
     debug!(
         "Effective change: {:.6}, Amount to redistribute: {} (votecoin_at_stake: {}, rate: {})",
         effective_change,
         amount_to_redistribute,
         votecoin_at_stake,
-        redistribution_rate
+        BasisPoints::REDISTRIBUTION_RATE
     );
 
     if amount_to_redistribute == 0 {
@@ -200,62 +204,62 @@ fn calculate_votecoin_deltas(
         return Ok(deltas);
     }
 
-    let mut total_delta_i64 = 0i64;
+    winners.sort_by_key(|(addr, _)| *addr);
+    losers.sort_by_key(|(addr, _)| *addr);
 
-    for (address, rep_gain) in winners {
-        let votecoin_gain = if total_win > 0.0 {
-            ((rep_gain / total_win) * amount_to_redistribute as f64).round()
-                as i64
-        } else {
-            0
-        };
-        deltas.insert(address, votecoin_gain);
-        total_delta_i64 += votecoin_gain;
+    // Calculate winner allocations using floor, track remainder
+    let mut total_assigned_gain = 0i64;
+    let mut winner_deltas: Vec<(Address, i64)> = Vec::new();
+
+    for (address, rep_gain) in &winners {
+        let proportion = rep_gain / total_win;
+        let gain = (proportion * amount_to_redistribute as f64).floor() as i64;
+        winner_deltas.push((*address, gain));
+        total_assigned_gain += gain;
     }
 
-    for (address, rep_loss) in losers {
-        let votecoin_loss = if total_loss > 0.0 {
-            -((rep_loss.abs() / total_loss) * amount_to_redistribute as f64)
-                .round() as i64
-        } else {
-            0
-        };
-        deltas.insert(address, votecoin_loss);
-        total_delta_i64 += votecoin_loss;
+    // Calculate loser allocations using floor, track remainder
+    let mut total_assigned_loss = 0i64;
+    let mut loser_deltas: Vec<(Address, i64)> = Vec::new();
+
+    for (address, rep_loss) in &losers {
+        let proportion = rep_loss / total_loss;
+        let loss = (proportion * amount_to_redistribute as f64).floor() as i64;
+        loser_deltas.push((*address, -loss));
+        total_assigned_loss += loss;
     }
 
+    let gain_remainder = amount_to_redistribute - total_assigned_gain;
+    let loss_remainder = amount_to_redistribute - total_assigned_loss;
+
+    if gain_remainder > 0 && !winner_deltas.is_empty() {
+        winner_deltas[0].1 += gain_remainder;
+    }
+    if loss_remainder > 0 && !loser_deltas.is_empty() {
+        loser_deltas[0].1 -= loss_remainder;
+    }
+
+    for (address, delta) in winner_deltas {
+        deltas.insert(address, delta);
+    }
+    for (address, delta) in loser_deltas {
+        deltas.insert(address, delta);
+    }
     for &address in reputation_changes.keys() {
         deltas.entry(address).or_insert(0);
     }
 
-    if total_delta_i64 != 0 {
-        warn!(
-            "VoteCoin conservation violation detected: total_delta = {}, adjusting",
-            total_delta_i64
-        );
-
-        let mut max_delta_voter = None;
-        let mut max_delta_abs = 0i64;
-
-        for (&address, &delta) in deltas.iter() {
-            if delta.abs() > max_delta_abs {
-                max_delta_abs = delta.abs();
-                max_delta_voter = Some(address);
-            }
-        }
-
-        if let Some(address) = max_delta_voter {
-            let current_delta = deltas.get(&address).copied().unwrap_or(0);
-            deltas.insert(address, current_delta - total_delta_i64);
-        }
-    }
-
+    // Verify conservation - this should always pass with the floor-then-remainder algorithm
     let final_sum: i64 = deltas.values().sum();
+    debug_assert_eq!(
+        final_sum, 0,
+        "Conservation invariant violated - this is a bug"
+    );
+
     if final_sum != 0 {
         return Err(Error::InvalidTransaction {
             reason: format!(
-                "VoteCoin redistribution conservation violated: sum = {} (expected 0)",
-                final_sum
+                "VoteCoin redistribution conservation violated: sum = {final_sum} (expected 0)"
             ),
         });
     }
@@ -283,7 +287,7 @@ fn generate_transfer_records(
                 period_id,
                 from_address: address,
                 to_address: address,
-                amount: delta as i32,
+                amount: delta,
                 reputation,
                 timestamp,
                 block_height,
@@ -351,11 +355,12 @@ fn adjust_deltas_for_insufficient_balances(
             );
         }
 
-        let winners: Vec<(Address, i64)> = votecoin_deltas
+        let mut winners: Vec<(Address, i64)> = votecoin_deltas
             .iter()
             .filter(|(_, delta)| **delta > 0)
             .map(|(id, delta)| (*id, *delta))
             .collect();
+        winners.sort_by_key(|(addr, _)| *addr);
 
         if !winners.is_empty() {
             let total_winnings: i64 = winners.iter().map(|(_, d)| d).sum();
@@ -363,13 +368,26 @@ fn adjust_deltas_for_insufficient_balances(
             if total_winnings > 0 {
                 let deficit_i64 = total_deficit as i64;
 
-                for (address, original_gain) in winners {
-                    let proportion =
-                        original_gain as f64 / total_winnings as f64;
-                    let reduction =
-                        (deficit_i64 as f64 * proportion).round() as i64;
-                    let new_gain = original_gain - reduction;
+                let mut total_reduced = 0i64;
+                let mut reductions: Vec<(Address, i64, i64)> = Vec::new();
 
+                for (address, original_gain) in &winners {
+                    let proportion =
+                        *original_gain as f64 / total_winnings as f64;
+                    let reduction =
+                        (deficit_i64 as f64 * proportion).floor() as i64;
+                    reductions.push((*address, *original_gain, reduction));
+                    total_reduced += reduction;
+                }
+
+                let remainder = deficit_i64 - total_reduced;
+                if remainder > 0 && !reductions.is_empty() {
+                    reductions[0].2 += remainder;
+                }
+
+                // Apply reductions
+                for (address, original_gain, reduction) in reductions {
+                    let new_gain = original_gain - reduction;
                     votecoin_deltas.insert(address, new_gain);
 
                     debug!(
@@ -379,34 +397,22 @@ fn adjust_deltas_for_insufficient_balances(
                 }
             }
         }
-
-        let final_sum: i64 = votecoin_deltas.values().sum();
-        if final_sum != 0 {
-            let mut max_abs_voter = None;
-            let mut max_abs = 0i64;
-
-            for (&address, &delta) in votecoin_deltas.iter() {
-                if delta.abs() > max_abs {
-                    max_abs = delta.abs();
-                    max_abs_voter = Some(address);
-                }
-            }
-
-            if let Some(address) = max_abs_voter {
-                let current = votecoin_deltas[&address];
-                votecoin_deltas.insert(address, current - final_sum);
-
-                debug!(
-                    "Final conservation adjustment: voter {} delta adjusted by {}",
-                    address, -final_sum
-                );
-            }
-        }
     }
 
     Ok(total_deficit)
 }
 
+/// Calculates votecoin redistribution deltas based on reputation changes.
+///
+/// # Locking Requirements
+///
+/// Like `apply_votecoin_redistribution`, this must be called under
+/// the consensus lock to ensure balance consistency.
+///
+/// # Conservation Invariant
+///
+/// The sum of all deltas MUST be zero (votecoin is neither created nor destroyed).
+/// This is verified via `conservation_check` in the returned summary.
 pub fn redistribute_votecoin_after_consensus(
     state: &State,
     rwtxn: &mut RwTxn,
@@ -442,7 +448,7 @@ pub fn redistribute_votecoin_after_consensus(
     let total_votecoin_supply = state
         .get_total_votecoin_supply(rwtxn)
         .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Failed to query total VoteCoin supply: {}", e),
+            reason: format!("Failed to query total VoteCoin supply: {e}"),
         })?;
 
     let votecoin_at_stake = total_votecoin_supply as u64;
@@ -470,13 +476,8 @@ pub fn redistribute_votecoin_after_consensus(
         votecoin_at_stake, period_id.0
     );
 
-    let redistribution_rate = 0.1;
-
-    let mut votecoin_deltas = calculate_votecoin_deltas(
-        reputation_changes,
-        votecoin_at_stake,
-        redistribution_rate,
-    )?;
+    let mut votecoin_deltas =
+        calculate_votecoin_deltas(reputation_changes, votecoin_at_stake)?;
 
     let total_deficit = adjust_deltas_for_insufficient_balances(
         state,
@@ -542,6 +543,25 @@ pub fn redistribute_votecoin_after_consensus(
     Ok(summary)
 }
 
+/// Applies votecoin redistribution after consensus is calculated.
+///
+/// # Locking Requirements
+///
+/// This function MUST be called while holding the consensus lock
+/// (`VotingSystem::consensus_lock`). The consensus lock ensures:
+///
+/// 1. No concurrent consensus calculations can modify votecoin balances
+/// 2. Balance reads during delta calculation match balances at application time
+/// 3. No race conditions between `adjust_deltas_for_insufficient_balances()`
+///    and actual balance modifications
+///
+/// The caller (`commit_consensus_result`) acquires this lock via
+/// `calculate_and_store_consensus()`.
+///
+/// # Atomicity
+///
+/// All UTXO modifications use the same `rwtxn` transaction, ensuring
+/// atomicity. Either all transfers complete or none do.
 pub fn apply_votecoin_redistribution(
     state: &State,
     rwtxn: &mut RwTxn,
@@ -562,8 +582,7 @@ pub fn apply_votecoin_redistribution(
 
     for transfer in &redistribution.transfers {
         let address = transfer.from_address;
-        *voter_net_changes.entry(address).or_insert(0i64) +=
-            transfer.amount as i64;
+        *voter_net_changes.entry(address).or_insert(0i64) += transfer.amount;
     }
 
     let total_delta: i64 = voter_net_changes.values().sum();
@@ -571,8 +590,7 @@ pub fn apply_votecoin_redistribution(
     if total_delta != 0 {
         return Err(Error::InvalidTransaction {
             reason: format!(
-                "VoteCoin redistribution conservation violation: total delta = {} (expected 0)",
-                total_delta
+                "VoteCoin redistribution conservation violation: total delta = {total_delta} (expected 0)"
             ),
         });
     }
@@ -660,7 +678,7 @@ fn remove_votecoin_from_voter(
         })
         .collect();
 
-    votecoin_utxos.sort_by_key(|(outpoint, _, _)| outpoint.clone());
+    votecoin_utxos.sort_by_key(|(outpoint, _, _)| *outpoint);
 
     let total_available: u32 =
         votecoin_utxos.iter().map(|(_, amt, _)| amt).sum();
@@ -668,8 +686,7 @@ fn remove_votecoin_from_voter(
     if total_available < amount {
         return Err(Error::InvalidTransaction {
             reason: format!(
-                "Insufficient VoteCoin for redistribution: address has {}, needs {}",
-                total_available, amount
+                "Insufficient VoteCoin for redistribution: address has {total_available}, needs {amount}"
             ),
         });
     }
@@ -735,8 +752,7 @@ fn remove_votecoin_from_voter(
     if removed != amount {
         return Err(Error::InvalidTransaction {
             reason: format!(
-                "VoteCoin removal mismatch: removed {}, expected {}",
-                removed, amount
+                "VoteCoin removal mismatch: removed {removed}, expected {amount}"
             ),
         });
     }
@@ -794,14 +810,10 @@ mod tests {
         reputation_changes.insert(make_address(3), (0.5, 0.5));
 
         let votecoin_at_stake = 100000u64;
-        let redistribution_rate = 0.1;
 
-        let deltas = calculate_votecoin_deltas(
-            &reputation_changes,
-            votecoin_at_stake,
-            redistribution_rate,
-        )
-        .unwrap();
+        let deltas =
+            calculate_votecoin_deltas(&reputation_changes, votecoin_at_stake)
+                .unwrap();
 
         let total: i64 = deltas.values().sum();
         assert_eq!(total, 0, "VoteCoin deltas must sum to zero (conservation)");
@@ -829,14 +841,10 @@ mod tests {
         reputation_changes.insert(make_address(3), (0.5, 0.5));
 
         let votecoin_at_stake = 100000u64;
-        let redistribution_rate = 0.1;
 
-        let deltas = calculate_votecoin_deltas(
-            &reputation_changes,
-            votecoin_at_stake,
-            redistribution_rate,
-        )
-        .unwrap();
+        let deltas =
+            calculate_votecoin_deltas(&reputation_changes, votecoin_at_stake)
+                .unwrap();
 
         for &delta in deltas.values() {
             assert_eq!(
@@ -869,14 +877,14 @@ mod tests {
 
         assert_eq!(transfers.len(), 3, "Should create 3 transfer records");
 
-        let total_delta: i32 = transfers.iter().map(|t| t.amount).sum();
+        let total_delta: i64 = transfers.iter().map(|t| t.amount).sum();
         assert_eq!(total_delta, 0, "Total delta should be zero (conservation)");
 
         for transfer in &transfers {
             let address = transfer.from_address;
             let expected_delta = votecoin_deltas.get(&address).unwrap();
             assert_eq!(
-                transfer.amount as i64, *expected_delta,
+                transfer.amount, *expected_delta,
                 "Transfer amount should match delta"
             );
         }

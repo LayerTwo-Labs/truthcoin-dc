@@ -12,17 +12,23 @@ pub mod types;
 
 use crate::state::{Error, slots::SlotId};
 use database::VotingDatabases;
+use parking_lot::Mutex;
 use sneed::{Env, RoTxn, RwTxn};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use types::{
-    DecisionOutcome, DecisionResolution, Vote, VoteValue, VoterReputation,
-    VotingPeriod, VotingPeriodId, VotingPeriodStats, VotingPeriodStatus,
+    ConsensusResult, DecisionOutcome, DecisionResolution, SlotResolution, Vote,
+    VoteValue, VoterReputation, VotingPeriod, VotingPeriodId,
+    VotingPeriodStats, VotingPeriodStatus,
 };
 
+/// Voting system for Bitcoin Hivemind consensus.
 #[derive(Clone)]
 pub struct VotingSystem {
     databases: VotingDatabases,
-    consensus_lock: std::sync::Arc<parking_lot::Mutex<()>>,
+    /// Lock to synchronize concurrent consensus calculations.
+    /// Prevents race conditions when multiple periods resolve simultaneously.
+    consensus_lock: Arc<Mutex<()>>,
 }
 
 impl VotingSystem {
@@ -32,7 +38,7 @@ impl VotingSystem {
         let databases = VotingDatabases::new(env, rwtxn)?;
         Ok(Self {
             databases,
-            consensus_lock: std::sync::Arc::new(parking_lot::Mutex::new(())),
+            consensus_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -72,155 +78,146 @@ impl VotingSystem {
         Ok(())
     }
 
-    pub(crate) fn calculate_and_store_consensus(
+    /// Pure computation phase no db writes
+    fn compute_consensus(
         &self,
         rwtxn: &mut RwTxn,
         period_id: VotingPeriodId,
         state: &crate::state::State,
         current_timestamp: u64,
         current_height: u64,
-        slots_db: &crate::state::slots::Dbs,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<ConsensusResult>, Error> {
         use crate::math::voting::{
-            ReputationVector, SparseVoteMatrix, calculate_consensus,
+            SparseVoteMatrix, VotingWeightVector,
+            calculate_consensus as math_calculate_consensus,
         };
-
-        let _consensus_guard = self.consensus_lock.lock();
-
-        tracing::debug!(
-            "calculate_and_store_consensus: Starting for period {} (lock acquired)",
-            period_id.0
-        );
 
         let existing_outcomes = self
             .databases
             .get_consensus_outcomes_for_period(rwtxn, period_id)?;
         if !existing_outcomes.is_empty() {
             tracing::warn!(
-                "calculate_and_store_consensus: Consensus already calculated for period {} ({} outcomes exist), skipping",
+                "compute_consensus: Consensus already calculated for period {} ({} outcomes exist), skipping",
                 period_id.0,
                 existing_outcomes.len()
             );
-            return Ok(());
+            return Ok(None);
         }
 
         let all_votes =
             self.databases.get_votes_for_period(rwtxn, period_id)?;
-
         if all_votes.is_empty() {
             tracing::warn!(
-                "calculate_and_store_consensus: No votes found for period {}, returning empty",
+                "compute_consensus: No votes found for period {}, returning empty",
                 period_id.0
             );
-            return Ok(());
+            return Ok(None);
         }
 
-        let mut voters_set = HashSet::new();
+        // Collect unique voters and decisions from votes
+        let mut voters_set: HashSet<crate::types::Address> = HashSet::new();
         let mut decisions_set = HashSet::new();
-        let mut voter_reputations = HashMap::new();
-
         for vote_key in all_votes.keys() {
-            if voters_set.insert(vote_key.voter_address) {
-                if let Some(rep) = self
-                    .databases
-                    .get_voter_reputation(rwtxn, vote_key.voter_address)?
-                {
-                    voter_reputations.insert(vote_key.voter_address, rep);
-                } else {
-                    let timestamp = 0u64;
-                    let default_rep = crate::state::voting::types::VoterReputation::new_default(
-                        vote_key.voter_address,
-                        timestamp,
-                        period_id,
-                    );
-                    self.databases.put_voter_reputation(rwtxn, &default_rep)?;
-                    voter_reputations
-                        .insert(vote_key.voter_address, default_rep);
-                }
-            }
+            voters_set.insert(vote_key.voter_address);
             decisions_set.insert(vote_key.decision_id);
         }
 
+        // Batch fetch all voter reputations in one query instead of N individual lookups
+        let mut voter_reputations = self
+            .databases
+            .get_voter_reputations_batch(rwtxn, &voters_set)?;
+        let mut new_voter_reputations = Vec::new();
+
+        // Create default reputations for new voters not in database
+        for &voter_address in &voters_set {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                voter_reputations.entry(voter_address)
+            {
+                let default_rep =
+                    VoterReputation::new_default(voter_address, 0, period_id);
+                new_voter_reputations.push(default_rep.clone());
+                entry.insert(default_rep);
+            }
+        }
+
         if voter_reputations.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let voters: Vec<_> = voters_set.into_iter().collect();
         let decisions: Vec<_> = decisions_set.into_iter().collect();
-
         let mut vote_matrix = SparseVoteMatrix::new(voters, decisions);
 
         for (vote_key, vote_entry) in &all_votes {
-            vote_matrix
-                .set_vote(
-                    vote_key.voter_address,
-                    vote_key.decision_id,
-                    vote_entry.to_f64(),
-                )
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!("Failed to set vote in matrix: {:?}", e),
-                })?;
+            // Skip abstent votes
+            if let Some(vote_value) = vote_entry.to_float_opt() {
+                vote_matrix
+                    .set_vote(
+                        vote_key.voter_address,
+                        vote_key.decision_id,
+                        vote_value,
+                    )
+                    .map_err(|e| Error::InvalidTransaction {
+                        reason: format!("Failed to set vote in matrix: {e:?}"),
+                    })?;
+            }
         }
 
         let reputation_vector =
-            ReputationVector::from_voter_reputations(&voter_reputations);
-
-        let consensus_result =
-            calculate_consensus(&vote_matrix, &reputation_vector).map_err(
-                |e| Error::InvalidTransaction {
-                    reason: format!("Failed to calculate consensus: {:?}", e),
-                },
-            )?;
+            VotingWeightVector::from_voter_reputations(&voter_reputations);
+        let math_result =
+            math_calculate_consensus(&vote_matrix, &reputation_vector)
+                .map_err(|e| Error::InvalidTransaction {
+                    reason: format!("Failed to calculate consensus: {e:?}"),
+                })?;
 
         let mut period_stats = self
             .databases
             .get_period_stats(rwtxn, period_id)?
             .unwrap_or_else(|| VotingPeriodStats::new(period_id, 0));
 
-        period_stats.first_loading =
-            Some(consensus_result.first_loading.clone());
-        period_stats.explained_variance =
-            Some(consensus_result.explained_variance);
-        period_stats.certainty = Some(consensus_result.certainty);
+        period_stats.first_loading = Some(math_result.first_loading.clone());
+        period_stats.certainty = Some(math_result.certainty);
 
         let mut reputation_changes = HashMap::new();
+        let mut updated_voter_reputations = new_voter_reputations;
 
-        for (voter_id, new_reputation) in
-            consensus_result.updated_reputations.iter()
+        for (voter_id, new_reputation) in math_result.updated_reputations.iter()
         {
-            let mut voter_rep = self
-                .databases
-                .get_voter_reputation(rwtxn, *voter_id)?
-                .unwrap_or_else(|| {
+            let mut voter_rep =
+                voter_reputations.get(voter_id).cloned().unwrap_or_else(|| {
                     VoterReputation::new_default(*voter_id, 0, period_id)
                 });
 
             let old_reputation = voter_rep.reputation;
-
             reputation_changes
                 .insert(*voter_id, (old_reputation, *new_reputation));
 
-            let consensus_txid = crate::types::Txid([0xff; 32]);
+            let consensus_txid =
+                crate::types::Txid::for_consensus_redistribution(
+                    period_id,
+                    current_height,
+                );
             voter_rep.reputation_history.push(
                 old_reputation,
                 consensus_txid,
-                0,
+                current_height as u32,
             );
-
             voter_rep.reputation = *new_reputation;
             voter_rep.last_updated = 0;
             voter_rep.last_period = period_id;
 
-            self.databases.put_voter_reputation(rwtxn, &voter_rep)?;
+            updated_voter_reputations.push(voter_rep);
         }
 
         if !reputation_changes.is_empty() {
             period_stats.reputation_changes = Some(reputation_changes.clone());
         }
 
-        self.databases.put_period_stats(rwtxn, &period_stats)?;
+        let mut decision_outcomes = Vec::new();
+        let mut slot_resolutions = Vec::new();
 
-        for (slot_id, outcome_value) in &consensus_result.outcomes {
+        for (slot_id, outcome_value) in &math_result.outcomes {
             let Some(outcome_f64) = outcome_value else {
                 tracing::warn!(
                     "Slot {} has unanimous abstention - no consensus outcome stored",
@@ -248,7 +245,11 @@ impl VotingSystem {
                 resolution,
             );
 
-            self.databases.put_decision_outcome(rwtxn, &outcome)?;
+            decision_outcomes.push(outcome);
+            slot_resolutions.push(SlotResolution {
+                slot_id: *slot_id,
+                outcome_value: *outcome_f64,
+            });
         }
 
         let redistribution_summary =
@@ -261,81 +262,238 @@ impl VotingSystem {
                 current_height,
             )?;
 
-        redistribution::apply_votecoin_redistribution(
-            state,
+        let resolved_slot_ids: Vec<SlotId> =
+            slot_resolutions.iter().map(|r| r.slot_id).collect();
+
+        let period_redistribution = redistribution::PeriodRedistribution::new(
+            period_id,
+            resolved_slot_ids,
+            redistribution_summary.clone(),
+            current_height,
+        );
+
+        let mut result =
+            ConsensusResult::new(period_id, current_height, current_timestamp);
+        result.voter_reputations = updated_voter_reputations;
+        result.period_stats = period_stats;
+        result.decision_outcomes = decision_outcomes;
+        result.slot_resolutions = slot_resolutions;
+        result.period_redistribution = Some(period_redistribution);
+        result.redistribution_summary = Some(redistribution_summary);
+
+        Ok(Some(result))
+    }
+
+    fn validate_consensus_commit(
+        &self,
+        rwtxn: &RwTxn,
+        result: &ConsensusResult,
+        state: &crate::state::State,
+        slots_db: &crate::state::slots::Dbs,
+    ) -> Result<(), Error> {
+        // Validate all slots exist and can be transitioned
+        for slot_resolution in &result.slot_resolutions {
+            let _history = slots_db
+                .get_slot_state_history(rwtxn, slot_resolution.slot_id)?
+                .ok_or(Error::InvalidSlotId {
+                    reason: format!(
+                        "Pre-validation failed: Slot {:?} has no state history",
+                        slot_resolution.slot_id
+                    ),
+                })?;
+        }
+
+        // Validate redistribution won't fail due to insufficient balances
+        if let Some(ref redistribution_summary) = result.redistribution_summary
+        {
+            if let Some(existing) = self
+                .databases
+                .get_pending_redistribution(rwtxn, result.period_id)?
+                && existing.applied
+            {
+                return Ok(());
+            }
+
+            let mut voter_net_changes: HashMap<crate::types::Address, i64> =
+                HashMap::new();
+            for transfer in &redistribution_summary.transfers {
+                *voter_net_changes.entry(transfer.from_address).or_insert(0) +=
+                    transfer.amount;
+            }
+
+            // Validate voters with negative balances have enough votecoin
+            for (&address, &net_change) in &voter_net_changes {
+                if net_change < 0 {
+                    let amount_needed = (-net_change) as u32;
+                    let balance =
+                        state.get_votecoin_balance(rwtxn, &address)?;
+                    if balance < amount_needed {
+                        return Err(Error::InvalidTransaction {
+                            reason: format!(
+                                "Pre-validation failed: Address {} has {} VoteCoin but needs {} for redistribution",
+                                address.as_base58(),
+                                balance,
+                                amount_needed
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn commit_consensus_result(
+        &self,
+        rwtxn: &mut RwTxn,
+        result: ConsensusResult,
+        state: &crate::state::State,
+        slots_db: &crate::state::slots::Dbs,
+    ) -> Result<(), Error> {
+        tracing::debug!(
+            period_id = result.period_id.0,
+            block_height = result.block_height,
+            voter_count = result.voter_reputations.len(),
+            outcome_count = result.decision_outcomes.len(),
+            "Starting atomic consensus commit"
+        );
+
+        self.validate_consensus_commit(rwtxn, &result, state, slots_db)?;
+
+        // Phase 1: Write voter reputations
+        for voter_rep in &result.voter_reputations {
+            self.databases.put_voter_reputation(rwtxn, voter_rep)?;
+        }
+        tracing::trace!(
+            count = result.voter_reputations.len(),
+            "Wrote voter reputations"
+        );
+
+        // Phase 2: Write period stats
+        self.databases
+            .put_period_stats(rwtxn, &result.period_stats)?;
+        tracing::trace!(period_id = result.period_id.0, "Wrote period stats");
+
+        // Phase 3: Write decision outcomes
+        for outcome in &result.decision_outcomes {
+            self.databases.put_decision_outcome(rwtxn, outcome)?;
+        }
+        tracing::trace!(
+            count = result.decision_outcomes.len(),
+            "Wrote decision outcomes"
+        );
+
+        // Phase 4: Apply votecoin redistribution
+        if let Some(ref redistribution_summary) = result.redistribution_summary
+        {
+            if let Some(existing) = self
+                .databases
+                .get_pending_redistribution(rwtxn, result.period_id)?
+            {
+                if existing.applied {
+                    tracing::trace!(
+                        period_id = result.period_id.0,
+                        applied_at = ?existing.applied_at_height,
+                        "Redistribution already applied, skipping"
+                    );
+                } else {
+                    redistribution::apply_votecoin_redistribution(
+                        state,
+                        rwtxn,
+                        redistribution_summary,
+                        result.block_height,
+                    )?;
+                    tracing::trace!(
+                        transfer_count = redistribution_summary.transfers.len(),
+                        "Applied votecoin redistribution"
+                    );
+                }
+            } else {
+                redistribution::apply_votecoin_redistribution(
+                    state,
+                    rwtxn,
+                    redistribution_summary,
+                    result.block_height,
+                )?;
+                tracing::trace!(
+                    transfer_count = redistribution_summary.transfers.len(),
+                    "Applied votecoin redistribution"
+                );
+            }
+        }
+
+        // Phase 5: Transition slots to resolved state
+        for slot_resolution in &result.slot_resolutions {
+            slots_db.transition_slot_to_resolved(
+                rwtxn,
+                slot_resolution.slot_id,
+                result.block_height,
+                result.timestamp,
+                slot_resolution.outcome_value,
+            )?;
+        }
+        tracing::trace!(
+            count = result.slot_resolutions.len(),
+            "Transitioned slots to resolved"
+        );
+
+        // Capture counts before moving period_redistribution
+        let resolved_count = result.resolved_slot_count();
+        let abstained_count = result.abstained_slot_count();
+
+        // Phase 6: Record redistribution as applied
+        if let Some(mut period_redistribution) = result.period_redistribution {
+            period_redistribution.mark_applied(result.block_height);
+            self.databases
+                .put_pending_redistribution(rwtxn, &period_redistribution)?;
+        }
+
+        tracing::info!(
+            period_id = result.period_id.0,
+            block_height = result.block_height,
+            resolved = resolved_count,
+            abstained = abstained_count,
+            "Consensus commit completed successfully"
+        );
+
+        Ok(())
+    }
+
+    pub(crate) fn calculate_and_store_consensus(
+        &self,
+        rwtxn: &mut RwTxn,
+        period_id: VotingPeriodId,
+        state: &crate::state::State,
+        current_timestamp: u64,
+        current_height: u64,
+        slots_db: &crate::state::slots::Dbs,
+    ) -> Result<(), Error> {
+        // Acquire consensus lock to prevent concurrent consensus calculations.
+        // This ensures votecoin balance reads during validation match state at application time.
+        let _consensus_guard = self.consensus_lock.lock();
+
+        tracing::debug!(
+            period_id = period_id.0,
+            "calculate_and_store_consensus: Starting"
+        );
+
+        let result = self.compute_consensus(
             rwtxn,
-            &redistribution_summary,
+            period_id,
+            state,
+            current_timestamp,
             current_height,
         )?;
 
-        let mut slots_in_period = Vec::new();
-        for (slot_id, _) in consensus_result.outcomes.iter() {
-            slots_in_period.push(*slot_id);
-        }
-
-        for slot_id in &slots_in_period {
-            let outcome_value = consensus_result
-                .outcomes
-                .get(slot_id)
-                .and_then(|v| *v)
-                .unwrap_or(0.5);
-
-            slots_db.transition_slot_to_resolved(
+        if let Some(consensus_result) = result {
+            self.commit_consensus_result(
                 rwtxn,
-                *slot_id,
-                current_height,
-                current_timestamp,
-                outcome_value,
+                consensus_result,
+                state,
+                slots_db,
             )?;
-
-            tracing::debug!(
-                "Slot {} resolved with outcome {:.4}",
-                hex::encode(slot_id.as_bytes()),
-                outcome_value
-            );
         }
-
-        // Collect only the slots that were actually resolved (not abstained)
-        let resolved_slot_ids: Vec<SlotId> = slots_in_period
-            .iter()
-            .filter(|slot_id| {
-                consensus_result
-                    .outcomes
-                    .get(slot_id)
-                    .and_then(|v| *v)
-                    .is_some()
-            })
-            .copied()
-            .collect();
-
-        let mut period_redistribution =
-            redistribution::PeriodRedistribution::new(
-                period_id,
-                resolved_slot_ids.clone(),
-                redistribution_summary,
-                current_height,
-            );
-        period_redistribution.mark_applied(current_height);
-
-        self.databases
-            .put_pending_redistribution(rwtxn, &period_redistribution)?;
-
-        tracing::debug!(
-            "Slots ossified during consensus: {:?}",
-            resolved_slot_ids
-                .iter()
-                .map(|s| hex::encode(s.as_bytes()))
-                .collect::<Vec<_>>()
-        );
-
-        let abstained_count = slots_in_period.len() - resolved_slot_ids.len();
-        tracing::info!(
-            "Atomically applied VoteCoin redistribution for period {} at height {}: {} resolved, {} abstained",
-            period_id.0,
-            current_height,
-            resolved_slot_ids.len(),
-            abstained_count
-        );
 
         Ok(())
     }
@@ -383,6 +541,7 @@ impl VotingSystem {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn cast_vote(
         &self,
         rwtxn: &mut RwTxn,
@@ -463,8 +622,7 @@ impl VotingSystem {
         let mut matrix = HashMap::new();
 
         for (key, entry) in vote_entries {
-            let vote_value = entry.to_f64();
-            if !vote_value.is_nan() {
+            if let Some(vote_value) = entry.to_float_opt() {
                 matrix.insert((key.voter_address, key.decision_id), vote_value);
             }
         }
@@ -515,8 +673,7 @@ impl VotingSystem {
         {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "Voter {:?} already has reputation",
-                    voter_address
+                    "Voter {voter_address:?} already has reputation"
                 ),
             });
         }
@@ -622,6 +779,7 @@ impl VotingSystem {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_period_decisions(
         &self,
         rwtxn: &mut RwTxn,
@@ -674,13 +832,12 @@ impl VotingSystem {
 
         let mut voter_reputations = HashMap::new();
         for vote_key in votes.keys() {
-            if !voter_reputations.contains_key(&vote_key.voter_address) {
-                if let Some(rep) = self
+            if !voter_reputations.contains_key(&vote_key.voter_address)
+                && let Some(rep) = self
                     .databases
                     .get_voter_reputation(rwtxn, vote_key.voter_address)?
-                {
-                    voter_reputations.insert(vote_key.voter_address, rep);
-                }
+            {
+                voter_reputations.insert(vote_key.voter_address, rep);
             }
         }
 

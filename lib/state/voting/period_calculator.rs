@@ -123,7 +123,7 @@ pub fn get_all_active_periods(
         let voting_period = slot.slot_id.voting_period();
         period_map
             .entry(voting_period)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(slot.slot_id);
     }
 
