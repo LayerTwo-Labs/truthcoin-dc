@@ -1,15 +1,19 @@
 /// Optimized LMSR Mathematical Operations using ndarray for Bitcoin Hivemind Sidechain
-use ndarray::{Array, Array1, ArrayView1, IxDyn};
+use ndarray::{Array1, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use super::satoshi::{self, Rounding};
+use super::safe_math::{self, BasisPoints, Rounding};
 
 const SATOSHI_PRECISION: f64 = 100_000_000.0;
 const LMSR_PRECISION: f64 = 1e-8;
 const MAX_BETA: f64 = 1e12;
 const MIN_BETA: f64 = 1e-6;
-const FEE_SCALE: u64 = 10000;
+
+/// Minimum number of outcomes for a valid market (binary)
+pub const MIN_OUTCOMES: usize = 2;
+/// Maximum number of outcomes
+pub const MAX_OUTCOMES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LmsrError {
@@ -34,16 +38,18 @@ pub enum LmsrError {
         expected: usize,
         actual: usize,
     },
+    InvalidFeeRate {
+        rate: f64,
+        reason: String,
+    },
 }
 
 impl fmt::Display for LmsrError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LmsrError::InvalidBeta { beta, min, max } => write!(
-                f,
-                "Beta {} outside valid range [{}, {}]",
-                beta, min, max
-            ),
+            LmsrError::InvalidBeta { beta, min, max } => {
+                write!(f, "Beta {beta} outside valid range [{min}, {max}]")
+            }
             LmsrError::ShareQuantityOverflow => {
                 write!(f, "Share quantity overflow")
             }
@@ -55,20 +61,20 @@ impl fmt::Display for LmsrError {
                 available,
             } => write!(
                 f,
-                "Insufficient treasury: required {}, available {}",
-                required, available
+                "Insufficient treasury: required {required}, available {available}"
             ),
             LmsrError::InvalidOutcomeCount { count, min, max } => write!(
                 f,
-                "Invalid outcome count {}: must be between {} and {}",
-                count, min, max
+                "Invalid outcome count {count}: must be between {min} and {max}"
             ),
             LmsrError::PrecisionLoss => write!(f, "Numerical precision loss"),
             LmsrError::DimensionMismatch { expected, actual } => write!(
                 f,
-                "Dimension mismatch: expected {}, got {}",
-                expected, actual
+                "Dimension mismatch: expected {expected}, got {actual}"
             ),
+            LmsrError::InvalidFeeRate { rate, reason } => {
+                write!(f, "Invalid fee rate {rate}: {reason}")
+            }
         }
     }
 }
@@ -97,6 +103,47 @@ pub struct LmsrPriceInfo {
     pub marginal_costs: Array1<u64>,
 }
 
+pub struct LmsrContext<'a> {
+    lmsr: &'a Lmsr,
+    state: &'a LmsrState,
+    cached_prices: Array1<f64>,
+    cached_base_cost: f64,
+}
+
+impl<'a> LmsrContext<'a> {
+    pub fn new(
+        lmsr: &'a Lmsr,
+        state: &'a LmsrState,
+    ) -> Result<Self, LmsrError> {
+        let prices = lmsr.validate_state(state)?;
+        let base_cost = lmsr.cost_function(state.beta, &state.shares.view())?;
+
+        Ok(Self {
+            lmsr,
+            state,
+            cached_prices: prices,
+            cached_base_cost: base_cost,
+        })
+    }
+
+    pub fn prices(&self) -> &Array1<f64> {
+        &self.cached_prices
+    }
+
+    pub fn calculate_buy_cost_fast(
+        &self,
+        outcome: usize,
+        shares_to_buy: f64,
+    ) -> Result<LmsrTradeResult, LmsrError> {
+        self.lmsr.calculate_buy_cost_with_base(
+            self.state,
+            outcome,
+            shares_to_buy,
+            self.cached_base_cost,
+        )
+    }
+}
+
 pub struct Lmsr {
     max_outcomes: usize,
 }
@@ -106,11 +153,12 @@ impl Lmsr {
         Self { max_outcomes }
     }
 
-    pub fn cost_function(
+    /// Core LMSR calculation: C = b × ln(Σ exp(qᵢ/b))
+    fn calculate_core_exp_ln(
         &self,
         beta: f64,
         shares: &ArrayView1<f64>,
-    ) -> Result<f64, LmsrError> {
+    ) -> Result<(f64, f64, Array1<f64>), LmsrError> {
         if beta <= MIN_BETA || beta >= MAX_BETA {
             return Err(LmsrError::InvalidBeta {
                 beta,
@@ -120,9 +168,10 @@ impl Lmsr {
         }
 
         if shares.is_empty() {
-            return Ok(0.0);
+            return Ok((0.0, 0.0, Array1::zeros(0)));
         }
 
+        // Shift by max for numerical stability (prevents exp overflow)
         let max_share = shares.fold(f64::NEG_INFINITY, |acc, &x| acc.max(x));
         let shifted_shares = (shares - max_share) / beta;
         let exp_shares = shifted_shares.mapv(f64::exp);
@@ -137,36 +186,39 @@ impl Lmsr {
             return Err(LmsrError::InvalidCostCalculation);
         }
 
+        // Hanson LMSR cost function: C = b × ln(Σ exp(qᵢ/b))
         let cost = beta * (sum_exp.ln() + max_share / beta);
 
         if !cost.is_finite() {
             return Err(LmsrError::InvalidCostCalculation);
         }
 
+        Ok((cost, sum_exp, exp_shares))
+    }
+
+    /// Calculate the LMSR cost function value.
+    /// Works for any market size from 2 to 256 outcomes.
+    pub fn cost_function(
+        &self,
+        beta: f64,
+        shares: &ArrayView1<f64>,
+    ) -> Result<f64, LmsrError> {
+        let (cost, _, _) = self.calculate_core_exp_ln(beta, shares)?;
         Ok(cost)
     }
 
+    /// Calculate outcome prices (probability distribution).
+    /// Works for any market size from 2 to 256 outcomes.
     pub fn calculate_prices(
         &self,
         beta: f64,
         shares: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, LmsrError> {
-        if shares.is_empty() {
+        let (_, sum_exp, exp_shares) =
+            self.calculate_core_exp_ln(beta, shares)?;
+
+        if sum_exp == 0.0 {
             return Ok(Array1::zeros(0));
-        }
-
-        let max_share = shares.fold(f64::NEG_INFINITY, |acc, &x| acc.max(x));
-        let shifted_shares = (shares - max_share) / beta;
-        let exp_shares = shifted_shares.mapv(f64::exp);
-
-        if !exp_shares.iter().all(|x| x.is_finite()) {
-            return Err(LmsrError::ShareQuantityOverflow);
-        }
-
-        let sum_exp = exp_shares.sum();
-
-        if sum_exp <= 0.0 || !sum_exp.is_finite() {
-            return Err(LmsrError::InvalidCostCalculation);
         }
 
         let prices = exp_shares / sum_exp;
@@ -184,8 +236,26 @@ impl Lmsr {
         outcome: usize,
         shares_to_buy: f64,
     ) -> Result<LmsrTradeResult, LmsrError> {
-        self.validate_state(state)?;
+        let _prices = self.validate_state(state)?;
+        let cost_before =
+            self.cost_function(state.beta, &state.shares.view())?;
+        self.calculate_buy_cost_with_base(
+            state,
+            outcome,
+            shares_to_buy,
+            cost_before,
+        )
+    }
 
+    /// Internal helper: calculate buy cost given a precomputed base cost.
+    /// Used by both `calculate_buy_cost` and `LmsrContext::calculate_buy_cost_fast`.
+    fn calculate_buy_cost_with_base(
+        &self,
+        state: &LmsrState,
+        outcome: usize,
+        shares_to_buy: f64,
+        cost_before: f64,
+    ) -> Result<LmsrTradeResult, LmsrError> {
         if shares_to_buy <= 0.0 {
             return Err(LmsrError::ShareQuantityOverflow);
         }
@@ -196,9 +266,6 @@ impl Lmsr {
                 actual: outcome + 1,
             });
         }
-
-        let cost_before =
-            self.cost_function(state.beta, &state.shares.view())?;
 
         let mut new_shares = state.shares.clone();
         new_shares[outcome] += shares_to_buy;
@@ -212,7 +279,7 @@ impl Lmsr {
         }
 
         let fee_satoshis =
-            self.calculate_fee(cost_satoshis as u64, state.trading_fee);
+            self.calculate_fee(cost_satoshis as u64, state.trading_fee)?;
         let total_cost = cost_satoshis + (fee_satoshis as i64);
 
         if total_cost > (state.treasury_balance as i64) {
@@ -238,7 +305,7 @@ impl Lmsr {
         outcome: usize,
         shares_to_sell: f64,
     ) -> Result<LmsrTradeResult, LmsrError> {
-        self.validate_state(state)?;
+        let _prices = self.validate_state(state)?;
 
         if shares_to_sell <= 0.0 {
             return Err(LmsrError::ShareQuantityOverflow);
@@ -270,7 +337,7 @@ impl Lmsr {
         }
 
         let fee_satoshis =
-            self.calculate_fee(payout_satoshis as u64, state.trading_fee);
+            self.calculate_fee(payout_satoshis as u64, state.trading_fee)?;
         let net_payout = payout_satoshis - (fee_satoshis as i64);
 
         let new_treasury_balance = state.treasury_balance + (net_payout as u64);
@@ -287,12 +354,12 @@ impl Lmsr {
         &self,
         state: &LmsrState,
     ) -> Result<LmsrPriceInfo, LmsrError> {
-        self.validate_state(state)?;
+        // Use context for single validation instead of N+1
+        let ctx = LmsrContext::new(self, state)?;
 
-        let prices = self.calculate_prices(state.beta, &state.shares.view())?;
         let mut marginal_costs = Array1::zeros(state.shares.len());
         for outcome in 0..state.shares.len() {
-            match self.calculate_buy_cost(state, outcome, 1.0) {
+            match ctx.calculate_buy_cost_fast(outcome, 1.0) {
                 Ok(result) => {
                     marginal_costs[outcome] = result.cost_satoshis as u64;
                 }
@@ -303,7 +370,7 @@ impl Lmsr {
         }
 
         Ok(LmsrPriceInfo {
-            prices,
+            prices: ctx.cached_prices.clone(),
             marginal_costs,
         })
     }
@@ -321,10 +388,10 @@ impl Lmsr {
             });
         }
 
-        if outcome_count == 0 || outcome_count > self.max_outcomes {
+        if outcome_count < MIN_OUTCOMES || outcome_count > self.max_outcomes {
             return Err(LmsrError::InvalidOutcomeCount {
                 count: outcome_count,
-                min: 1,
+                min: MIN_OUTCOMES,
                 max: self.max_outcomes,
             });
         }
@@ -335,45 +402,54 @@ impl Lmsr {
             return Err(LmsrError::InvalidCostCalculation);
         }
 
-        satoshi::to_sats(max_cost, Rounding::Up)
+        safe_math::to_sats(max_cost, Rounding::Up)
             .map_err(|_| LmsrError::InvalidCostCalculation)
     }
 
-    pub fn validate_state(&self, state: &LmsrState) -> Result<(), LmsrError> {
-        if state.beta <= MIN_BETA || state.beta >= MAX_BETA {
+    pub fn validate_state(
+        &self,
+        state: &LmsrState,
+    ) -> Result<Array1<f64>, LmsrError> {
+        if state.trading_fee < 0.0 || state.trading_fee >= 1.0 {
+            return Err(LmsrError::InvalidCostCalculation);
+        }
+
+        self.validate_params(state.beta, &state.shares.view())
+    }
+
+    /// Validate LMSR parameters without requiring full LmsrState
+    pub fn validate_params(
+        &self,
+        beta: f64,
+        shares: &ArrayView1<f64>,
+    ) -> Result<Array1<f64>, LmsrError> {
+        if beta <= MIN_BETA || beta >= MAX_BETA {
             return Err(LmsrError::InvalidBeta {
-                beta: state.beta,
+                beta,
                 min: MIN_BETA,
                 max: MAX_BETA,
             });
         }
 
-        if state.trading_fee < 0.0 || state.trading_fee >= 1.0 {
-            return Err(LmsrError::InvalidCostCalculation);
-        }
-
-        if !state.shares.iter().all(|&x| x >= 0.0 && x.is_finite()) {
+        if !shares.iter().all(|&x| x >= 0.0 && x.is_finite()) {
             return Err(LmsrError::ShareQuantityOverflow);
         }
 
-        if state.shares.len() > self.max_outcomes {
+        if shares.len() < MIN_OUTCOMES || shares.len() > self.max_outcomes {
             return Err(LmsrError::InvalidOutcomeCount {
-                count: state.shares.len(),
-                min: 1,
+                count: shares.len(),
+                min: MIN_OUTCOMES,
                 max: self.max_outcomes,
             });
         }
 
-        if state.shares.len() > 0 {
-            let prices =
-                self.calculate_prices(state.beta, &state.shares.view())?;
-            let price_sum: f64 = prices.sum();
-            if (price_sum - 1.0).abs() > LMSR_PRECISION {
-                return Err(LmsrError::PrecisionLoss);
-            }
+        let prices = self.calculate_prices(beta, shares)?;
+        let price_sum: f64 = prices.sum();
+        if (price_sum - 1.0).abs() > LMSR_PRECISION {
+            return Err(LmsrError::PrecisionLoss);
         }
 
-        Ok(())
+        Ok(prices)
     }
 
     fn cost_to_satoshis(&self, cost: f64) -> Result<i64, LmsrError> {
@@ -383,114 +459,28 @@ impl Lmsr {
             return Err(LmsrError::InvalidCostCalculation);
         }
 
-        satoshi::to_sats_signed(satoshis, Rounding::Up)
+        safe_math::to_sats_signed(satoshis, Rounding::Up)
             .map_err(|_| LmsrError::InvalidCostCalculation)
     }
 
-    fn calculate_fee(&self, cost_satoshis: u64, fee_rate: f64) -> u64 {
-        let fee_bp = (fee_rate * (FEE_SCALE as f64)).round() as u64;
-        cost_satoshis.saturating_mul(fee_bp) / FEE_SCALE
+    fn calculate_fee(
+        &self,
+        cost_satoshis: u64,
+        fee_rate: f64,
+    ) -> Result<u64, LmsrError> {
+        let bp = BasisPoints::from_f64(fee_rate).map_err(|e| {
+            LmsrError::InvalidFeeRate {
+                rate: fee_rate,
+                reason: e.to_string(),
+            }
+        })?;
+        Ok(bp.apply_to_u64(cost_satoshis))
     }
 }
 
 impl Default for Lmsr {
     fn default() -> Self {
-        Self::new(256)
-    }
-}
-
-pub struct LmsrMultidim;
-
-impl LmsrMultidim {
-    pub fn new(_max_total_outcomes: usize) -> Self {
-        Self
-    }
-
-    pub fn cost_function_multidim(
-        &self,
-        beta: f64,
-        shares: &Array<f64, IxDyn>,
-    ) -> Result<f64, LmsrError> {
-        if beta <= MIN_BETA || beta >= MAX_BETA {
-            return Err(LmsrError::InvalidBeta {
-                beta,
-                min: MIN_BETA,
-                max: MAX_BETA,
-            });
-        }
-
-        let flat_shares =
-            shares.as_slice().ok_or(LmsrError::InvalidCostCalculation)?;
-
-        if flat_shares.is_empty() {
-            return Ok(0.0);
-        }
-
-        let max_share = flat_shares
-            .iter()
-            .fold(f64::NEG_INFINITY, |acc, &x| acc.max(x));
-
-        let mut sum_exp = 0.0;
-        for &share in flat_shares {
-            let exp_val = ((share - max_share) / beta).exp();
-            if !exp_val.is_finite() {
-                return Err(LmsrError::ShareQuantityOverflow);
-            }
-            sum_exp += exp_val;
-        }
-
-        if sum_exp <= 0.0 || !sum_exp.is_finite() {
-            return Err(LmsrError::InvalidCostCalculation);
-        }
-
-        let cost = beta * (sum_exp.ln() + max_share / beta);
-
-        if !cost.is_finite() {
-            return Err(LmsrError::InvalidCostCalculation);
-        }
-
-        Ok(cost)
-    }
-
-    pub fn calculate_prices_multidim(
-        &self,
-        beta: f64,
-        shares: &Array<f64, IxDyn>,
-    ) -> Result<Array<f64, IxDyn>, LmsrError> {
-        let flat_shares =
-            shares.as_slice().ok_or(LmsrError::InvalidCostCalculation)?;
-
-        if flat_shares.is_empty() {
-            return Ok(Array::zeros(shares.raw_dim()));
-        }
-
-        let max_share = flat_shares
-            .iter()
-            .fold(f64::NEG_INFINITY, |acc, &x| acc.max(x));
-
-        let mut exp_values = Vec::with_capacity(flat_shares.len());
-        let mut sum_exp = 0.0;
-
-        for &share in flat_shares {
-            let exp_val = ((share - max_share) / beta).exp();
-            if !exp_val.is_finite() {
-                return Err(LmsrError::ShareQuantityOverflow);
-            }
-            exp_values.push(exp_val);
-            sum_exp += exp_val;
-        }
-
-        if sum_exp <= 0.0 || !sum_exp.is_finite() {
-            return Err(LmsrError::InvalidCostCalculation);
-        }
-
-        let prices_vec: Vec<f64> =
-            exp_values.iter().map(|&x| x / sum_exp).collect();
-
-        let prices = Array::from_shape_vec(shares.raw_dim(), prices_vec)
-            .map_err(|_| LmsrError::InvalidCostCalculation)?;
-
-        Ok(prices)
+        Self::new(MAX_OUTCOMES)
     }
 }
 
@@ -509,14 +499,9 @@ impl LmsrService {
         beta: f64,
         shares: &Array1<f64>,
     ) -> Result<(), LmsrError> {
-        let state = LmsrState {
-            beta,
-            shares: shares.clone(),
-            treasury_balance: u64::MAX,
-            trading_fee: 0.0,
-        };
         let lmsr = Lmsr::new(shares.len());
-        lmsr.validate_state(&state)
+        let _prices = lmsr.validate_params(beta, &shares.view())?;
+        Ok(())
     }
 
     pub fn calculate_prices(
@@ -545,34 +530,6 @@ impl LmsrService {
 
         Ok(new_cost - current_cost)
     }
-
-    pub fn query_cost_for_update(
-        current_shares: &Array1<f64>,
-        beta: f64,
-        target_cost: f64,
-    ) -> Result<f64, LmsrError> {
-        if target_cost <= 0.0 {
-            return Err(LmsrError::InvalidCostCalculation);
-        }
-
-        let lmsr = Lmsr::new(current_shares.len());
-        let current_cost = lmsr.cost_function(beta, &current_shares.view())?;
-        let target_total_cost = current_cost + target_cost;
-        Ok(target_total_cost)
-    }
-
-    pub fn create_lmsr_for_market(
-        market_size: usize,
-    ) -> Result<Lmsr, LmsrError> {
-        if market_size == 0 || market_size > 256 {
-            return Err(LmsrError::InvalidOutcomeCount {
-                count: market_size,
-                min: 1,
-                max: 256,
-            });
-        }
-        Ok(Lmsr::new(market_size))
-    }
 }
 
 pub fn calculate_cost(shares: &[f64], beta: f64) -> Result<f64, LmsrError> {
@@ -591,6 +548,7 @@ pub fn calculate_prices(
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::uninlined_format_args)]
 mod tests {
     use super::*;
     use ndarray::array;
@@ -623,21 +581,6 @@ mod tests {
     }
 
     #[test]
-    fn test_multidim_market() {
-        let lmsr = LmsrMultidim::new(256);
-        let shares = Array::zeros(IxDyn(&[2, 3, 2]));
-        let beta = 7.0;
-
-        let cost = lmsr.cost_function_multidim(beta, &shares).unwrap();
-        let expected_cost = beta * (12.0_f64).ln();
-        assert!((cost - expected_cost).abs() < LMSR_PRECISION);
-
-        let prices = lmsr.calculate_prices_multidim(beta, &shares).unwrap();
-        let price_sum: f64 = prices.sum();
-        assert!((price_sum - 1.0).abs() < LMSR_PRECISION);
-    }
-
-    #[test]
     fn test_numerical_stability() {
         let lmsr = Lmsr::default();
         let shares = array![1000.0, 999.0, 998.0];
@@ -650,7 +593,7 @@ mod tests {
         assert!(
             prices
                 .iter()
-                .all(|&p| p.is_finite() && p >= 0.0 && p <= 1.0)
+                .all(|&p| p.is_finite() && (0.0..=1.0).contains(&p))
         );
     }
 }
