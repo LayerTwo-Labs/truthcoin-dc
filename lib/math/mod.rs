@@ -1,3 +1,3 @@
 pub mod lmsr;
-pub mod satoshi;
+pub mod safe_math;
 pub mod voting;
