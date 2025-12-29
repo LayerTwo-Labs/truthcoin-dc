@@ -1,11 +1,8 @@
 pub mod consensus;
 pub mod constants;
-pub mod matrix;
 
 use crate::state::slots::SlotId;
-
-use ndarray::{Array1, Array2};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum VotingMathError {
@@ -17,6 +14,11 @@ pub enum VotingMathError {
 
     #[error("Invalid reputation values: {reason}")]
     InvalidReputation { reason: String },
+
+    #[error(
+        "Invalid reputation value: {value} (must be finite and in [0.0, 1.0])"
+    )]
+    InvalidReputationValue { value: f64 },
 
     #[error("Numerical computation error: {reason}")]
     NumericalError { reason: String },
@@ -30,10 +32,14 @@ pub struct SparseVoteMatrix {
     entries: HashMap<(usize, usize), f64>,
     voter_indices: HashMap<crate::types::Address, usize>,
     decision_indices: HashMap<SlotId, usize>,
-    index_to_voter: HashMap<usize, crate::types::Address>,
-    index_to_decision: HashMap<usize, SlotId>,
+    voters: Vec<crate::types::Address>,
+    decisions: Vec<SlotId>,
     num_voters: usize,
     num_decisions: usize,
+    /// set of decision indices with votes
+    row_entries: Vec<HashSet<usize>>,
+    /// set of voter indices with votes
+    col_entries: Vec<HashSet<usize>>,
 }
 
 impl SparseVoteMatrix {
@@ -44,28 +50,28 @@ impl SparseVoteMatrix {
         let num_voters = voters.len();
         let num_decisions = decisions.len();
 
-        let mut voter_indices = HashMap::new();
-        let mut index_to_voter = HashMap::new();
-        for (i, voter_id) in voters.into_iter().enumerate() {
-            voter_indices.insert(voter_id, i);
-            index_to_voter.insert(i, voter_id);
-        }
+        let voter_indices: HashMap<_, _> = voters
+            .iter()
+            .enumerate()
+            .map(|(i, &addr)| (addr, i))
+            .collect();
 
-        let mut decision_indices = HashMap::new();
-        let mut index_to_decision = HashMap::new();
-        for (j, decision_id) in decisions.into_iter().enumerate() {
-            decision_indices.insert(decision_id, j);
-            index_to_decision.insert(j, decision_id);
-        }
+        let decision_indices: HashMap<_, _> = decisions
+            .iter()
+            .enumerate()
+            .map(|(j, &slot)| (slot, j))
+            .collect();
 
         Self {
             entries: HashMap::new(),
             voter_indices,
             decision_indices,
-            index_to_voter,
-            index_to_decision,
+            voters,
+            decisions,
             num_voters,
             num_decisions,
+            row_entries: vec![HashSet::new(); num_voters],
+            col_entries: vec![HashSet::new(); num_decisions],
         }
     }
 
@@ -79,8 +85,7 @@ impl SparseVoteMatrix {
             *self.voter_indices.get(&voter_address).ok_or_else(|| {
                 VotingMathError::InvalidReputation {
                     reason: format!(
-                        "Voter {:?} not found in matrix",
-                        voter_address
+                        "Voter {voter_address:?} not found in matrix"
                     ),
                 }
             })?;
@@ -89,13 +94,13 @@ impl SparseVoteMatrix {
             .decision_indices
             .get(&decision_id)
             .ok_or_else(|| VotingMathError::InvalidReputation {
-                reason: format!(
-                    "Decision {:?} not found in matrix",
-                    decision_id
-                ),
+                reason: format!("Decision {decision_id:?} not found in matrix"),
             })?;
 
         self.entries.insert((voter_idx, decision_idx), value);
+        self.row_entries[voter_idx].insert(decision_idx);
+        self.col_entries[decision_idx].insert(voter_idx);
+
         Ok(())
     }
 
@@ -109,19 +114,6 @@ impl SparseVoteMatrix {
         self.entries.get(&(voter_idx, decision_idx)).copied()
     }
 
-    pub fn to_dense(&self, fill_value: f64) -> Array2<f64> {
-        let mut dense = Array2::from_elem(
-            (self.num_voters, self.num_decisions),
-            fill_value,
-        );
-
-        for (&(i, j), &value) in &self.entries {
-            dense[[i, j]] = value;
-        }
-
-        dense
-    }
-
     pub fn dimensions(&self) -> (usize, usize) {
         (self.num_voters, self.num_decisions)
     }
@@ -130,14 +122,7 @@ impl SparseVoteMatrix {
         self.entries.len()
     }
 
-    pub fn density(&self) -> f64 {
-        if self.num_voters == 0 || self.num_decisions == 0 {
-            return 0.0;
-        }
-        self.entries.len() as f64
-            / (self.num_voters * self.num_decisions) as f64
-    }
-
+    /// Get all votes by a specific voter. O(k) where k = votes by a voter.
     pub fn get_voter_votes(
         &self,
         voter_address: crate::types::Address,
@@ -145,11 +130,12 @@ impl SparseVoteMatrix {
         let mut votes = HashMap::new();
 
         if let Some(&voter_idx) = self.voter_indices.get(&voter_address) {
-            for (&(i, j), &value) in &self.entries {
-                if i == voter_idx {
-                    if let Some(&decision_id) = self.index_to_decision.get(&j) {
-                        votes.insert(decision_id, value);
-                    }
+            for &decision_idx in &self.row_entries[voter_idx] {
+                if let Some(&value) =
+                    self.entries.get(&(voter_idx, decision_idx))
+                {
+                    let decision_id = self.decisions[decision_idx];
+                    votes.insert(decision_id, value);
                 }
             }
         }
@@ -164,11 +150,14 @@ impl SparseVoteMatrix {
         let mut votes = HashMap::new();
 
         if let Some(&decision_idx) = self.decision_indices.get(&decision_id) {
-            for (&(i, j), &value) in &self.entries {
-                if j == decision_idx {
-                    if let Some(&voter_id) = self.index_to_voter.get(&i) {
-                        votes.insert(voter_id, value);
-                    }
+            // Use column index for O(k) lookup instead of O(M) full scan
+            for &voter_idx in &self.col_entries[decision_idx] {
+                if let Some(&value) =
+                    self.entries.get(&(voter_idx, decision_idx))
+                {
+                    // Vec index lookup is O(1) and bounds-checked
+                    let voter_id = self.voters[voter_idx];
+                    votes.insert(voter_id, value);
                 }
             }
         }
@@ -176,26 +165,24 @@ impl SparseVoteMatrix {
         votes
     }
 
-    pub fn get_voters(&self) -> Vec<crate::types::Address> {
-        (0..self.num_voters)
-            .filter_map(|i| self.index_to_voter.get(&i).copied())
-            .collect()
+    /// Returns a slice of all voters. Avoids cloning.
+    pub fn get_voters(&self) -> &[crate::types::Address] {
+        &self.voters
     }
 
-    pub fn get_decisions(&self) -> Vec<SlotId> {
-        (0..self.num_decisions)
-            .filter_map(|j| self.index_to_decision.get(&j).copied())
-            .collect()
+    /// Returns a slice of all decisions. Avoids cloning.
+    pub fn get_decisions(&self) -> &[SlotId] {
+        &self.decisions
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ReputationVector {
+pub struct VotingWeightVector {
     reputations: HashMap<crate::types::Address, f64>,
     total_weight: Option<f64>,
 }
 
-impl ReputationVector {
+impl VotingWeightVector {
     pub fn new() -> Self {
         Self {
             reputations: HashMap::new(),
@@ -227,22 +214,6 @@ impl ReputationVector {
         weight
     }
 
-    pub fn normalize(&mut self) {
-        let total = self.total_weight();
-        if total > 0.0 {
-            for reputation in self.reputations.values_mut() {
-                *reputation /= total;
-            }
-            self.total_weight = Some(1.0);
-        }
-    }
-
-    pub fn to_array(&self, voters: &[crate::types::Address]) -> Array1<f64> {
-        Array1::from_iter(
-            voters.iter().map(|&voter_id| self.get_reputation(voter_id)),
-        )
-    }
-
     pub fn len(&self) -> usize {
         self.reputations.len()
     }
@@ -270,189 +241,16 @@ impl ReputationVector {
     }
 }
 
-impl Default for ReputationVector {
+impl Default for VotingWeightVector {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub struct VoteAggregator;
-
-impl VoteAggregator {
-    pub fn simple_majority(votes: &HashMap<crate::types::Address, f64>) -> f64 {
-        if votes.is_empty() {
-            return 0.5;
-        }
-
-        let total: f64 = votes.values().sum();
-        let average = total / votes.len() as f64;
-
-        if average >= 0.5 { 1.0 } else { 0.0 }
-    }
-
-    pub fn weighted_average(
-        votes: &HashMap<crate::types::Address, f64>,
-        reputations: &ReputationVector,
-    ) -> f64 {
-        if votes.is_empty() {
-            return 0.5;
-        }
-
-        let mut weighted_sum = 0.0;
-        let mut total_weight = 0.0;
-
-        for (&voter_id, &vote) in votes {
-            let weight = reputations.get_reputation(voter_id);
-            weighted_sum += vote * weight;
-            total_weight += weight;
-        }
-
-        if total_weight > 0.0 {
-            weighted_sum / total_weight
-        } else {
-            0.5
-        }
-    }
-
-    pub fn median_vote(votes: &HashMap<crate::types::Address, f64>) -> f64 {
-        if votes.is_empty() {
-            return 0.5;
-        }
-
-        let mut values: Vec<f64> = votes.values().copied().collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let len = values.len();
-        if len % 2 == 0 {
-            (values[len / 2 - 1] + values[len / 2]) / 2.0
-        } else {
-            values[len / 2]
-        }
-    }
-
-    pub fn calculate_confidence(
-        votes: &HashMap<crate::types::Address, f64>,
-        outcome: f64,
-    ) -> f64 {
-        if votes.is_empty() {
-            return 0.0;
-        }
-
-        let mut agreement_count = 0;
-        let total_votes = votes.len();
-
-        for &vote in votes.values() {
-            let agrees = if outcome >= 0.5 {
-                vote >= 0.5
-            } else {
-                vote < 0.5
-            };
-
-            if agrees {
-                agreement_count += 1;
-            }
-        }
-
-        agreement_count as f64 / total_votes as f64
-    }
-}
-
-pub struct MatrixUtils;
-
-impl MatrixUtils {
-    pub fn calculate_participation_rates(
-        matrix: &SparseVoteMatrix,
-    ) -> HashMap<SlotId, f64> {
-        let mut rates = HashMap::new();
-        let (num_voters, _) = matrix.dimensions();
-
-        if num_voters == 0 {
-            return rates;
-        }
-
-        for decision_id in matrix.get_decisions() {
-            let votes = matrix.get_decision_votes(decision_id);
-            let rate = votes.len() as f64 / num_voters as f64;
-            rates.insert(decision_id, rate);
-        }
-
-        rates
-    }
-
-    pub fn calculate_voter_activity(
-        matrix: &SparseVoteMatrix,
-    ) -> HashMap<crate::types::Address, f64> {
-        let mut activity = HashMap::new();
-        let (_, num_decisions) = matrix.dimensions();
-
-        if num_decisions == 0 {
-            return activity;
-        }
-
-        for voter_id in matrix.get_voters() {
-            let votes = matrix.get_voter_votes(voter_id);
-            let rate = votes.len() as f64 / num_decisions as f64;
-            activity.insert(voter_id, rate);
-        }
-
-        activity
-    }
-
-    pub fn find_outlier_voters(
-        matrix: &SparseVoteMatrix,
-        threshold: f64,
-    ) -> Result<Vec<crate::types::Address>, VotingMathError> {
-        let decisions = matrix.get_decisions();
-        if decisions.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut outliers = Vec::new();
-
-        for voter_id in matrix.get_voters() {
-            let mut deviations = Vec::new();
-
-            for decision_id in &decisions {
-                let decision_votes = matrix.get_decision_votes(*decision_id);
-                if decision_votes.len() < 2 {
-                    continue;
-                }
-
-                let majority = VoteAggregator::simple_majority(&decision_votes);
-                if let Some(voter_vote) =
-                    matrix.get_vote(voter_id, *decision_id)
-                {
-                    let deviation = (voter_vote - majority).abs();
-                    deviations.push(deviation);
-                }
-            }
-
-            if deviations.is_empty() {
-                continue;
-            }
-
-            let mean: f64 =
-                deviations.iter().sum::<f64>() / deviations.len() as f64;
-            let variance: f64 =
-                deviations.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
-                    / deviations.len() as f64;
-            let std_dev = variance.sqrt();
-
-            if mean > threshold * std_dev {
-                outliers.push(voter_id);
-            }
-        }
-
-        Ok(outliers)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct DetailedConsensusResult {
-    /// Decision outcomes. `None` indicates unanimous abstention (no votes cast).
     pub outcomes: HashMap<SlotId, Option<f64>>,
     pub first_loading: Vec<f64>,
-    pub explained_variance: f64,
     pub certainty: f64,
     pub updated_reputations: HashMap<crate::types::Address, f64>,
     pub outliers: Vec<crate::types::Address>,
@@ -462,18 +260,9 @@ pub struct DetailedConsensusResult {
 /// Outcomes are then used to update reputation in the next period.
 pub fn calculate_consensus(
     vote_matrix: &SparseVoteMatrix,
-    reputation_vector: &ReputationVector,
+    reputation_vector: &VotingWeightVector,
 ) -> Result<DetailedConsensusResult, VotingMathError> {
-    let detailed = consensus::run_consensus(vote_matrix, reputation_vector)?;
-
-    Ok(DetailedConsensusResult {
-        outcomes: detailed.outcomes,
-        first_loading: detailed.first_loading,
-        explained_variance: detailed.explained_variance,
-        certainty: detailed.certainty,
-        updated_reputations: detailed.updated_reputations,
-        outliers: detailed.outliers,
-    })
+    consensus::run_consensus(vote_matrix, reputation_vector)
 }
 
 #[cfg(test)]

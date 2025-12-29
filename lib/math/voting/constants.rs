@@ -11,16 +11,8 @@ pub const PRODUCTION_PERIOD_DURATION_SECONDS: u64 = SECONDS_PER_QUARTER;
 pub const VOTECOIN_STALENESS_BLOCKS: u64 = 10;
 pub const CONSENSUS_PRECISION_DECIMALS: u32 = 8;
 pub const REPUTATION_PRECISION_DECIMALS: u32 = 10;
-pub const SVD_PRECISION_DECIMALS: u32 = 12;
 
-#[inline]
-pub fn round_to_precision(value: f64, decimals: u32) -> f64 {
-    if value.is_nan() || value.is_infinite() {
-        return value;
-    }
-    let multiplier = 10f64.powi(decimals as i32);
-    (value * multiplier).round() / multiplier
-}
+pub use crate::math::safe_math::round_to_precision;
 
 #[inline]
 pub fn round_outcome(value: f64) -> f64 {
@@ -32,12 +24,8 @@ pub fn round_reputation(value: f64) -> f64 {
     round_to_precision(value, REPUTATION_PRECISION_DECIMALS)
 }
 
-#[inline]
-pub fn round_svd(value: f64) -> f64 {
-    round_to_precision(value, SVD_PRECISION_DECIMALS)
-}
-
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
 

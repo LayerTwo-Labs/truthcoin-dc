@@ -2,8 +2,11 @@ use super::constants::{
     BITCOIN_HIVEMIND_NEUTRAL_VALUE, CONSENSUS_CATCH_TOLERANCE,
     SVD_NUMERICAL_TOLERANCE, round_outcome, round_reputation,
 };
-use super::{ReputationVector, SparseVoteMatrix, VotingMathError};
-use crate::state::slots::SlotId;
+use super::{
+    DetailedConsensusResult, SparseVoteMatrix, VotingMathError,
+    VotingWeightVector,
+};
+use crate::math::safe_math::safe_cmp_f64;
 
 use nalgebra::{DMatrix, DVector, SVD};
 use std::collections::HashMap;
@@ -35,7 +38,7 @@ pub fn re_weight(vector_in: &DVector<f64>) -> DVector<f64> {
     }
 
     let sum = out.sum();
-    out.apply(|x| *x = *x / sum);
+    out.apply(|x| *x /= sum);
 
     out
 }
@@ -50,15 +53,57 @@ pub fn catch_tl(x: f64, tolerance: f64) -> f64 {
     }
 }
 
-pub fn weighted_median(values: &DVector<f64>, weights: &DVector<f64>) -> f64 {
-    assert_eq!(
-        values.len(),
-        weights.len(),
-        "Values and weights must have the same length"
-    );
+/// Compute weighted mean for each column (decision) in a vote matrix.
+/// Returns (outcomes, has_votes) where has_votes[j] is true if column j had any non-NaN votes.
+pub fn compute_weighted_column_means(
+    matrix: &DMatrix<f64>,
+    weights: &DVector<f64>,
+) -> (DVector<f64>, Vec<bool>) {
+    let num_decisions = matrix.ncols();
+    let mut outcomes = DVector::zeros(num_decisions);
+    let mut has_votes = vec![false; num_decisions];
+
+    for j in 0..num_decisions {
+        let mut weighted_sum = 0.0;
+        let mut total_weight = 0.0;
+
+        for i in 0..matrix.nrows() {
+            let vote = matrix[(i, j)];
+            if !vote.is_nan() {
+                let weight = weights[i];
+                weighted_sum += vote * weight;
+                total_weight += weight;
+                has_votes[j] = true;
+            }
+        }
+
+        outcomes[j] = if total_weight > 0.0 {
+            weighted_sum / total_weight
+        } else {
+            BITCOIN_HIVEMIND_NEUTRAL_VALUE
+        };
+    }
+
+    (outcomes, has_votes)
+}
+
+pub fn weighted_median(
+    values: &DVector<f64>,
+    weights: &DVector<f64>,
+) -> Result<f64, VotingMathError> {
+    if values.len() != weights.len() {
+        return Err(VotingMathError::DimensionMismatch {
+            expected: format!("values length {}", values.len()),
+            actual: format!("weights length {}", weights.len()),
+        });
+    }
+
+    if values.is_empty() {
+        return Err(VotingMathError::EmptyMatrix);
+    }
 
     let mut sorted: Vec<_> = values.iter().zip(weights.iter()).collect();
-    sorted.sort_by(|a, b| a.0.partial_cmp(b.0).unwrap());
+    sorted.sort_by(|a, b| safe_cmp_f64(*a.0, *b.0));
 
     let total_weight: f64 = weights.iter().sum();
     let mut cumulative_weight = 0.0;
@@ -68,26 +113,27 @@ pub fn weighted_median(values: &DVector<f64>, weights: &DVector<f64>) -> f64 {
         cumulative_weight += weight;
         if cumulative_weight >= half_weight {
             if cumulative_weight == half_weight && i < sorted.len() - 1 {
-                return (*value + *sorted[i + 1].0) / 2.0;
+                return Ok((*value + *sorted[i + 1].0) / 2.0);
             } else {
-                return *value;
+                return Ok(*value);
             }
         }
     }
 
-    *sorted.last().unwrap().0
+    // Safe because we checked for empty above
+    Ok(*sorted.last().expect("non-empty after check").0)
 }
 
 fn score_reflect(
     component: &DVector<f64>,
     previous_reputation: &DVector<f64>,
-) -> DVector<f64> {
+) -> Result<DVector<f64>, VotingMathError> {
     let unique_count = component.len();
     if unique_count <= 2 {
-        return component.clone();
+        return Ok(component.clone());
     }
 
-    let median_factor = weighted_median(component, previous_reputation);
+    let median_factor = weighted_median(component, previous_reputation)?;
     let reflection =
         component - DVector::from_element(component.len(), median_factor);
     let excessive = reflection.map(|x| x > 0.0);
@@ -100,13 +146,12 @@ fn score_reflect(
         }
     }
 
-    adj_prin_comp
+    Ok(adj_prin_comp)
 }
 
 pub fn weighted_prin_comp(
     x: &DMatrix<f64>,
     weights: Option<&DVector<f64>>,
-    _verbose: bool,
 ) -> Result<(DVector<f64>, DVector<f64>), VotingMathError> {
     let n_rows = x.nrows();
     let _n_cols = x.ncols();
@@ -115,7 +160,7 @@ pub fn weighted_prin_comp(
         Some(w) => {
             if w.len() != n_rows {
                 return Err(VotingMathError::DimensionMismatch {
-                    expected: format!("weights length {}", n_rows),
+                    expected: format!("weights length {n_rows}"),
                     actual: format!("weights length {}", w.len()),
                 });
             }
@@ -172,8 +217,6 @@ pub fn get_reward_weights(
     vote_matrix: &DMatrix<f64>,
     rep: Option<&DVector<f64>>,
     alpha: f64,
-    _tolerance: f64,
-    _verbose: bool,
 ) -> Result<RewardWeightsResult, VotingMathError> {
     let num_voters = vote_matrix.nrows();
 
@@ -183,7 +226,7 @@ pub fn get_reward_weights(
     };
 
     let (first_score, first_loading) =
-        weighted_prin_comp(vote_matrix, Some(&old_rep), false)?;
+        weighted_prin_comp(vote_matrix, Some(&old_rep))?;
 
     let mut new_rep = old_rep.clone();
 
@@ -196,34 +239,13 @@ pub fn get_reward_weights(
         let option1 = &first_score + score_min.abs();
         let option2 = (&first_score - score_max).abs();
 
-        let new_score_1 = score_reflect(&option1, &old_rep);
-        let new_score_2 = score_reflect(&option2, &old_rep);
+        let new_score_1 = score_reflect(&option1, &old_rep)?;
+        let new_score_2 = score_reflect(&option2, &old_rep)?;
 
-        let mut old_rep_outcomes = DVector::zeros(vote_matrix.ncols());
-        for j in 0..vote_matrix.ncols() {
-            let mut weighted_sum = 0.0;
-            let mut total_weight = 0.0;
-
-            for i in 0..vote_matrix.nrows() {
-                let vote = vote_matrix[(i, j)];
-                if !vote.is_nan() {
-                    let weight = old_rep[i];
-                    weighted_sum += vote * weight;
-                    total_weight += weight;
-                }
-            }
-
-            old_rep_outcomes[j] = if total_weight > 0.0 {
-                weighted_sum / total_weight
-            } else {
-                BITCOIN_HIVEMIND_NEUTRAL_VALUE
-            };
-        }
-
-        for j in 0..old_rep_outcomes.len() {
-            old_rep_outcomes[j] =
-                catch_tl(old_rep_outcomes[j], CONSENSUS_CATCH_TOLERANCE);
-        }
+        let (raw_outcomes, _) =
+            compute_weighted_column_means(vote_matrix, &old_rep);
+        let old_rep_outcomes =
+            raw_outcomes.map(|x| catch_tl(x, CONSENSUS_CATCH_TOLERANCE));
 
         let mut distance =
             DMatrix::zeros(vote_matrix.nrows(), vote_matrix.ncols());
@@ -306,13 +328,12 @@ pub fn fill_na(
     m_na: &DMatrix<f64>,
     rep: Option<&DVector<f64>>,
     catch_p: f64,
-    _verbose: bool,
 ) -> FillNaResult {
     let mut m_new = m_na.clone();
     let num_decisions = m_na.ncols();
 
     // Track which decisions have at least one vote
-    let mut has_votes = vec![false; num_decisions];
+    let has_votes;
 
     let has_nan = m_na.iter().any(|&x| x.is_nan());
 
@@ -323,29 +344,10 @@ pub fn fill_na(
             None => DVector::from_element(num_voters, 1.0 / num_voters as f64),
         };
 
-        let mut decision_outcomes = DVector::zeros(m_na.ncols());
-        for j in 0..m_na.ncols() {
-            let mut weighted_sum = 0.0;
-            let mut total_weight = 0.0;
-
-            for i in 0..m_na.nrows() {
-                let vote = m_na[(i, j)];
-                if !vote.is_nan() {
-                    let weight = rep[i];
-                    weighted_sum += vote * weight;
-                    total_weight += weight;
-                    has_votes[j] = true;
-                }
-            }
-
-            let outcome = if total_weight > 0.0 {
-                weighted_sum / total_weight
-            } else {
-                BITCOIN_HIVEMIND_NEUTRAL_VALUE
-            };
-
-            decision_outcomes[j] = catch_tl(outcome, catch_p);
-        }
+        let (raw_outcomes, votes_present) =
+            compute_weighted_column_means(m_na, &rep);
+        has_votes = votes_present;
+        let decision_outcomes = raw_outcomes.map(|x| catch_tl(x, catch_p));
 
         for i in 0..m_new.nrows() {
             for j in 0..m_new.ncols() {
@@ -372,56 +374,27 @@ pub struct FactoryResult {
     pub has_votes: Vec<bool>,
     pub certainty: f64,
     pub first_loading: DVector<f64>,
-    pub explained_variance: f64,
 }
 
 pub fn factory(
     m0: &DMatrix<f64>,
     rep: Option<&DVector<f64>>,
     catch_p: Option<f64>,
-    verbose: Option<bool>,
 ) -> Result<FactoryResult, VotingMathError> {
-    let verbose = verbose.unwrap_or(false);
     let catch_p = catch_p.unwrap_or(CONSENSUS_CATCH_TOLERANCE);
 
-    let fill_result = fill_na(m0, rep, catch_p, verbose);
+    let fill_result = fill_na(m0, rep, catch_p);
     let filled = fill_result.filled;
     let has_votes = fill_result.has_votes;
 
     use super::constants::REPUTATION_SMOOTHING_ALPHA;
-    let player_info = get_reward_weights(
-        &filled,
-        rep,
-        REPUTATION_SMOOTHING_ALPHA,
-        catch_p,
-        verbose,
-    )?;
+    let player_info =
+        get_reward_weights(&filled, rep, REPUTATION_SMOOTHING_ALPHA)?;
 
-    let mut decision_outcomes = DVector::zeros(filled.ncols());
-    for j in 0..filled.ncols() {
-        let mut weighted_sum = 0.0;
-        let mut total_weight = 0.0;
-
-        for i in 0..filled.nrows() {
-            let vote = filled[(i, j)];
-            if !vote.is_nan() {
-                let weight = player_info.smooth_rep[i];
-                weighted_sum += vote * weight;
-                total_weight += weight;
-            }
-        }
-
-        decision_outcomes[j] = if total_weight > 0.0 {
-            weighted_sum / total_weight
-        } else {
-            BITCOIN_HIVEMIND_NEUTRAL_VALUE
-        };
-    }
-
-    let mut decision_outcomes_final = decision_outcomes.clone();
-    for j in 0..decision_outcomes_final.len() {
-        decision_outcomes_final[j] = catch_tl(decision_outcomes[j], catch_p);
-    }
+    let (decision_outcomes, _) =
+        compute_weighted_column_means(&filled, &player_info.smooth_rep);
+    let decision_outcomes_final =
+        decision_outcomes.map(|x| catch_tl(x, catch_p));
 
     let mut certainty = vec![0.0; filled.ncols()];
     for j in 0..filled.ncols() {
@@ -438,21 +411,9 @@ pub fn factory(
 
     let avg_certainty = certainty.iter().sum::<f64>() / certainty.len() as f64;
 
-    let svd_for_variance =
-        weighted_prin_comp(&filled, Some(&player_info.smooth_rep), false)?;
-
-    let first_component_magnitude = svd_for_variance.0.norm();
-    let total_magnitude = filled.norm();
-    let explained_variance = if total_magnitude > 0.0 {
-        (first_component_magnitude / total_magnitude).min(1.0)
-    } else {
-        0.0
-    };
-
     Ok(FactoryResult {
         filled,
         first_loading: player_info.first_loading.clone(),
-        explained_variance,
         agents: player_info,
         decisions: decision_outcomes_final,
         has_votes,
@@ -460,19 +421,10 @@ pub fn factory(
     })
 }
 
-pub struct DetailedConsensusOutput {
-    pub outcomes: HashMap<SlotId, Option<f64>>,
-    pub first_loading: Vec<f64>,
-    pub explained_variance: f64,
-    pub certainty: f64,
-    pub updated_reputations: HashMap<crate::types::Address, f64>,
-    pub outliers: Vec<crate::types::Address>,
-}
-
 pub fn run_consensus(
     vote_matrix: &SparseVoteMatrix,
-    reputation_vector: &ReputationVector,
-) -> Result<DetailedConsensusOutput, VotingMathError> {
+    reputation_vector: &VotingWeightVector,
+) -> Result<DetailedConsensusResult, VotingMathError> {
     let voters = vote_matrix.get_voters();
     let decisions = vote_matrix.get_decisions();
     let (num_voters, num_decisions) = vote_matrix.dimensions();
@@ -504,7 +456,6 @@ pub fn run_consensus(
         &dense_matrix,
         Some(&rep_vector),
         Some(CONSENSUS_CATCH_TOLERANCE),
-        Some(false),
     )?;
 
     let mut outcomes = HashMap::new();
@@ -563,10 +514,9 @@ pub fn run_consensus(
         }
     }
 
-    Ok(DetailedConsensusOutput {
+    Ok(DetailedConsensusResult {
         outcomes,
         first_loading,
-        explained_variance: result.explained_variance,
         certainty: result.certainty,
         updated_reputations,
         outliers,
@@ -574,6 +524,7 @@ pub fn run_consensus(
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::uninlined_format_args)]
 mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
@@ -593,10 +544,24 @@ mod tests {
     fn test_weighted_median() {
         let values = DVector::from_vec(vec![3.0, 4.0, 5.0]);
         let weights = DVector::from_vec(vec![0.2, 0.2, 0.6]);
-        assert_eq!(weighted_median(&values, &weights), 5.0);
+        assert_eq!(weighted_median(&values, &weights).unwrap(), 5.0);
 
         let weights2 = DVector::from_vec(vec![0.2, 0.2, 0.4]);
-        assert_eq!(weighted_median(&values, &weights2), 4.5);
+        assert_eq!(weighted_median(&values, &weights2).unwrap(), 4.5);
+    }
+
+    #[test]
+    fn test_weighted_median_empty() {
+        let values = DVector::from_vec(vec![]);
+        let weights = DVector::from_vec(vec![]);
+        assert!(weighted_median(&values, &weights).is_err());
+    }
+
+    #[test]
+    fn test_weighted_median_dimension_mismatch() {
+        let values = DVector::from_vec(vec![1.0, 2.0]);
+        let weights = DVector::from_vec(vec![0.5]);
+        assert!(weighted_median(&values, &weights).is_err());
     }
 
     #[test]
@@ -619,7 +584,7 @@ mod tests {
             &[0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
         );
 
-        let (score, loading) = weighted_prin_comp(&m1, None, false).unwrap();
+        let (score, loading) = weighted_prin_comp(&m1, None).unwrap();
 
         // Check dimensions
         assert_eq!(score.len(), 3);
