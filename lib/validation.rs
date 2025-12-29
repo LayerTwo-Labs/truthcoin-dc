@@ -1,4 +1,4 @@
-use crate::math::satoshi::{self, Rounding};
+use crate::math::safe_math::{self, Rounding};
 use crate::state::Error;
 use crate::state::markets::MarketState::*;
 use crate::state::markets::{
@@ -232,8 +232,7 @@ impl MarketValidator {
                 state.slots().get_slot(rotxn, slot_id)?.ok_or_else(|| {
                     Error::InvalidTransaction {
                         reason: format!(
-                            "Referenced decision slot {} does not exist",
-                            slot_hex
+                            "Referenced decision slot {slot_hex} does not exist"
                         ),
                     }
                 })?;
@@ -242,8 +241,7 @@ impl MarketValidator {
             if slot.decision.is_none() {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
-                        "Referenced slot {} has no decision claimed",
-                        slot_hex
+                        "Referenced slot {slot_hex} has no decision claimed"
                     ),
                 });
             }
@@ -272,22 +270,20 @@ impl MarketValidator {
         if beta <= 0.0 {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "LMSR beta parameter must be positive, got {}",
-                    beta
+                    "LMSR beta parameter must be positive, got {beta}"
                 ),
             });
         }
 
         // Validate trading fee if specified
-        if let Some(fee) = market_data.trading_fee {
-            if fee < 0.0 || fee > 1.0 {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Trading fee must be between 0.0 and 1.0, got {}",
-                        fee
-                    ),
-                });
-            }
+        if let Some(fee) = market_data.trading_fee
+            && (!(0.0..=1.0).contains(&fee))
+        {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Trading fee must be between 0.0 and 1.0, got {fee}"
+                ),
+            });
         }
 
         // Validate market maker authorization
@@ -376,7 +372,7 @@ impl MarketValidator {
         }
 
         // Validate max cost is positive
-        if buy_data.max_cost <= 0 {
+        if buy_data.max_cost == 0 {
             return Err(Error::InvalidTransaction {
                 reason: format!(
                     "Max cost must be positive, got {}",
@@ -394,12 +390,12 @@ impl MarketValidator {
         // per Bitcoin Hivemind whitepaper section on market maker algorithm
         use crate::math::lmsr::LmsrService;
         let trade_cost = LmsrService::calculate_update_cost(
-            &market.shares(),
+            market.shares(),
             &new_shares,
             market.b(),
         )
         .map_err(|e| Error::InvalidTransaction {
-            reason: format!("LMSR trade cost calculation failed: {:?}", e),
+            reason: format!("LMSR trade cost calculation failed: {e:?}"),
         })?;
 
         // Validate trade cost doesn't exceed max cost
@@ -414,13 +410,15 @@ impl MarketValidator {
 
         // Calculate fee amount
         let fee_amount = trade_cost * market.trading_fee();
-        let base_cost_sats = satoshi::to_sats(trade_cost, Rounding::Up)
+        let base_cost_sats = safe_math::to_sats(trade_cost, Rounding::Up)
             .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Base cost conversion failed: {}", e),
+                reason: format!("Base cost conversion failed: {e}"),
             })?;
-        let fee_sats = satoshi::to_sats(fee_amount, Rounding::Up)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Fee conversion failed: {}", e),
+        let fee_sats =
+            safe_math::to_sats(fee_amount, Rounding::Up).map_err(|e| {
+                Error::InvalidTransaction {
+                    reason: format!("Fee conversion failed: {e}"),
+                }
             })?;
 
         // Validate explicit treasury and fee outputs exist with correct content types and amounts
@@ -478,8 +476,7 @@ impl MarketValidator {
         if treasury_output_amount < base_cost_sats {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "BuyShares tx missing treasury output: expected {} sats to {}, found {} sats",
-                    base_cost_sats, treasury_address, treasury_output_amount
+                    "BuyShares tx missing treasury output: expected {base_cost_sats} sats to {treasury_address}, found {treasury_output_amount} sats"
                 ),
             });
         }
@@ -487,8 +484,7 @@ impl MarketValidator {
         if fee_output_amount < fee_sats {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "BuyShares tx missing fee output: expected {} sats to {}, found {} sats",
-                    fee_sats, fee_address, fee_output_amount
+                    "BuyShares tx missing fee output: expected {fee_sats} sats to {fee_address}, found {fee_output_amount} sats"
                 ),
             });
         }
@@ -531,7 +527,7 @@ impl MarketValidator {
                 .markets()
                 .get_market(rotxn, &trade.market_id)
                 .map_err(|e| {
-                    Error::DatabaseError(format!("Market access failed: {}", e))
+                    Error::DatabaseError(format!("Market access failed: {e}"))
                 })?
                 .ok_or_else(|| {
                     Error::Market(MarketError::MarketNotFound {
@@ -567,8 +563,7 @@ impl MarketValidator {
             let cost = trade.calculate_trade_cost().map_err(|e| {
                 Error::InvalidTransaction {
                     reason: format!(
-                        "Batch trade {}: Trade cost calculation failed: {}",
-                        trade_index, e
+                        "Batch trade {trade_index}: Trade cost calculation failed: {e}"
                     ),
                 }
             })?;
@@ -612,8 +607,7 @@ impl MarketValidator {
         if beta <= 0.0 || !beta.is_finite() {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "LMSR beta must be positive and finite, got {}",
-                    beta
+                    "LMSR beta must be positive and finite, got {beta}"
                 ),
             });
         }
@@ -623,8 +617,7 @@ impl MarketValidator {
             if share_qty < 0.0 || !share_qty.is_finite() {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
-                        "Share quantity at index {} must be non-negative and finite, got {}",
-                        idx, share_qty
+                        "Share quantity at index {idx} must be non-negative and finite, got {share_qty}"
                     ),
                 });
             }
@@ -655,7 +648,6 @@ impl DFunctionValidator {
     /// # Arguments
     /// * `d_function` - The D-function to validate
     /// * `max_decision_index` - Maximum valid decision index
-    /// * `decision_slots` - Available decision slots
     ///
     /// # Returns
     /// * `Ok(())` - D-function is valid
@@ -663,7 +655,6 @@ impl DFunctionValidator {
     pub fn validate_constraint(
         d_function: &DFunction,
         max_decision_index: usize,
-        decision_slots: &[SlotId],
     ) -> Result<(), MarketError> {
         match d_function {
             DFunction::Decision(idx) => {
@@ -674,11 +665,7 @@ impl DFunctionValidator {
             }
             DFunction::Equals(func, value) => {
                 // Validate the nested function
-                Self::validate_constraint(
-                    func,
-                    max_decision_index,
-                    decision_slots,
-                )?;
+                Self::validate_constraint(func, max_decision_index)?;
                 // For decision equality, ensure value is within valid range
                 if let DFunction::Decision(_) = func.as_ref() {
                     // For binary decisions, valid values are 0, 1, 2 (No, Yes, Invalid)
@@ -691,37 +678,17 @@ impl DFunctionValidator {
                 Ok(())
             }
             DFunction::And(left, right) => {
-                Self::validate_constraint(
-                    left,
-                    max_decision_index,
-                    decision_slots,
-                )?;
-                Self::validate_constraint(
-                    right,
-                    max_decision_index,
-                    decision_slots,
-                )?;
+                Self::validate_constraint(left, max_decision_index)?;
+                Self::validate_constraint(right, max_decision_index)?;
                 Ok(())
             }
             DFunction::Or(left, right) => {
-                Self::validate_constraint(
-                    left,
-                    max_decision_index,
-                    decision_slots,
-                )?;
-                Self::validate_constraint(
-                    right,
-                    max_decision_index,
-                    decision_slots,
-                )?;
+                Self::validate_constraint(left, max_decision_index)?;
+                Self::validate_constraint(right, max_decision_index)?;
                 Ok(())
             }
             DFunction::Not(func) => {
-                Self::validate_constraint(
-                    func,
-                    max_decision_index,
-                    decision_slots,
-                )?;
+                Self::validate_constraint(func, max_decision_index)?;
                 Ok(())
             }
             DFunction::True => Ok(()),
@@ -794,14 +761,10 @@ impl DFunctionValidator {
         // Validate each D-function against its corresponding combination
         for (df, combo) in d_functions.iter().zip(all_combos.iter()) {
             // Basic constraint validation
-            Self::validate_constraint(
-                df,
-                decision_slots.len(),
-                decision_slots,
-            )?;
+            Self::validate_constraint(df, decision_slots.len())?;
 
             // Evaluate the D-function against its own combination - should be true
-            if !df.evaluate(combo, decision_slots)? {
+            if !df.evaluate(combo)? {
                 return Err(MarketError::InvalidOutcomeCombination);
             }
 
@@ -834,7 +797,7 @@ impl DFunctionValidator {
         for combo in all_combos {
             let mut satisfied_count = 0;
             for df in d_functions {
-                if df.evaluate(combo, decision_slots)? {
+                if df.evaluate(combo)? {
                     satisfied_count += 1;
                 }
             }
@@ -886,8 +849,7 @@ impl MarketStateValidator {
         if !valid_transition {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "Invalid market state transition from {:?} to {:?}",
-                    from_state, to_state
+                    "Invalid market state transition from {from_state:?} to {to_state:?}"
                 ),
             });
         }
@@ -1023,14 +985,13 @@ impl VoteValidator {
             state.slots().get_slot(rotxn, decision_id)?.ok_or_else(|| {
                 Error::InvalidSlotId {
                     reason: format!(
-                        "Decision slot {:?} does not exist",
-                        decision_id
+                        "Decision slot {decision_id:?} does not exist"
                     ),
                 }
             })?;
 
         let decision = slot.decision.ok_or_else(|| Error::InvalidSlotId {
-            reason: format!("Slot {:?} has no decision", decision_id),
+            reason: format!("Slot {decision_id:?} has no decision"),
         })?;
 
         Ok(decision)
@@ -1060,8 +1021,7 @@ impl VoteValidator {
             if !vote_value.is_nan() && (vote_value < min || vote_value > max) {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
-                        "Vote value {} outside valid range [{}, {}]",
-                        vote_value, min, max
+                        "Vote value {vote_value} outside valid range [{min}, {max}]"
                     ),
                 });
             }
@@ -1069,11 +1029,10 @@ impl VoteValidator {
             // Binary decision - validate value is between 0.0 and 1.0, or NaN (abstain)
             // Per Bitcoin Hivemind whitepaper, 0.5 represents "inconclusive"
             // Voters can express uncertainty using any value in [0.0, 1.0]
-            if !vote_value.is_nan() && (vote_value < 0.0 || vote_value > 1.0) {
+            if !vote_value.is_nan() && !(0.0..=1.0).contains(&vote_value) {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
-                        "Binary decision vote must be between 0.0 and 1.0, or NaN (abstain), got {}",
-                        vote_value
+                        "Binary decision vote must be between 0.0 and 1.0, or NaN (abstain), got {vote_value}"
                     ),
                 });
             }
@@ -1103,8 +1062,7 @@ impl VoteValidator {
         if !state.slots().is_slot_in_voting(rotxn, decision_id)? {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "Decision slot {:?} is not in voting period",
-                    decision_id
+                    "Decision slot {decision_id:?} is not in voting period"
                 ),
             });
         }
@@ -1304,8 +1262,7 @@ impl VoteValidator {
                         Error::InvalidSlotId { reason } => {
                             Error::InvalidSlotId {
                                 reason: format!(
-                                    "Vote batch item {}: {}",
-                                    idx, reason
+                                    "Vote batch item {idx}: {reason}"
                                 ),
                             }
                         }
@@ -1317,10 +1274,7 @@ impl VoteValidator {
                 .map_err(|e| match e {
                     Error::InvalidTransaction { reason } => {
                         Error::InvalidTransaction {
-                            reason: format!(
-                                "Vote batch item {}: {}",
-                                idx, reason
-                            ),
+                            reason: format!("Vote batch item {idx}: {reason}"),
                         }
                     }
                     other => other,
@@ -1331,10 +1285,7 @@ impl VoteValidator {
                 |e| match e {
                     Error::InvalidTransaction { reason } => {
                         Error::InvalidTransaction {
-                            reason: format!(
-                                "Vote batch item {}: {}",
-                                idx, reason
-                            ),
+                            reason: format!("Vote batch item {idx}: {reason}"),
                         }
                     }
                     other => other,
@@ -1352,7 +1303,7 @@ impl VoteValidator {
             .map_err(|e| match e {
                 Error::InvalidTransaction { reason } => {
                     Error::InvalidTransaction {
-                        reason: format!("Vote batch item {}: {}", idx, reason),
+                        reason: format!("Vote batch item {idx}: {reason}"),
                     }
                 }
                 other => other,
@@ -1419,8 +1370,7 @@ impl VoterValidator {
         if consensus_outcomes.is_empty() {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "No consensus outcomes found for period {:?}",
-                    period_id
+                    "No consensus outcomes found for period {period_id:?}"
                 ),
             });
         }

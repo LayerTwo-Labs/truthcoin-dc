@@ -629,9 +629,7 @@ mod filled_content {
         /** Returns the LP token's corresponding asset pair and amount,
          *  if the filled output content corresponds to an LP token output. */
         pub fn lp_token_amount(&self) -> Option<(AssetId, AssetId, u64)> {
-            match self {
-                _ => None,
-            }
+            None
         }
 
         /// `true` if the output content corresponds to a Votecoin

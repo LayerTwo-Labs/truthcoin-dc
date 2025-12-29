@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sneed::{DatabaseUnique, Env, RoTxn, RwTxn};
 use std::collections::{HashMap, HashSet};
 
-use crate::math::satoshi::{self, Rounding};
+use crate::math::safe_math::{self, Rounding};
 use crate::state::Error;
 use crate::state::UtxoManager;
 use crate::state::slots::{Decision, SlotId};
@@ -87,14 +87,7 @@ impl MarketState {
 }
 
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    Hash,
-    BorshSerialize,
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash, BorshSerialize,
 )]
 pub enum DFunction {
     Decision(usize),
@@ -404,8 +397,7 @@ impl BatchedMarketTrade {
         )
         .map_err(|e| {
             MarketError::DatabaseError(format!(
-                "LMSR calculation failed: {:?}",
-                e
+                "LMSR calculation failed: {e:?}"
             ))
         })?;
 
@@ -556,14 +548,12 @@ impl MarketBuilder {
         let (all_slots, d_functions, state_combos) =
             if let Some(ref dimension_specs) = self.dimension_specs {
                 let (d_funcs, combos) =
-                    generate_mixed_dimensional(&dimension_specs, decisions)?;
+                    generate_mixed_dimensional(dimension_specs, decisions)?;
 
                 let mut slots = Vec::new();
                 for spec in dimension_specs {
                     match spec {
-                        DimensionSpec::Single(slot_id) => {
-                            slots.push(slot_id.clone())
-                        }
+                        DimensionSpec::Single(slot_id) => slots.push(*slot_id),
                         DimensionSpec::Categorical(slot_ids) => {
                             slots.extend(slot_ids)
                         }
@@ -577,7 +567,7 @@ impl MarketBuilder {
                     return Err(MarketError::InvalidDimensions);
                 }
                 let (d_funcs, combos) = generate_categorical_functions(
-                    &cat_slots,
+                    cat_slots,
                     has_residual,
                     decisions,
                 )?;
@@ -606,11 +596,7 @@ impl MarketBuilder {
 }
 
 impl DFunction {
-    pub fn evaluate(
-        &self,
-        combo: &[usize],
-        decision_slots: &[SlotId],
-    ) -> Result<bool, MarketError> {
+    pub fn evaluate(&self, combo: &[usize]) -> Result<bool, MarketError> {
         match self {
             DFunction::Decision(idx) => {
                 if *idx >= combo.len() {
@@ -625,28 +611,28 @@ impl DFunction {
                     }
                     Ok(combo[*idx] == *value)
                 } else {
-                    let func_result = func.evaluate(combo, decision_slots)?;
+                    let func_result = func.evaluate(combo)?;
                     Ok(func_result && *value == 1)
                 }
             }
             DFunction::And(left, right) => {
-                let left_result = left.evaluate(combo, decision_slots)?;
+                let left_result = left.evaluate(combo)?;
                 if !left_result {
                     return Ok(false);
                 }
-                let right_result = right.evaluate(combo, decision_slots)?;
+                let right_result = right.evaluate(combo)?;
                 Ok(left_result && right_result)
             }
             DFunction::Or(left, right) => {
-                let left_result = left.evaluate(combo, decision_slots)?;
+                let left_result = left.evaluate(combo)?;
                 if left_result {
                     return Ok(true);
                 }
-                let right_result = right.evaluate(combo, decision_slots)?;
+                let right_result = right.evaluate(combo)?;
                 Ok(left_result || right_result)
             }
             DFunction::Not(func) => {
-                let result = func.evaluate(combo, decision_slots)?;
+                let result = func.evaluate(combo)?;
                 Ok(!result)
             }
             DFunction::True => Ok(true),
@@ -656,12 +642,10 @@ impl DFunction {
     pub fn validate_constraint(
         &self,
         max_decision_index: usize,
-        decision_slots: &[SlotId],
     ) -> Result<(), MarketError> {
         crate::validation::DFunctionValidator::validate_constraint(
             self,
             max_decision_index,
-            decision_slots,
         )
     }
 
@@ -696,7 +680,7 @@ impl DFunction {
     fn build_balanced_and_tree(mut constraints: Vec<DFunction>) -> DFunction {
         while constraints.len() > 1 {
             let mut next_level =
-                Vec::with_capacity((constraints.len() + 1) / 2);
+                Vec::with_capacity(constraints.len().div_ceil(2));
 
             while constraints.len() >= 2 {
                 let right = constraints
@@ -911,10 +895,10 @@ fn generate_categorical_functions(
     decisions: &HashMap<SlotId, Decision>,
 ) -> Result<(Vec<DFunction>, Vec<Vec<usize>>), MarketError> {
     for slot_id in slots {
-        if let Some(decision) = decisions.get(slot_id) {
-            if decision.is_scaled {
-                return Err(MarketError::InvalidDimensions);
-            }
+        if let Some(decision) = decisions.get(slot_id)
+            && decision.is_scaled
+        {
+            return Err(MarketError::InvalidDimensions);
         }
     }
 
@@ -953,7 +937,7 @@ fn generate_categorical_functions(
     }
     if has_residual {
         let all_decisions: Vec<DFunction> =
-            (0..slots.len()).map(|i| DFunction::Decision(i)).collect();
+            (0..slots.len()).map(DFunction::Decision).collect();
 
         let or_all = all_decisions
             .into_iter()
@@ -1045,6 +1029,7 @@ fn calculate_max_tau(
 }
 
 impl Market {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         title: String,
         description: String,
@@ -1225,11 +1210,12 @@ impl Market {
 
     pub fn current_prices(&self) -> Array<f64, Ix1> {
         use crate::math::lmsr::LmsrService;
-        LmsrService::calculate_prices(&self.shares, self.b)
-            .unwrap_or_else(|_| {
+        LmsrService::calculate_prices(&self.shares, self.b).unwrap_or_else(
+            |_| {
                 let n = self.shares.len();
                 Array::from_elem(n, 1.0 / n as f64)
-            })
+            },
+        )
     }
 
     pub fn calculate_prices(
@@ -1237,12 +1223,10 @@ impl Market {
         shares: &Array<f64, Ix1>,
     ) -> Array<f64, Ix1> {
         use crate::math::lmsr::LmsrService;
-        LmsrService::calculate_prices(shares, self.b).unwrap_or_else(
-            |_| {
-                let n = shares.len();
-                Array::from_elem(n, 1.0 / n as f64)
-            },
-        )
+        LmsrService::calculate_prices(shares, self.b).unwrap_or_else(|_| {
+            let n = shares.len();
+            Array::from_elem(n, 1.0 / n as f64)
+        })
     }
 
     pub fn calculate_prices_for_display(&self) -> Vec<f64> {
@@ -1308,18 +1292,16 @@ impl Market {
             .cost_function(self.b, &self.shares.view())
             .map_err(|e| {
                 MarketError::DatabaseError(format!(
-                    "LMSR calculation failed: {:?}",
-                    e
+                    "LMSR calculation failed: {e:?}"
                 ))
             })?;
-        let new_cost = lmsr
-            .cost_function(self.b, &new_shares.view())
-            .map_err(|e| {
-                MarketError::DatabaseError(format!(
-                    "LMSR calculation failed: {:?}",
-                    e
-                ))
-            })?;
+        let new_cost =
+            lmsr.cost_function(self.b, &new_shares.view())
+                .map_err(|e| {
+                    MarketError::DatabaseError(format!(
+                        "LMSR calculation failed: {e:?}"
+                    ))
+                })?;
 
         Ok(new_cost - current_cost)
     }
@@ -1335,18 +1317,16 @@ impl Market {
             .cost_function(self.b, &self.shares.view())
             .map_err(|e| {
                 MarketError::DatabaseError(format!(
-                    "LMSR calculation failed: {:?}",
-                    e
+                    "LMSR calculation failed: {e:?}"
                 ))
             })?;
-        let new_cost = lmsr
-            .cost_function(new_b, &self.shares.view())
-            .map_err(|e| {
-                MarketError::DatabaseError(format!(
-                    "LMSR calculation failed: {:?}",
-                    e
-                ))
-            })?;
+        let new_cost =
+            lmsr.cost_function(new_b, &self.shares.view())
+                .map_err(|e| {
+                    MarketError::DatabaseError(format!(
+                        "LMSR calculation failed: {e:?}"
+                    ))
+                })?;
 
         Ok(new_cost - current_cost)
     }
@@ -1356,7 +1336,13 @@ impl Market {
         _transaction_id: Option<[u8; 32]>,
         height: u64,
     ) -> Result<(), MarketError> {
-        self.update_state(height, Some(MarketState::Cancelled), None, None, None)
+        self.update_state(
+            height,
+            Some(MarketState::Cancelled),
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn invalidate_market(
@@ -1433,21 +1419,41 @@ impl Market {
         // Find which state_combo(s) match the resolved combo
         // For full-product markets, d_functions are all DFunction::True,
         // so we must match against state_combos directly
+        //
+        // Per Truthcoin whitepaper: outcome 0.5 (ABSTAIN) means the decision
+        // was unresolvable, and payout should be split equally between valid
+        // outcomes. We achieve this by:
+        // 1. Only exact-matching against valid state_combos (those without ABSTAIN)
+        // 2. Using partial matching when resolved_combo contains ABSTAIN
         let mut prices = Array::zeros(self.state_combos.len());
 
-        for (i, state_combo) in self.state_combos.iter().enumerate() {
-            if state_combo == &resolved_combo {
-                prices[i] = 1.0;
+        // Check if resolved_combo contains any ABSTAIN values
+        let has_abstain = resolved_combo.contains(&2);
+
+        if !has_abstain {
+            // No ABSTAIN in resolved - try exact match
+            for (i, state_combo) in self.state_combos.iter().enumerate() {
+                // Skip state_combos that contain ABSTAIN (not valid trading outcomes)
+                if state_combo.contains(&2) {
+                    continue;
+                }
+                if state_combo == &resolved_combo {
+                    prices[i] = 1.0;
+                }
             }
         }
 
-        // If no exact match (e.g., resolved combo contains ABSTAIN values),
-        // find partial matches where non-ABSTAIN values match
+        // If no exact match found (either because resolved contains ABSTAIN,
+        // or no valid state_combo matched), use partial matching
         let sum: f64 = prices.sum();
         if sum == 0.0 {
             // Check for partial matches - outcomes that are consistent with
             // the resolved combo (where ABSTAIN acts as wildcard)
             for (i, state_combo) in self.state_combos.iter().enumerate() {
+                // Skip state_combos that contain ABSTAIN (not valid trading outcomes)
+                if state_combo.contains(&2) {
+                    continue;
+                }
                 let matches = resolved_combo
                     .iter()
                     .zip(state_combo.iter())
@@ -1471,12 +1477,21 @@ impl Market {
         Ok(prices)
     }
 
+    /// Returns the number of tradeable outcomes (excludes ABSTAIN states).
+    /// This is the single source of truth for LMSR calculations.
+    /// For a binary market, this returns 2 (No/Yes), not 3 (No/Yes/Abstain).
     pub fn get_outcome_count(&self) -> usize {
+        self.get_valid_state_combos().len()
+    }
+
+    /// Returns the total number of state combinations including ABSTAIN.
+    /// Use this for array indexing, not for LMSR calculations.
+    pub fn get_total_state_count(&self) -> usize {
         self.shares().len()
     }
 
     pub fn get_dimensions(&self) -> Vec<usize> {
-        vec![self.shares().len()]
+        vec![self.get_outcome_count()]
     }
 
     pub fn get_state_combos(&self) -> &Vec<Vec<usize>> {
@@ -1487,7 +1502,7 @@ impl Market {
         self.state_combos
             .iter()
             .enumerate()
-            .filter(|(_, combo)| !combo.iter().any(|&value| value == 2))
+            .filter(|(_, combo)| !combo.contains(&2))
             .collect()
     }
 
@@ -1666,12 +1681,12 @@ impl MarketsDatabase {
         let mut share_utxo_count = 0;
 
         let utxo_iter = utxos_db.iter(txn).map_err(|e| {
-            Error::DatabaseError(format!("UTXO iteration failed: {}", e))
+            Error::DatabaseError(format!("UTXO iteration failed: {e}"))
         })?;
 
         let mut utxo_iter = utxo_iter;
         while let Some(item) = utxo_iter.next().map_err(|e| {
-            Error::DatabaseError(format!("UTXO iteration item failed: {}", e))
+            Error::DatabaseError(format!("UTXO iteration item failed: {e}"))
         })? {
             let (outpoint, filled_output) = item;
 
@@ -1723,8 +1738,7 @@ impl MarketsDatabase {
                 .try_get(txn, &address)
                 .map_err(|e| {
                     Error::DatabaseError(format!(
-                        "Share account lookup failed: {}",
-                        e
+                        "Share account lookup failed: {e}"
                     ))
                 })?
                 .is_some()
@@ -1760,8 +1774,7 @@ impl MarketsDatabase {
                 .put(txn, &address, &share_account)
                 .map_err(|e| {
                     Error::DatabaseError(format!(
-                        "Share account creation failed for {}: {}",
-                        address, e
+                        "Share account creation failed for {address}: {e}"
                     ))
                 })?;
 
@@ -1785,11 +1798,9 @@ impl MarketsDatabase {
 
     fn extract_legacy_share_data(
         _outpoint: &OutPoint,
-        filled_output: &crate::types::FilledOutput,
+        _filled_output: &crate::types::FilledOutput,
     ) -> Option<LegacyShareData> {
-        match &filled_output.content {
-            _ => None,
-        }
+        None
     }
 
     pub fn needs_utxo_migration(
@@ -1801,12 +1812,12 @@ impl MarketsDatabase {
         >,
     ) -> Result<bool, Error> {
         let utxo_iter = utxos_db.iter(txn).map_err(|e| {
-            Error::DatabaseError(format!("UTXO iteration failed: {}", e))
+            Error::DatabaseError(format!("UTXO iteration failed: {e}"))
         })?;
 
         let mut utxo_iter = utxo_iter;
         while let Some(item) = utxo_iter.next().map_err(|e| {
-            Error::DatabaseError(format!("UTXO iteration item failed: {}", e))
+            Error::DatabaseError(format!("UTXO iteration item failed: {e}"))
         })? {
             let (outpoint, filled_output) = item;
 
@@ -1968,17 +1979,13 @@ impl MarketsDatabase {
         let mut found_count = 0;
 
         let market_iter = self.markets.iter(txn).map_err(|e| {
-            Error::DatabaseError(format!(
-                "Market batch iteration failed: {}",
-                e
-            ))
+            Error::DatabaseError(format!("Market batch iteration failed: {e}"))
         })?;
 
         let mut market_iter = market_iter;
         while let Some(item) = market_iter.next().map_err(|e| {
             Error::DatabaseError(format!(
-                "Market batch iteration item failed: {}",
-                e
+                "Market batch iteration item failed: {e}"
             ))
         })? {
             let (market_id_bytes, market) = item;
@@ -2031,10 +2038,7 @@ impl MarketsDatabase {
         let mut markets = Vec::new();
 
         let expiry_iter = self.expiry_index.iter(txn).map_err(|e| {
-            Error::DatabaseError(format!(
-                "Expiry index iteration failed: {}",
-                e
-            ))
+            Error::DatabaseError(format!("Expiry index iteration failed: {e}"))
         })?;
 
         let mut matching_market_ids = Vec::new();
@@ -2044,24 +2048,21 @@ impl MarketsDatabase {
         let mut expiry_iter = expiry_iter;
         while let Some(item) = expiry_iter.next().map_err(|e| {
             Error::DatabaseError(format!(
-                "Expiry index iteration item failed: {}",
-                e
+                "Expiry index iteration item failed: {e}"
             ))
         })? {
             let (expiry_height, market_ids) = item;
 
             entries_checked += 1;
 
-            if let Some(max) = max_height {
-                if expiry_height > max {
-                    break;
-                }
+            if let Some(max) = max_height
+                && expiry_height > max
+            {
+                break;
             }
 
-            let matches_min =
-                min_height.map_or(true, |min| expiry_height >= min);
-            let matches_max =
-                max_height.map_or(true, |max| expiry_height <= max);
+            let matches_min = min_height.is_none_or(|min| expiry_height >= min);
+            let matches_max = max_height.is_none_or(|max| expiry_height <= max);
 
             if matches_min && matches_max {
                 entries_matched += 1;
@@ -2150,8 +2151,7 @@ impl MarketsDatabase {
                     e
                 );
                 Error::DatabaseError(format!(
-                    "Primary market update failed: {}",
-                    e
+                    "Primary market update failed: {e}"
                 ))
             })?;
 
@@ -2170,8 +2170,7 @@ impl MarketsDatabase {
                         e
                     );
                     Error::DatabaseError(format!(
-                        "State index update failed: {}",
-                        e
+                        "State index update failed: {e}"
                     ))
                 })?;
             }
@@ -2190,8 +2189,7 @@ impl MarketsDatabase {
                         e
                     );
                     Error::DatabaseError(format!(
-                        "Expiry index update failed: {}",
-                        e
+                        "Expiry index update failed: {e}"
                     ))
                 })?;
             }
@@ -2209,8 +2207,7 @@ impl MarketsDatabase {
                             e
                         );
                         Error::DatabaseError(format!(
-                            "Slot index removal failed: {}",
-                            e
+                            "Slot index removal failed: {e}"
                         ))
                     })?;
             }
@@ -2225,8 +2222,7 @@ impl MarketsDatabase {
                             e
                         );
                         Error::DatabaseError(format!(
-                            "Slot index addition failed: {}",
-                            e
+                            "Slot index addition failed: {e}"
                         ))
                     })?;
             }
@@ -2297,10 +2293,10 @@ impl MarketsDatabase {
                 }
 
                 // Get decision for scaled handling
-                if let Some(slot) = slots_db.get_slot(txn, *slot_id)? {
-                    if let Some(decision) = slot.decision {
-                        decisions.insert(*slot_id, decision);
-                    }
+                if let Some(slot) = slots_db.get_slot(txn, *slot_id)?
+                    && let Some(decision) = slot.decision
+                {
+                    decisions.insert(*slot_id, decision);
                 }
             }
 
@@ -2312,8 +2308,7 @@ impl MarketsDatabase {
                     .calculate_final_prices(&slot_outcomes, &decisions)
                     .map_err(|e| {
                         Error::DatabaseError(format!(
-                            "Failed to calculate final prices: {:?}",
-                            e
+                            "Failed to calculate final prices: {e:?}"
                         ))
                     })?;
 
@@ -2328,8 +2323,7 @@ impl MarketsDatabase {
                     )
                     .map_err(|e| {
                         Error::DatabaseError(format!(
-                            "Failed to set final prices: {:?}",
-                            e
+                            "Failed to set final prices: {e:?}"
                         ))
                     })?;
 
@@ -2361,8 +2355,7 @@ impl MarketsDatabase {
                     )
                     .map_err(|e| {
                         Error::DatabaseError(format!(
-                            "Failed to ossify market: {:?}",
-                            e
+                            "Failed to ossify market: {e:?}"
                         ))
                     })?;
 
@@ -2642,8 +2635,7 @@ impl MarketsDatabase {
                 .update_state(0, None, None, Some(new_shares_array), None)
                 .map_err(|e| {
                     Error::DatabaseError(format!(
-                        "Failed to update market state: {:?}",
-                        e
+                        "Failed to update market state: {e:?}"
                     ))
                 })?;
 
@@ -2683,8 +2675,7 @@ impl MarketsDatabase {
                     e
                 );
                 Error::DatabaseError(format!(
-                    "Share account update failed for trade {}: {}",
-                    trade_index, e
+                    "Share account update failed for trade {trade_index}: {e}"
                 ))
             })?;
         }
@@ -2762,7 +2753,7 @@ impl MarketsDatabase {
     pub fn get_all_share_accounts(
         &self,
         txn: &RoTxn,
-    ) -> Result<Vec<(Address, Vec<(MarketId, u32, f64)>)>, Error> {
+    ) -> Result<super::type_aliases::AllShareAccounts, Error> {
         let mut result = Vec::new();
         let mut iter = self.share_accounts.iter(txn)?;
         while let Some((address, account)) = iter.next()? {
@@ -2864,7 +2855,7 @@ impl MarketsDatabase {
         &self,
         txn: &RoTxn,
         market_id: &MarketId,
-    ) -> Result<Vec<(Address, Vec<(u32, f64)>)>, Error> {
+    ) -> Result<super::type_aliases::MarketShareholders, Error> {
         let mut shareholders = Vec::new();
         let mut iter = self.share_accounts.iter(txn)?;
 
@@ -2934,8 +2925,9 @@ impl MarketsDatabase {
                 let weighted_shares = shares * final_price;
                 let payout_calc = weighted_shares / total_weighted_shares
                     * treasury_sats as f64;
-                let payout_sats = satoshi::to_sats(payout_calc, Rounding::Down)
-                    .unwrap_or(0);
+                let payout_sats =
+                    safe_math::to_sats(payout_calc, Rounding::Down)
+                        .unwrap_or(0);
 
                 if payout_sats > 0 {
                     payouts.push(SharePayoutRecord {
@@ -2953,16 +2945,16 @@ impl MarketsDatabase {
 
         // Handle rounding remainder - add to largest payout
         let remainder = treasury_sats.saturating_sub(total_distributed);
-        if remainder > 0 && !payouts.is_empty() {
-            if let Some(max_idx) = payouts
+        if remainder > 0
+            && !payouts.is_empty()
+            && let Some(max_idx) = payouts
                 .iter()
                 .enumerate()
                 .max_by_key(|(_, p)| p.payout_sats)
                 .map(|(idx, _)| idx)
-            {
-                payouts[max_idx].payout_sats += remainder;
-                total_distributed += remainder;
-            }
+        {
+            payouts[max_idx].payout_sats += remainder;
+            total_distributed += remainder;
         }
 
         // Get author fees from Author Fee UTXO
@@ -3014,7 +3006,6 @@ impl MarketsDatabase {
 
             state.insert_utxo_with_address_index(txn, &outpoint, &output)?;
 
-            // Remove shares from account
             self.remove_shares_from_account(
                 txn,
                 &payout.address,
@@ -3421,51 +3412,38 @@ struct LegacyShareData {
 }
 
 #[cfg(test)]
+#[allow(clippy::print_stdout, clippy::uninlined_format_args)]
 mod tests {
     use super::*;
     use ndarray::Array;
 
     #[test]
     fn test_dfunction_constraint_validation() {
-        let decision_slots = vec![];
-
         let valid_func = DFunction::Decision(0);
-        assert!(valid_func.validate_constraint(2, &decision_slots).is_ok());
+        assert!(valid_func.validate_constraint(2).is_ok());
 
         let invalid_func = DFunction::Decision(5);
-        assert!(
-            invalid_func
-                .validate_constraint(2, &decision_slots)
-                .is_err()
-        );
+        assert!(invalid_func.validate_constraint(2).is_err());
 
         let valid_equals =
             DFunction::Equals(Box::new(DFunction::Decision(0)), 1);
-        assert!(valid_equals.validate_constraint(2, &decision_slots).is_ok());
+        assert!(valid_equals.validate_constraint(2).is_ok());
 
         let invalid_equals =
             DFunction::Equals(Box::new(DFunction::Decision(0)), 5);
-        assert!(
-            invalid_equals
-                .validate_constraint(2, &decision_slots)
-                .is_err()
-        );
+        assert!(invalid_equals.validate_constraint(2).is_err());
 
         let nested_and = DFunction::And(
             Box::new(DFunction::Decision(0)),
             Box::new(DFunction::Decision(1)),
         );
-        assert!(nested_and.validate_constraint(2, &decision_slots).is_ok());
+        assert!(nested_and.validate_constraint(2).is_ok());
 
         let invalid_nested = DFunction::And(
             Box::new(DFunction::Decision(0)),
             Box::new(DFunction::Decision(5)),
         );
-        assert!(
-            invalid_nested
-                .validate_constraint(2, &decision_slots)
-                .is_err()
-        );
+        assert!(invalid_nested.validate_constraint(2).is_err());
     }
 
     #[test]

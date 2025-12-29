@@ -35,6 +35,32 @@ use crate::{
     util::Watchable,
 };
 
+/// Input struct for claiming a decision slot.
+#[derive(Clone, Debug)]
+pub struct SlotClaimInput {
+    pub slot_id_bytes: [u8; 3],
+    pub is_standard: bool,
+    pub is_scaled: bool,
+    pub question: String,
+    pub min: Option<u16>,
+    pub max: Option<u16>,
+}
+
+/// Input struct for creating a market.
+#[derive(Clone, Debug)]
+pub struct CreateMarketInput {
+    pub title: String,
+    pub description: String,
+    pub market_type: String,
+    pub decision_slots: Option<Vec<String>>,
+    pub dimensions: Option<String>,
+    pub has_residual: Option<bool>,
+    pub beta: Option<f64>,
+    pub trading_fee: Option<f64>,
+    pub tags: Option<Vec<String>>,
+    pub initial_liquidity: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct Balance {
     #[serde(rename = "total_sats", with = "bitcoin::amount::serde::as_sat")]
@@ -613,12 +639,11 @@ impl Wallet {
         while let Some((outpoint, filled_output)) = iter.next()? {
             if filled_output.is_votecoin()
                 && !filled_output.content.is_withdrawal()
+                && let Some(votecoin_value) = filled_output.votecoin()
             {
-                if let Some(votecoin_value) = filled_output.votecoin() {
-                    // Convert FilledOutput to Output for uniform handling
-                    let output: Output = filled_output.into();
-                    votecoin_utxos.push((outpoint, output, votecoin_value));
-                }
+                // Convert FilledOutput to Output for uniform handling
+                let output: Output = filled_output.into();
+                votecoin_utxos.push((outpoint, output, votecoin_value));
             }
         }
 
@@ -668,14 +693,18 @@ impl Wallet {
     /// Returns a new transaction ready to be signed and sent.
     pub fn claim_decision_slot(
         &self,
-        slot_id_bytes: [u8; 3],
-        is_standard: bool,
-        is_scaled: bool,
-        question: String,
-        min: Option<u16>,
-        max: Option<u16>,
+        input: SlotClaimInput,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
+        let SlotClaimInput {
+            slot_id_bytes,
+            is_standard,
+            is_scaled,
+            question,
+            min,
+            max,
+        } = input;
+
         // Select minimal bitcoins to pay the fee
         let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
         let change = total_bitcoin - fee;
@@ -762,18 +791,22 @@ impl Wallet {
     /// Implements Bitcoin Hivemind Section 3.1 - Market Creation with code path
     pub fn create_market(
         &self,
-        title: String,
-        description: String,
-        market_type: String,
-        decision_slots: Option<Vec<String>>,
-        dimensions: Option<String>,
-        has_residual: Option<bool>,
-        b: Option<f64>,
-        trading_fee: Option<f64>,
-        tags: Option<Vec<String>>,
-        initial_liquidity: Option<u64>,
+        input: CreateMarketInput,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
+        let CreateMarketInput {
+            title,
+            description,
+            market_type,
+            decision_slots,
+            dimensions,
+            has_residual,
+            beta: b,
+            trading_fee,
+            tags,
+            initial_liquidity,
+        } = input;
+
         // Determine transaction data type and estimate storage fee based on market type
         let (tx_data, storage_fee) = match market_type.as_str() {
             "dimensional" => {
@@ -843,7 +876,7 @@ impl Wallet {
             _ => {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("Unsupported market type: {}", market_type),
+                    format!("Unsupported market type: {market_type}"),
                 )));
             }
         };

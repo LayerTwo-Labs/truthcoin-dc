@@ -168,6 +168,21 @@ impl Txid {
     pub fn as_slice(&self) -> &[u8] {
         self.0.as_slice()
     }
+
+    /// Generate a deterministic txid for consensus-generated reputation changes.
+    /// this creates a unique but reproducible identifier for internal
+    /// redistribution operations that don't correspond to actual transactions
+    pub fn for_consensus_redistribution(
+        period_id: crate::state::voting::types::VotingPeriodId,
+        block_height: u64,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"CONSENSUS_REDISTRIBUTION_TXID");
+        hasher.update(&period_id.as_u32().to_le_bytes());
+        hasher.update(&block_height.to_le_bytes());
+        let hash = hasher.finalize();
+        Self(*hash.as_bytes())
+    }
 }
 
 impl From<Hash> for Txid {

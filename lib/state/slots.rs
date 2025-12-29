@@ -1,7 +1,7 @@
-use borsh::BorshSerialize;
 use crate::state::Error;
 use crate::types::{BITCOIN_GENESIS_TIMESTAMP, SECONDS_PER_QUARTER};
 use crate::validation::SlotValidationInterface;
+use borsh::BorshSerialize;
 use fallible_iterator::FallibleIterator;
 use heed::types::SerdeBincode;
 use serde::{Deserialize, Serialize};
@@ -36,16 +36,14 @@ fn validate_slot_bounds(period: u32, index: u32) -> Result<(), Error> {
     if period > MAX_PERIOD_INDEX {
         return Err(Error::InvalidSlotId {
             reason: format!(
-                "Period {} exceeds maximum {}",
-                period, MAX_PERIOD_INDEX
+                "Period {period} exceeds maximum {MAX_PERIOD_INDEX}"
             ),
         });
     }
     if index > MAX_SLOT_INDEX {
         return Err(Error::InvalidSlotId {
             reason: format!(
-                "Slot index {} exceeds maximum {}",
-                index, MAX_SLOT_INDEX
+                "Slot index {index} exceeds maximum {MAX_SLOT_INDEX}"
             ),
         });
     }
@@ -55,7 +53,9 @@ fn validate_slot_bounds(period: u32, index: u32) -> Result<(), Error> {
 impl SlotId {
     #[inline(always)]
     const fn as_u32(self) -> u32 {
-        ((self.0[0] as u32) << 16) | ((self.0[1] as u32) << 8) | (self.0[2] as u32)
+        ((self.0[0] as u32) << 16)
+            | ((self.0[1] as u32) << 8)
+            | (self.0[2] as u32)
     }
 
     pub fn new(period: u32, index: u32) -> Result<Self, Error> {
@@ -151,7 +151,7 @@ impl Decision {
         min: Option<u16>,
         max: Option<u16>,
     ) -> Result<Self, Error> {
-        if question.as_bytes().len() > 1000 {
+        if question.len() > 1000 {
             return Err(Error::InvalidSlotId {
                 reason: "Question must be 1000 bytes or less".to_string(),
             });
@@ -214,13 +214,13 @@ pub enum SlotState {
 impl SlotState {
     pub fn can_transition_to(&self, new_state: SlotState) -> bool {
         use SlotState::*;
-        match (self, new_state) {
-            (Created, Claimed) => true,
-            (Claimed, Voting) => true,
-            (Voting, Resolved) => true,
-            (_, Invalid) => true,
-            _ => false,
-        }
+        matches!(
+            (self, new_state),
+            (Created, Claimed)
+                | (Claimed, Voting)
+                | (Voting, Resolved)
+                | (_, Invalid)
+        )
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -269,8 +269,7 @@ impl SlotStateHistory {
         if !current.can_transition_to(SlotState::Claimed) {
             return Err(Error::InvalidSlotState {
                 reason: format!(
-                    "Cannot transition to Claimed from {:?}",
-                    current
+                    "Cannot transition to Claimed from {current:?}"
                 ),
             });
         }
@@ -286,10 +285,7 @@ impl SlotStateHistory {
         let current = self.current_state();
         if !current.can_transition_to(SlotState::Voting) {
             return Err(Error::InvalidSlotState {
-                reason: format!(
-                    "Cannot transition to Voting from {:?}",
-                    current
-                ),
+                reason: format!("Cannot transition to Voting from {current:?}"),
             });
         }
         self.voting_period = Some(voting_period);
@@ -306,8 +302,7 @@ impl SlotStateHistory {
         if !current.can_transition_to(SlotState::Resolved) {
             return Err(Error::InvalidSlotState {
                 reason: format!(
-                    "Cannot transition to Resolved from {:?}",
-                    current
+                    "Cannot transition to Resolved from {current:?}"
                 ),
             });
         }
@@ -315,8 +310,7 @@ impl SlotStateHistory {
         if !(0.0..=1.0).contains(&consensus_outcome) {
             return Err(Error::InvalidSlotState {
                 reason: format!(
-                    "Consensus outcome {} outside valid range [0.0, 1.0]",
-                    consensus_outcome
+                    "Consensus outcome {consensus_outcome} outside valid range [0.0, 1.0]"
                 ),
             });
         }
@@ -447,12 +441,12 @@ pub fn period_to_name(period: u32) -> String {
     }
     let year = 2009 + (period - 1) / 4;
     let quarter = ((period - 1) % 4) + 1;
-    format!("Q{} Y{}", quarter, year)
+    format!("Q{quarter} Y{year}")
 }
 
 pub fn quarter_to_string(quarter_idx: u32, config: &SlotConfig) -> String {
     if config.testing_mode {
-        format!("Testing Period {}", quarter_idx)
+        format!("Testing Period {quarter_idx}")
     } else {
         let year = quarter_idx / 4;
         let quarter = quarter_idx % 4;
@@ -463,7 +457,7 @@ pub fn quarter_to_string(quarter_idx: u32, config: &SlotConfig) -> String {
             3 => "Q4",
             _ => unreachable!(),
         };
-        format!("{} {}", quarter_name, year)
+        format!("{quarter_name} {year}")
     }
 }
 
@@ -741,7 +735,7 @@ impl Dbs {
         if self.is_slot_ossified(slot_id, current_ts, current_height) {
             return Err(Error::SlotNotAvailable {
                 slot_id,
-                reason: format!("Slot period {} is ossified", period_index),
+                reason: format!("Slot period {period_index} is ossified"),
             });
         }
 
@@ -749,8 +743,7 @@ impl Dbs {
             return Err(Error::SlotNotAvailable {
                 slot_id,
                 reason: format!(
-                    "Slot {:?} is in voting state - no new slots can be claimed",
-                    slot_id
+                    "Slot {slot_id:?} is in voting state - no new slots can be claimed"
                 ),
             });
         }
@@ -771,8 +764,7 @@ impl Dbs {
                 return Err(Error::SlotNotAvailable {
                     slot_id,
                     reason: format!(
-                        "Standard slots must have index <= {}, got {}",
-                        STANDARD_SLOT_MAX, slot_index
+                        "Standard slots must have index <= {STANDARD_SLOT_MAX}, got {slot_index}"
                     ),
                 });
             }
@@ -783,8 +775,7 @@ impl Dbs {
                 return Err(Error::SlotNotAvailable {
                     slot_id,
                     reason: format!(
-                        "Period {} is not in active window for new slots ({}-{})",
-                        period_index, start_period, end_period
+                        "Period {period_index} is not in active window for new slots ({start_period}-{end_period})"
                     ),
                 });
             }
@@ -799,21 +790,17 @@ impl Dbs {
                 return Err(Error::SlotNotAvailable {
                     slot_id,
                     reason: format!(
-                        "Standard slot index {} exceeds available slots {} for period {}",
-                        slot_index, total_slots, period_index
+                        "Standard slot index {slot_index} exceeds available slots {total_slots} for period {period_index}"
                     ),
                 });
             }
-        } else {
-            if slot_index < NONSTANDARD_SLOT_MIN {
-                return Err(Error::SlotNotAvailable {
-                    slot_id,
-                    reason: format!(
-                        "Non-standard slots must have index >= {}, got {}",
-                        NONSTANDARD_SLOT_MIN, slot_index
-                    ),
-                });
-            }
+        } else if slot_index < NONSTANDARD_SLOT_MIN {
+            return Err(Error::SlotNotAvailable {
+                slot_id,
+                reason: format!(
+                    "Non-standard slots must have index >= {NONSTANDARD_SLOT_MIN}, got {slot_index}"
+                ),
+            });
         }
 
         let claimed_slots =
@@ -937,7 +924,7 @@ impl Dbs {
             self.period_slots.try_get(rotxn, &period_index)?
         {
             for slot in &period_slots {
-                if matches!(slot.decision, Some(_)) {
+                if slot.decision.is_some() {
                     claimed_slots.push(slot.clone());
                 }
             }
@@ -1009,7 +996,7 @@ impl Dbs {
         rotxn: &sneed::RoTxn,
         current_ts: u64,
         current_height: Option<u32>,
-    ) -> Result<(Vec<(u32, u64)>, Vec<(u32, u64)>), Error> {
+    ) -> Result<super::type_aliases::PeriodSummary, Error> {
         let active_periods =
             self.get_active_periods(rotxn, current_ts, current_height)?;
         let voting_periods_full =
@@ -1087,7 +1074,7 @@ impl Dbs {
     ) -> Result<(), Error> {
         let mut history = self.get_slot_state_history(rwtxn, slot_id)?.ok_or(
             Error::InvalidSlotId {
-                reason: format!("Slot {:?} has no state history", slot_id),
+                reason: format!("Slot {slot_id:?} has no state history"),
             },
         )?;
 
@@ -1111,7 +1098,7 @@ impl Dbs {
     ) -> Result<(), Error> {
         let mut history = self.get_slot_state_history(rwtxn, slot_id)?.ok_or(
             Error::InvalidSlotId {
-                reason: format!("Slot {:?} has no state history", slot_id),
+                reason: format!("Slot {slot_id:?} has no state history"),
             },
         )?;
 

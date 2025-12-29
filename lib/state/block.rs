@@ -6,7 +6,7 @@ use sneed::{RoTxn, RwTxn};
 use crate::{
     math::{
         lmsr::{LmsrError, LmsrService},
-        satoshi::{self, Rounding},
+        safe_math::{self, Rounding},
     },
     state::{Error, State, UtxoManager, error, markets::MarketId},
     types::{
@@ -105,8 +105,7 @@ impl StateUpdate {
                 if !delta.is_finite() {
                     return Err(Error::InvalidTransaction {
                         reason: format!(
-                            "Invalid share delta for address {:?} market {:?}: {}",
-                            address, market_id, delta
+                            "Invalid share delta for address {address:?} market {market_id:?}: {delta}"
                         ),
                     });
                 }
@@ -125,12 +124,12 @@ impl StateUpdate {
 
         for update in &self.market_updates {
             // Validate beta if provided (share deltas don't need LMSR validation here)
-            if let Some(beta) = update.new_beta {
-                if beta <= 0.0 {
-                    return Err(Error::InvalidTransaction {
-                        reason: "Beta must be positive".to_string(),
-                    });
-                }
+            if let Some(beta) = update.new_beta
+                && beta <= 0.0
+            {
+                return Err(Error::InvalidTransaction {
+                    reason: "Beta must be positive".to_string(),
+                });
             }
 
             if state
@@ -163,24 +162,23 @@ impl StateUpdate {
 
             crate::validation::MarketValidator::validate_lmsr_parameters(
                 creation.market.b(),
-                &creation.market.shares(),
+                creation.market.shares(),
             )?;
         }
 
         for slot_change in &self.slot_changes {
-            if slot_change.new_decision.is_some() {
-                if state
+            if slot_change.new_decision.is_some()
+                && state
                     .slots()
                     .get_slot(rotxn, slot_change.slot_id)?
                     .is_none()
-                {
-                    return Err(Error::InvalidSlotId {
-                        reason: format!(
-                            "Slot {:?} does not exist",
-                            slot_change.slot_id
-                        ),
-                    });
-                }
+            {
+                return Err(Error::InvalidSlotId {
+                    reason: format!(
+                        "Slot {:?} does not exist",
+                        slot_change.slot_id
+                    ),
+                });
             }
         }
 
@@ -203,10 +201,8 @@ impl StateUpdate {
         }
 
         // Aggregate share deltas per market before applying
-        let mut aggregated_deltas: std::collections::HashMap<
-            MarketId,
-            Vec<(usize, f64, Option<u64>, Option<u64>, Option<[u8; 32]>)>,
-        > = std::collections::HashMap::new();
+        let mut aggregated_deltas: super::type_aliases::AggregatedDeltas =
+            std::collections::HashMap::new();
 
         for update in &self.market_updates {
             if let Some((outcome_index, delta)) = update.share_delta {
@@ -229,7 +225,7 @@ impl StateUpdate {
                 .markets()
                 .get_market(rwtxn, &market_id)?
                 .ok_or_else(|| Error::InvalidTransaction {
-                    reason: format!("Market {:?} not found", market_id),
+                    reason: format!("Market {market_id:?} not found"),
                 })?;
 
             let mut new_shares = market.shares().clone();
@@ -242,7 +238,7 @@ impl StateUpdate {
                     market
                         .update_trading_volume(*outcome_index, *vol)
                         .map_err(|e| Error::InvalidTransaction {
-                            reason: format!("Failed to update volume: {:?}", e),
+                            reason: format!("Failed to update volume: {e:?}"),
                         })?;
                 }
             }
@@ -250,10 +246,7 @@ impl StateUpdate {
             market
                 .update_state(height as u64, None, None, Some(new_shares), None)
                 .map_err(|e| Error::InvalidTransaction {
-                    reason: format!(
-                        "Failed to update market state: {:?}",
-                        e
-                    ),
+                    reason: format!("Failed to update market state: {e:?}"),
                 })?;
 
             state.markets().update_market(rwtxn, &market)?;
@@ -306,19 +299,17 @@ impl StateUpdate {
         }
 
         for slot_change in &self.slot_changes {
-            if let Some(ref _decision) = slot_change.new_decision {
-                if let Some(slot) =
+            if let Some(ref _decision) = slot_change.new_decision
+                && let Some(slot) =
                     state.slots().get_slot(rwtxn, slot_change.slot_id)?
-                {
-                    if slot.decision.is_some() {
-                        return Err(Error::InvalidSlotId {
-                            reason: format!(
-                                "Slot {:?} already has a decision",
-                                slot_change.slot_id
-                            ),
-                        });
-                    }
-                }
+                && slot.decision.is_some()
+            {
+                return Err(Error::InvalidSlotId {
+                    reason: format!(
+                        "Slot {:?} already has a decision",
+                        slot_change.slot_id
+                    ),
+                });
             }
 
             if let Some(new_period) = slot_change.period_transition {
@@ -326,8 +317,7 @@ impl StateUpdate {
                 if new_period <= current_period {
                     return Err(Error::InvalidSlotId {
                         reason: format!(
-                            "Invalid period transition from {} to {}",
-                            current_period, new_period
+                            "Invalid period transition from {current_period} to {new_period}"
                         ),
                     });
                 }
@@ -403,13 +393,11 @@ impl StateUpdate {
             // Get existing consolidated treasury UTXO (if any)
             if let Some(existing_outpoint) =
                 state.markets().get_market_utxo(rwtxn, &market_id)?
-            {
-                if let Some(utxo) =
+                && let Some(utxo) =
                     state.utxos.try_get(rwtxn, &existing_outpoint)?
-                {
-                    treasury_total += utxo.get_bitcoin_value().to_sat();
-                    treasury_utxos_to_consume.push(existing_outpoint);
-                }
+            {
+                treasury_total += utxo.get_bitcoin_value().to_sat();
+                treasury_utxos_to_consume.push(existing_outpoint);
             }
 
             // Get pending treasury UTXOs from transactions
@@ -430,13 +418,11 @@ impl StateUpdate {
             // Get existing consolidated fee UTXO (if any)
             if let Some(existing_outpoint) =
                 state.markets().get_author_fee_utxo(rwtxn, &market_id)?
-            {
-                if let Some(utxo) =
+                && let Some(utxo) =
                     state.utxos.try_get(rwtxn, &existing_outpoint)?
-                {
-                    fee_total += utxo.get_bitcoin_value().to_sat();
-                    fee_utxos_to_consume.push(existing_outpoint);
-                }
+            {
+                fee_total += utxo.get_bitcoin_value().to_sat();
+                fee_utxos_to_consume.push(existing_outpoint);
             }
 
             // Get pending fee UTXOs from transactions
@@ -542,7 +528,7 @@ impl StateUpdate {
     ) {
         self.share_account_changes
             .entry((address, market_id))
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(outcome, delta);
     }
     fn add_market_creation(&mut self, creation: MarketCreation) {
@@ -816,7 +802,7 @@ pub fn connect(
                 apply_market_trade(
                     state,
                     rwtxn,
-                    &filled_tx,
+                    filled_tx,
                     &mut state_update,
                     height,
                 )?;
@@ -825,7 +811,7 @@ pub fn connect(
                 apply_market_creation(
                     state,
                     rwtxn,
-                    &filled_tx,
+                    filled_tx,
                     &mut state_update,
                     height,
                 )?;
@@ -834,7 +820,7 @@ pub fn connect(
                 apply_dimensional_market(
                     state,
                     rwtxn,
-                    &filled_tx,
+                    filled_tx,
                     &mut state_update,
                     height,
                 )?;
@@ -843,7 +829,7 @@ pub fn connect(
                 apply_slot_claim(
                     state,
                     rwtxn,
-                    &filled_tx,
+                    filled_tx,
                     &mut state_update,
                     height,
                     mainchain_timestamp,
@@ -853,7 +839,7 @@ pub fn connect(
                 apply_submit_vote(
                     state,
                     rwtxn,
-                    &filled_tx,
+                    filled_tx,
                     &mut state_update,
                     height,
                 )?;
@@ -862,7 +848,7 @@ pub fn connect(
                 apply_submit_vote_batch(
                     state,
                     rwtxn,
-                    &filled_tx,
+                    filled_tx,
                     &mut state_update,
                     height,
                 )?;
@@ -1149,23 +1135,25 @@ fn revert_create_market(
     for slot_hex in &market_data.decision_slots {
         let slot_bytes =
             hex::decode(slot_hex).map_err(|_| Error::InvalidTransaction {
-                reason: format!("Invalid slot ID hex: {}", slot_hex),
+                reason: format!("Invalid slot ID hex: {slot_hex}"),
             })?;
 
         let slot_id_array: [u8; 3] =
-            slot_bytes.try_into().map_err(|_| Error::InvalidTransaction {
-                reason: "Invalid slot ID length".to_string(),
-            })?;
+            slot_bytes
+                .try_into()
+                .map_err(|_| Error::InvalidTransaction {
+                    reason: "Invalid slot ID length".to_string(),
+                })?;
         let slot_id = SlotId::from_bytes(slot_id_array)?;
 
         let slot = state.slots.get_slot(rwtxn, slot_id)?.ok_or_else(|| {
             Error::InvalidSlotId {
-                reason: format!("Slot {} does not exist", slot_hex),
+                reason: format!("Slot {slot_hex} does not exist"),
             }
         })?;
 
         let decision = slot.decision.ok_or_else(|| Error::InvalidSlotId {
-            reason: format!("Slot {} has no decision", slot_hex),
+            reason: format!("Slot {slot_hex} has no decision"),
         })?;
 
         slot_ids.push(slot_id);
@@ -1201,7 +1189,7 @@ fn revert_create_market(
     // Reconstruct the market to get its ID (height doesn't affect ID)
     let market = builder.build(0, None, &decisions).map_err(|e| {
         Error::InvalidTransaction {
-            reason: format!("Market reconstruction failed: {}", e),
+            reason: format!("Market reconstruction failed: {e}"),
         }
     })?;
 
@@ -1244,7 +1232,7 @@ fn revert_create_market_dimensional(
     let dimension_specs: Vec<DimensionSpec> =
         parse_dimensions(&market_data.dimensions).map_err(|e| {
             Error::InvalidTransaction {
-                reason: format!("Failed to parse dimensions: {}", e),
+                reason: format!("Failed to parse dimensions: {e}"),
             }
         })?;
 
@@ -1254,18 +1242,18 @@ fn revert_create_market_dimensional(
     for spec in &dimension_specs {
         match spec {
             DimensionSpec::Single(slot_id) => {
-                if let Some(slot) = state.slots.get_slot(rwtxn, *slot_id)? {
-                    if let Some(decision) = slot.decision {
-                        decisions.insert(*slot_id, decision);
-                    }
+                if let Some(slot) = state.slots.get_slot(rwtxn, *slot_id)?
+                    && let Some(decision) = slot.decision
+                {
+                    decisions.insert(*slot_id, decision);
                 }
             }
             DimensionSpec::Categorical(slot_ids) => {
                 for &slot_id in slot_ids {
-                    if let Some(slot) = state.slots.get_slot(rwtxn, slot_id)? {
-                        if let Some(decision) = slot.decision {
-                            decisions.insert(slot_id, decision);
-                        }
+                    if let Some(slot) = state.slots.get_slot(rwtxn, slot_id)?
+                        && let Some(decision) = slot.decision
+                    {
+                        decisions.insert(slot_id, decision);
                     }
                 }
             }
@@ -1287,7 +1275,7 @@ fn revert_create_market_dimensional(
     // Reconstruct the market to get its ID (height doesn't affect ID)
     let market = builder.build(0, None, &decisions).map_err(|e| {
         Error::InvalidTransaction {
-            reason: format!("Market reconstruction failed: {}", e),
+            reason: format!("Market reconstruction failed: {e}"),
         }
     })?;
 
@@ -1312,9 +1300,11 @@ fn revert_buy_shares(
     filled_tx: &FilledTransaction,
 ) -> Result<(), Error> {
     let buy_data =
-        filled_tx.buy_shares().ok_or_else(|| Error::InvalidTransaction {
-            reason: "Not a buy shares transaction".to_string(),
-        })?;
+        filled_tx
+            .buy_shares()
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: "Not a buy shares transaction".to_string(),
+            })?;
 
     let trader_address = filled_tx
         .spent_utxos
@@ -1408,9 +1398,11 @@ fn apply_market_trade(
     _height: u32,
 ) -> Result<(), Error> {
     let buy_data =
-        filled_tx.buy_shares().ok_or_else(|| Error::InvalidTransaction {
-            reason: "Not a buy shares transaction".to_string(),
-        })?;
+        filled_tx
+            .buy_shares()
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: "Not a buy shares transaction".to_string(),
+            })?;
 
     let market = state
         .markets()
@@ -1423,8 +1415,7 @@ fn apply_market_trade(
     if !market_state.allows_trading() {
         return Err(Error::InvalidTransaction {
             reason: format!(
-                "Cannot trade: market is in {:?} state",
-                market_state
+                "Cannot trade: market is in {market_state:?} state"
             ),
         });
     }
@@ -1436,12 +1427,10 @@ fn apply_market_trade(
     let mut new_shares = market.shares().clone();
     new_shares[outcome_index] += shares_to_buy;
 
-    let base_cost =
-        query_update_cost(&market.shares(), &new_shares, market.b()).map_err(
-            |e| Error::InvalidTransaction {
-                reason: format!("Failed to calculate trade cost: {:?}", e),
-            },
-        )?;
+    let base_cost = query_update_cost(market.shares(), &new_shares, market.b())
+        .map_err(|e| Error::InvalidTransaction {
+            reason: format!("Failed to calculate trade cost: {e:?}"),
+        })?;
 
     // Calculate fee for market author
     let fee_amount = base_cost * market.trading_fee();
@@ -1464,18 +1453,20 @@ fn apply_market_trade(
             reason: "No spent UTXOs found for trade".to_string(),
         })?;
 
-    let volume_sats = satoshi::to_sats(total_cost, Rounding::Up)
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Volume conversion failed: {}", e),
+    let volume_sats =
+        safe_math::to_sats(total_cost, Rounding::Up).map_err(|e| {
+            Error::InvalidTransaction {
+                reason: format!("Volume conversion failed: {e}"),
+            }
         })?;
-    let fee_sats = satoshi::to_sats_signed(fee_amount, Rounding::Up)
+    let fee_sats = safe_math::to_sats_signed(fee_amount, Rounding::Up)
         .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Fee conversion failed: {}", e),
+            reason: format!("Fee conversion failed: {e}"),
         })?;
     // Note: base_cost_sats is used for validation of explicit tx outputs
-    let _base_cost_sats = satoshi::to_sats_signed(base_cost, Rounding::Up)
+    let _base_cost_sats = safe_math::to_sats_signed(base_cost, Rounding::Up)
         .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Base cost conversion failed: {}", e),
+            reason: format!("Base cost conversion failed: {e}"),
         })?;
 
     state_update.add_market_update(MarketStateUpdate {
@@ -1532,7 +1523,7 @@ fn apply_market_creation(
     for slot_hex in &market_data.decision_slots {
         let slot_bytes =
             hex::decode(slot_hex).map_err(|_| Error::InvalidTransaction {
-                reason: format!("Invalid slot ID hex: {}", slot_hex),
+                reason: format!("Invalid slot ID hex: {slot_hex}"),
             })?;
 
         let slot_id_array: [u8; 3] = slot_bytes.try_into().unwrap();
@@ -1540,12 +1531,12 @@ fn apply_market_creation(
 
         let slot = state.slots.get_slot(rwtxn, slot_id)?.ok_or_else(|| {
             Error::InvalidSlotId {
-                reason: format!("Slot {} does not exist", slot_hex),
+                reason: format!("Slot {slot_hex} does not exist"),
             }
         })?;
 
         let decision = slot.decision.ok_or_else(|| Error::InvalidSlotId {
-            reason: format!("Slot {} has no decision", slot_hex),
+            reason: format!("Slot {slot_hex} has no decision"),
         })?;
 
         slot_ids.push(slot_id);
@@ -1582,15 +1573,15 @@ fn apply_market_creation(
         builder
             .build(height as u64, None, &decisions)
             .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Market creation failed: {}", e),
+                reason: format!("Market creation failed: {e}"),
             })?;
 
     // Calculate initial treasury from beta: b * ln(num_outcomes)
     let num_outcomes = market.get_outcome_count() as f64;
     let treasury_calc = market.b() * num_outcomes.ln();
-    let initial_treasury_sats = satoshi::to_sats(treasury_calc, Rounding::Up)
+    let initial_treasury_sats = safe_math::to_sats(treasury_calc, Rounding::Up)
         .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Treasury calculation failed: {}", e),
+            reason: format!("Treasury calculation failed: {e}"),
         })?;
 
     // Create the initial MarketTreasury UTXO if there's initial liquidity
@@ -1676,13 +1667,13 @@ fn apply_dimensional_market(
             let slot =
                 state.slots.get_slot(rwtxn, slot_id)?.ok_or_else(|| {
                     Error::InvalidSlotId {
-                        reason: format!("Slot {:?} does not exist", slot_id),
+                        reason: format!("Slot {slot_id:?} does not exist"),
                     }
                 })?;
 
             let decision =
                 slot.decision.ok_or_else(|| Error::InvalidSlotId {
-                    reason: format!("Slot {:?} has no decision", slot_id),
+                    reason: format!("Slot {slot_id:?} has no decision"),
                 })?;
 
             decisions.insert(slot_id, decision);
@@ -1705,15 +1696,15 @@ fn apply_dimensional_market(
         builder
             .build(height as u64, None, &decisions)
             .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Dimensional market creation failed: {}", e),
+                reason: format!("Dimensional market creation failed: {e}"),
             })?;
 
     // Calculate initial treasury from beta: b * ln(num_outcomes)
     let num_outcomes = market.get_outcome_count() as f64;
     let treasury_calc = market.b() * num_outcomes.ln();
-    let initial_treasury_sats = satoshi::to_sats(treasury_calc, Rounding::Up)
+    let initial_treasury_sats = safe_math::to_sats(treasury_calc, Rounding::Up)
         .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Treasury calculation failed: {}", e),
+            reason: format!("Treasury calculation failed: {e}"),
         })?;
 
     // Create the initial MarketTreasury UTXO if there's initial liquidity

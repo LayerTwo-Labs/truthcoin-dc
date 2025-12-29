@@ -286,8 +286,7 @@ where
         height: u32,
     ) -> Result<crate::state::votecoin::VotecoinNetworkData, Error> {
         let rotxn = self.env.read_txn()?;
-        Ok(self
-            .state
+        self.state
             .votecoin()
             .try_get_votecoin_data_at_block_height(&rotxn, votecoin_id, height)
             .map_err(state::Error::from)?
@@ -296,7 +295,7 @@ where
                     inputs: 0,
                     outputs: 0,
                 }))
-            })?)
+            })
     }
 
     pub fn try_get_current_votecoin_data(
@@ -308,8 +307,7 @@ where
         Ok(self
             .state
             .votecoin()
-            .try_get_current_votecoin_data(&rotxn, votecoin_id)
-            .map_err(state::Error::from)?)
+            .try_get_current_votecoin_data(&rotxn, votecoin_id)?)
     }
 
     pub fn get_current_votecoin_data(
@@ -317,17 +315,15 @@ where
         votecoin_id: &crate::state::votecoin::VotecoinId,
     ) -> Result<crate::state::votecoin::VotecoinNetworkData, Error> {
         let rotxn = self.env.read_txn()?;
-        Ok(self
-            .state
+        self.state
             .votecoin()
-            .try_get_current_votecoin_data(&rotxn, votecoin_id)
-            .map_err(state::Error::from)?
+            .try_get_current_votecoin_data(&rotxn, votecoin_id)?
             .ok_or_else(|| {
                 Error::State(Box::new(state::Error::UnbalancedVotecoin {
                     inputs: 0,
                     outputs: 0,
                 }))
-            })?)
+            })
     }
 
     pub fn submit_transaction(
@@ -339,21 +335,20 @@ where
             self.state.validate_transaction(&rwtxn, &transaction)?;
             self.mempool.put(&mut rwtxn, &transaction)?;
 
-            if let Some(data) = transaction.transaction.data.as_ref() {
-                if let crate::types::TxData::BuyShares {
+            if let Some(data) = transaction.transaction.data.as_ref()
+                && let crate::types::TxData::BuyShares {
                     market_id,
                     outcome_index,
                     shares_to_buy,
                     ..
                 } = data
-                {
-                    self.update_mempool_buy(
-                        &mut rwtxn,
-                        market_id.clone(),
-                        *outcome_index,
-                        *shares_to_buy,
-                    )?;
-                }
+            {
+                self.update_mempool_buy(
+                    &mut rwtxn,
+                    market_id.clone(),
+                    *outcome_index,
+                    *shares_to_buy,
+                )?;
             }
 
             rwtxn.commit().map_err(RwTxnError::from)?;
@@ -388,7 +383,7 @@ where
             .get_market(rwtxn, &market_id)?
             .ok_or_else(|| {
                 Error::State(Box::new(state::Error::InvalidSlotId {
-                    reason: format!("Market {:?} does not exist", market_id),
+                    reason: format!("Market {market_id:?} does not exist"),
                 }))
             })?;
 
@@ -422,8 +417,7 @@ where
             .map_err(|e| {
                 Error::State(Box::new(state::Error::InvalidSlotId {
                     reason: format!(
-                        "Invalid LMSR state after mempool update: {:?}",
-                        e
+                        "Invalid LMSR state after mempool update: {e:?}"
                     ),
                 }))
             })?;
@@ -964,7 +958,7 @@ where
 
     pub fn get_period_summary(
         &self,
-    ) -> Result<(Vec<(u32, u64)>, Vec<(u32, u64)>), Error> {
+    ) -> Result<crate::state::type_aliases::PeriodSummary, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self.state.get_period_summary(&rotxn)?)
     }
@@ -1083,10 +1077,10 @@ where
         let mut decisions = std::collections::HashMap::new();
 
         for &slot_id in &market.decision_slots {
-            if let Some(slot) = self.state.slots().get_slot(&rotxn, slot_id)? {
-                if let Some(decision) = slot.decision {
-                    decisions.insert(slot_id, decision);
-                }
+            if let Some(slot) = self.state.slots().get_slot(&rotxn, slot_id)?
+                && let Some(decision) = slot.decision
+            {
+                decisions.insert(slot_id, decision);
             }
         }
 
@@ -1118,13 +1112,7 @@ where
 
     pub fn get_all_share_accounts(
         &self,
-    ) -> Result<
-        Vec<(
-            crate::types::Address,
-            Vec<(crate::state::MarketId, u32, f64)>,
-        )>,
-        Error,
-    > {
+    ) -> Result<crate::state::type_aliases::AllShareAccounts, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self.state.markets().get_all_share_accounts(&rotxn)?)
     }
@@ -1172,7 +1160,7 @@ where
         let timestamp =
             SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| {
                 Error::State(Box::new(state::Error::InvalidTransaction {
-                    reason: format!("Failed to get current time: {}", e),
+                    reason: format!("Failed to get current time: {e}"),
                 }))
             })?;
         Ok(timestamp.as_secs())

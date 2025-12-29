@@ -784,9 +784,7 @@ impl FilledTransaction {
                     OutputContent::Bitcoin(value) => {
                         let new_max =
                             output_bitcoin_max_value.checked_sub(value.0);
-                        if new_max.is_none() {
-                            return None;
-                        }
+                        new_max?;
 
                         output_bitcoin_max_value = new_max.unwrap();
                         FilledOutputContent::Bitcoin(value)
@@ -797,9 +795,7 @@ impl FilledTransaction {
                     OutputContent::MarketTreasury { market_id, amount } => {
                         let new_max =
                             output_bitcoin_max_value.checked_sub(amount.0);
-                        if new_max.is_none() {
-                            return None;
-                        }
+                        new_max?;
 
                         output_bitcoin_max_value = new_max.unwrap();
                         FilledOutputContent::MarketTreasury {
@@ -810,9 +806,7 @@ impl FilledTransaction {
                     OutputContent::MarketAuthorFee { market_id, amount } => {
                         let new_max =
                             output_bitcoin_max_value.checked_sub(amount.0);
-                        if new_max.is_none() {
-                            return None;
-                        }
+                        new_max?;
 
                         output_bitcoin_max_value = new_max.unwrap();
                         FilledOutputContent::MarketAuthorFee {
