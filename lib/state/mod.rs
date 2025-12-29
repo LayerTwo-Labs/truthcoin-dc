@@ -56,6 +56,7 @@ pub mod error;
 pub mod markets;
 mod rollback;
 pub mod slots;
+pub mod type_aliases;
 use slots::{Decision, SlotId};
 mod two_way_peg_data;
 pub mod votecoin;
@@ -306,12 +307,11 @@ impl State {
 
         let mut iter = self.utxos_by_address.iter(rotxn)?;
         while let Some(((addr, outpoint), _)) = iter.next()? {
-            if addresses.contains(&addr) {
-                if let Some(filled_output) =
+            if addresses.contains(&addr)
+                && let Some(filled_output) =
                     self.utxos.try_get(rotxn, &outpoint)?
-                {
-                    result.insert(outpoint, filled_output);
-                }
+            {
+                result.insert(outpoint, filled_output);
             }
         }
 
@@ -726,7 +726,7 @@ impl State {
             .transaction
             .data
             .as_ref()
-            .map_or(false, |data| data.is_buy_shares())
+            .is_some_and(|data| data.is_buy_shares())
         {
             self.validate_buy_shares(rotxn, tx, override_height)?;
         }
@@ -1025,7 +1025,7 @@ impl State {
     pub fn get_period_summary(
         &self,
         rotxn: &RoTxn,
-    ) -> Result<(Vec<(u32, u64)>, Vec<(u32, u64)>), Error> {
+    ) -> Result<type_aliases::PeriodSummary, Error> {
         let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
         let current_height = self.try_get_height(rotxn)?;
         self.slots
