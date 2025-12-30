@@ -69,26 +69,19 @@ jobs:
           rm -r bip300301-enforcer-latest-x86_64-unknown-linux-gnu
           chmod +x bip300301-enforcer
           popd
-      - name: Checkout electrs
+      - name: Download latest electrs
         run: |
           pushd ..
-          git clone https://github.com/mempool/electrs.git
+          wget https://releases.drivechain.info/electrs-latest-x86_64-unknown-linux-gnu.zip
+          unzip electrs-latest-x86_64-unknown-linux-gnu.zip
+          rm electrs-latest-x86_64-unknown-linux-gnu.zip
+          chmod +x electrs
           popd
       - name: Install latest nightly toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
           target: x86_64-pc-windows-gnu
-      - name: Rust Cache (electrs)
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v0-rust-electrs"
-          workspaces: ../electrs -> target
-      - name: Install electrs
-        run: |
-          pushd ../electrs
-          cargo build --locked --release
-          popd
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
@@ -104,7 +97,7 @@ jobs:
           export BIP300301_ENFORCER='../bip300301-enforcer'
           export BITCOIND='../bitcoin-patched-bins/bitcoind'
           export BITCOIN_CLI='../bitcoin-patched-bins/bitcoin-cli'
-          export ELECTRS='../electrs/target/release/electrs'
+          export ELECTRS='../electrs'
           export TRUTHCOIN_APP='target/debug/truthcoin_dc_app'
           cargo run --example integration_tests
 
