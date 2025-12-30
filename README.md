@@ -42,7 +42,7 @@ To run a specific test:
 ```bash
 TRUTHCOIN_INTEGRATION_TEST_ENV=integration_tests/example.env cargo run --example integration_tests -- --exact <test_name> 
 
-roundtrip.rs is a full coverage test of the node
+roundtrip is a full coverage test of the node
 
 ```
 
@@ -59,7 +59,7 @@ rm -rf /tmp/regtest-data && mkdir -p /tmp/regtest-data/{bitcoin,electrs,enforcer
 
 **Bitcoin Core:**
 ```bash
-../bitcoin-patched/build/src/bitcoind -acceptnonstdtxn -chain=regtest -datadir=/tmp/regtest-data/bitcoin \
+../bitcoin-patched/bitcoind -acceptnonstdtxn -chain=regtest -datadir=/tmp/regtest-data/bitcoin \
 -bind=127.0.0.1:18444 -rpcuser=regtest_user -rpcpassword=regtest_pass -rpcport=18443 \
 -rest -server -zmqpubsequence=tcp://127.0.0.1:28332 -listenonion=0 -txindex
 ```
@@ -74,7 +74,7 @@ rm -rf /tmp/regtest-data && mkdir -p /tmp/regtest-data/{bitcoin,electrs,enforcer
 
 **BIP300301 Enforcer:**
 ```bash
-../bip300301_enforcer/target/debug/bip300301_enforcer --data-dir=/tmp/regtest-data/enforcer \
+../bip300301_enforcer/bip300301_enforcer --data-dir=/tmp/regtest-data/enforcer \
 --node-rpc-addr=127.0.0.1:18443 --node-rpc-user=regtest_user --node-rpc-pass=regtest_pass \
 --enable-wallet --log-level=trace --serve-grpc-addr=127.0.0.1:50051 \
 --serve-json-rpc-addr=127.0.0.1:18080 --serve-rpc-addr=127.0.0.1:18081 \
