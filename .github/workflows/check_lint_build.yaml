@@ -75,6 +75,7 @@ jobs:
           wget https://releases.drivechain.info/electrs-latest-x86_64-unknown-linux-gnu.zip
           unzip electrs-latest-x86_64-unknown-linux-gnu.zip
           rm electrs-latest-x86_64-unknown-linux-gnu.zip
+          mv electrs-latest-x86_64-unknown-linux-gnu electrs
           chmod +x electrs
           popd
       - name: Install latest nightly toolchain
