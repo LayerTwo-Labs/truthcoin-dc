@@ -43,6 +43,7 @@ impl std::fmt::Display for FillTxOutputContents {
 
 impl std::error::Error for FillTxOutputContents {}
 
+#[allow(clippy::duplicated_attributes)]
 #[derive(Debug, Error, Transitive)]
 #[transitive(from(db::Clear, db::Error))]
 #[transitive(from(db::Delete, db::Error))]
