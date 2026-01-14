@@ -612,6 +612,8 @@ pub struct ConsensusResult {
         Option<super::redistribution::RedistributionSummary>,
     pub block_height: u64,
     pub timestamp: u64,
+    /// Total number of slots being voted on in this period
+    pub total_slot_count: usize,
 }
 
 impl ConsensusResult {
@@ -619,6 +621,7 @@ impl ConsensusResult {
         period_id: VotingPeriodId,
         block_height: u64,
         timestamp: u64,
+        total_slot_count: usize,
     ) -> Self {
         Self {
             period_id,
@@ -630,6 +633,7 @@ impl ConsensusResult {
             redistribution_summary: None,
             block_height,
             timestamp,
+            total_slot_count,
         }
     }
 
@@ -642,8 +646,7 @@ impl ConsensusResult {
     }
 
     pub fn abstained_slot_count(&self) -> usize {
-        self.decision_outcomes
-            .len()
+        self.total_slot_count
             .saturating_sub(self.slot_resolutions.len())
     }
 }

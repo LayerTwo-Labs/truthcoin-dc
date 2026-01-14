@@ -112,7 +112,11 @@ pub fn weighted_median(
     for (i, &(value, weight)) in sorted.iter().enumerate() {
         cumulative_weight += weight;
         if cumulative_weight >= half_weight {
-            if cumulative_weight == half_weight && i < sorted.len() - 1 {
+            // Use epsilon comparison instead of exact equality for f64
+            // Exact equality (==) on f64 is unreliable due to floating-point precision
+            if (cumulative_weight - half_weight).abs() < 1e-10
+                && i < sorted.len() - 1
+            {
                 return Ok((*value + *sorted[i + 1].0) / 2.0);
             } else {
                 return Ok(*value);
@@ -263,31 +267,24 @@ pub fn get_reward_weights(
             dissent.map(|x| if x != 0.0 { 1.0 / x } else { f64::NAN });
         let mainstream = re_weight(&mainstream_preweight);
 
-        let mut non_compliance =
-            DMatrix::zeros(vote_matrix.nrows(), vote_matrix.ncols());
-        for i in 0..vote_matrix.nrows() {
-            for j in 0..vote_matrix.ncols() {
-                if j < mainstream.len() {
-                    non_compliance[(i, j)] = distance[(i, j)] * mainstream[j];
-                }
-            }
-        }
-
-        let max_non_compliance = non_compliance.max();
-        let compliance = non_compliance.map(|x| (x - max_non_compliance).abs());
-
-        let mut compliance_scores = DVector::zeros(num_voters);
+        // Compute per-voter non-compliance as weighted sum (matches R algorithm)
+        // R: NonCompliance[i] = Σⱼ distance[i,j] × mainstream[j]
+        let mut non_compliance_per_voter = DVector::zeros(num_voters);
         for i in 0..num_voters {
-            let mut sum = 0.0;
-            let mut count = 0.0;
+            let mut weighted_sum = 0.0;
             for j in 0..vote_matrix.ncols() {
                 if j < mainstream.len() {
-                    sum += compliance[(i, j)];
-                    count += 1.0;
+                    weighted_sum += distance[(i, j)] * mainstream[j];
                 }
             }
-            compliance_scores[i] = if count > 0.0 { sum / count } else { 0.0 };
+            non_compliance_per_voter[i] = weighted_sum;
         }
+
+        // R: Compliance = ReWeight(|NonCompliance - max(NonCompliance)|)
+        let max_non_compliance = non_compliance_per_voter.max();
+        let compliance_raw =
+            non_compliance_per_voter.map(|x| (x - max_non_compliance).abs());
+        let compliance_scores = re_weight(&compliance_raw);
 
         let weighted_score_1 = get_weight(&new_score_1);
         let difference_1 = &weighted_score_1 - &compliance_scores;
@@ -376,12 +373,26 @@ pub struct FactoryResult {
     pub first_loading: DVector<f64>,
 }
 
+/// Compute consensus outcomes for each decision.
+///
+/// Per Bitcoin Hivemind whitepaper:
+/// - Binary decisions: weighted mean + catch_tl to discretize to {0, 0.5, 1}
+/// - Scaled decisions: weighted median, continuous value in [0, 1]
+///
+/// `scaled_indices` indicates which column indices correspond to scaled decisions.
 pub fn factory(
     m0: &DMatrix<f64>,
     rep: Option<&DVector<f64>>,
     catch_p: Option<f64>,
+    scaled_indices: Option<&[bool]>,
 ) -> Result<FactoryResult, VotingMathError> {
     let catch_p = catch_p.unwrap_or(CONSENSUS_CATCH_TOLERANCE);
+    let num_decisions = m0.ncols();
+
+    // Default: all binary (no scaled)
+    let scaled_flags: Vec<bool> = scaled_indices
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| vec![false; num_decisions]);
 
     let fill_result = fill_na(m0, rep, catch_p);
     let filled = fill_result.filled;
@@ -391,13 +402,60 @@ pub fn factory(
     let player_info =
         get_reward_weights(&filled, rep, REPUTATION_SMOOTHING_ALPHA)?;
 
-    let (decision_outcomes, _) =
-        compute_weighted_column_means(&filled, &player_info.smooth_rep);
-    let decision_outcomes_final =
-        decision_outcomes.map(|x| catch_tl(x, catch_p));
+    // Calculate outcomes differently for binary vs scaled decisions
+    let mut decision_outcomes_final = DVector::zeros(num_decisions);
 
-    let mut certainty = vec![0.0; filled.ncols()];
-    for j in 0..filled.ncols() {
+    for j in 0..num_decisions {
+        let is_scaled = scaled_flags.get(j).copied().unwrap_or(false);
+
+        if is_scaled {
+            // Scaled decisions: use weighted median, keep continuous value
+            let col_values: DVector<f64> =
+                DVector::from_iterator(filled.nrows(), filled.column(j).iter().copied());
+
+            // Filter out NaN values and their corresponding weights
+            let mut valid_values = Vec::new();
+            let mut valid_weights = Vec::new();
+            for i in 0..filled.nrows() {
+                let val = col_values[i];
+                if !val.is_nan() {
+                    valid_values.push(val);
+                    valid_weights.push(player_info.smooth_rep[i]);
+                }
+            }
+
+            if valid_values.is_empty() {
+                decision_outcomes_final[j] = BITCOIN_HIVEMIND_NEUTRAL_VALUE;
+            } else {
+                let values_vec = DVector::from_vec(valid_values);
+                let weights_vec = DVector::from_vec(valid_weights);
+                decision_outcomes_final[j] =
+                    weighted_median(&values_vec, &weights_vec)
+                        .unwrap_or(BITCOIN_HIVEMIND_NEUTRAL_VALUE);
+            }
+        } else {
+            // Binary decisions: weighted mean + catch_tl
+            let mut weighted_sum = 0.0;
+            let mut total_weight = 0.0;
+            for i in 0..filled.nrows() {
+                let vote = filled[(i, j)];
+                if !vote.is_nan() {
+                    let weight = player_info.smooth_rep[i];
+                    weighted_sum += vote * weight;
+                    total_weight += weight;
+                }
+            }
+            let raw_outcome = if total_weight > 0.0 {
+                weighted_sum / total_weight
+            } else {
+                BITCOIN_HIVEMIND_NEUTRAL_VALUE
+            };
+            decision_outcomes_final[j] = catch_tl(raw_outcome, catch_p);
+        }
+    }
+
+    let mut certainty = vec![0.0; num_decisions];
+    for j in 0..num_decisions {
         let mut sum = 0.0;
         for i in 0..filled.nrows() {
             if (decision_outcomes_final[j] - filled[(i, j)]).abs()
@@ -421,13 +479,25 @@ pub fn factory(
     })
 }
 
+/// Run consensus calculation on a vote matrix.
+///
+/// `scaled_decisions` contains the SlotIds of decisions that are scaled (not binary).
+/// For scaled decisions, weighted median is used and the outcome is continuous [0,1].
+/// For binary decisions, weighted mean + catch_tl produces {0, 0.5, 1}.
 pub fn run_consensus(
     vote_matrix: &SparseVoteMatrix,
     reputation_vector: &VotingWeightVector,
+    scaled_decisions: &std::collections::HashSet<crate::state::slots::SlotId>,
 ) -> Result<DetailedConsensusResult, VotingMathError> {
     let voters = vote_matrix.get_voters();
     let decisions = vote_matrix.get_decisions();
     let (num_voters, num_decisions) = vote_matrix.dimensions();
+
+    // Build scaled_indices array matching column order
+    let scaled_indices: Vec<bool> = decisions
+        .iter()
+        .map(|slot_id| scaled_decisions.contains(slot_id))
+        .collect();
 
     let mut dense_matrix =
         DMatrix::from_element(num_voters, num_decisions, f64::NAN);
@@ -456,6 +526,7 @@ pub fn run_consensus(
         &dense_matrix,
         Some(&rep_vector),
         Some(CONSENSUS_CATCH_TOLERANCE),
+        Some(&scaled_indices),
     )?;
 
     let mut outcomes = HashMap::new();

@@ -83,6 +83,8 @@ pub enum Error {
     InvalidTimestamp,
     #[error("invalid transaction: {reason}")]
     InvalidTransaction { reason: String },
+    #[error("invalid vote value: {reason}")]
+    InvalidVoteValue { reason: String },
     #[error("slot {slot_id:?} is already claimed")]
     SlotAlreadyClaimed {
         slot_id: crate::state::slots::SlotId,

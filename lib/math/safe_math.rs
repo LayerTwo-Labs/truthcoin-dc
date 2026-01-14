@@ -1,4 +1,10 @@
-//! Satoshi conversion utilities with standardized rounding.
+//! Safe math utilities with standardized rounding.
+//!
+//! This module serves as the single source of truth for all mathematical
+//! operations in the system that require:
+//! - Consistent rounding behavior across all calculations
+//! - Deterministic results across platforms
+//! - Overflow protection
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -21,7 +27,21 @@ pub enum Rounding {
     Nearest, // round - for neutral calculations
 }
 
+// Maximum f64 value that can safely be converted to u64.
+// u64::MAX = 18446744073709551615, but f64 loses precision for values > 2^53.
+// We use 2^64 as the boundary since any f64 >= 2^64 definitely overflows u64.
+const U64_MAX_F64_BOUND: f64 = 18446744073709551616.0; // 2^64
+
+// Maximum f64 values that can safely be converted to i64.
+// i64::MAX = 9223372036854775807, i64::MIN = -9223372036854775808
+const I64_MAX_F64_BOUND: f64 = 9223372036854775808.0; // 2^63
+const I64_MIN_F64_BOUND: f64 = -9223372036854775808.0; // -2^63
+
 /// Convert f64 to u64 satoshis with validation and rounding.
+///
+/// # Overflow Check
+/// Uses explicit f64 bound (2^64) rather than `u64::MAX as f64` which loses precision
+/// due to f64's 53-bit mantissa.
 pub fn to_sats(value: f64, mode: Rounding) -> Result<u64, SatoshiError> {
     if !value.is_finite() {
         return Err(SatoshiError::NonFinite(value));
@@ -34,13 +54,18 @@ pub fn to_sats(value: f64, mode: Rounding) -> Result<u64, SatoshiError> {
         Rounding::Down => value.floor(),
         Rounding::Nearest => value.round(),
     };
-    if rounded > u64::MAX as f64 {
+    // Use explicit bound to avoid precision loss with u64::MAX as f64
+    if rounded >= U64_MAX_F64_BOUND {
         return Err(SatoshiError::Overflow(value));
     }
     Ok(rounded as u64)
 }
 
 /// Convert f64 to i64 satoshis (for values that can be negative).
+///
+/// # Overflow Check
+/// Uses explicit f64 bounds (2^63 and -2^63) rather than casting i64::MAX/MIN to f64
+/// which can lose precision due to f64's 53-bit mantissa.
 pub fn to_sats_signed(value: f64, mode: Rounding) -> Result<i64, SatoshiError> {
     if !value.is_finite() {
         return Err(SatoshiError::NonFinite(value));
@@ -62,7 +87,8 @@ pub fn to_sats_signed(value: f64, mode: Rounding) -> Result<i64, SatoshiError> {
         }
         Rounding::Nearest => value.round(),
     };
-    if rounded > i64::MAX as f64 || rounded < i64::MIN as f64 {
+    // Use explicit bounds to avoid precision loss with i64::MAX/MIN as f64
+    if rounded >= I64_MAX_F64_BOUND || rounded < I64_MIN_F64_BOUND {
         return Err(SatoshiError::Overflow(value));
     }
     Ok(rounded as i64)
@@ -115,6 +141,33 @@ impl BasisPoints {
     #[inline]
     pub fn apply_to_i64(&self, amount: i64) -> i64 {
         ((amount as i128 * self.0 as i128) / 10000) as i64
+    }
+
+    /// Checked version that returns None if the result would exceed i64::MAX.
+    /// Use this when converting from u64 amounts that may be large.
+    #[inline]
+    pub fn checked_apply_to_u64_as_i64(&self, amount: u64) -> Option<i64> {
+        let result = (amount as u128 * self.0 as u128) / 10000;
+        if result > i64::MAX as u128 {
+            None
+        } else {
+            Some(result as i64)
+        }
+    }
+
+    /// Create BasisPoints from a ratio (numerator / denominator).
+    /// Returns None if denominator is zero or if the result exceeds 10000 (100%).
+    pub fn from_ratio(numerator: u64, denominator: u64) -> Option<Self> {
+        if denominator == 0 {
+            return None;
+        }
+        // Calculate as (numerator * 10000) / denominator
+        let result = (numerator as u128 * 10000) / denominator as u128;
+        if result > 10000 {
+            None
+        } else {
+            Some(BasisPoints(result as u32))
+        }
     }
 
     #[inline]

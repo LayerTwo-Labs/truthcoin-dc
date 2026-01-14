@@ -258,11 +258,17 @@ pub struct DetailedConsensusResult {
 
 /// Calculate consensus using SVD-based PCA and current reputation weights.
 /// Outcomes are then used to update reputation in the next period.
+///
+/// `scaled_decisions` contains the SlotIds of decisions that are scaled (not binary).
+/// Per Bitcoin Hivemind whitepaper:
+/// - Binary decisions use weighted mean + catch_tl → {0, 0.5, 1}
+/// - Scaled decisions use weighted median → continuous [0, 1]
 pub fn calculate_consensus(
     vote_matrix: &SparseVoteMatrix,
     reputation_vector: &VotingWeightVector,
+    scaled_decisions: &std::collections::HashSet<crate::state::slots::SlotId>,
 ) -> Result<DetailedConsensusResult, VotingMathError> {
-    consensus::run_consensus(vote_matrix, reputation_vector)
+    consensus::run_consensus(vote_matrix, reputation_vector, scaled_decisions)
 }
 
 #[cfg(test)]

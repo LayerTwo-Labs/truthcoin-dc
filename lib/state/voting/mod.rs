@@ -146,6 +146,21 @@ impl VotingSystem {
 
         let voters: Vec<_> = voters_set.into_iter().collect();
         let decisions: Vec<_> = decisions_set.into_iter().collect();
+
+        // Determine which decisions are scaled (vs binary) BEFORE creating vote matrix
+        // This avoids cloning the decisions vector
+        // Per Bitcoin Hivemind whitepaper: scaled decisions use weighted median
+        let mut scaled_decisions: HashSet<SlotId> = HashSet::new();
+        for slot_id in &decisions {
+            if let Some(slot) = state.slots().get_slot(rwtxn, *slot_id)?
+                && let Some(decision) = slot.decision
+                && decision.is_scaled
+            {
+                scaled_decisions.insert(*slot_id);
+            }
+        }
+
+        // Now pass ownership of decisions - no clone needed
         let mut vote_matrix = SparseVoteMatrix::new(voters, decisions);
 
         for (vote_key, vote_entry) in &all_votes {
@@ -166,7 +181,7 @@ impl VotingSystem {
         let reputation_vector =
             VotingWeightVector::from_voter_reputations(&voter_reputations);
         let math_result =
-            math_calculate_consensus(&vote_matrix, &reputation_vector)
+            math_calculate_consensus(&vote_matrix, &reputation_vector, &scaled_decisions)
                 .map_err(|e| Error::InvalidTransaction {
                     reason: format!("Failed to calculate consensus: {e:?}"),
                 })?;
@@ -216,6 +231,7 @@ impl VotingSystem {
 
         let mut decision_outcomes = Vec::new();
         let mut slot_resolutions = Vec::new();
+        let total_slot_count = math_result.outcomes.len();
 
         for (slot_id, outcome_value) in &math_result.outcomes {
             let Some(outcome_f64) = outcome_value else {
@@ -272,8 +288,12 @@ impl VotingSystem {
             current_height,
         );
 
-        let mut result =
-            ConsensusResult::new(period_id, current_height, current_timestamp);
+        let mut result = ConsensusResult::new(
+            period_id,
+            current_height,
+            current_timestamp,
+            total_slot_count,
+        );
         result.voter_reputations = updated_voter_reputations;
         result.period_stats = period_stats;
         result.decision_outcomes = decision_outcomes;
