@@ -1,15 +1,20 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use fallible_iterator::FallibleIterator as _;
+use futures::{Stream, StreamExt};
 use heed::types::SerdeBincode;
 use sneed::{
     DatabaseUnique, DbError, EnvError, RoTxn, RwTxn, RwTxnError, UnitKey, db,
     env, rwtxn,
 };
+use tokio_stream::{StreamMap, wrappers::WatchStream};
 
-use crate::types::{
-    Address, AuthorizedTransaction, InPoint, OutPoint, Output, Txid, VERSION,
-    Version,
+use crate::{
+    types::{
+        Address, AuthorizedTransaction, InPoint, OutPoint, Output, Txid,
+        VERSION, Version,
+    },
+    util::Watchable,
 };
 
 #[allow(clippy::duplicated_attributes)]
@@ -31,6 +36,8 @@ pub enum Error {
     MissingTransaction(Txid),
     #[error("can't add transaction, utxo double spent")]
     UtxoDoubleSpent,
+    #[error("can't add transaction, slot {0} already claimed in mempool")]
+    SlotAlreadyClaimedInMempool(String),
 }
 
 #[derive(Clone)]
@@ -42,11 +49,14 @@ pub struct MemPool {
     /// Associates relevant txs to each address
     address_to_txs:
         DatabaseUnique<SerdeBincode<Address>, SerdeBincode<HashSet<Txid>>>,
+    /// Tracks pending slot claims: slot_id_bytes -> claiming txid
+    pending_slot_claims:
+        DatabaseUnique<SerdeBincode<[u8; 3]>, SerdeBincode<Txid>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
 }
 
 impl MemPool {
-    pub const NUM_DBS: u32 = 4;
+    pub const NUM_DBS: u32 = 5;
 
     pub fn new(env: &sneed::Env) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
@@ -56,6 +66,8 @@ impl MemPool {
             DatabaseUnique::create(env, &mut rwtxn, "spent_utxos")?;
         let address_to_txs =
             DatabaseUnique::create(env, &mut rwtxn, "address_to_txs")?;
+        let pending_slot_claims =
+            DatabaseUnique::create(env, &mut rwtxn, "pending_slot_claims")?;
         let version =
             DatabaseUnique::create(env, &mut rwtxn, "mempool_version")?;
         if version.try_get(&rwtxn, &())?.is_none() {
@@ -66,6 +78,7 @@ impl MemPool {
             transactions,
             spent_utxos,
             address_to_txs,
+            pending_slot_claims,
             _version: version,
         })
     }
@@ -169,6 +182,71 @@ impl MemPool {
         })
     }
 
+    /// Extract slot IDs being claimed by this transaction
+    fn get_claimed_slot_ids(transaction: &AuthorizedTransaction) -> Vec<[u8; 3]> {
+        use crate::types::TransactionData;
+
+        let mut slot_ids = Vec::new();
+        if let Some(ref data) = transaction.transaction.data {
+            match data {
+                TransactionData::ClaimDecisionSlot { slot_id_bytes, .. } => {
+                    slot_ids.push(*slot_id_bytes);
+                }
+                TransactionData::ClaimCategorySlots { slots, .. } => {
+                    for (slot_id_bytes, _) in slots {
+                        slot_ids.push(*slot_id_bytes);
+                    }
+                }
+                _ => {}
+            }
+        }
+        slot_ids
+    }
+
+    /// Check if any slots are already claimed in mempool, and add them.
+    ///
+    /// # Atomicity
+    /// This method uses a check-then-act pattern that relies on LMDB write
+    /// transaction exclusivity - only one write transaction can be active at
+    /// a time across all threads, preventing TOCTOU races between the check
+    /// and add phases.
+    fn put_slot_claims(
+        &self,
+        rwtxn: &mut RwTxn,
+        txid: Txid,
+        slot_ids: &[[u8; 3]],
+    ) -> Result<(), Error> {
+        // First check for conflicts
+        for slot_id in slot_ids {
+            if let Some(existing_txid) =
+                self.pending_slot_claims.try_get(rwtxn, slot_id)?
+                && existing_txid != txid
+            {
+                return Err(Error::SlotAlreadyClaimedInMempool(
+                    hex::encode(slot_id),
+                ));
+            }
+        }
+        // No conflicts, add all claims
+        for slot_id in slot_ids {
+            self.pending_slot_claims.put(rwtxn, slot_id, &txid)?;
+        }
+        Ok(())
+    }
+
+    /// Remove slot claims for a transaction
+    fn delete_slot_claims(
+        &self,
+        rwtxn: &mut RwTxn,
+        transaction: &AuthorizedTransaction,
+    ) -> Result<(), Error> {
+        let slot_ids = Self::get_claimed_slot_ids(transaction);
+        for slot_id in slot_ids {
+            self.pending_slot_claims.delete(rwtxn, &slot_id)?;
+        }
+        Ok(())
+    }
+
     pub fn put(
         &self,
         rwtxn: &mut RwTxn,
@@ -176,6 +254,13 @@ impl MemPool {
     ) -> Result<(), Error> {
         let txid = transaction.transaction.txid();
         tracing::debug!("adding transaction {txid} to mempool");
+
+        // Check for duplicate slot claims first
+        let claimed_slots = Self::get_claimed_slot_ids(transaction);
+        if !claimed_slots.is_empty() {
+            self.put_slot_claims(rwtxn, txid, &claimed_slots)?;
+        }
+
         let stxos = {
             let txid = transaction.transaction.txid();
             transaction.transaction.inputs.iter().enumerate().map(
@@ -202,6 +287,7 @@ impl MemPool {
             if let Some(tx) = self.transactions.try_get(rwtxn, &txid)? {
                 let () = self.delete_stxos(rwtxn, &tx.transaction.inputs)?;
                 let () = self.unassoc_tx_with_relevant_addresses(rwtxn, &tx)?;
+                let () = self.delete_slot_claims(rwtxn, &tx)?;
                 self.transactions.delete(rwtxn, &txid)?;
                 for vout in 0..tx.transaction.outputs.len() {
                     let outpoint = OutPoint::Regular {
@@ -304,5 +390,27 @@ impl MemPool {
             })
             .collect();
         Ok(res)
+    }
+}
+
+impl Watchable<()> for MemPool {
+    type WatchStream = impl Stream<Item = ()>;
+
+    /// Get a signal that notifies whenever the mempool changes
+    fn watch(&self) -> Self::WatchStream {
+        let watchables = [
+            self.transactions.watch().clone(),
+            self.spent_utxos.watch().clone(),
+            self.pending_slot_claims.watch().clone(),
+        ];
+        let streams = StreamMap::from_iter(
+            watchables.into_iter().map(WatchStream::new).enumerate(),
+        );
+        let streams_len = streams.len();
+        streams.ready_chunks(streams_len).map(|signals| {
+            assert_ne!(signals.len(), 0);
+            #[allow(clippy::unused_unit)]
+            ()
+        })
     }
 }

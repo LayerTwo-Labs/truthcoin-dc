@@ -354,9 +354,26 @@ pub enum Command {
         #[arg(long)]
         question: String,
         #[arg(long)]
-        min: Option<u16>,
+        min: Option<i64>,
         #[arg(long)]
-        max: Option<u16>,
+        max: Option<i64>,
+        #[arg(long, default_value = "1000")]
+        fee_sats: u64,
+    },
+
+    /// Claim multiple decision slots as a category (atomic transaction)
+    /// The txid of the transaction becomes the category identifier
+    #[command(name = "slot-claim-category", alias = "claim-cat")]
+    SlotClaimCategory {
+        /// Comma-separated list of slot IDs in hex format (e.g., "004008,004009,00400a")
+        #[arg(long)]
+        slot_ids: String,
+        /// Comma-separated list of questions corresponding to each slot
+        #[arg(long)]
+        questions: String,
+        /// Whether these are standard slots
+        #[arg(long, action = ArgAction::Set)]
+        is_standard: bool,
         #[arg(long, default_value = "1000")]
         fee_sats: u64,
     },
@@ -430,16 +447,12 @@ pub enum Command {
     CalculateInitialLiquidity {
         #[arg(long)]
         beta: f64,
-        #[arg(long, default_value = "independent")]
-        market_type: String,
-        #[arg(long)]
-        num_outcomes: Option<usize>,
-        #[arg(long)]
-        decision_slots: Option<String>,
-        #[arg(long)]
-        has_residual: Option<bool>,
+        /// Dimension specification in bracket notation
         #[arg(long)]
         dimensions: Option<String>,
+        /// Number of outcomes (alternative to dimensions)
+        #[arg(long)]
+        num_outcomes: Option<usize>,
     },
 
     // === VOTE COMMANDS (vote_*) ===
@@ -861,6 +874,50 @@ where
                 .await?;
             format!("Slot claimed: {txid}")
         }
+        Command::SlotClaimCategory {
+            slot_ids,
+            questions,
+            is_standard,
+            fee_sats,
+        } => {
+            use truthcoin_dc_app_rpc_api::{CategoryClaimRequest, CategorySlotItem};
+
+            let slot_id_list: Vec<&str> = slot_ids.split(',').map(|s| s.trim()).collect();
+            let question_list: Vec<&str> = questions.split(',').map(|s| s.trim()).collect();
+
+            if slot_id_list.len() != question_list.len() {
+                return Err(anyhow::anyhow!(
+                    "Number of slot IDs ({}) must match number of questions ({})",
+                    slot_id_list.len(),
+                    question_list.len()
+                ));
+            }
+
+            if slot_id_list.len() < 2 {
+                return Err(anyhow::anyhow!(
+                    "Category claim requires at least 2 slots, got {}",
+                    slot_id_list.len()
+                ));
+            }
+
+            let slots: Vec<CategorySlotItem> = slot_id_list
+                .into_iter()
+                .zip(question_list.into_iter())
+                .map(|(slot_id, question)| CategorySlotItem {
+                    slot_id_hex: slot_id.to_string(),
+                    question: question.to_string(),
+                })
+                .collect();
+
+            let request = CategoryClaimRequest {
+                slots,
+                is_standard,
+                fee_sats,
+            };
+
+            let txid = rpc_client.slot_claim_category(request).await?;
+            format!("Category claimed with txid (also category_id): {txid}")
+        }
 
         // === MARKET COMMANDS (market_*) ===
         Command::MarketCreate {
@@ -873,22 +930,17 @@ where
             fee_sats,
         } => {
             use truthcoin_dc_app_rpc_api::CreateMarketRequest;
-            let slots = match extract_slots_from_dimensions(&dimensions) {
-                Ok(slots) => slots,
-                Err(err) => return Ok(err),
-            };
             let parsed_tags = tags.map(|t| parse_comma_separated(&t));
             let request = CreateMarketRequest {
                 title: title.clone(),
                 description,
-                market_type: "dimensional".to_string(),
-                decision_slots: slots,
-                dimensions: Some(dimensions),
-                has_residual: None,
+                dimensions,
                 beta: Some(beta),
                 trading_fee: Some(trading_fee),
                 tags: parsed_tags,
                 initial_liquidity: None,
+                category_txids: None, // TODO: Add CLI support for category claims
+                residual_names: None, // TODO: Add CLI support for residual names
                 fee_sats,
             };
             let txid = rpc_client.market_create(request).await?;
@@ -1022,25 +1074,15 @@ where
 
         Command::CalculateInitialLiquidity {
             beta,
-            market_type,
             num_outcomes,
-            decision_slots,
-            has_residual,
             dimensions,
         } => {
             use truthcoin_dc_app_rpc_api::CalculateInitialLiquidityRequest;
 
-            // Parse decision slots if provided
-            let parsed_slots =
-                decision_slots.map(|s| parse_comma_separated(&s));
-
             let request = CalculateInitialLiquidityRequest {
                 beta,
-                market_type,
-                decision_slots: parsed_slots,
-                num_outcomes,
                 dimensions,
-                has_residual,
+                num_outcomes,
             };
 
             let result =

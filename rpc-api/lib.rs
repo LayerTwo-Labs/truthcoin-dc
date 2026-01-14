@@ -68,6 +68,26 @@ pub struct MarketBuyRequest {
     pub dry_run: Option<bool>,
 }
 
+/// A single slot item for category claim
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct CategorySlotItem {
+    /// Slot ID in hex format (e.g., "004008")
+    pub slot_id_hex: String,
+    /// Human readable question for voters (<1000 bytes)
+    pub question: String,
+}
+
+/// Request to claim multiple slots as a category (atomic transaction)
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct CategoryClaimRequest {
+    /// List of slots to claim as a category
+    pub slots: Vec<CategorySlotItem>,
+    /// Whether these are standard slots
+    pub is_standard: bool,
+    /// Transaction fee in satoshis
+    pub fee_sats: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct MarketBuyResponse {
     pub txid: Option<String>,
@@ -117,8 +137,12 @@ pub struct PeriodStats {
     pub participation_rate: f64,
 }
 
+/// Results from the SVD consensus algorithm for a voting period.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ConsensusResults {
+    /// Final consensus outcomes for each decision (slot_id_hex -> value).
+    /// For scaled decisions, values are in real units (e.g., 270 electoral votes).
+    /// For binary decisions, values are 0.0 or 1.0.
     pub outcomes: std::collections::HashMap<String, f64>,
     pub first_loading: Vec<f64>,
     pub certainty: f64,
@@ -171,8 +195,8 @@ pub struct DecisionInfo {
     pub is_standard: bool,
     pub is_scaled: bool,
     pub question: String,
-    pub min: Option<u16>,
-    pub max: Option<u16>,
+    pub min: Option<i64>,
+    pub max: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -310,25 +334,35 @@ pub struct UserHoldings {
 pub struct CreateMarketRequest {
     pub title: String,
     pub description: String,
-    pub market_type: String,
-    pub decision_slots: Vec<String>,
-    pub dimensions: Option<String>,
-    pub has_residual: Option<bool>,
+    /// Dimension specification in bracket notation.
+    /// Examples: "[004008]", "[004008,004009]", "[[004008,004009]]"
+    pub dimensions: String,
+    /// Advanced: LMSR liquidity parameter controlling price sensitivity.
+    /// Higher beta = more liquid = smaller price moves per trade.
+    /// Mutually exclusive with initial_liquidity - specify one or the other.
     pub beta: Option<f64>,
     pub trading_fee: Option<f64>,
     pub tags: Option<Vec<String>>,
+    /// Initial liquidity in satoshis to fund the market (recommended).
+    /// Beta is derived: β = liquidity / ln(num_outcomes)
+    /// Mutually exclusive with beta - specify one or the other.
     pub initial_liquidity: Option<u64>,
+    /// Txid(s) for categorical dimensions in hex format - required when using [[...]] notation
+    /// Each txid must be a ClaimCategorySlots transaction
+    pub category_txids: Option<Vec<String>>,
+    /// Names for residual outcomes in categorical dimensions (one per [[...]])
+    /// e.g., ["Bengals"] when explicit slots are Steelers/Ravens/Browns
+    pub residual_names: Option<Vec<String>>,
     pub fee_sats: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct CalculateInitialLiquidityRequest {
     pub beta: f64,
-    pub market_type: String,
-    pub decision_slots: Option<Vec<String>>,
-    pub num_outcomes: Option<usize>,
+    /// Dimension specification in bracket notation (alternative to num_outcomes)
     pub dimensions: Option<String>,
-    pub has_residual: Option<bool>,
+    /// Number of outcomes (alternative to dimensions)
+    pub num_outcomes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -347,16 +381,26 @@ pub struct RegisterVoterRequest {
     pub fee_sats: u64,
 }
 
+/// Request to submit a single vote.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct SubmitVoteRequest {
     pub decision_id: String,
+    /// The vote value in real units (e.g., 270 for electoral votes).
+    /// For scaled decisions with min/max bounds, enter the actual value
+    /// within those bounds. The system handles internal normalization.
+    /// For binary decisions, use 0.0 (No) or 1.0 (Yes).
     pub vote_value: f64,
     pub fee_sats: u64,
 }
 
+/// A single vote in a batch submission.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VoteBatchItem {
     pub decision_id: String,
+    /// The vote value in real units (e.g., 270 for electoral votes).
+    /// For scaled decisions with min/max bounds, enter the actual value
+    /// within those bounds. The system handles internal normalization.
+    /// For binary decisions, use 0.0 (No) or 1.0 (Yes).
     pub vote_value: f64,
 }
 
@@ -377,10 +421,14 @@ pub struct VoterInfo {
     pub is_active: bool,
 }
 
+/// Information about a recorded vote.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VoteInfo {
     pub voter_address: String,
     pub decision_id: String,
+    /// The vote value in real units (e.g., 270 for electoral votes).
+    /// For scaled decisions, this is the denormalized value within the
+    /// decision's min/max bounds. For binary decisions, this is 0.0 or 1.0.
     pub vote_value: f64,
     pub period_id: u32,
     pub block_height: u64,
@@ -438,7 +486,8 @@ pub struct VotingConsensusResults {
     truthcoin_schema::BitcoinTransaction, truthcoin_schema::BitcoinOutPoint,
     truthcoin_schema::SocketAddr, Address, AssetId, Authorization,
     BitcoinOutputContent, BlockHash, Body,
-    CalculateInitialLiquidityRequest, ConsensusResults, CreateMarketRequest, DecisionSummary,
+    CalculateInitialLiquidityRequest, CategoryClaimRequest, CategorySlotItem,
+    ConsensusResults, CreateMarketRequest, DecisionSummary,
     EncryptionPubKey, FilledOutputContent, Header, InitialLiquidityCalculation,
     MarketBuyRequest, MarketBuyResponse, MarketData, MarketOutcome, MarketSummary,
     MerkleRoot, OutPoint, Output, OutputContent,
@@ -728,9 +777,19 @@ pub trait Rpc {
         is_standard: bool,
         is_scaled: bool,
         question: String,
-        min: Option<u16>,
-        max: Option<u16>,
+        min: Option<i64>,
+        max: Option<i64>,
         fee_sats: u64,
+    ) -> RpcResult<Txid>;
+
+    /// Claim multiple slots as a category (atomic transaction).
+    /// Returns the txid which also serves as the category identifier.
+    /// All category slots are binary (is_scaled=false) by design.
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "slot_claim_category")]
+    async fn slot_claim_category(
+        &self,
+        request: CategoryClaimRequest,
     ) -> RpcResult<Txid>;
 
     /// Create a new prediction market

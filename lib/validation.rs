@@ -49,8 +49,8 @@ impl SlotValidator {
         is_standard: bool,
         is_scaled: bool,
         question: &str,
-        min: Option<u16>,
-        max: Option<u16>,
+        min: Option<i64>,
+        max: Option<i64>,
     ) -> Result<Decision, Error> {
         Decision::new(
             market_maker_address_bytes,
@@ -121,6 +121,133 @@ impl SlotValidator {
                 other => other,
             })
     }
+
+    /// Validate a complete category slots claim transaction.
+    ///
+    /// Category claims allow atomic claiming of multiple slots under a single txid
+    /// that serves as the category identifier. All slots in a category are binary.
+    ///
+    /// # Validation Rules
+    /// 1. At least 2 slots in the category (otherwise use single claim)
+    /// 2. No duplicate slot IDs within the claim
+    /// 3. All questions under 1000 bytes
+    /// 4. All slot IDs valid format
+    /// 5. All slots pass individual validation (not claimed, not ossified, not voting)
+    /// 6. All slots in same period (since they form a category)
+    pub fn validate_complete_category_slots_claim<T>(
+        slots_db: &T,
+        rotxn: &RoTxn,
+        tx: &FilledTransaction,
+        override_height: Option<u32>,
+    ) -> Result<(), Error>
+    where
+        T: SlotValidationInterface,
+    {
+        let category_claim = tx.claim_category_slots().ok_or_else(|| {
+            Error::InvalidTransaction {
+                reason: "Not a category slots claim transaction".to_string(),
+            }
+        })?;
+
+        if category_claim.slots.len() < 2 {
+            return Err(Error::InvalidTransaction {
+                reason: "Category claim requires at least 2 slots".to_string(),
+            });
+        }
+
+        let mut seen_ids = HashSet::new();
+        for (slot_id_bytes, _) in &category_claim.slots {
+            if !seen_ids.insert(*slot_id_bytes) {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Duplicate slot ID {} in category claim",
+                        hex::encode(slot_id_bytes)
+                    ),
+                });
+            }
+        }
+
+        for (slot_id_bytes, question) in &category_claim.slots {
+            if question.len() >= 1000 {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Question for slot {} exceeds 1000 bytes",
+                        hex::encode(slot_id_bytes)
+                    ),
+                });
+            }
+
+            let _slot_id = SlotId::from_bytes(*slot_id_bytes)?;
+        }
+
+        let market_maker_address =
+            MarketValidator::validate_market_maker_authorization(tx)?;
+
+        let current_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_secs();
+
+        let current_height = override_height
+            .or_else(|| slots_db.try_get_height(rotxn).ok().flatten());
+
+        let mut first_period: Option<u32> = None;
+
+        for (slot_id_bytes, question) in &category_claim.slots {
+            let slot_id = SlotId::from_bytes(*slot_id_bytes)?;
+
+            let slot_period = slot_id.period_index();
+            match first_period {
+                None => first_period = Some(slot_period),
+                Some(expected_period) if expected_period != slot_period => {
+                    return Err(Error::InvalidTransaction {
+                        reason: format!(
+                            "All category slots must be in the same period. Slot {} is in period {} but expected period {}",
+                            hex::encode(slot_id_bytes),
+                            slot_period,
+                            expected_period
+                        ),
+                    });
+                }
+                _ => {}
+            }
+
+            let decision = Decision::new(
+                market_maker_address.0,
+                *slot_id_bytes,
+                category_claim.is_standard,
+                false, // is_scaled = false for category slots
+                question.clone(),
+                None, // min = None for binary
+                None, // max = None for binary
+            )?;
+
+            slots_db
+                .validate_slot_claim(
+                    rotxn,
+                    slot_id,
+                    &decision,
+                    current_ts,
+                    current_height,
+                )
+                .map_err(|e| match e {
+                    Error::SlotNotAvailable { slot_id: _, reason } => {
+                        Error::InvalidSlotId { reason }
+                    }
+                    Error::SlotAlreadyClaimed { slot_id: _ } => {
+                        Error::InvalidSlotId {
+                            reason: format!(
+                                "Slot {} already claimed",
+                                hex::encode(slot_id_bytes)
+                            ),
+                        }
+                    }
+                    other => other,
+                })?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Market validation utilities for Bitcoin Hivemind prediction markets.
@@ -160,7 +287,6 @@ impl MarketValidator {
             });
         }
 
-        // Extract market maker address from first UTXO
         let first_utxo = &tx.spent_utxos[0];
         let market_maker_address = first_utxo.address;
 
@@ -195,77 +321,131 @@ impl MarketValidator {
         tx: &FilledTransaction,
         _override_height: Option<u32>,
     ) -> Result<(), Error> {
+        use crate::state::markets::DimensionSpec;
+
         let market_data =
             tx.create_market()
                 .ok_or_else(|| Error::InvalidTransaction {
                     reason: "Not a market creation transaction".to_string(),
                 })?;
 
-        // Validate market type per whitepaper specifications
-        if market_data.market_type != "independent"
-            && market_data.market_type != "categorical"
-        {
+        let dimension_specs = &market_data.dimension_specs;
+
+        if dimension_specs.is_empty() {
             return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Invalid market type '{}': must be 'independent' or 'categorical'",
-                    market_data.market_type
-                ),
+                reason: "Market must have at least one dimension".to_string(),
             });
         }
 
-        // Validate decision slots are provided
-        if market_data.decision_slots.is_empty() {
-            return Err(Error::InvalidTransaction {
-                reason: "Market must reference at least one decision slot"
-                    .to_string(),
-            });
-        }
+        for spec in dimension_specs {
+            let slot_ids = match spec {
+                DimensionSpec::Single(slot_id) => vec![*slot_id],
+                DimensionSpec::Categorical(slot_ids) => slot_ids.clone(),
+            };
 
-        // Validate slot IDs and ensure they exist with decisions
-        let mut slot_ids = Vec::new();
-        for slot_hex in &market_data.decision_slots {
-            // Use common validation utility for slot ID parsing
-            let slot_id = SlotValidator::parse_slot_id_from_hex(slot_hex)?;
-
-            // Verify slot exists
-            let slot =
-                state.slots().get_slot(rotxn, slot_id)?.ok_or_else(|| {
-                    Error::InvalidTransaction {
-                        reason: format!(
-                            "Referenced decision slot {slot_hex} does not exist"
-                        ),
-                    }
-                })?;
-
-            // Verify slot has a decision
-            if slot.decision.is_none() {
+            if let DimensionSpec::Categorical(ids) = spec
+                && ids.len() < 2
+            {
                 return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Referenced slot {slot_hex} has no decision claimed"
-                    ),
+                    reason: "Categorical dimensions require at least 2 options"
+                        .to_string(),
                 });
             }
 
-            slot_ids.push(slot_id);
-        }
+            for slot_id in slot_ids {
+                let slot = state
+                    .slots()
+                    .get_slot(rotxn, slot_id)?
+                    .ok_or_else(|| Error::InvalidTransaction {
+                        reason: format!(
+                            "Referenced decision slot {slot_id:?} does not exist"
+                        ),
+                    })?;
 
-        // Validate categorical market constraints per whitepaper
-        if market_data.market_type == "categorical" {
-            // All decisions must be binary for categorical markets
-            for slot_id in &slot_ids {
-                let slot = state.slots().get_slot(rotxn, *slot_id)?.unwrap();
-                let decision = slot.decision.unwrap();
-                if decision.is_scaled {
+                let decision =
+                    slot.decision.ok_or_else(|| Error::InvalidTransaction {
+                        reason: format!(
+                            "Referenced slot {slot_id:?} has no decision claimed"
+                        ),
+                    })?;
+
+                if let DimensionSpec::Categorical(_) = spec
+                    && decision.is_scaled
+                {
                     return Err(Error::InvalidTransaction {
                         reason:
-                            "Categorical markets can only use binary decisions"
+                            "Categorical dimensions can only use binary decisions"
                                 .to_string(),
                     });
                 }
             }
         }
 
-        // Validate LMSR beta parameter (liquidity sensitivity)
+        let categorical_dimensions: Vec<_> = dimension_specs
+            .iter()
+            .filter_map(|spec| match spec {
+                DimensionSpec::Categorical(slots) => Some(slots.clone()),
+                _ => None,
+            })
+            .collect();
+
+        if !categorical_dimensions.is_empty() {
+            let category_txids = market_data.category_txids.as_ref().ok_or_else(|| {
+                Error::InvalidTransaction {
+                    reason: "category_txids required when using categorical dimensions [[...]]"
+                        .to_string(),
+                }
+            })?;
+
+            if category_txids.len() != categorical_dimensions.len() {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Expected {} category_txids for {} categorical dimensions, got {}",
+                        categorical_dimensions.len(),
+                        categorical_dimensions.len(),
+                        category_txids.len()
+                    ),
+                });
+            }
+
+            for (dim_index, (dim_slots, category_txid_bytes)) in
+                categorical_dimensions.iter().zip(category_txids.iter()).enumerate()
+            {
+                let category_slots: HashSet<_> = dim_slots
+                    .iter()
+                    .map(|slot_id| {
+                        let slot = state
+                            .slots()
+                            .get_slot(rotxn, *slot_id)?
+                            .ok_or_else(|| Error::InvalidTransaction {
+                                reason: format!("Slot {slot_id:?} not found"),
+                            })?;
+
+                        if slot.claiming_txid.0 != *category_txid_bytes {
+                            return Err(Error::InvalidTransaction {
+                                reason: format!(
+                                    "Slot {} in categorical dimension {} was not claimed by the specified category (expected txid {}, slot has txid {})",
+                                    hex::encode(slot_id.as_bytes()),
+                                    dim_index,
+                                    hex::encode(category_txid_bytes),
+                                    hex::encode(slot.claiming_txid.0)
+                                ),
+                            });
+                        }
+                        Ok(*slot_id)
+                    })
+                    .collect::<Result<HashSet<_>, Error>>()?;
+
+                if category_slots.len() != dim_slots.len() {
+                    return Err(Error::InvalidTransaction {
+                        reason: format!(
+                            "Duplicate slots found in categorical dimension {dim_index}"
+                        ),
+                    });
+                }
+            }
+        }
+
         let beta = market_data.b;
         if beta <= 0.0 {
             return Err(Error::InvalidTransaction {
@@ -275,7 +455,6 @@ impl MarketValidator {
             });
         }
 
-        // Validate trading fee if specified
         if let Some(fee) = market_data.trading_fee
             && (!(0.0..=1.0).contains(&fee))
         {
@@ -286,9 +465,36 @@ impl MarketValidator {
             });
         }
 
-        // Validate market maker authorization
-        let _market_maker_address =
+        let market_maker_address =
             Self::validate_market_maker_authorization(tx)?;
+
+        // Compute expected market_id and validate treasury output
+        use crate::state::markets::compute_market_id;
+        let expected_market_id = compute_market_id(
+            &market_data.title,
+            &market_data.description,
+            &market_maker_address,
+            dimension_specs,
+        );
+        let expected_market_id_bytes = *expected_market_id.as_bytes();
+
+        // Check for MarketTreasury output with matching market_id
+        let treasury_output = tx.outputs().iter().find(|output| {
+            matches!(
+                &output.content,
+                crate::types::OutputContent::MarketTreasury { market_id, .. }
+                    if market_id == &expected_market_id_bytes
+            )
+        });
+
+        if treasury_output.is_none() {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "CreateMarket tx must have MarketTreasury output with market_id {}",
+                    hex::encode(expected_market_id_bytes)
+                ),
+            });
+        }
 
         Ok(())
     }
@@ -329,7 +535,6 @@ impl MarketValidator {
                 reason: "Not a buy shares transaction".to_string(),
             })?;
 
-        // Validate market exists
         let market = state
             .markets()
             .get_market(rotxn, &buy_data.market_id)?
@@ -340,7 +545,6 @@ impl MarketValidator {
                 ),
             })?;
 
-        // Validate market is in trading state
         if market.state() != MarketState::Trading {
             return Err(Error::InvalidTransaction {
                 reason: format!(
@@ -350,7 +554,6 @@ impl MarketValidator {
             });
         }
 
-        // Validate outcome index
         if buy_data.outcome_index as usize >= market.shares().len() {
             return Err(Error::InvalidTransaction {
                 reason: format!(
@@ -361,7 +564,6 @@ impl MarketValidator {
             });
         }
 
-        // Validate shares amount is positive
         if buy_data.shares_to_buy <= 0.0 {
             return Err(Error::InvalidTransaction {
                 reason: format!(
@@ -371,7 +573,6 @@ impl MarketValidator {
             });
         }
 
-        // Validate max cost is positive
         if buy_data.max_cost == 0 {
             return Err(Error::InvalidTransaction {
                 reason: format!(
@@ -381,13 +582,9 @@ impl MarketValidator {
             });
         }
 
-        // Calculate new share quantities after the trade
         let mut new_shares = market.shares().clone();
         new_shares[buy_data.outcome_index as usize] += buy_data.shares_to_buy;
 
-        // Validate LMSR constraints using centralized LmsrService
-        // This ensures single source of truth for all LMSR calculations
-        // per Bitcoin Hivemind whitepaper section on market maker algorithm
         use crate::math::lmsr::LmsrService;
         let trade_cost = LmsrService::calculate_update_cost(
             market.shares(),
@@ -398,7 +595,6 @@ impl MarketValidator {
             reason: format!("LMSR trade cost calculation failed: {e:?}"),
         })?;
 
-        // Validate trade cost doesn't exceed max cost
         if trade_cost > buy_data.max_cost as f64 {
             return Err(Error::InvalidTransaction {
                 reason: format!(
@@ -408,7 +604,6 @@ impl MarketValidator {
             });
         }
 
-        // Calculate fee amount
         let fee_amount = trade_cost * market.trading_fee();
         let base_cost_sats = safe_math::to_sats(trade_cost, Rounding::Up)
             .map_err(|e| Error::InvalidTransaction {
@@ -421,7 +616,6 @@ impl MarketValidator {
                 }
             })?;
 
-        // Validate explicit treasury and fee outputs exist with correct content types and amounts
         let treasury_address =
             generate_market_treasury_address(&buy_data.market_id);
         let fee_address =
@@ -489,7 +683,6 @@ impl MarketValidator {
             });
         }
 
-        // Validate trader authorization
         let _trader_address = Self::validate_market_maker_authorization(tx)?;
 
         Ok(())
@@ -535,7 +728,6 @@ impl MarketValidator {
                     })
                 })?;
 
-            // Validate market state allows trading
             if market.state() != MarketState::Trading {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
@@ -547,7 +739,6 @@ impl MarketValidator {
                 });
             }
 
-            // Validate outcome index is valid for market
             if trade.outcome_index as usize >= market.shares().len() {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
@@ -559,7 +750,6 @@ impl MarketValidator {
                 });
             }
 
-            // Calculate and validate trade cost using market snapshot
             let cost = trade.calculate_trade_cost().map_err(|e| {
                 Error::InvalidTransaction {
                     reason: format!(
@@ -568,7 +758,6 @@ impl MarketValidator {
                 }
             })?;
 
-            // Validate cost against trader's maximum
             if cost > trade.max_cost as f64 {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
@@ -603,7 +792,6 @@ impl MarketValidator {
         beta: f64,
         shares: &ndarray::Array1<f64>,
     ) -> Result<(), Error> {
-        // Validate beta is positive
         if beta <= 0.0 || !beta.is_finite() {
             return Err(Error::InvalidTransaction {
                 reason: format!(
@@ -612,7 +800,6 @@ impl MarketValidator {
             });
         }
 
-        // Validate share quantities are non-negative and finite
         for (idx, &share_qty) in shares.iter().enumerate() {
             if share_qty < 0.0 || !share_qty.is_finite() {
                 return Err(Error::InvalidTransaction {
@@ -623,7 +810,6 @@ impl MarketValidator {
             }
         }
 
-        // Validate we have at least 2 outcomes for a meaningful market
         if shares.len() < 2 {
             return Err(Error::InvalidTransaction {
                 reason: format!(
@@ -664,13 +850,8 @@ impl DFunctionValidator {
                 Ok(())
             }
             DFunction::Equals(func, value) => {
-                // Validate the nested function
                 Self::validate_constraint(func, max_decision_index)?;
-                // For decision equality, ensure value is within valid range
                 if let DFunction::Decision(_) = func.as_ref() {
-                    // For binary decisions, valid values are 0, 1, 2 (No, Yes, Invalid)
-                    // For scalar decisions, valid values are 0 to range+1
-                    // For now, we use a simple check - values > 2 are invalid for most cases
                     if *value > 2 {
                         return Err(MarketError::InvalidOutcomeCombination);
                     }
@@ -723,14 +904,11 @@ impl DFunctionValidator {
                 return Err(MarketError::InvalidDimensions);
             }
 
-            // Check if this slot is true in the combination
             if combo[slot_idx] == 1 {
                 true_count += 1;
             }
         }
 
-        // For valid categorical constraint, exactly one should be true
-        // Unless all are false (residual case)
         Ok(true_count <= 1)
     }
 
@@ -758,17 +936,13 @@ impl DFunctionValidator {
             return Err(MarketError::InvalidDimensions);
         }
 
-        // Validate each D-function against its corresponding combination
         for (df, combo) in d_functions.iter().zip(all_combos.iter()) {
-            // Basic constraint validation
             Self::validate_constraint(df, decision_slots.len())?;
 
-            // Evaluate the D-function against its own combination - should be true
             if !df.evaluate(combo)? {
                 return Err(MarketError::InvalidOutcomeCombination);
             }
 
-            // Check categorical constraints for each dimension
             let mut slot_idx = 0;
             for spec in dimension_specs {
                 match spec {
@@ -792,8 +966,6 @@ impl DFunctionValidator {
             }
         }
 
-        // Additional validation: ensure D-functions are mutually exclusive
-        // (each combination should satisfy exactly one D-function)
         for combo in all_combos {
             let mut satisfied_count = 0;
             for df in d_functions {
@@ -833,16 +1005,11 @@ impl MarketStateValidator {
         to_state: MarketState,
     ) -> Result<(), Error> {
         let valid_transition = match (from_state, to_state) {
-            // No change is always valid
             (a, b) if a == b => true,
-
-            // Valid forward transitions
-            (Trading, Ossified) => true, // Direct transition with automatic payout
-            (Trading, Cancelled) => true, // Only if no trades occurred (checked elsewhere)
-            (Trading, Invalid) => true,   // Governance action
+            (Trading, Ossified) => true,
+            (Trading, Cancelled) => true,
+            (Trading, Invalid) => true,
             (Invalid, Ossified) => true,
-
-            // All other transitions are invalid
             _ => false,
         };
 
@@ -1015,9 +1182,12 @@ impl VoteValidator {
         vote_value: f64,
     ) -> Result<(), Error> {
         if decision.is_scaled {
-            // Scalar decision - validate value is within range
-            let min = decision.min.unwrap_or(0) as f64;
-            let max = decision.max.unwrap_or(1) as f64;
+            let min = decision
+                .min
+                .expect("scaled decision must have min") as f64;
+            let max = decision
+                .max
+                .expect("scaled decision must have max") as f64;
             if !vote_value.is_nan() && (vote_value < min || vote_value > max) {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
@@ -1026,9 +1196,6 @@ impl VoteValidator {
                 });
             }
         } else {
-            // Binary decision - validate value is between 0.0 and 1.0, or NaN (abstain)
-            // Per Bitcoin Hivemind whitepaper, 0.5 represents "inconclusive"
-            // Voters can express uncertainty using any value in [0.0, 1.0]
             if !vote_value.is_nan() && !(0.0..=1.0).contains(&vote_value) {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
@@ -1146,16 +1313,12 @@ impl VoteValidator {
             })?
             .address;
 
-        // Validate voter eligibility using shared helper
         let _votecoin_balance =
             Self::validate_voter_eligibility(state, rotxn, &voter_address)?;
 
-        // Parse and validate decision slot using shared helper
         let decision_id = SlotId::from_bytes(vote_data.slot_id_bytes)?;
         let decision = Self::validate_decision_slot(state, rotxn, decision_id)?;
 
-        // BITCOIN HIVEMIND PRINCIPLE: Validate period matches slot's expected voting period
-        // Slots claimed in period_index N are voted on in voting_period N+1 (temporal separation)
         let slot_claim_period = decision_id.period_index();
         let expected_voting_period = decision_id.voting_period();
 
@@ -1171,13 +1334,10 @@ impl VoteValidator {
             });
         }
 
-        // Validate vote value using shared helper
         Self::validate_vote_value(&decision, vote_data.vote_value)?;
 
-        // Validate voting period using shared helper (queries SlotStateHistory)
         Self::validate_voting_period(state, rotxn, decision_id)?;
 
-        // Check for duplicate votes using shared helper
         let period_id = VotingPeriodId::new(vote_data.voting_period);
         Self::validate_no_duplicate_vote(
             state,
@@ -1218,7 +1378,6 @@ impl VoteValidator {
             }
         })?;
 
-        // Extract voter address
         let voter_address = filled_tx
             .spent_utxos
             .first()
@@ -1227,18 +1386,14 @@ impl VoteValidator {
             })?
             .address;
 
-        // Validate voter eligibility once for the entire batch using shared helper
         let _votecoin_balance =
             Self::validate_voter_eligibility(state, rotxn, &voter_address)?;
 
         let period_id = VotingPeriodId::new(batch_data.voting_period);
 
-        // Validate each vote in the batch using shared helpers
         for (idx, vote_item) in batch_data.votes.iter().enumerate() {
             let decision_id = SlotId::from_bytes(vote_item.slot_id_bytes)?;
 
-            // BITCOIN HIVEMIND PRINCIPLE: Validate period matches slot's expected voting period
-            // Slots claimed in period N are voted on in period N (same period)
             let slot_claim_period = decision_id.period_index();
             let expected_voting_period = decision_id.voting_period();
 
@@ -1255,7 +1410,6 @@ impl VoteValidator {
                 });
             }
 
-            // Validate decision slot using shared helper with batch context
             let decision =
                 Self::validate_decision_slot(state, rotxn, decision_id)
                     .map_err(|e| match e {
@@ -1269,7 +1423,6 @@ impl VoteValidator {
                         other => other,
                     })?;
 
-            // Validate vote value using shared helper with batch context
             Self::validate_vote_value(&decision, vote_item.vote_value)
                 .map_err(|e| match e {
                     Error::InvalidTransaction { reason } => {
@@ -1280,7 +1433,6 @@ impl VoteValidator {
                     other => other,
                 })?;
 
-            // Validate voting period using shared helper with batch context (queries SlotStateHistory)
             Self::validate_voting_period(state, rotxn, decision_id).map_err(
                 |e| match e {
                     Error::InvalidTransaction { reason } => {
@@ -1292,7 +1444,6 @@ impl VoteValidator {
                 },
             )?;
 
-            // Check for duplicate votes using shared helper with batch context
             Self::validate_no_duplicate_vote(
                 state,
                 rotxn,

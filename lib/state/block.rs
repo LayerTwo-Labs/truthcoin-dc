@@ -816,15 +816,6 @@ pub fn connect(
                     height,
                 )?;
             }
-            Some(TxData::CreateMarketDimensional { .. }) => {
-                apply_dimensional_market(
-                    state,
-                    rwtxn,
-                    filled_tx,
-                    &mut state_update,
-                    height,
-                )?;
-            }
             Some(TxData::ClaimDecisionSlot { .. }) => {
                 apply_slot_claim(
                     state,
@@ -850,6 +841,15 @@ pub fn connect(
                     rwtxn,
                     filled_tx,
                     &mut state_update,
+                    height,
+                )?;
+            }
+            Some(TxData::ClaimCategorySlots { .. }) => {
+                apply_claim_category_slots(
+                    state,
+                    rwtxn,
+                    filled_tx,
+                    mainchain_timestamp,
                     height,
                 )?;
             }
@@ -915,10 +915,6 @@ pub fn disconnect_tip(
             Some(TxData::CreateMarket { .. }) => {
                 let () = revert_create_market(state, rwtxn, &filled_tx)?;
             }
-            Some(TxData::CreateMarketDimensional { .. }) => {
-                let () =
-                    revert_create_market_dimensional(state, rwtxn, &filled_tx)?;
-            }
             Some(TxData::BuyShares { .. }) => {
                 let () = revert_buy_shares(state, rwtxn, &filled_tx)?;
             }
@@ -927,6 +923,9 @@ pub fn disconnect_tip(
             }
             Some(TxData::SubmitVoteBatch { .. }) => {
                 let () = revert_submit_vote_batch(state, rwtxn, &filled_tx)?;
+            }
+            Some(TxData::ClaimCategorySlots { .. }) => {
+                let () = revert_claim_category_slots(state, rwtxn, &filled_tx)?;
             }
             Some(TxData::RegisterVoter { .. }) => {}
         }
@@ -1035,10 +1034,13 @@ fn apply_claim_decision_slot(
         claim.max,
     )?;
 
+    let claiming_txid = filled_tx.transaction.txid();
+
     state.slots().claim_slot(
         rwtxn,
         slot_id,
         decision,
+        claiming_txid,
         mainchain_timestamp,
         Some(block_height),
     )?;
@@ -1072,6 +1074,97 @@ fn revert_claim_decision_slot(
     let slot_id = SlotId::from_bytes(claim.slot_id_bytes)?;
 
     state.slots().revert_claim_slot(rwtxn, slot_id)?;
+
+    Ok(())
+}
+
+/// Apply a category slots claim transaction.
+/// Claims multiple slots atomically with the same txid as the category identifier.
+fn apply_claim_category_slots(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    filled_tx: &FilledTransaction,
+    mainchain_timestamp: u64,
+    block_height: u32,
+) -> Result<(), Error> {
+    use crate::state::slots::{Decision, SlotId};
+
+    let category_claim = filled_tx.claim_category_slots().ok_or_else(|| {
+        Error::InvalidTransaction {
+            reason: "Not a category slots claim transaction".to_string(),
+        }
+    })?;
+
+    let market_maker_address_bytes = filled_tx
+        .spent_utxos
+        .first()
+        .ok_or_else(|| Error::InvalidTransaction {
+            reason: "No spent UTXOs found".to_string(),
+        })?
+        .address
+        .0;
+
+    let claiming_txid = filled_tx.transaction.txid();
+
+    // Claim all slots in the category with the same txid
+    for (slot_id_bytes, question) in &category_claim.slots {
+        let slot_id = SlotId::from_bytes(*slot_id_bytes)?;
+
+        // Category slots are always binary (is_scaled=false)
+        let decision = Decision::new(
+            market_maker_address_bytes,
+            *slot_id_bytes,
+            category_claim.is_standard,
+            false, // is_scaled = false for category slots
+            question.clone(),
+            None, // min = None for binary
+            None, // max = None for binary
+        )?;
+
+        state.slots().claim_slot(
+            rwtxn,
+            slot_id,
+            decision,
+            claiming_txid,
+            mainchain_timestamp,
+            Some(block_height),
+        )?;
+
+        tracing::debug!(
+            "Claimed category slot {} with category txid {}",
+            hex::encode(slot_id.as_bytes()),
+            hex::encode(claiming_txid.0)
+        );
+    }
+
+    tracing::info!(
+        "Claimed {} slots as category with txid {}",
+        category_claim.slots.len(),
+        hex::encode(claiming_txid.0)
+    );
+
+    Ok(())
+}
+
+/// Revert a category slots claim transaction.
+fn revert_claim_category_slots(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    filled_tx: &FilledTransaction,
+) -> Result<(), Error> {
+    use crate::state::slots::SlotId;
+
+    let category_claim = filled_tx.claim_category_slots().ok_or_else(|| {
+        Error::InvalidTransaction {
+            reason: "Not a category slots claim transaction".to_string(),
+        }
+    })?;
+
+    // Revert all slots in the category
+    for (slot_id_bytes, _question) in &category_claim.slots {
+        let slot_id = SlotId::from_bytes(*slot_id_bytes)?;
+        state.slots().revert_claim_slot(rwtxn, slot_id)?;
+    }
 
     Ok(())
 }
@@ -1117,7 +1210,7 @@ fn revert_create_market(
     rwtxn: &mut RwTxn,
     filled_tx: &FilledTransaction,
 ) -> Result<(), Error> {
-    use crate::state::{MarketBuilder, slots::SlotId};
+    use crate::state::{MarketBuilder, markets::DimensionSpec};
     use std::collections::HashMap;
 
     let market_data =
@@ -1129,112 +1222,8 @@ fn revert_create_market(
 
     let creator_address = extract_creator_address(filled_tx)?;
 
-    let mut slot_ids = Vec::new();
-    let mut decisions = HashMap::new();
-
-    for slot_hex in &market_data.decision_slots {
-        let slot_bytes =
-            hex::decode(slot_hex).map_err(|_| Error::InvalidTransaction {
-                reason: format!("Invalid slot ID hex: {slot_hex}"),
-            })?;
-
-        let slot_id_array: [u8; 3] =
-            slot_bytes
-                .try_into()
-                .map_err(|_| Error::InvalidTransaction {
-                    reason: "Invalid slot ID length".to_string(),
-                })?;
-        let slot_id = SlotId::from_bytes(slot_id_array)?;
-
-        let slot = state.slots.get_slot(rwtxn, slot_id)?.ok_or_else(|| {
-            Error::InvalidSlotId {
-                reason: format!("Slot {slot_hex} does not exist"),
-            }
-        })?;
-
-        let decision = slot.decision.ok_or_else(|| Error::InvalidSlotId {
-            reason: format!("Slot {slot_hex} has no decision"),
-        })?;
-
-        slot_ids.push(slot_id);
-        decisions.insert(slot_id, decision);
-    }
-
-    let mut builder =
-        MarketBuilder::new(market_data.title.clone(), creator_address);
-    builder = configure_market_builder(
-        builder,
-        &market_data.description,
-        &market_data.tags,
-        market_data.b,
-        market_data.trading_fee,
-    );
-
-    let builder = match market_data.market_type.as_str() {
-        "independent" => builder.add_decisions(slot_ids),
-        "categorical" => builder.set_categorical(
-            slot_ids,
-            market_data.has_residual.unwrap_or(false),
-        ),
-        _ => {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Invalid market type: {}",
-                    market_data.market_type
-                ),
-            });
-        }
-    };
-
-    // Reconstruct the market to get its ID (height doesn't affect ID)
-    let market = builder.build(0, None, &decisions).map_err(|e| {
-        Error::InvalidTransaction {
-            reason: format!("Market reconstruction failed: {e}"),
-        }
-    })?;
-
-    let market_id = market.id.clone();
-
-    // Delete the market UTXO if it exists
-    if let Some(outpoint) =
-        state.markets().get_market_utxo(rwtxn, &market_id)?
-    {
-        state.delete_utxo_with_address_index(rwtxn, &outpoint)?;
-    }
-
-    // Delete the market and all its index entries
-    state.markets().delete_market(rwtxn, &market_id)?;
-
-    Ok(())
-}
-
-fn revert_create_market_dimensional(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<(), Error> {
-    use crate::state::{
-        MarketBuilder,
-        markets::{DimensionSpec, parse_dimensions},
-    };
-    use std::collections::HashMap;
-
-    let market_data =
-        filled_tx.create_market_dimensional().ok_or_else(|| {
-            Error::InvalidTransaction {
-                reason: "Not a dimensional market creation transaction"
-                    .to_string(),
-            }
-        })?;
-
-    let creator_address = extract_creator_address(filled_tx)?;
-
-    let dimension_specs: Vec<DimensionSpec> =
-        parse_dimensions(&market_data.dimensions).map_err(|e| {
-            Error::InvalidTransaction {
-                reason: format!("Failed to parse dimensions: {e}"),
-            }
-        })?;
+    // Use pre-parsed dimension specs from transaction data
+    let dimension_specs = market_data.dimension_specs.clone();
 
     let mut decisions = HashMap::new();
 
@@ -1249,11 +1238,11 @@ fn revert_create_market_dimensional(
                 }
             }
             DimensionSpec::Categorical(slot_ids) => {
-                for &slot_id in slot_ids {
-                    if let Some(slot) = state.slots.get_slot(rwtxn, slot_id)?
+                for slot_id in slot_ids {
+                    if let Some(slot) = state.slots.get_slot(rwtxn, *slot_id)?
                         && let Some(decision) = slot.decision
                     {
-                        decisions.insert(slot_id, decision);
+                        decisions.insert(*slot_id, decision);
                     }
                 }
             }
@@ -1270,7 +1259,9 @@ fn revert_create_market_dimensional(
         market_data.trading_fee,
     );
 
-    let builder = builder.with_dimensions(dimension_specs);
+    let builder = builder
+        .with_dimensions(dimension_specs)
+        .with_residual_names(market_data.residual_names.clone());
 
     // Reconstruct the market to get its ID (height doesn't affect ID)
     let market = builder.build(0, None, &decisions).map_err(|e| {
@@ -1505,7 +1496,7 @@ fn apply_market_creation(
     state_update: &mut StateUpdate,
     height: u32,
 ) -> Result<(), Error> {
-    use crate::state::{MarketBuilder, slots::SlotId};
+    use crate::state::{MarketBuilder, markets::DimensionSpec};
     use std::collections::HashMap;
 
     let market_data =
@@ -1517,144 +1508,8 @@ fn apply_market_creation(
 
     let creator_address = extract_creator_address(filled_tx)?;
 
-    let mut slot_ids = Vec::new();
-    let mut decisions = HashMap::new();
-
-    for slot_hex in &market_data.decision_slots {
-        let slot_bytes =
-            hex::decode(slot_hex).map_err(|_| Error::InvalidTransaction {
-                reason: format!("Invalid slot ID hex: {slot_hex}"),
-            })?;
-
-        let slot_id_array: [u8; 3] = slot_bytes.try_into().unwrap();
-        let slot_id = SlotId::from_bytes(slot_id_array)?;
-
-        let slot = state.slots.get_slot(rwtxn, slot_id)?.ok_or_else(|| {
-            Error::InvalidSlotId {
-                reason: format!("Slot {slot_hex} does not exist"),
-            }
-        })?;
-
-        let decision = slot.decision.ok_or_else(|| Error::InvalidSlotId {
-            reason: format!("Slot {slot_hex} has no decision"),
-        })?;
-
-        slot_ids.push(slot_id);
-        decisions.insert(slot_id, decision);
-    }
-
-    let mut builder =
-        MarketBuilder::new(market_data.title.clone(), creator_address);
-    builder = configure_market_builder(
-        builder,
-        &market_data.description,
-        &market_data.tags,
-        market_data.b,
-        market_data.trading_fee,
-    );
-
-    let builder = match market_data.market_type.as_str() {
-        "independent" => builder.add_decisions(slot_ids),
-        "categorical" => builder.set_categorical(
-            slot_ids,
-            market_data.has_residual.unwrap_or(false),
-        ),
-        _ => {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Invalid market type: {}",
-                    market_data.market_type
-                ),
-            });
-        }
-    };
-
-    let market =
-        builder
-            .build(height as u64, None, &decisions)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Market creation failed: {e}"),
-            })?;
-
-    // Calculate initial treasury from beta: b * ln(num_outcomes)
-    let num_outcomes = market.get_outcome_count() as f64;
-    let treasury_calc = market.b() * num_outcomes.ln();
-    let initial_treasury_sats = safe_math::to_sats(treasury_calc, Rounding::Up)
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Treasury calculation failed: {e}"),
-        })?;
-
-    // Create the initial MarketTreasury UTXO if there's initial liquidity
-    // The funds come from the transaction inputs (included in total_cost by wallet)
-    if initial_treasury_sats > 0 {
-        use crate::state::markets::generate_market_treasury_address;
-        use crate::types::{BitcoinOutputContent, FilledOutput, OutPoint};
-
-        let market_id = market.id.clone();
-        let market_id_bytes = *market_id.as_bytes();
-        let treasury_address = generate_market_treasury_address(&market_id);
-
-        let outpoint = OutPoint::Market {
-            market_id: market_id_bytes,
-            block_height: height,
-        };
-        let output = FilledOutput::new(
-            treasury_address,
-            FilledOutputContent::MarketTreasury {
-                market_id: market_id_bytes,
-                amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
-                    initial_treasury_sats,
-                )),
-            },
-        );
-
-        state.insert_utxo_with_address_index(rwtxn, &outpoint, &output)?;
-        state
-            .markets()
-            .set_market_utxo(rwtxn, &market_id, &outpoint)?;
-
-        tracing::debug!(
-            "Created initial MarketTreasury UTXO for market {:?} with {} sats",
-            market_id,
-            initial_treasury_sats
-        );
-    }
-
-    state_update.add_market_creation(MarketCreation {
-        market: market.clone(),
-    });
-
-    Ok(())
-}
-fn apply_dimensional_market(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-    state_update: &mut StateUpdate,
-    height: u32,
-) -> Result<(), Error> {
-    use crate::state::{
-        MarketBuilder,
-        markets::{DimensionSpec, parse_dimensions},
-    };
-    use std::collections::HashMap;
-
-    let market_data =
-        filled_tx.create_market_dimensional().ok_or_else(|| {
-            Error::InvalidTransaction {
-                reason: "Not a dimensional market creation transaction"
-                    .to_string(),
-            }
-        })?;
-
-    let creator_address = extract_creator_address(filled_tx)?;
-
-    let dimension_specs =
-        parse_dimensions(&market_data.dimensions).map_err(|_| {
-            Error::InvalidTransaction {
-                reason: "Failed to parse dimension specification".to_string(),
-            }
-        })?;
+    // Use pre-parsed dimension specs from transaction data
+    let dimension_specs = market_data.dimension_specs.clone();
 
     let mut decisions = HashMap::new();
     for spec in &dimension_specs {
@@ -1690,56 +1545,47 @@ fn apply_dimensional_market(
         market_data.trading_fee,
     );
 
-    let builder = builder.with_dimensions(dimension_specs);
+    let builder = builder
+        .with_dimensions(dimension_specs)
+        .with_residual_names(market_data.residual_names.clone());
 
     let market =
         builder
             .build(height as u64, None, &decisions)
             .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Dimensional market creation failed: {e}"),
+                reason: format!("Market creation failed: {e}"),
             })?;
 
-    // Calculate initial treasury from beta: b * ln(num_outcomes)
-    let num_outcomes = market.get_outcome_count() as f64;
-    let treasury_calc = market.b() * num_outcomes.ln();
-    let initial_treasury_sats = safe_math::to_sats(treasury_calc, Rounding::Up)
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Treasury calculation failed: {e}"),
-        })?;
+    let market_id = market.id.clone();
+    let market_id_bytes = *market_id.as_bytes();
+    let txid = filled_tx.txid();
 
-    // Create the initial MarketTreasury UTXO if there's initial liquidity
-    if initial_treasury_sats > 0 {
-        use crate::state::markets::generate_market_treasury_address;
-        use crate::types::{BitcoinOutputContent, FilledOutput, OutPoint};
+    // Find the MarketTreasury output in the transaction and register it
+    // The UTXO will be created by apply_utxo_changes later
+    for (vout, output) in filled_tx.outputs().iter().enumerate() {
+        if let OutputContent::MarketTreasury {
+            market_id: output_market_id,
+            amount,
+        } = &output.content
+        {
+            if output_market_id == &market_id_bytes {
+                let outpoint = OutPoint::Regular {
+                    txid,
+                    vout: vout as u32,
+                };
+                state
+                    .markets()
+                    .set_market_utxo(rwtxn, &market_id, &outpoint)?;
 
-        let market_id = market.id.clone();
-        let market_id_bytes = *market_id.as_bytes();
-        let treasury_address = generate_market_treasury_address(&market_id);
-
-        let outpoint = OutPoint::Market {
-            market_id: market_id_bytes,
-            block_height: height,
-        };
-        let output = FilledOutput::new(
-            treasury_address,
-            FilledOutputContent::MarketTreasury {
-                market_id: market_id_bytes,
-                amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
-                    initial_treasury_sats,
-                )),
-            },
-        );
-
-        state.insert_utxo_with_address_index(rwtxn, &outpoint, &output)?;
-        state
-            .markets()
-            .set_market_utxo(rwtxn, &market_id, &outpoint)?;
-
-        tracing::debug!(
-            "Created initial MarketTreasury UTXO for dimensional market {:?} with {} sats",
-            market_id,
-            initial_treasury_sats
-        );
+                tracing::debug!(
+                    "Registered MarketTreasury UTXO for market {:?} with {} sats at {:?}",
+                    market_id,
+                    amount.0.to_sat(),
+                    outpoint
+                );
+                break;
+            }
+        }
     }
 
     state_update.add_market_creation(MarketCreation {

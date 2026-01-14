@@ -1,5 +1,5 @@
 use crate::state::Error;
-use crate::types::{BITCOIN_GENESIS_TIMESTAMP, SECONDS_PER_QUARTER};
+use crate::types::{BITCOIN_GENESIS_TIMESTAMP, SECONDS_PER_QUARTER, Txid};
 use crate::validation::SlotValidationInterface;
 use borsh::BorshSerialize;
 use fallible_iterator::FallibleIterator;
@@ -131,14 +131,13 @@ impl SlotId {
     Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd,
 )]
 pub struct Decision {
-    pub id: [u8; 32],
     pub market_maker_pubkey_hash: [u8; 20],
     pub slot_id_bytes: [u8; 3],
     pub is_standard: bool,
     pub is_scaled: bool,
     pub question: String,
-    pub min: Option<u16>,
-    pub max: Option<u16>,
+    pub min: Option<i64>,
+    pub max: Option<i64>,
 }
 
 impl Decision {
@@ -148,8 +147,8 @@ impl Decision {
         is_standard: bool,
         is_scaled: bool,
         question: String,
-        min: Option<u16>,
-        max: Option<u16>,
+        min: Option<i64>,
+        max: Option<i64>,
     ) -> Result<Self, Error> {
         if question.len() > 1000 {
             return Err(Error::InvalidSlotId {
@@ -167,8 +166,7 @@ impl Decision {
             _ => return Err(Error::InconsistentDecisionType),
         }
 
-        let mut decision = Decision {
-            id: [0; 32],
+        Ok(Decision {
             market_maker_pubkey_hash,
             slot_id_bytes,
             is_standard,
@@ -176,14 +174,11 @@ impl Decision {
             question,
             min,
             max,
-        };
-
-        decision.id = decision.compute_id_hash();
-
-        Ok(decision)
+        })
     }
 
-    fn compute_id_hash(&self) -> [u8; 32] {
+    /// Compute the decision's unique ID hash on-demand from its fields.
+    pub fn id(&self) -> [u8; 32] {
         use crate::types::hashes;
 
         let hash_data = (
@@ -197,6 +192,106 @@ impl Decision {
         );
 
         hashes::hash(&hash_data)
+    }
+
+    /// Normalize a user-facing value to internal 0-1 range.
+    ///
+    /// For binary decisions: 0.0 (NO), 1.0 (YES), NaN (ABSTAIN)
+    /// For scaled decisions: maps [min, max] to [0.0, 1.0]
+    ///
+    /// Example: electoral votes 0-538, user enters 270
+    ///          normalized = (270 - 0) / (538 - 0) = 0.502
+    pub fn normalize_value(&self, user_value: f64) -> f64 {
+        if user_value.is_nan() {
+            return f64::NAN; // Abstain
+        }
+
+        if !self.is_scaled {
+            // Binary: already in 0-1 range
+            return user_value;
+        }
+
+        let min = self.min.unwrap_or(0) as f64;
+        let max = self.max.unwrap_or(100) as f64;
+        let range = max - min;
+
+        if range == 0.0 {
+            return 0.5; // Degenerate case
+        }
+
+        (user_value - min) / range
+    }
+
+    /// Convert internal 0-1 value back to user-facing range.
+    ///
+    /// For binary decisions: returns 0.0 or 1.0
+    /// For scaled decisions: maps [0.0, 1.0] to [min, max]
+    ///
+    /// Example: internal 0.502 with range 0-538
+    ///          real = 0.502 * (538 - 0) + 0 = 270.08
+    pub fn denormalize_value(&self, internal_value: f64) -> f64 {
+        if internal_value.is_nan() {
+            return f64::NAN; // Abstain
+        }
+
+        if !self.is_scaled {
+            // Binary: already in 0-1 range
+            return internal_value;
+        }
+
+        let min = self.min.unwrap_or(0) as f64;
+        let max = self.max.unwrap_or(100) as f64;
+        let range = max - min;
+
+        internal_value * range + min
+    }
+
+    /// Validate that a user value is within bounds and normalize it.
+    ///
+    /// Returns Ok(normalized_value) or Err if out of bounds.
+    pub fn validate_and_normalize(&self, user_value: f64) -> Result<f64, Error> {
+        if user_value.is_nan() {
+            return Ok(f64::NAN); // Abstain is always valid
+        }
+
+        if self.is_scaled {
+            let min = self.min.unwrap_or(0) as f64;
+            let max = self.max.unwrap_or(100) as f64;
+
+            if user_value < min || user_value > max {
+                return Err(Error::InvalidVoteValue {
+                    reason: format!(
+                        "Value {user_value} is outside allowed range [{min}, {max}]"
+                    ),
+                });
+            }
+        } else {
+            // Binary: must be 0, 1, or in between for partial confidence
+            if !(0.0..=1.0).contains(&user_value) {
+                return Err(Error::InvalidVoteValue {
+                    reason: format!(
+                        "Binary vote value {user_value} must be between 0.0 and 1.0"
+                    ),
+                });
+            }
+        }
+
+        Ok(self.normalize_value(user_value))
+    }
+
+    /// Get the user-facing range for display purposes.
+    ///
+    /// Returns (min, max) - for binary this is (0.0, 1.0),
+    /// for scaled this is the actual min/max bounds.
+    pub fn get_display_range(&self) -> (f64, f64) {
+        if self.is_scaled {
+            (
+                self.min.unwrap_or(0) as f64,
+                self.max.unwrap_or(100) as f64,
+            )
+        } else {
+            (0.0, 1.0)
+        }
     }
 }
 
@@ -381,6 +476,8 @@ impl SlotStateHistory {
 pub struct Slot {
     pub slot_id: SlotId,
     pub decision: Option<Decision>,
+    /// Txid of the transaction that claimed this slot
+    pub claiming_txid: Txid,
 }
 
 const FUTURE_PERIODS: u32 = 20;
@@ -818,6 +915,7 @@ impl Dbs {
         rwtxn: &mut RwTxn<'_>,
         slot_id: SlotId,
         decision: Decision,
+        claiming_txid: Txid,
         current_ts: u64,
         current_height: Option<u32>,
     ) -> Result<(), Error> {
@@ -839,6 +937,7 @@ impl Dbs {
         let new_slot = Slot {
             slot_id,
             decision: Some(decision),
+            claiming_txid,
         };
         period_slots.insert(new_slot);
         self.period_slots.put(rwtxn, &period_index, &period_slots)?;
@@ -866,6 +965,7 @@ impl Dbs {
             let search_slot = Slot {
                 slot_id,
                 decision: None,
+                claiming_txid: Txid([0u8; 32]),
             };
 
             if let Some(found_slot) = period_slots.get(&search_slot) {
@@ -1021,7 +1121,6 @@ impl Dbs {
             .try_get(rwtxn, &period_index)?
             .unwrap_or_default();
 
-        // Find and remove the slot using BTreeSet operations
         let target_slot = period_slots
             .iter()
             .find(|slot| slot.slot_id == slot_id)
@@ -1030,7 +1129,6 @@ impl Dbs {
         if let Some(slot_to_remove) = target_slot {
             period_slots.remove(&slot_to_remove);
 
-            // Update period_slots database
             if period_slots.is_empty() {
                 self.period_slots.delete(rwtxn, &period_index)?;
             } else {
@@ -1142,8 +1240,6 @@ impl Dbs {
         height: u64,
     ) -> Result<(), Error> {
         let mut slots_to_update = Vec::new();
-        // Track slots that need to be removed from period_slots
-        // because they rolled back to Created state (before being claimed)
         let mut slots_to_unclaim: Vec<SlotId> = Vec::new();
 
         {
@@ -1154,7 +1250,6 @@ impl Dbs {
                 let is_now_created =
                     history.current_state() == SlotState::Created;
 
-                // If slot was claimed but rolled back to Created, track it for removal
                 if was_claimed && is_now_created {
                     slots_to_unclaim.push(slot_id);
                 }
@@ -1162,12 +1257,10 @@ impl Dbs {
             }
         }
 
-        // Update slot state histories
         for (slot_id, history) in slots_to_update {
             self.slot_state_histories.put(rwtxn, &slot_id, &history)?;
         }
 
-        // Remove unclaimed slots from period_slots
         for slot_id in slots_to_unclaim {
             let period_index = slot_id.period_index();
 
@@ -1211,5 +1304,169 @@ impl SlotValidationInterface for Dbs {
 
     fn try_get_height(&self, _rotxn: &RoTxn) -> Result<Option<u32>, Error> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_binary_decision() -> Decision {
+        Decision {
+            market_maker_pubkey_hash: [0u8; 20],
+            slot_id_bytes: [0u8; 3],
+            question: "Test binary".to_string(),
+            is_standard: false,
+            is_scaled: false,
+            min: None,
+            max: None,
+        }
+    }
+
+    fn make_scaled_decision(min: i64, max: i64) -> Decision {
+        Decision {
+            market_maker_pubkey_hash: [0u8; 20],
+            slot_id_bytes: [0u8; 3],
+            question: "Test scaled".to_string(),
+            is_standard: false,
+            is_scaled: true,
+            min: Some(min),
+            max: Some(max),
+        }
+    }
+
+    #[test]
+    fn test_binary_decision_no_normalization() {
+        let decision = make_binary_decision();
+
+        // Binary decisions pass through unchanged
+        assert_eq!(decision.normalize_value(0.0), 0.0);
+        assert_eq!(decision.normalize_value(1.0), 1.0);
+        assert_eq!(decision.normalize_value(0.5), 0.5);
+
+        assert_eq!(decision.denormalize_value(0.0), 0.0);
+        assert_eq!(decision.denormalize_value(1.0), 1.0);
+        assert_eq!(decision.denormalize_value(0.5), 0.5);
+    }
+
+    #[test]
+    fn test_scaled_decision_normalization() {
+        // Electoral votes: 0-538
+        let decision = make_scaled_decision(0, 538);
+
+        // 0 -> 0.0, 538 -> 1.0, 269 -> 0.5
+        assert!((decision.normalize_value(0.0) - 0.0).abs() < 1e-10);
+        assert!((decision.normalize_value(538.0) - 1.0).abs() < 1e-10);
+        assert!((decision.normalize_value(269.0) - 0.5).abs() < 1e-10);
+        assert!((decision.normalize_value(270.0) - (270.0 / 538.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_scaled_decision_denormalization() {
+        // Electoral votes: 0-538
+        let decision = make_scaled_decision(0, 538);
+
+        // 0.0 -> 0, 1.0 -> 538, 0.5 -> 269
+        assert!((decision.denormalize_value(0.0) - 0.0).abs() < 1e-10);
+        assert!((decision.denormalize_value(1.0) - 538.0).abs() < 1e-10);
+        assert!((decision.denormalize_value(0.5) - 269.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_scaled_decision_with_offset() {
+        // Score: 50 to 150 (range of 100)
+        let decision = make_scaled_decision(50, 150);
+
+        // 50 -> 0.0, 150 -> 1.0, 100 -> 0.5
+        assert!((decision.normalize_value(50.0) - 0.0).abs() < 1e-10);
+        assert!((decision.normalize_value(150.0) - 1.0).abs() < 1e-10);
+        assert!((decision.normalize_value(100.0) - 0.5).abs() < 1e-10);
+
+        // Inverse
+        assert!((decision.denormalize_value(0.0) - 50.0).abs() < 1e-10);
+        assert!((decision.denormalize_value(1.0) - 150.0).abs() < 1e-10);
+        assert!((decision.denormalize_value(0.5) - 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_roundtrip_normalization() {
+        let decision = make_scaled_decision(100, 200);
+
+        for value in [100.0, 125.0, 150.0, 175.0, 200.0] {
+            let normalized = decision.normalize_value(value);
+            let denormalized = decision.denormalize_value(normalized);
+            assert!(
+                (denormalized - value).abs() < 1e-10,
+                "Roundtrip failed for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_and_normalize_success() {
+        let decision = make_scaled_decision(0, 100);
+
+        // Valid values
+        assert!(decision.validate_and_normalize(0.0).is_ok());
+        assert!(decision.validate_and_normalize(50.0).is_ok());
+        assert!(decision.validate_and_normalize(100.0).is_ok());
+
+        // Check the normalized value
+        let normalized = decision.validate_and_normalize(50.0).unwrap();
+        assert!((normalized - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_validate_and_normalize_out_of_bounds() {
+        let decision = make_scaled_decision(0, 100);
+
+        // Out of bounds
+        assert!(decision.validate_and_normalize(-1.0).is_err());
+        assert!(decision.validate_and_normalize(101.0).is_err());
+    }
+
+    #[test]
+    fn test_validate_and_normalize_nan_abstain() {
+        let decision = make_scaled_decision(0, 100);
+        // NaN is valid - it means "abstain" in voting
+        let result = decision.validate_and_normalize(f64::NAN);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_get_display_range_scaled() {
+        let decision = make_scaled_decision(0, 538);
+        let (min, max) = decision.get_display_range();
+        assert!((min - 0.0).abs() < 1e-10);
+        assert!((max - 538.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_get_display_range_binary() {
+        let decision = make_binary_decision();
+        let (min, max) = decision.get_display_range();
+        assert!((min - 0.0).abs() < 1e-10);
+        assert!((max - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_nan_handling() {
+        let decision = make_scaled_decision(0, 100);
+
+        // NaN input returns NaN
+        assert!(decision.normalize_value(f64::NAN).is_nan());
+        assert!(decision.denormalize_value(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn test_zero_range() {
+        // Edge case: min == max
+        let decision = make_scaled_decision(50, 50);
+
+        // With zero range, normalize returns 0.5
+        assert!((decision.normalize_value(50.0) - 0.5).abs() < 1e-10);
+        // Denormalize returns min (50)
+        assert!((decision.denormalize_value(0.5) - 50.0).abs() < 1e-10);
     }
 }

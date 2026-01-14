@@ -1,4 +1,4 @@
-use crate::math::safe_math::BasisPoints;
+use crate::math::safe_math::{self, BasisPoints, Rounding};
 use crate::math::voting::constants::round_reputation;
 use crate::state::{
     Error, State, UtxoManager, slots::SlotId, voting::types::VotingPeriodId,
@@ -143,8 +143,12 @@ fn calculate_votecoin_deltas(
     }
 
     // Calculate redistribution pool using integer arithmetic via BasisPoints
-    let redistribution_pool =
-        BasisPoints::REDISTRIBUTION_RATE.apply_to_u64(votecoin_at_stake) as i64;
+    // Use checked conversion to avoid silent overflow if votecoin_at_stake is very large
+    let redistribution_pool = BasisPoints::REDISTRIBUTION_RATE
+        .checked_apply_to_u64_as_i64(votecoin_at_stake)
+        .ok_or_else(|| Error::InvalidTransaction {
+            reason: "Redistribution pool exceeds i64::MAX".to_string(),
+        })?;
 
     if redistribution_pool == 0 {
         debug!("Redistribution pool is zero, skipping VoteCoin redistribution");
@@ -183,8 +187,13 @@ fn calculate_votecoin_deltas(
 
     // Calculate amount to redistribute
     let effective_change = total_win.min(total_loss);
-    let amount_to_redistribute =
-        ((redistribution_pool as f64) * effective_change).floor() as i64;
+    let amount_to_redistribute = safe_math::to_sats_signed(
+        (redistribution_pool as f64) * effective_change,
+        Rounding::Down,
+    )
+    .map_err(|e| Error::InvalidTransaction {
+        reason: format!("Failed to calculate redistribution amount: {e}"),
+    })?;
 
     debug!(
         "Effective change: {:.6}, Amount to redistribute: {} (votecoin_at_stake: {}, rate: {})",
@@ -204,39 +213,90 @@ fn calculate_votecoin_deltas(
         return Ok(deltas);
     }
 
-    winners.sort_by_key(|(addr, _)| *addr);
-    losers.sort_by_key(|(addr, _)| *addr);
-
-    // Calculate winner allocations using floor, track remainder
+    // Calculate winner allocations using round-to-nearest for fairness
     let mut total_assigned_gain = 0i64;
     let mut winner_deltas: Vec<(Address, i64)> = Vec::new();
 
     for (address, rep_gain) in &winners {
         let proportion = rep_gain / total_win;
-        let gain = (proportion * amount_to_redistribute as f64).floor() as i64;
+        let gain = safe_math::to_sats_signed(
+            proportion * amount_to_redistribute as f64,
+            Rounding::Nearest,
+        )
+        .unwrap_or_else(|e| {
+            warn!("Winner gain calculation failed for {}: {}", address.as_base58(), e);
+            0
+        });
         winner_deltas.push((*address, gain));
         total_assigned_gain += gain;
     }
 
-    // Calculate loser allocations using floor, track remainder
+    // Calculate loser allocations using round-to-nearest for fairness
     let mut total_assigned_loss = 0i64;
     let mut loser_deltas: Vec<(Address, i64)> = Vec::new();
 
     for (address, rep_loss) in &losers {
         let proportion = rep_loss / total_loss;
-        let loss = (proportion * amount_to_redistribute as f64).floor() as i64;
+        let loss = safe_math::to_sats_signed(
+            proportion * amount_to_redistribute as f64,
+            Rounding::Nearest,
+        )
+        .unwrap_or_else(|e| {
+            warn!("Loser loss calculation failed for {}: {}", address.as_base58(), e);
+            0
+        });
         loser_deltas.push((*address, -loss));
         total_assigned_loss += loss;
     }
 
-    let gain_remainder = amount_to_redistribute - total_assigned_gain;
-    let loss_remainder = amount_to_redistribute - total_assigned_loss;
-
-    if gain_remainder > 0 && !winner_deltas.is_empty() {
-        winner_deltas[0].1 += gain_remainder;
+    // Adjust for rounding: round-to-nearest may over or under distribute
+    // Under: remainder to largest winner (who lost most to rounding)
+    // Over: subtract from smallest winner
+    if !winner_deltas.is_empty() {
+        if total_assigned_gain < amount_to_redistribute {
+            let remainder = amount_to_redistribute - total_assigned_gain;
+            let largest_idx = winner_deltas
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (_, g))| *g)
+                .map(|(idx, _)| idx)
+                .unwrap();
+            winner_deltas[largest_idx].1 += remainder;
+        } else if total_assigned_gain > amount_to_redistribute {
+            let excess = total_assigned_gain - amount_to_redistribute;
+            let smallest_idx = winner_deltas
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, g))| *g)
+                .map(|(idx, _)| idx)
+                .unwrap();
+            winner_deltas[smallest_idx].1 -= excess;
+        }
     }
-    if loss_remainder > 0 && !loser_deltas.is_empty() {
-        loser_deltas[0].1 -= loss_remainder;
+
+    // Same adjustment for losers
+    // Under: remainder subtracted from largest loser (most negative)
+    // Over: add back to smallest loser (least negative)
+    if !loser_deltas.is_empty() {
+        if total_assigned_loss < amount_to_redistribute {
+            let remainder = amount_to_redistribute - total_assigned_loss;
+            let largest_idx = loser_deltas
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, l))| *l) // Most negative = largest loss
+                .map(|(idx, _)| idx)
+                .unwrap();
+            loser_deltas[largest_idx].1 -= remainder as i64;
+        } else if total_assigned_loss > amount_to_redistribute {
+            let excess = total_assigned_loss - amount_to_redistribute;
+            let smallest_idx = loser_deltas
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (_, l))| *l) // Least negative = smallest loss
+                .map(|(idx, _)| idx)
+                .unwrap();
+            loser_deltas[smallest_idx].1 += excess as i64;
+        }
     }
 
     for (address, delta) in winner_deltas {
@@ -374,15 +434,41 @@ fn adjust_deltas_for_insufficient_balances(
                 for (address, original_gain) in &winners {
                     let proportion =
                         *original_gain as f64 / total_winnings as f64;
-                    let reduction =
-                        (deficit_i64 as f64 * proportion).floor() as i64;
+                    let reduction = safe_math::to_sats_signed(
+                        deficit_i64 as f64 * proportion,
+                        Rounding::Nearest,
+                    )
+                    .unwrap_or_else(|e| {
+                        warn!("Deficit reduction calculation failed for {}: {}", address.as_base58(), e);
+                        0
+                    });
                     reductions.push((*address, *original_gain, reduction));
                     total_reduced += reduction;
                 }
 
-                let remainder = deficit_i64 - total_reduced;
-                if remainder > 0 && !reductions.is_empty() {
-                    reductions[0].2 += remainder;
+                // Adjust for rounding
+                // Under: largest winner absorbs remainder
+                // Over: smallest winner gets reduction decreased
+                if total_reduced < deficit_i64 {
+                    let remainder = deficit_i64 - total_reduced;
+                    if let Some(largest_idx) = reductions
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, (_, g, _))| *g)
+                        .map(|(idx, _)| idx)
+                    {
+                        reductions[largest_idx].2 += remainder;
+                    }
+                } else if total_reduced > deficit_i64 {
+                    let excess = total_reduced - deficit_i64;
+                    if let Some(smallest_idx) = reductions
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (_, g, _))| *g)
+                        .map(|(idx, _)| idx)
+                    {
+                        reductions[smallest_idx].2 -= excess;
+                    }
                 }
 
                 // Apply reductions

@@ -51,11 +51,16 @@ mod expected {
     pub const OUTCOME_TOLERANCE: f64 = 0.01;
 }
 
-/// Pre-calculated LMSR trade costs for deterministic testing.
-/// All values calculated with: β = 1,000,000, fee_rate = 0.5%
+/// Pre-calculated LMSR values for deterministic testing.
+/// All values calculated with fee_rate = 0.5%
 mod expected_costs {
-    /// Initial treasury for binary market: ceil(β * ln(2)) = 693148 sats (~0.007 BTC)
-    pub const INITIAL_TREASURY: u64 = 693148;
+    /// Initial liquidity for test markets (~0.007 BTC)
+    /// For binary markets, this gives β = 693148 / ln(2) ≈ 1,000,001.18
+    pub const INITIAL_LIQUIDITY: u64 = 693148;
+
+    /// Explicit beta for advanced market creation path
+    /// For binary markets, min treasury = β × ln(2) = 1,000,000 × 0.693... ≈ 693148
+    pub const BETA: f64 = 1_000_000.0;
 }
 
 /// Helper functions for verifying market UTXO state transitions
@@ -622,23 +627,41 @@ async fn roundtrip_task(
         ),
     ];
 
-    for (voter_node, slot_idx, title, description) in market_configs.iter() {
+    // Create markets using both valid parameter paths:
+    // - Market 0: initial_liquidity only (primary user-facing path)
+    // - Market 1: beta only (advanced path)
+    // - Market 2: initial_liquidity only (different amount)
+    // - Market 3: beta only (same beta, verifies consistency)
+    // Note: "neither" path uses DEFAULT_MARKET_BETA=7.0 which is too low for trading tests
+    for (idx, (voter_node, slot_idx, title, description)) in
+        market_configs.iter().enumerate()
+    {
         use truthcoin_dc_app_rpc_api::CreateMarketRequest;
 
         let slot_id = &market_slot_ids[*slot_idx];
+        let dimensions = format!("[{slot_id}]");
+
+        let (beta, initial_liquidity) = match idx {
+            // Market 0: initial_liquidity only (primary user-facing)
+            0 => (None, Some(expected_costs::INITIAL_LIQUIDITY)),
+            // Market 1: beta only (advanced)
+            1 => (Some(expected_costs::BETA), None),
+            // Market 2: initial_liquidity only (higher liquidity)
+            2 => (None, Some(expected_costs::INITIAL_LIQUIDITY * 2)),
+            // Market 3: beta only (same beta as market 1)
+            _ => (Some(expected_costs::BETA), None),
+        };
+
         let request = CreateMarketRequest {
             title: title.to_string(),
             description: description.to_string(),
-            market_type: "independent".to_string(),
-            decision_slots: vec![slot_id.clone()],
-            dimensions: None,
-            has_residual: None,
-            // beta = 1000000 gives ~693147 sats minimum treasury (~0.007 BTC)
-            // This is a realistic liquidity level for a small prediction market
-            beta: Some(1000000.0),
+            dimensions,
+            beta,
             trading_fee: Some(0.005),
             tags: Some(vec!["integration-test".to_string()]),
-            initial_liquidity: None,
+            initial_liquidity,
+            category_txids: None,
+            residual_names: None,
             fee_sats: 1000,
         };
 
@@ -1244,14 +1267,14 @@ async fn roundtrip_task(
 
         // Calculate treasury increase from initial
         let treasury_increase =
-            current_amount.saturating_sub(expected_costs::INITIAL_TREASURY);
+            current_amount.saturating_sub(expected_costs::INITIAL_LIQUIDITY);
 
         tracing::info!(
             "  Market {} (idx {}): treasury = {} sats (initial {} + {} from trades)",
             market_id_short,
             market_idx,
             current_amount,
-            expected_costs::INITIAL_TREASURY,
+            expected_costs::INITIAL_LIQUIDITY,
             treasury_increase
         );
 

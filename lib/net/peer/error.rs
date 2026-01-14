@@ -227,7 +227,7 @@ pub enum Error {
     SendRequest(#[from] request_queue::SendRequest),
     #[error(transparent)]
     SendResponse(#[from] connection::SendResponse),
-    #[error("state error")]
+    #[error("state error: {0}")]
     State(#[from] Box<crate::state::Error>),
 }
 

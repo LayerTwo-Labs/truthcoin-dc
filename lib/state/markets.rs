@@ -5,6 +5,7 @@ use ndarray::{Array, Ix1};
 use serde::{Deserialize, Serialize};
 use sneed::{DatabaseUnique, Env, RoTxn, RwTxn};
 use std::collections::{HashMap, HashSet};
+use tracing::warn;
 
 use crate::math::safe_math::{self, Rounding};
 use crate::state::Error;
@@ -17,6 +18,12 @@ use thiserror::Error as ThisError;
 pub const MAX_MARKET_OUTCOMES: usize = 256;
 pub const L2_STORAGE_RATE_SATS_PER_BYTE: u64 = 1;
 pub const BASE_MARKET_STORAGE_COST_SATS: u64 = 1000;
+
+/// Default LMSR beta parameter (liquidity depth)
+pub const DEFAULT_MARKET_BETA: f64 = 7.0;
+
+/// Default trading fee (0.5%)
+pub const DEFAULT_TRADING_FEE: f64 = 0.005;
 
 #[derive(Debug, ThisError, Clone)]
 pub enum MarketError {
@@ -46,6 +53,9 @@ pub enum MarketError {
 
     #[error("Invalid outcome combination")]
     InvalidOutcomeCombination,
+
+    #[error("Duplicate slot in market dimensions: {slot_id:?}")]
+    DuplicateSlot { slot_id: SlotId },
 
     #[error("Database error: {0}")]
     DatabaseError(String),
@@ -98,7 +108,7 @@ pub enum DFunction {
     True,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, BorshSerialize)]
 pub enum DimensionSpec {
     Single(SlotId),
     Categorical(Vec<SlotId>),
@@ -414,15 +424,16 @@ pub struct Market {
     pub description: String,
     pub tags: Vec<String>,
     pub creator_address: Address,
+    pub dimension_specs: Vec<DimensionSpec>,
     pub decision_slots: Vec<SlotId>,
     pub d_functions: Vec<DFunction>,
     pub state_combos: Vec<Vec<usize>>,
+    pub residual_names: Option<Vec<String>>,
     pub created_at_height: u64,
     pub expires_at_height: Option<u64>,
     pub tau_from_now: u8,
     pub share_vector_length: usize,
     pub storage_fee_sats: u64,
-    pub size: usize,
     // Direct state fields (replacing state_history)
     pub market_state: MarketState,
     pub b: f64,
@@ -473,6 +484,7 @@ pub struct MarketBuilder {
     decision_slots: Vec<SlotId>,
     categorical_slots: Option<(Vec<SlotId>, bool)>,
     dimension_specs: Option<Vec<DimensionSpec>>,
+    residual_names: Option<Vec<String>>,
     b: f64,
     trading_fee: f64,
 }
@@ -487,8 +499,9 @@ impl MarketBuilder {
             decision_slots: Vec::new(),
             categorical_slots: None,
             dimension_specs: None,
-            b: 7.0,
-            trading_fee: 0.005,
+            residual_names: None,
+            b: DEFAULT_MARKET_BETA,
+            trading_fee: DEFAULT_TRADING_FEE,
         }
     }
 
@@ -539,6 +552,14 @@ impl MarketBuilder {
         self
     }
 
+    pub fn with_residual_names(
+        mut self,
+        residual_names: Option<Vec<String>>,
+    ) -> Self {
+        self.residual_names = residual_names;
+        self
+    }
+
     pub fn build(
         self,
         created_at_height: u64,
@@ -578,14 +599,18 @@ impl MarketBuilder {
                 (self.decision_slots.clone(), d_funcs, combos)
             };
 
+        let dimension_specs = self.dimension_specs.clone().unwrap_or_default();
+
         Market::new(
             self.title,
             self.description,
             self.tags,
             self.creator_address,
+            dimension_specs,
             all_slots,
             d_functions,
             state_combos,
+            self.residual_names,
             self.b,
             self.trading_fee,
             created_at_height,
@@ -722,8 +747,24 @@ pub fn generate_mixed_dimensional(
     dimension_specs: &[DimensionSpec],
     decisions: &HashMap<SlotId, Decision>,
 ) -> Result<(Vec<DFunction>, Vec<Vec<usize>>), MarketError> {
+    use std::collections::HashSet;
+
     if dimension_specs.is_empty() {
         return Err(MarketError::InvalidDimensions);
+    }
+
+    // Check for duplicate slots across all dimensions
+    let mut seen_slots = HashSet::new();
+    for spec in dimension_specs {
+        let slots = match spec {
+            DimensionSpec::Single(slot_id) => vec![*slot_id],
+            DimensionSpec::Categorical(slot_ids) => slot_ids.clone(),
+        };
+        for slot_id in slots {
+            if !seen_slots.insert(slot_id) {
+                return Err(MarketError::DuplicateSlot { slot_id });
+            }
+        }
     }
 
     let mut expected_outcomes = 1usize;
@@ -754,22 +795,15 @@ pub fn generate_mixed_dimensional(
                 all_slots.push(*slot_id);
                 slot_to_dimension.push(dim_idx);
 
-                let decision = decisions.get(slot_id).ok_or(
+                decisions.get(slot_id).ok_or(
                     MarketError::DecisionSlotNotFound { slot_id: *slot_id },
                 )?;
 
-                let outcomes = if decision.is_scaled {
-                    if let (Some(min), Some(max)) = (decision.min, decision.max)
-                    {
-                        (max - min) as usize + 2
-                    } else {
-                        return Err(MarketError::SlotValidationFailed {
-                            slot_id: *slot_id,
-                        });
-                    }
-                } else {
-                    3
-                };
+                // Both binary and scaled decisions have 3 outcomes for LMSR consistency:
+                // Binary: 0=No, 1=Yes, 2=Abstain
+                // Scaled: 0=Min bound, 1=Max bound, 2=Abstain
+                // For scaled, the continuous value (0-1) determines payout distribution during resolution
+                let outcomes = 3;
                 dimension_ranges.push(outcomes);
             }
             DimensionSpec::Categorical(slot_ids) => {
@@ -961,21 +995,14 @@ fn get_raw_dimensions(
     let mut dimensions = Vec::new();
 
     for slot_id in slots {
-        let decision = decisions
+        decisions
             .get(slot_id)
             .ok_or(MarketError::DecisionSlotNotFound { slot_id: *slot_id })?;
 
-        let outcomes = if decision.is_scaled {
-            if let (Some(min), Some(max)) = (decision.min, decision.max) {
-                (max - min) as usize + 2
-            } else {
-                return Err(MarketError::SlotValidationFailed {
-                    slot_id: *slot_id,
-                });
-            }
-        } else {
-            3
-        };
+        // Both binary and scaled have 3 outcomes for LMSR consistency
+        // Binary: 0=No, 1=Yes, 2=Abstain
+        // Scaled: 0=Min, 1=Max, 2=Abstain (continuous 0-1 value determines payout)
+        let outcomes = 3;
         dimensions.push(outcomes);
     }
 
@@ -1035,9 +1062,11 @@ impl Market {
         description: String,
         tags: Vec<String>,
         creator_address: Address,
+        dimension_specs: Vec<DimensionSpec>,
         decision_slots: Vec<SlotId>,
         d_functions: Vec<DFunction>,
         state_combos: Vec<Vec<usize>>,
+        residual_names: Option<Vec<String>>,
         b: f64,
         trading_fee: f64,
         created_at_height: u64,
@@ -1074,15 +1103,16 @@ impl Market {
             description,
             tags,
             creator_address,
+            dimension_specs,
             decision_slots: decision_slots.clone(),
             d_functions,
             state_combos,
+            residual_names,
             created_at_height,
             expires_at_height,
             tau_from_now: calculate_max_tau(&decision_slots, decisions),
             share_vector_length,
             storage_fee_sats,
-            size: 0,
             market_state: MarketState::Trading,
             b,
             trading_fee,
@@ -1095,55 +1125,49 @@ impl Market {
         };
 
         market.id = market.calculate_id();
-        market.calculate_size();
 
         Ok(market)
     }
 
     fn calculate_id(&self) -> MarketId {
-        #[derive(BorshSerialize)]
-        struct MarketIdInput<'a> {
-            title: &'a str,
-            description: &'a str,
-            creator_address: &'a Address,
-            decision_slots: &'a [SlotId],
-            d_functions: &'a [DFunction],
-            state_combos: &'a [Vec<usize>],
-            created_at_height: u64,
-            expires_at_height: Option<u64>,
-        }
-
-        let input = MarketIdInput {
-            title: &self.title,
-            description: &self.description,
-            creator_address: &self.creator_address,
-            decision_slots: &self.decision_slots,
-            d_functions: &self.d_functions,
-            state_combos: &self.state_combos,
-            created_at_height: self.created_at_height,
-            expires_at_height: self.expires_at_height,
-        };
-
-        let hash_bytes = hashes::hash(&input);
-        let mut id_bytes = [0u8; 6];
-        id_bytes.copy_from_slice(&hash_bytes[0..6]);
-        MarketId(id_bytes)
+        compute_market_id(
+            &self.title,
+            &self.description,
+            &self.creator_address,
+            &self.dimension_specs,
+        )
     }
-    fn calculate_size(&mut self) {
-        self.size = self.title.len()
-            + self.description.len()
-            + self.tags.iter().map(|tag| tag.len()).sum::<usize>()
-            + std::mem::size_of_val(&self.tau_from_now)
-            + self.creator_address.to_string().len()
-            + self.decision_slots.len() * 3
-            + std::mem::size_of_val(&self.created_at_height)
-            + std::mem::size_of_val(&self.expires_at_height)
-            + std::mem::size_of_val(&self.share_vector_length)
-            + std::mem::size_of_val(&self.storage_fee_sats)
-            + self.shares.len() * std::mem::size_of::<f64>()
-            + self.final_prices.len() * std::mem::size_of::<f64>();
+}
+
+/// Compute market ID from content fields.
+pub fn compute_market_id(
+    title: &str,
+    description: &str,
+    creator_address: &Address,
+    dimension_specs: &[DimensionSpec],
+) -> MarketId {
+    #[derive(BorshSerialize)]
+    struct MarketIdInput<'a> {
+        title: &'a str,
+        description: &'a str,
+        creator_address: &'a Address,
+        dimension_specs: &'a [DimensionSpec],
     }
 
+    let input = MarketIdInput {
+        title,
+        description,
+        creator_address,
+        dimension_specs,
+    };
+
+    let hash_bytes = hashes::hash(&input);
+    let mut id_bytes = [0u8; 6];
+    id_bytes.copy_from_slice(&hash_bytes[0..6]);
+    MarketId(id_bytes)
+}
+
+impl Market {
     pub fn state(&self) -> MarketState {
         self.market_state
     }
@@ -1203,7 +1227,6 @@ impl Market {
 
         self.version += 1;
         self.last_updated_height = height;
-        self.calculate_size();
 
         Ok(())
     }
@@ -1249,6 +1272,52 @@ impl Market {
                 vec![]
             }
         }
+    }
+
+    /// For single-slot markets (binary or scaled), calculate the implied value (0-1).
+    /// Returns p_max / (p_min + p_max) where:
+    /// - p_min is the price of outcome 0 (No/Min)
+    /// - p_max is the price of outcome 1 (Yes/Max)
+    ///
+    /// For binary decisions: 0.0 = "No", 1.0 = "Yes"
+    /// For scaled decisions: 0.0 = min bound, 1.0 = max bound
+    ///
+    /// Returns None if market has multiple decision slots or invalid structure.
+    pub fn get_implied_value_normalized(&self) -> Option<f64> {
+        // Only works for single-slot markets (3 outcomes: min/no, max/yes, abstain)
+        if self.decision_slots.len() != 1 || self.state_combos.len() != 3 {
+            return None;
+        }
+
+        let prices = self.current_prices();
+        if prices.len() < 2 {
+            return None;
+        }
+
+        // prices[0] = min/no, prices[1] = max/yes, prices[2] = abstain
+        let p_min = prices[0];
+        let p_max = prices[1];
+        let sum = p_min + p_max;
+
+        if sum > 0.0 {
+            Some(p_max / sum)
+        } else {
+            Some(0.5) // Default to 50% if no price info
+        }
+    }
+
+    /// Denormalize an implied value (0-1) to the actual [min, max] range.
+    /// Use with scaled decisions where min/max are defined.
+    pub fn denormalize_value(normalized: f64, min: i64, max: i64) -> f64 {
+        min as f64 + normalized * (max - min) as f64
+    }
+
+    /// Normalize a real-world value to 0-1 range.
+    pub fn normalize_value(value: f64, min: i64, max: i64) -> f64 {
+        if max == min {
+            return 0.5;
+        }
+        ((value - min as f64) / (max - min) as f64).clamp(0.0, 1.0)
     }
 
     pub fn update_shares(
@@ -1353,122 +1422,60 @@ impl Market {
         self.update_state(height, Some(MarketState::Invalid), None, None, None)
     }
 
-    /// Calculate final_prices from resolved slot outcomes.
-    ///
-    /// For each market outcome, evaluates the corresponding DFunction against
-    /// the resolved slot outcomes to determine which outcomes are "winning".
-    /// Final prices are normalized to sum to 1.0.
-    ///
     /// # Arguments
     /// * `slot_outcomes` - Map of SlotId to consensus outcome value (0.0-1.0)
     /// * `decisions` - Map of SlotId to Decision (needed for scaled decision handling)
     ///
     /// # Returns
     /// Array of final prices, one per market outcome, summing to 1.0
+    ///
+    /// Binary: threshold-based (>0.7→Yes, <0.3→No, else split)
+    /// Scaled: proportional (outcome→Max, 1-outcome→Min)
     pub fn calculate_final_prices(
         &self,
         slot_outcomes: &std::collections::HashMap<SlotId, f64>,
         decisions: &HashMap<SlotId, Decision>,
     ) -> Result<Array<f64, Ix1>, MarketError> {
-        // Build resolved combo from slot outcomes
-        // For binary decisions: outcome > 0.7 → 1 (YES), outcome < 0.3 → 0 (NO), else 2 (ABSTAIN)
-        // For scaled decisions: outcome maps to [min, max] range index
-        let resolved_combo: Vec<usize> = self
-            .decision_slots
-            .iter()
-            .map(|slot_id| {
-                let outcome =
-                    slot_outcomes.get(slot_id).copied().unwrap_or(0.5);
+        // Compute axis weights for each dimension: [state_0, state_1, Abstain]
+        let mut axes: Vec<[f64; 3]> = Vec::with_capacity(self.decision_slots.len());
 
-                // Check if this is a scaled decision
-                if let Some(decision) = decisions.get(slot_id) {
-                    if decision.is_scaled {
-                        // For scaled decisions, map 0.0-1.0 to the [min, max] range
-                        let min = decision.min.unwrap_or(0) as f64;
-                        let max = decision.max.unwrap_or(100) as f64;
-                        let range = max - min;
+        for slot_id in &self.decision_slots {
+            let outcome = slot_outcomes.get(slot_id).copied().unwrap_or(0.5);
+            let is_scaled = decisions
+                .get(slot_id)
+                .map(|d| d.is_scaled)
+                .unwrap_or(false);
 
-                        // Map outcome to scaled index
-                        // outcome 0.0 → 0, outcome 1.0 → (max-min)
-                        let scaled_index = (outcome * range).round() as usize;
-                        // Clamp to valid range
-                        scaled_index.min((max - min) as usize)
-                    } else {
-                        // Binary decision: use threshold logic
-                        if outcome > 0.7 {
-                            1
-                        } else if outcome < 0.3 {
-                            0
-                        } else {
-                            2 // ABSTAIN
-                        }
-                    }
-                } else {
-                    // Default to binary if decision not found
-                    if outcome > 0.7 {
-                        1
-                    } else if outcome < 0.3 {
-                        0
-                    } else {
-                        2
-                    }
-                }
-            })
-            .collect();
+            let axis = if is_scaled {
+                [1.0 - outcome, outcome, 0.0]
+            } else if outcome > 0.7 {
+                [0.0, 1.0, 0.0]
+            } else if outcome < 0.3 {
+                [1.0, 0.0, 0.0]
+            } else {
+                [0.5, 0.5, 0.0]
+            };
 
-        // Find which state_combo(s) match the resolved combo
-        // For full-product markets, d_functions are all DFunction::True,
-        // so we must match against state_combos directly
-        //
-        // Per Truthcoin whitepaper: outcome 0.5 (ABSTAIN) means the decision
-        // was unresolvable, and payout should be split equally between valid
-        // outcomes. We achieve this by:
-        // 1. Only exact-matching against valid state_combos (those without ABSTAIN)
-        // 2. Using partial matching when resolved_combo contains ABSTAIN
+            axes.push(axis);
+        }
+
+        // Tensor product: multiply axis weights for each state_combo
         let mut prices = Array::zeros(self.state_combos.len());
 
-        // Check if resolved_combo contains any ABSTAIN values
-        let has_abstain = resolved_combo.contains(&2);
+        for (i, state_combo) in self.state_combos.iter().enumerate() {
+            if state_combo.contains(&2) {
+                continue;
+            }
 
-        if !has_abstain {
-            // No ABSTAIN in resolved - try exact match
-            for (i, state_combo) in self.state_combos.iter().enumerate() {
-                // Skip state_combos that contain ABSTAIN (not valid trading outcomes)
-                if state_combo.contains(&2) {
-                    continue;
-                }
-                if state_combo == &resolved_combo {
-                    prices[i] = 1.0;
+            let mut joint_prob = 1.0;
+            for (dim, &state) in state_combo.iter().enumerate() {
+                if dim < axes.len() && state < 3 {
+                    joint_prob *= axes[dim][state];
                 }
             }
+            prices[i] = joint_prob;
         }
 
-        // If no exact match found (either because resolved contains ABSTAIN,
-        // or no valid state_combo matched), use partial matching
-        let sum: f64 = prices.sum();
-        if sum == 0.0 {
-            // Check for partial matches - outcomes that are consistent with
-            // the resolved combo (where ABSTAIN acts as wildcard)
-            for (i, state_combo) in self.state_combos.iter().enumerate() {
-                // Skip state_combos that contain ABSTAIN (not valid trading outcomes)
-                if state_combo.contains(&2) {
-                    continue;
-                }
-                let matches = resolved_combo
-                    .iter()
-                    .zip(state_combo.iter())
-                    .all(|(resolved, state)| {
-                        // ABSTAIN (2) in resolved means any value is acceptable
-                        // Otherwise must match exactly
-                        *resolved == 2 || resolved == state
-                    });
-                if matches {
-                    prices[i] = 1.0;
-                }
-            }
-        }
-
-        // Normalize to sum to 1.0
         let sum: f64 = prices.sum();
         if sum > 0.0 {
             prices /= sum;
@@ -1602,14 +1609,28 @@ impl Market {
                 .get(&slot_id)
                 .ok_or(MarketError::DecisionSlotNotFound { slot_id })?;
 
+            // Both binary and scaled decisions use 3 outcomes:
+            // Binary: 0=No, 1=Yes, 2=Abstain
+            // Scaled: 0=Min bound, 1=Max bound, 2=Abstain
             let outcome_desc = if decision.is_scaled {
-                let value = decision.min.unwrap_or(0) + positions[i] as u16;
-                format!("{}: {}", decision.question, value)
+                match positions[i] {
+                    0 => format!(
+                        "{}: {} (Min)",
+                        decision.question,
+                        decision.min.unwrap_or(0)
+                    ),
+                    1 => format!(
+                        "{}: {} (Max)",
+                        decision.question,
+                        decision.max.unwrap_or(100)
+                    ),
+                    _ => format!("{}: Abstain", decision.question),
+                }
             } else {
                 let outcome = match positions[i] {
                     0 => "No",
                     1 => "Yes",
-                    _ => "Invalid",
+                    _ => "Abstain",
                 };
                 format!("{}: {}", decision.question, outcome)
             };
@@ -2916,6 +2937,8 @@ impl MarketsDatabase {
             });
         }
 
+        // Calculate payouts using round-to-nearest for fairness
+        // This minimizes dust by having rounding errors cancel out (some up, some down)
         let mut payouts = Vec::new();
         let mut total_distributed: u64 = 0;
 
@@ -2923,11 +2946,21 @@ impl MarketsDatabase {
             for (outcome_index, shares) in positions {
                 let final_price = final_prices[outcome_index as usize];
                 let weighted_shares = shares * final_price;
-                let payout_calc = weighted_shares / total_weighted_shares
-                    * treasury_sats as f64;
+                let payout_calc =
+                    weighted_shares / total_weighted_shares * treasury_sats as f64;
                 let payout_sats =
-                    safe_math::to_sats(payout_calc, Rounding::Down)
-                        .unwrap_or(0);
+                    safe_math::to_sats(payout_calc, Rounding::Nearest).unwrap_or_else(
+                        |e| {
+                            warn!(
+                                "Payout conversion failed for {} (market {}, outcome {}): {}. Defaulting to 0.",
+                                address.as_base58(),
+                                market.id,
+                                outcome_index,
+                                e
+                            );
+                            0
+                        },
+                    );
 
                 if payout_sats > 0 {
                     payouts.push(SharePayoutRecord {
@@ -2943,19 +2976,40 @@ impl MarketsDatabase {
             }
         }
 
-        // Handle rounding remainder - add to largest payout
-        let remainder = treasury_sats.saturating_sub(total_distributed);
-        if remainder > 0
-            && !payouts.is_empty()
-            && let Some(max_idx) = payouts
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, p)| p.payout_sats)
-                .map(|(idx, _)| idx)
-        {
-            payouts[max_idx].payout_sats += remainder;
-            total_distributed += remainder;
+        // Adjust for rounding: round-to-nearest may over or under distribute
+        // Under: remainder to largest shareholder (who lost most to rounding)
+        // Over: subtract from smallest shareholder (who gained most from rounding)
+        if !payouts.is_empty() {
+            if total_distributed < treasury_sats {
+                let remainder = treasury_sats - total_distributed;
+                let largest_idx = payouts
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, p)| p.payout_sats)
+                    .map(|(idx, _)| idx)
+                    .unwrap();
+                payouts[largest_idx].payout_sats += remainder;
+                total_distributed += remainder;
+            } else if total_distributed > treasury_sats {
+                let excess = total_distributed - treasury_sats;
+                let smallest_idx = payouts
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, p)| p.payout_sats)
+                    .map(|(idx, _)| idx)
+                    .unwrap();
+                payouts[smallest_idx].payout_sats =
+                    payouts[smallest_idx].payout_sats.saturating_sub(excess);
+                total_distributed -= excess;
+            }
         }
+
+        // Conservation invariant: all treasury satoshis are distributed
+        debug_assert_eq!(
+            total_distributed, treasury_sats,
+            "Conservation invariant violated: {} distributed but treasury was {}",
+            total_distributed, treasury_sats
+        );
 
         // Get author fees from Author Fee UTXO
         let author_fees_distributed =
@@ -3696,4 +3750,5 @@ mod tests {
             "Adequate liquidity should result in positive, finite shares"
         );
     }
+
 }

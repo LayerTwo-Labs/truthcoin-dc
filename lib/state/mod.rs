@@ -681,6 +681,20 @@ impl State {
         )
     }
 
+    pub fn validate_category_slots_claim(
+        &self,
+        rotxn: &RoTxn,
+        tx: &FilledTransaction,
+        override_height: Option<u32>,
+    ) -> Result<(), Error> {
+        SlotValidator::validate_complete_category_slots_claim(
+            self,
+            rotxn,
+            tx,
+            override_height,
+        )
+    }
+
     pub fn validate_market_creation(
         &self,
         rotxn: &RoTxn,
@@ -716,6 +730,10 @@ impl State {
 
         if tx.is_claim_decision_slot() {
             self.validate_decision_slot_claim(rotxn, tx, override_height)?;
+        }
+
+        if tx.is_claim_category_slots() {
+            self.validate_category_slots_claim(rotxn, tx, override_height)?;
         }
 
         if tx.is_create_market() {
