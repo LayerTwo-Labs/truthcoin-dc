@@ -82,6 +82,8 @@ ignore = [
     { id = "RUSTSEC-2025-0119", reason = "Transitive dependency from indicatif, awaiting upstream update"},
     # rustls-pemfile is unmaintained (transitive via reqwest)
     { id = "RUSTSEC-2025-0134", reason = "Transitive dependency from reqwest/esplora-client, awaiting upstream update"},
+    # bincode is unmaintained (transitive via heed)
+    { id = "RUSTSEC-2025-0141", reason = "Transitive dependency from heed, awaiting upstream update to use alternative"},
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
