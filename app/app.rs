@@ -28,13 +28,13 @@ use crate::cli::Config;
 pub enum Error {
     #[error(transparent)]
     AmountOverflow(#[from] AmountOverflowError),
-    #[error("CUSF mainchain proto error")]
+    #[error("CUSF mainchain proto error: {0}")]
     CusfMainchain(#[from] truthcoin_dc::types::proto::Error),
-    #[error("io error")]
+    #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("miner error: {0}")]
     Miner(#[from] miner::Error),
-    #[error("node error")]
+    #[error("node error: {0}")]
     Node(#[source] Box<node::Error>),
     #[error("No CUSF mainchain wallet client")]
     NoCusfMainchainWalletClient,
@@ -43,7 +43,7 @@ pub enum Error {
         url: Box<url::Url>,
         source: Box<tonic::Status>,
     },
-    #[error("wallet error")]
+    #[error("wallet error: {0}")]
     Wallet(#[from] wallet::Error),
 }
 
