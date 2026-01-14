@@ -854,7 +854,9 @@ impl DFunctionValidator {
             }
             DFunction::Equals(func, value) => {
                 Self::validate_constraint(func, max_decision_index)?;
-                if let DFunction::Decision(_) = func.as_ref() && *value > 2 {
+                if let DFunction::Decision(_) = func.as_ref()
+                    && *value > 2
+                {
                     return Err(MarketError::InvalidOutcomeCombination);
                 }
                 Ok(())
