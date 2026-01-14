@@ -88,7 +88,7 @@ pub fn to_sats_signed(value: f64, mode: Rounding) -> Result<i64, SatoshiError> {
         Rounding::Nearest => value.round(),
     };
     // Use explicit bounds to avoid precision loss with i64::MAX/MIN as f64
-    if rounded >= I64_MAX_F64_BOUND || rounded < I64_MIN_F64_BOUND {
+    if !(I64_MIN_F64_BOUND..I64_MAX_F64_BOUND).contains(&rounded) {
         return Err(SatoshiError::Overflow(value));
     }
     Ok(rounded as i64)

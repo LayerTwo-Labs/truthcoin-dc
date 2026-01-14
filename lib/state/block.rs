@@ -1567,24 +1567,23 @@ fn apply_market_creation(
             market_id: output_market_id,
             amount,
         } = &output.content
+            && output_market_id == &market_id_bytes
         {
-            if output_market_id == &market_id_bytes {
-                let outpoint = OutPoint::Regular {
-                    txid,
-                    vout: vout as u32,
-                };
-                state
-                    .markets()
-                    .set_market_utxo(rwtxn, &market_id, &outpoint)?;
+            let outpoint = OutPoint::Regular {
+                txid,
+                vout: vout as u32,
+            };
+            state
+                .markets()
+                .set_market_utxo(rwtxn, &market_id, &outpoint)?;
 
-                tracing::debug!(
-                    "Registered MarketTreasury UTXO for market {:?} with {} sats at {:?}",
-                    market_id,
-                    amount.0.to_sat(),
-                    outpoint
-                );
-                break;
-            }
+            tracing::debug!(
+                "Registered MarketTreasury UTXO for market {:?} with {} sats at {:?}",
+                market_id,
+                amount.0.to_sat(),
+                outpoint
+            );
+            break;
         }
     }
 

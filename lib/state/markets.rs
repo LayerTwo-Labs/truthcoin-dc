@@ -3008,8 +3008,7 @@ impl MarketsDatabase {
         // Conservation invariant: all treasury satoshis are distributed
         debug_assert_eq!(
             total_distributed, treasury_sats,
-            "Conservation invariant violated: {} distributed but treasury was {}",
-            total_distributed, treasury_sats
+            "Conservation invariant violated: {total_distributed} distributed but treasury was {treasury_sats}"
         );
 
         // Get author fees from Author Fee UTXO

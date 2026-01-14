@@ -854,10 +854,8 @@ impl DFunctionValidator {
             }
             DFunction::Equals(func, value) => {
                 Self::validate_constraint(func, max_decision_index)?;
-                if let DFunction::Decision(_) = func.as_ref() {
-                    if *value > 2 {
-                        return Err(MarketError::InvalidOutcomeCombination);
-                    }
+                if let DFunction::Decision(_) = func.as_ref() && *value > 2 {
+                    return Err(MarketError::InvalidOutcomeCombination);
                 }
                 Ok(())
             }
@@ -1196,14 +1194,12 @@ impl VoteValidator {
                     ),
                 });
             }
-        } else {
-            if !vote_value.is_nan() && !(0.0..=1.0).contains(&vote_value) {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Binary decision vote must be between 0.0 and 1.0, or NaN (abstain), got {vote_value}"
-                    ),
-                });
-            }
+        } else if !vote_value.is_nan() && !(0.0..=1.0).contains(&vote_value) {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Binary decision vote must be between 0.0 and 1.0, or NaN (abstain), got {vote_value}"
+                ),
+            });
         }
         Ok(())
     }
