@@ -22,8 +22,9 @@ use tokio_stream::{StreamMap, wrappers::WatchStream};
 use crate::{
     authorization::{self, Authorization, Signature, get_address},
     state::markets::{
-        DimensionSpec, MarketId, generate_market_author_fee_address,
-        generate_market_treasury_address, parse_dimensions,
+        DimensionSpec, MarketId, DEFAULT_MARKET_BETA,
+        generate_market_author_fee_address, generate_market_treasury_address,
+        parse_dimensions,
     },
     types::{
         Address, AmountOverflowError, AmountUnderflowError, AssetId,
@@ -42,23 +43,50 @@ pub struct SlotClaimInput {
     pub is_standard: bool,
     pub is_scaled: bool,
     pub question: String,
-    pub min: Option<u16>,
-    pub max: Option<u16>,
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+}
+
+/// Input struct for claiming multiple slots as a category.
+/// The txid of the resulting transaction serves as the category identifier.
+/// All category slots are binary (is_scaled=false) by design.
+#[derive(Clone, Debug)]
+pub struct CategoryClaimInput {
+    /// List of (slot_id_bytes, question) pairs
+    pub slots: Vec<([u8; 3], String)>,
+    /// Whether these are standard slots
+    pub is_standard: bool,
 }
 
 /// Input struct for creating a market.
+///
+/// Markets are defined using dimension bracket notation:
+/// - Single binary decision: `[slot_id]`
+/// - Multiple independent decisions: `[slot1,slot2,slot3]`
+/// - Categorical (mutually exclusive): `[[slot1,slot2,slot3]]`
+/// - Mixed dimensions: `[slot1,[slot2,slot3],slot4]`
 #[derive(Clone, Debug)]
 pub struct CreateMarketInput {
     pub title: String,
     pub description: String,
-    pub market_type: String,
-    pub decision_slots: Option<Vec<String>>,
-    pub dimensions: Option<String>,
-    pub has_residual: Option<bool>,
+    /// Dimension specification in bracket notation
+    pub dimensions: String,
+    /// Advanced: LMSR liquidity parameter controlling price sensitivity.
+    /// Higher beta = more liquid = smaller price moves per trade.
+    /// Mutually exclusive with initial_liquidity - specify one or the other.
     pub beta: Option<f64>,
     pub trading_fee: Option<f64>,
     pub tags: Option<Vec<String>>,
+    /// Initial liquidity in satoshis to fund the market (recommended).
+    /// Beta is derived: β = liquidity / ln(num_outcomes)
+    /// Mutually exclusive with beta - specify one or the other.
     pub initial_liquidity: Option<u64>,
+    /// Txid(s) for categorical dimensions - required when using [[...]] notation
+    /// Each txid must be a ClaimCategorySlots transaction
+    pub category_txids: Option<Vec<[u8; 32]>>,
+    /// Names for residual outcomes in categorical dimensions (one per [[...]])
+    /// e.g., ["Bengals"] when explicit slots are Steelers/Ravens/Browns
+    pub residual_names: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
@@ -576,11 +604,8 @@ impl Wallet {
     ) -> Result<(bitcoin::Amount, HashMap<OutPoint, Output>), Error> {
         let rotxn = self.env.read_txn()?;
 
-        // Pre-allocate with estimated capacity to reduce reallocations
-        let mut bitcoin_utxos = Vec::with_capacity(64); // Reasonable starting capacity
+        let mut bitcoin_utxos = Vec::with_capacity(64);
 
-        // CRITICAL FIX: Only select CONFIRMED UTXOs (utxos database), NOT unconfirmed_utxos
-        // This prevents spending mempool UTXOs that haven't been mined yet
         let mut iter = self.utxos.iter(&rotxn).map_err(DbError::from)?;
         while let Some((outpoint, filled_output)) =
             iter.next().map_err(DbError::from)?
@@ -590,22 +615,16 @@ impl Wallet {
                 && !filled_output.is_votecoin()
                 && filled_output.get_bitcoin_value() > bitcoin::Amount::ZERO
             {
-                // Convert FilledOutput to Output for uniform handling
                 let output: Output = filled_output.into();
                 bitcoin_utxos.push((outpoint, output));
             }
         }
 
-        // REMOVED: No longer include unconfirmed_utxos to prevent mempool UTXO spending
-        // This enforces Bitcoin Hivemind's confirmed-only spending requirement
-
-        // Sort by value for optimal selection (smallest first for exact change)
         bitcoin_utxos.sort_unstable_by_key(
             |(_, output): &(OutPoint, Output)| output.get_bitcoin_value(),
         );
 
-        // Greedy selection with early termination
-        let mut selected = HashMap::with_capacity(bitcoin_utxos.len().min(10)); // Most selections use few UTXOs
+        let mut selected = HashMap::with_capacity(bitcoin_utxos.len().min(10));
         let mut total = bitcoin::Amount::ZERO;
 
         for (outpoint, output) in bitcoin_utxos {
@@ -614,7 +633,6 @@ impl Wallet {
                 .ok_or(AmountOverflowError)?;
             selected.insert(outpoint, output);
 
-            // Early termination when we have enough
             if total >= value {
                 return Ok((total, selected));
             }
@@ -623,36 +641,30 @@ impl Wallet {
         Err(Error::NotEnoughFunds)
     }
 
-    /// Select confirmed Votecoin UTXOs only, following Bitcoin Hivemind's requirement
-    /// that only confirmed UTXOs can be spent in block construction.
+    /// Select confirmed Votecoin UTXOs only.
     pub fn select_votecoin_utxos(
         &self,
         value: u32,
     ) -> Result<(u32, HashMap<OutPoint, Output>), Error> {
         let rotxn = self.env.read_txn()?;
 
-        // Pre-allocate and collect in a single pass with filtering
-        let mut votecoin_utxos = Vec::with_capacity(32); // Reasonable starting capacity for votecoin UTXOs
+        let mut votecoin_utxos = Vec::with_capacity(32);
 
-        // CRITICAL FIX: Only select CONFIRMED Votecoin UTXOs, not unconfirmed ones
         let mut iter = self.utxos.iter(&rotxn)?;
         while let Some((outpoint, filled_output)) = iter.next()? {
             if filled_output.is_votecoin()
                 && !filled_output.content.is_withdrawal()
                 && let Some(votecoin_value) = filled_output.votecoin()
             {
-                // Convert FilledOutput to Output for uniform handling
                 let output: Output = filled_output.into();
                 votecoin_utxos.push((outpoint, output, votecoin_value));
             }
         }
 
-        // Sort by votecoin value (smallest first for optimal selection)
         votecoin_utxos
             .sort_unstable_by_key(|(_, _, votecoin_value)| *votecoin_value);
 
-        // Greedy selection with early termination
-        let mut selected = HashMap::with_capacity(votecoin_utxos.len().min(8)); // Votecoin selections typically use few UTXOs
+        let mut selected = HashMap::with_capacity(votecoin_utxos.len().min(8));
         let mut total_value: u32 = 0;
 
         for (outpoint, output, votecoin_value) in votecoin_utxos {
@@ -661,7 +673,6 @@ impl Wallet {
                 .ok_or(Error::AmountOverflow(AmountOverflowError))?;
             selected.insert(outpoint, output);
 
-            // Early termination when we have enough (>= not > for correct logic)
             if total_value >= value {
                 return Ok((total_value, selected));
             }
@@ -705,16 +716,12 @@ impl Wallet {
             max,
         } = input;
 
-        // Select minimal bitcoins to pay the fee
         let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
         let change = total_bitcoin - fee;
-
-        // Collect inputs
         let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
 
         let mut outputs = Vec::new();
 
-        // Add change output if needed
         if change > bitcoin::Amount::ZERO {
             let change_address = self.get_new_address()?;
             outputs.push(Output::new(
@@ -723,10 +730,7 @@ impl Wallet {
             ));
         }
 
-        // Create the transaction
         let mut tx = Transaction::new(inputs, outputs);
-
-        // Set the transaction data
         tx.data = Some(TxData::ClaimDecisionSlot {
             slot_id_bytes,
             is_standard,
@@ -735,6 +739,36 @@ impl Wallet {
             min,
             max,
         });
+
+        Ok(tx)
+    }
+
+    /// Create a transaction to claim multiple decision slots as a category.
+    /// Returns a new transaction ready to be signed and sent.
+    /// The txid of this transaction serves as the category identifier.
+    pub fn claim_category_slots(
+        &self,
+        input: CategoryClaimInput,
+        fee: bitcoin::Amount,
+    ) -> Result<Transaction, Error> {
+        let CategoryClaimInput { slots, is_standard } = input;
+
+        let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
+        let change = total_bitcoin - fee;
+        let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
+
+        let mut outputs = Vec::new();
+
+        if change > bitcoin::Amount::ZERO {
+            let change_address = self.get_new_address()?;
+            outputs.push(Output::new(
+                change_address,
+                OutputContent::Bitcoin(BitcoinOutputContent(change)),
+            ));
+        }
+
+        let mut tx = Transaction::new(inputs, outputs);
+        tx.data = Some(TxData::ClaimCategorySlots { slots, is_standard });
 
         Ok(tx)
     }
@@ -755,150 +789,176 @@ impl Wallet {
         Ok(bitcoin::Amount::from_sat(total_cost))
     }
 
-    /// Estimate storage fee for market based on decision slots
-    fn estimate_market_storage_fee(
-        &self,
-        decision_slots: &[String],
-    ) -> Result<bitcoin::Amount, Error> {
-        // Simple validation: prevent creating markets with too many decision slots
-        // This is a rough approximation - the actual outcome count depends on the specific decisions
-        // but this provides early validation in the wallet layer
-        const MAX_DECISION_SLOTS: usize = 8; // Conservative limit - prevents most > 256 outcome scenarios
-
-        if decision_slots.len() > MAX_DECISION_SLOTS {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Too many decision slots: {} (max {})",
-                    decision_slots.len(),
-                    MAX_DECISION_SLOTS
-                ),
-            )));
-        }
-
-        // Base fee + quadratic scaling based on market complexity
-        // This is a simplified estimation - actual fee calculated in market creation
-        let base_fee = bitcoin::Amount::from_sat(1000); // BASE_MARKET_STORAGE_COST_SATS
-        let complexity_factor = decision_slots.len() as u64;
-        let complexity_fee =
-            bitcoin::Amount::from_sat(complexity_factor * complexity_factor);
-        base_fee
-            .checked_add(complexity_fee)
-            .ok_or(Error::AmountOverflow(AmountOverflowError))
-    }
-
-    /// Market creation method supporting all market types
-    /// Implements Bitcoin Hivemind Section 3.1 - Market Creation with code path
+    /// Create a prediction market using dimension bracket notation
+    ///
+    /// Implements Bitcoin Hivemind Section 3.1 - Market Creation
+    ///
+    /// Dimension notation examples:
+    /// - Single binary: `[004008]`
+    /// - Multiple independent: `[004008,004009]`
+    /// - Categorical: `[[004008,004009,00400a]]`
+    /// - Mixed: `[004008,[004009,00400a]]`
     pub fn create_market(
         &self,
         input: CreateMarketInput,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
+        use crate::state::markets::{
+            compute_market_id, generate_market_treasury_address,
+        };
+
         let CreateMarketInput {
             title,
             description,
-            market_type,
-            decision_slots,
             dimensions,
-            has_residual,
-            beta: b,
+            beta: input_beta,
             trading_fee,
             tags,
             initial_liquidity,
+            category_txids,
+            residual_names,
         } = input;
 
-        // Determine transaction data type and estimate storage fee based on market type
-        let (tx_data, storage_fee) = match market_type.as_str() {
-            "dimensional" => {
-                let dimensions = dimensions.ok_or_else(|| {
-                    Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Dimensional markets require dimensions specification",
-                    ))
-                })?;
+        let dimension_specs = parse_dimensions(&dimensions).map_err(|_| {
+            Error::InvalidSlotId {
+                reason: "Failed to parse dimension specification".to_string(),
+            }
+        })?;
 
-                // Parse dimensions to estimate storage fee
-                let dimension_specs =
-                    parse_dimensions(&dimensions).map_err(|_| {
-                        Error::InvalidSlotId {
-                            reason: "Failed to parse dimension specification"
-                                .to_string(),
-                        }
-                    })?;
+        // Validate residual_names count matches categorical dimension count
+        if let Some(ref names) = residual_names {
+            let categorical_count = dimension_specs
+                .iter()
+                .filter(|d| matches!(d, DimensionSpec::Categorical(_)))
+                .count();
+            if names.len() != categorical_count {
+                return Err(Error::InvalidSlotId {
+                    reason: format!(
+                        "residual_names count ({}) must match categorical dimension count ({})",
+                        names.len(),
+                        categorical_count
+                    ),
+                });
+            }
+        }
 
-                // Count total slots for storage fee estimation
-                let mut total_slots = 0;
-                for spec in &dimension_specs {
-                    match spec {
-                        DimensionSpec::Single(_) => total_slots += 1,
-                        DimensionSpec::Categorical(slots) => {
-                            total_slots += slots.len()
-                        }
-                    }
+        let mut total_slots = 0;
+        for spec in &dimension_specs {
+            match spec {
+                DimensionSpec::Single(_) => total_slots += 1,
+                DimensionSpec::Categorical(slots) => {
+                    total_slots += slots.len()
                 }
-
-                let storage_fee = self.estimate_dimensional_storage_fee(
-                    total_slots,
-                    dimension_specs.len(),
-                )?;
-                let tx_data = TxData::CreateMarketDimensional {
-                    title,
-                    description,
-                    dimensions,
-                    b: b.unwrap_or(7.0),
-                    trading_fee,
-                    tags,
-                };
-
-                (tx_data, storage_fee)
             }
-            "independent" | "categorical" => {
-                let decision_slots = decision_slots.ok_or_else(|| Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Independent and categorical markets require decision_slots specification"
-                )))?;
+        }
 
-                let storage_fee =
-                    self.estimate_market_storage_fee(&decision_slots)?;
-                let tx_data = TxData::CreateMarket {
-                    title,
-                    description,
-                    decision_slots,
-                    market_type,
-                    has_residual,
-                    b: b.unwrap_or(7.0),
-                    trading_fee,
-                    tags,
-                };
+        let storage_fee = self.estimate_dimensional_storage_fee(
+            total_slots,
+            dimension_specs.len(),
+        )?;
 
-                (tx_data, storage_fee)
+        // Calculate number of resolved outcomes for beta derivation
+        let num_outcomes: usize = dimension_specs.iter().fold(1, |acc, spec| {
+            let spec_outcomes = match spec {
+                DimensionSpec::Single(_) => 2,
+                DimensionSpec::Categorical(slots) => slots.len() + 1,
+            };
+            acc * spec_outcomes
+        });
+
+        // Determine beta and treasury from inputs (mutually exclusive)
+        // LMSR relationship: min_liquidity = β × ln(num_outcomes)
+        let ln_outcomes = (num_outcomes as f64).ln();
+
+        let (beta, treasury_sats) = match (input_beta, initial_liquidity) {
+            // Both provided: error - use one or the other
+            (Some(_), Some(_)) => {
+                return Err(Error::InvalidSlotId {
+                    reason: "Specify either beta or initial_liquidity, not both".to_string(),
+                });
             }
-            _ => {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Unsupported market type: {market_type}"),
-                )));
+            // Only beta (advanced): calculate minimum liquidity
+            (Some(b), None) => {
+                let min_liq = if ln_outcomes > 0.0 {
+                    (b * ln_outcomes).ceil() as u64
+                } else {
+                    0
+                };
+                (b, min_liq)
+            }
+            // Only liquidity (primary user-facing): derive beta
+            (None, Some(liq)) => {
+                let derived_beta = if ln_outcomes > 0.0 {
+                    liq as f64 / ln_outcomes
+                } else {
+                    DEFAULT_MARKET_BETA
+                };
+                (derived_beta, liq)
+            }
+            // Neither: use defaults
+            (None, None) => {
+                let min_liq = if ln_outcomes > 0.0 {
+                    (DEFAULT_MARKET_BETA * ln_outcomes).ceil() as u64
+                } else {
+                    0
+                };
+                (DEFAULT_MARKET_BETA, min_liq)
             }
         };
 
-        // Calculate total cost: transaction fee + storage fee + initial liquidity
+        // Calculate total cost: fee + storage + treasury
         let mut total_cost =
             fee.checked_add(storage_fee).ok_or(AmountOverflowError)?;
-
-        // Add initial liquidity cost if specified
-        if let Some(liquidity_sats) = initial_liquidity {
-            let liquidity_amount = bitcoin::Amount::from_sat(liquidity_sats);
+        if treasury_sats > 0 {
             total_cost = total_cost
-                .checked_add(liquidity_amount)
+                .checked_add(bitcoin::Amount::from_sat(treasury_sats))
                 .ok_or(AmountOverflowError)?;
         }
 
+        // Select UTXOs - need to get creator_address from first UTXO
         let (total_bitcoin, bitcoin_utxos) =
             self.select_bitcoins(total_cost)?;
         let change = total_bitcoin - total_cost;
 
-        let inputs = bitcoin_utxos.into_keys().collect();
+        // Get creator address from first selected UTXO
+        let creator_address = bitcoin_utxos
+            .values()
+            .next()
+            .ok_or(Error::NotEnoughFunds)?
+            .address;
+
+        // Compute market_id deterministically from content
+        let market_id =
+            compute_market_id(&title, &description, &creator_address, &dimension_specs);
+        let market_id_bytes = *market_id.as_bytes();
+
+        let tx_data = TxData::CreateMarket {
+            title,
+            description,
+            dimension_specs,
+            b: beta,
+            trading_fee,
+            tags,
+            category_txids,
+            residual_names,
+        };
+
+        let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
         let mut outputs = Vec::new();
+
+        // Create explicit MarketTreasury output with treasury funding
+        if treasury_sats > 0 {
+            let treasury_address = generate_market_treasury_address(&market_id);
+            outputs.push(Output::new(
+                treasury_address,
+                OutputContent::MarketTreasury {
+                    market_id: market_id_bytes,
+                    amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
+                        treasury_sats,
+                    )),
+                },
+            ));
+        }
 
         // Add change output if needed
         if change > bitcoin::Amount::ZERO {
@@ -934,7 +994,6 @@ impl Wallet {
     ) -> Result<Transaction, Error> {
         let market_id_bytes = *market_id.as_bytes();
 
-        // Calculate total cost (base + trading fee + tx fee)
         let total_market_cost =
             bitcoin::Amount::from_sat(base_cost_sats + trading_fee_sats);
         let total_cost = tx_fee
@@ -948,7 +1007,6 @@ impl Wallet {
         let inputs = bitcoin_utxos.into_keys().collect();
         let mut outputs = Vec::new();
 
-        // Add explicit MarketTreasury output (base cost goes to market treasury)
         let treasury_address = generate_market_treasury_address(&market_id);
         outputs.push(Output::new(
             treasury_address,
@@ -960,7 +1018,6 @@ impl Wallet {
             },
         ));
 
-        // Add explicit MarketAuthorFee output (trading fee goes to market author)
         let fee_address = generate_market_author_fee_address(&market_id);
         outputs.push(Output::new(
             fee_address,
@@ -972,7 +1029,6 @@ impl Wallet {
             },
         ));
 
-        // Add change output if needed
         if change > bitcoin::Amount::ZERO {
             outputs.push(Output::new(
                 self.get_new_address()?,
@@ -981,8 +1037,6 @@ impl Wallet {
         }
 
         let mut tx = Transaction::new(inputs, outputs);
-
-        // Set the transaction data
         let max_cost = base_cost_sats + trading_fee_sats;
         tx.data = Some(TxData::BuyShares {
             market_id: MarketId::new(market_id_bytes),
@@ -1161,24 +1215,21 @@ impl Wallet {
         let mut authorizations = vec![];
 
         for input in &transaction.inputs {
-            // CRITICAL VALIDATION: First try confirmed UTXOs only
             let spent_utxo: Output = if let Some(filled_utxo) =
                 self.utxos.try_get(&rotxn, input).map_err(DbError::from)?
             {
-                // Convert FilledOutput to Output for authorization
                 filled_utxo.into()
             } else {
-                // Check if this is an attempt to spend an unconfirmed UTXO
                 if let Some(_unconfirmed_utxo) = self
                     .unconfirmed_utxos
                     .try_get(&rotxn, input)
                     .map_err(DbError::from)?
                 {
                     tracing::error!(
-                        "Attempted to spend unconfirmed UTXO {:?}. Only confirmed UTXOs can be spent according to Bitcoin Hivemind protocol.",
+                        "Attempted to spend unconfirmed UTXO {:?}",
                         input
                     );
-                    return Err(Error::NoUtxo); // Reject spending mempool UTXOs
+                    return Err(Error::NoUtxo);
                 }
                 return Err(Error::NoUtxo);
             };
@@ -1254,7 +1305,6 @@ impl Wallet {
         let inputs = bitcoin_utxos.into_keys().collect();
         let mut outputs = Vec::new();
 
-        // Add change output if needed
         if change > bitcoin::Amount::ZERO {
             outputs.push(Output::new(
                 self.get_new_address()?,
@@ -1282,33 +1332,27 @@ impl Wallet {
             voting_period,
         };
 
-        // CRITICAL: Include at least one Votecoin UTXO as the first input
-        // The validation logic checks if the first input's address has Votecoin balance
-        // to verify voting rights per Bitcoin Hivemind protocol
+        // First input must be Votecoin UTXO to verify voting rights
         let (total_votecoin, votecoin_utxos) = self.select_votecoin_utxos(1)?;
         let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
         let change_bitcoin = total_bitcoin - fee;
 
-        // Extract voter address from first Votecoin UTXO to maintain "one address = one voter"
         let voter_address = votecoin_utxos
             .values()
             .next()
             .ok_or_else(|| Error::NotEnoughFunds)?
             .address;
 
-        // First input must be Votecoin UTXO for validation
         let mut inputs: Vec<_> = votecoin_utxos.into_keys().collect();
         inputs.extend(bitcoin_utxos.into_keys());
 
         let mut outputs = Vec::new();
 
-        // Return the Votecoin to the SAME address to maintain voter identity
         outputs.push(Output::new(
             voter_address,
             OutputContent::Votecoin(total_votecoin),
         ));
 
-        // Add Bitcoin change output if needed
         if change_bitcoin > bitcoin::Amount::ZERO {
             outputs.push(Output::new(
                 self.get_new_address()?,
@@ -1334,33 +1378,27 @@ impl Wallet {
             voting_period,
         };
 
-        // CRITICAL: Include at least one Votecoin UTXO as the first input
-        // The validation logic checks if the first input's address has Votecoin balance
-        // to verify voting rights per Bitcoin Hivemind protocol
+        // First input must be Votecoin UTXO to verify voting rights
         let (total_votecoin, votecoin_utxos) = self.select_votecoin_utxos(1)?;
         let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
         let change_bitcoin = total_bitcoin - fee;
 
-        // Extract voter address from first Votecoin UTXO to maintain "one address = one voter"
         let voter_address = votecoin_utxos
             .values()
             .next()
             .ok_or_else(|| Error::NotEnoughFunds)?
             .address;
 
-        // First input must be Votecoin UTXO for validation
         let mut inputs: Vec<_> = votecoin_utxos.into_keys().collect();
         inputs.extend(bitcoin_utxos.into_keys());
 
         let mut outputs = Vec::new();
 
-        // Return the Votecoin to the SAME address to maintain voter identity
         outputs.push(Output::new(
             voter_address,
             OutputContent::Votecoin(total_votecoin),
         ));
 
-        // Add Bitcoin change output if needed
         if change_bitcoin > bitcoin::Amount::ZERO {
             outputs.push(Output::new(
                 self.get_new_address()?,

@@ -8,7 +8,7 @@ use utoipa::{PartialSchema, ToSchema};
 
 use crate::{
     authorization::Authorization,
-    state::markets::MarketId,
+    state::markets::{DimensionSpec, MarketId},
     types::{
         AmountOverflowError, GetAddress, GetBitcoinValue,
         address::Address,
@@ -166,43 +166,37 @@ pub enum TransactionData {
         /// Human readable question for voters (<1000 bytes)
         question: String,
         /// Min value (only for scaled decisions)
-        min: Option<u16>,
+        min: Option<i64>,
         /// Max value (only for scaled decisions)
-        max: Option<u16>,
+        max: Option<i64>,
     },
-    /// Create a prediction market
+    /// Create a prediction market using dimension bracket notation
+    ///
+    /// Dimension notation examples:
+    /// - Single binary: `[004008]`
+    /// - Multiple independent: `[004008,004009]`
+    /// - Categorical (mutually exclusive): `[[004008,004009,00400a]]`
+    /// - Mixed dimensions: `[004008,[004009,00400a]]`
     CreateMarket {
         /// Market title
         title: String,
         /// Market description
         description: String,
-        /// Decision slot IDs (hex-encoded)
-        decision_slots: Vec<String>,
-        /// Market type: "independent" or "categorical"
-        market_type: String,
-        /// Has residual outcome (for categorical markets)
-        has_residual: Option<bool>,
+        /// Parsed dimension specifications (internal use)
+        #[schema(value_type = Vec<String>)]
+        dimension_specs: Vec<DimensionSpec>,
         /// LMSR beta parameter (required - liquidity calculated as b * ln(num_states))
         b: f64,
         /// Trading fee percentage
         trading_fee: Option<f64>,
         /// Categorization tags
         tags: Option<Vec<String>>,
-    },
-    /// Create a multidimensional prediction market with mixed dimension types
-    CreateMarketDimensional {
-        /// Market title
-        title: String,
-        /// Market description
-        description: String,
-        /// Dimension specification: "[slot1,[slot2,slot3],slot4]"
-        dimensions: String,
-        /// LMSR beta parameter (required - liquidity calculated as b * ln(num_states))
-        b: f64,
-        /// Trading fee percentage
-        trading_fee: Option<f64>,
-        /// Categorization tags
-        tags: Option<Vec<String>>,
+        /// Txid(s) for categorical dimensions - required when using [[...]] notation
+        /// Each txid must be a ClaimCategorySlots transaction
+        category_txids: Option<Vec<[u8; 32]>>,
+        /// Names for residual outcomes in categorical dimensions (one per [[...]])
+        /// e.g., ["Bengals"] for AFC North when explicit slots are Steelers/Ravens/Browns
+        residual_names: Option<Vec<String>>,
     },
     /// Buy shares in a prediction market by spending Bitcoin on L2
     BuyShares {
@@ -236,6 +230,15 @@ pub enum TransactionData {
         /// The voting period these votes belong to
         voting_period: u32,
     },
+    /// Claim multiple decision slots as a category (atomic)
+    /// The txid becomes the implicit category identifier
+    /// NOTE: All category slots are binary (is_scaled=false) by design
+    ClaimCategorySlots {
+        /// List of (slot_id_bytes, question) pairs
+        slots: Vec<([u8; 3], String)>,
+        /// Whether these are standard slots
+        is_standard: bool,
+    },
 }
 
 pub type TxData = TransactionData;
@@ -249,11 +252,6 @@ impl TxData {
     /// `true` if the tx data corresponds to market creation
     pub fn is_create_market(&self) -> bool {
         matches!(self, Self::CreateMarket { .. })
-    }
-
-    /// `true` if the tx data corresponds to dimensional market creation
-    pub fn is_create_market_dimensional(&self) -> bool {
-        matches!(self, Self::CreateMarketDimensional { .. })
     }
 
     /// `true` if the tx data corresponds to buying shares
@@ -275,6 +273,11 @@ impl TxData {
     pub fn is_submit_vote_batch(&self) -> bool {
         matches!(self, Self::SubmitVoteBatch { .. })
     }
+
+    /// `true` if the tx data corresponds to claiming category slots
+    pub fn is_claim_category_slots(&self) -> bool {
+        matches!(self, Self::ClaimCategorySlots { .. })
+    }
 }
 
 /// Struct describing a decision slot claim
@@ -289,47 +292,30 @@ pub struct ClaimDecisionSlot {
     /// Human readable question for voters (<1000 bytes)
     pub question: String,
     /// Min value (only for scaled decisions)
-    pub min: Option<u16>,
+    pub min: Option<i64>,
     /// Max value (only for scaled decisions)
-    pub max: Option<u16>,
+    pub max: Option<i64>,
 }
 
-/// Struct describing a market creation
+/// Struct describing a market creation using dimension specifications
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateMarket {
     /// Market title
     pub title: String,
     /// Market description
     pub description: String,
-    /// Decision slot IDs (hex-encoded)
-    pub decision_slots: Vec<String>,
-    /// Market type: "independent" or "categorical"
-    pub market_type: String,
-    /// Has residual outcome (for categorical markets)
-    pub has_residual: Option<bool>,
+    /// Parsed dimension specifications
+    pub dimension_specs: Vec<DimensionSpec>,
     /// LMSR beta parameter (required - liquidity calculated as b * ln(num_states))
     pub b: f64,
     /// Trading fee percentage
     pub trading_fee: Option<f64>,
     /// Categorization tags
     pub tags: Option<Vec<String>>,
-}
-
-/// Struct describing a dimensional market creation
-#[derive(Clone, Debug, PartialEq)]
-pub struct CreateMarketDimensional {
-    /// Market title
-    pub title: String,
-    /// Market description
-    pub description: String,
-    /// Dimension specification: "[slot1,[slot2,slot3],slot4]"
-    pub dimensions: String,
-    /// LMSR beta parameter (required - liquidity calculated as b * ln(num_states))
-    pub b: f64,
-    /// Trading fee percentage
-    pub trading_fee: Option<f64>,
-    /// Categorization tags
-    pub tags: Option<Vec<String>>,
+    /// Txid(s) for categorical dimensions - required when using [[...]] notation
+    pub category_txids: Option<Vec<[u8; 32]>>,
+    /// Names for residual outcomes in categorical dimensions (one per [[...]])
+    pub residual_names: Option<Vec<String>>,
 }
 
 /// Struct describing a share buy operation
@@ -370,6 +356,15 @@ pub struct SubmitVoteBatch {
     pub votes: Vec<VoteBatchItem>,
     /// The voting period these votes belong to
     pub voting_period: u32,
+}
+
+/// Struct describing a category slots claim (atomic claiming of multiple slots)
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimCategorySlots {
+    /// List of (slot_id_bytes, question) pairs
+    pub slots: Vec<([u8; 3], String)>,
+    /// Whether these are standard slots
+    pub is_standard: bool,
 }
 
 #[derive(
@@ -489,6 +484,14 @@ impl FilledTransaction {
         }
     }
 
+    /// `true` if the tx data corresponds to claiming category slots
+    pub fn is_claim_category_slots(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_claim_category_slots(),
+            None => false,
+        }
+    }
+
     /// If the tx is a decision slot claim, returns the corresponding [`ClaimDecisionSlot`].
     pub fn claim_decision_slot(&self) -> Option<ClaimDecisionSlot> {
         match &self.transaction.data {
@@ -517,43 +520,21 @@ impl FilledTransaction {
             Some(TransactionData::CreateMarket {
                 title,
                 description,
-                decision_slots,
-                market_type,
-                has_residual,
+                dimension_specs,
                 b,
                 trading_fee,
                 tags,
+                category_txids,
+                residual_names,
             }) => Some(CreateMarket {
                 title: title.clone(),
                 description: description.clone(),
-                decision_slots: decision_slots.clone(),
-                market_type: market_type.clone(),
-                has_residual: *has_residual,
+                dimension_specs: dimension_specs.clone(),
                 b: *b,
                 trading_fee: *trading_fee,
                 tags: tags.clone(),
-            }),
-            _ => None,
-        }
-    }
-
-    /// If the tx is a dimensional market creation, returns the corresponding [`CreateMarketDimensional`].
-    pub fn create_market_dimensional(&self) -> Option<CreateMarketDimensional> {
-        match &self.transaction.data {
-            Some(TransactionData::CreateMarketDimensional {
-                title,
-                description,
-                dimensions,
-                b,
-                trading_fee,
-                tags,
-            }) => Some(CreateMarketDimensional {
-                title: title.clone(),
-                description: description.clone(),
-                dimensions: dimensions.clone(),
-                b: *b,
-                trading_fee: *trading_fee,
-                tags: tags.clone(),
+                category_txids: category_txids.clone(),
+                residual_names: residual_names.clone(),
             }),
             _ => None,
         }
@@ -615,6 +596,19 @@ impl FilledTransaction {
                 votes: votes.clone(),
                 voting_period: *voting_period,
             }),
+            _ => None,
+        }
+    }
+
+    /// If the tx is a category slots claim, returns the corresponding [`ClaimCategorySlots`].
+    pub fn claim_category_slots(&self) -> Option<ClaimCategorySlots> {
+        match &self.transaction.data {
+            Some(TransactionData::ClaimCategorySlots { slots, is_standard }) => {
+                Some(ClaimCategorySlots {
+                    slots: slots.clone(),
+                    is_standard: *is_standard,
+                })
+            }
             _ => None,
         }
     }
