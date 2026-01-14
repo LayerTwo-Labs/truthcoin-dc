@@ -8,7 +8,7 @@ use std::{
 
 use bitcoin::amount::CheckedSum as _;
 use fallible_iterator::FallibleIterator;
-use futures::{Stream, future::BoxFuture};
+use futures::future::BoxFuture;
 use sneed::{DbError, Env, EnvError, RwTxnError, env};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
@@ -77,7 +77,7 @@ pub enum Error {
     ReceiveMainchainTaskResponse,
     #[error("Send mainchain task request failed")]
     SendMainchainTaskRequest,
-    #[error("state error")]
+    #[error("state error: {0}")]
     State(#[source] Box<state::Error>),
     #[error("Utreexo error: {0}")]
     Utreexo(String),
@@ -367,6 +367,23 @@ where
             .map_err(|e| Error::State(Box::new(e)))
     }
 
+    /// Single unified watch stream - fires when state or mempool changes.
+    /// State changes cover: new blocks, market updates, slot changes.
+    /// Mempool changes cover: new tx submissions, tx confirmations.
+    pub fn watch(
+        &self,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = ()> + Send>> {
+        Box::pin(futures::stream::select(
+            self.state.watch(),
+            self.mempool.watch(),
+        ))
+    }
+
+    /// Watch for state changes only (new blocks)
+    pub fn watch_state(&self) -> <State as Watchable<()>>::WatchStream {
+        self.state.watch()
+    }
+
     fn update_mempool_buy(
         &self,
         rwtxn: &mut RwTxn,
@@ -516,6 +533,35 @@ where
         let rotxn = self.env.read_txn()?;
         let utxos = self.state.get_utxos_by_addresses(&rotxn, addresses)?;
         Ok(utxos)
+    }
+
+    /// Get UTXOs for addresses along with their mempool spent status.
+    /// This is atomic - both queries use the same read transaction.
+    #[allow(clippy::type_complexity)]
+    pub fn get_utxos_with_mempool_status(
+        &self,
+        addresses: &HashSet<Address>,
+    ) -> Result<(HashMap<OutPoint, FilledOutput>, Vec<(OutPoint, InPoint)>), Error>
+    {
+        let rotxn = self.env.read_txn()?;
+
+        // Get confirmed UTXOs from state
+        let utxos = self.state.get_utxos_by_addresses(&rotxn, addresses)?;
+
+        // Check which are spent in mempool (same transaction - atomic)
+        let mut spent_in_mempool = vec![];
+        for outpoint in utxos.keys() {
+            if let Some(inpoint) = self
+                .mempool
+                .spent_utxos
+                .try_get(&rotxn, outpoint)
+                .map_err(mempool::Error::from)?
+            {
+                spent_in_mempool.push((*outpoint, inpoint));
+            }
+        }
+
+        Ok((utxos, spent_in_mempool))
     }
 
     pub fn try_get_header(
@@ -891,10 +937,6 @@ where
             tracing::trace!(%m6id, "Broadcast withdrawal bundle");
         }
         Ok(true)
-    }
-
-    pub fn watch_state(&self) -> impl Stream<Item = ()> {
-        self.state.watch()
     }
 
     pub fn get_all_slot_quarters(&self) -> Result<Vec<(u32, u64)>, Error> {

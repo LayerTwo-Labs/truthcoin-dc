@@ -72,7 +72,7 @@ pub enum Error {
     SendNewTipReady(#[source] TrySendError<NewTipReadyMessage>),
     #[error("Send reorg result error (oneshot)")]
     SendReorgResultOneshot,
-    #[error("state error")]
+    #[error("state error: {0}")]
     State(#[from] Box<state::Error>),
 }
 
