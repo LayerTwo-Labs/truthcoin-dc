@@ -409,7 +409,10 @@ impl MarketValidator {
             }
 
             for (dim_index, (dim_slots, category_txid_bytes)) in
-                categorical_dimensions.iter().zip(category_txids.iter()).enumerate()
+                categorical_dimensions
+                    .iter()
+                    .zip(category_txids.iter())
+                    .enumerate()
             {
                 let category_slots: HashSet<_> = dim_slots
                     .iter()
@@ -1182,12 +1185,10 @@ impl VoteValidator {
         vote_value: f64,
     ) -> Result<(), Error> {
         if decision.is_scaled {
-            let min = decision
-                .min
-                .expect("scaled decision must have min") as f64;
-            let max = decision
-                .max
-                .expect("scaled decision must have max") as f64;
+            let min =
+                decision.min.expect("scaled decision must have min") as f64;
+            let max =
+                decision.max.expect("scaled decision must have max") as f64;
             if !vote_value.is_nan() && (vote_value < min || vote_value > max) {
                 return Err(Error::InvalidTransaction {
                     reason: format!(

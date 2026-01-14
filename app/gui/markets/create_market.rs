@@ -80,7 +80,9 @@ impl CreateMarket {
         let periods = match app.node.get_all_slot_quarters() {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!("Failed to load periods for slot dropdown: {e:#}");
+                tracing::warn!(
+                    "Failed to load periods for slot dropdown: {e:#}"
+                );
                 self.slots_loaded = true;
                 return;
             }
@@ -92,8 +94,10 @@ impl CreateMarket {
                 Ok(slots) => {
                     for slot in slots {
                         if let Some(decision) = &slot.decision {
-                            let slot_id_hex = hex::encode(slot.slot_id.as_bytes());
-                            let claiming_txid_bytes: [u8; 32] = slot.claiming_txid.into();
+                            let slot_id_hex =
+                                hex::encode(slot.slot_id.as_bytes());
+                            let claiming_txid_bytes: [u8; 32] =
+                                slot.claiming_txid.into();
 
                             self.claimed_slots.push(ClaimedSlotInfo {
                                 slot_id_hex: slot_id_hex.clone(),
@@ -112,7 +116,9 @@ impl CreateMarket {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to load slots for period {period}: {e:#}");
+                    tracing::warn!(
+                        "Failed to load slots for period {period}: {e:#}"
+                    );
                 }
             }
         }
@@ -131,7 +137,9 @@ impl CreateMarket {
             .dimensions
             .iter()
             .filter_map(|dim| {
-                if dim.slot_ids.is_empty() || dim.slot_ids.iter().all(|s| s.is_empty()) {
+                if dim.slot_ids.is_empty()
+                    || dim.slot_ids.iter().all(|s| s.is_empty())
+                {
                     return None;
                 }
 
@@ -144,7 +152,14 @@ impl CreateMarket {
 
                 if dim.is_categorical && non_empty.len() >= 2 {
                     // Categorical: [slot1,slot2,slot3]
-                    Some(format!("[{}]", non_empty.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")))
+                    Some(format!(
+                        "[{}]",
+                        non_empty
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ))
                 } else if !non_empty.is_empty() {
                     // Single: just the slot id
                     Some(non_empty[0].clone())
@@ -165,7 +180,8 @@ impl CreateMarket {
         let mut count = 1usize;
 
         for dim in &self.dimensions {
-            let non_empty_slots = dim.slot_ids.iter().filter(|s| !s.is_empty()).count();
+            let non_empty_slots =
+                dim.slot_ids.iter().filter(|s| !s.is_empty()).count();
             if non_empty_slots == 0 {
                 continue;
             }
@@ -187,7 +203,9 @@ impl CreateMarket {
         let dimensions = self.build_dimensions_string();
 
         if dimensions.is_none() {
-            self.error = Some("At least one dimension with a slot is required".to_string());
+            self.error = Some(
+                "At least one dimension with a slot is required".to_string(),
+            );
             return;
         }
 
@@ -197,7 +215,8 @@ impl CreateMarket {
             match self.trading_fee_input.parse::<f64>() {
                 Ok(f) if (0.0..=1.0).contains(&f) => Some(f),
                 Ok(_) => {
-                    self.error = Some("Trading fee must be between 0 and 1".to_string());
+                    self.error =
+                        Some("Trading fee must be between 0 and 1".to_string());
                     return;
                 }
                 Err(_) => {
@@ -213,7 +232,8 @@ impl CreateMarket {
             match self.initial_liquidity_input.parse::<u64>() {
                 Ok(l) => Some(l),
                 Err(_) => {
-                    self.error = Some("Invalid initial liquidity value".to_string());
+                    self.error =
+                        Some("Invalid initial liquidity value".to_string());
                     return;
                 }
             }
@@ -235,7 +255,11 @@ impl CreateMarket {
             let txids: Vec<[u8; 32]> = self
                 .dimensions
                 .iter()
-                .filter(|d| d.is_categorical && d.slot_ids.len() >= 2 && !d.category_txid.is_empty())
+                .filter(|d| {
+                    d.is_categorical
+                        && d.slot_ids.len() >= 2
+                        && !d.category_txid.is_empty()
+                })
                 .filter_map(|d| {
                     hex::decode(&d.category_txid).ok().and_then(|bytes| {
                         if bytes.len() == 32 {
@@ -248,11 +272,7 @@ impl CreateMarket {
                     })
                 })
                 .collect();
-            if txids.is_empty() {
-                None
-            } else {
-                Some(txids)
-            }
+            if txids.is_empty() { None } else { Some(txids) }
         };
 
         let residual_names: Option<Vec<String>> = {
@@ -263,11 +283,7 @@ impl CreateMarket {
                 .map(|d| d.residual_name.clone())
                 .filter(|s| !s.is_empty())
                 .collect();
-            if names.is_empty() {
-                None
-            } else {
-                Some(names)
-            }
+            if names.is_empty() { None } else { Some(names) }
         };
 
         let dimensions_str = dimensions.unwrap();
@@ -294,8 +310,10 @@ impl CreateMarket {
                     tracing::error!("Create market failed: {e:#}");
                 } else {
                     tracing::info!("Market created: {}", self.title);
-                    self.success_message =
-                        Some(format!("Market '{}' created successfully!", self.title));
+                    self.success_message = Some(format!(
+                        "Market '{}' created successfully!",
+                        self.title
+                    ));
                     self.reset();
                 }
             }

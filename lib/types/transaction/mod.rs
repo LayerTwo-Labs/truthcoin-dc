@@ -603,12 +603,13 @@ impl FilledTransaction {
     /// If the tx is a category slots claim, returns the corresponding [`ClaimCategorySlots`].
     pub fn claim_category_slots(&self) -> Option<ClaimCategorySlots> {
         match &self.transaction.data {
-            Some(TransactionData::ClaimCategorySlots { slots, is_standard }) => {
-                Some(ClaimCategorySlots {
-                    slots: slots.clone(),
-                    is_standard: *is_standard,
-                })
-            }
+            Some(TransactionData::ClaimCategorySlots {
+                slots,
+                is_standard,
+            }) => Some(ClaimCategorySlots {
+                slots: slots.clone(),
+                is_standard: *is_standard,
+            }),
             _ => None,
         }
     }

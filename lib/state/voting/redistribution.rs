@@ -224,7 +224,11 @@ fn calculate_votecoin_deltas(
             Rounding::Nearest,
         )
         .unwrap_or_else(|e| {
-            warn!("Winner gain calculation failed for {}: {}", address.as_base58(), e);
+            warn!(
+                "Winner gain calculation failed for {}: {}",
+                address.as_base58(),
+                e
+            );
             0
         });
         winner_deltas.push((*address, gain));
@@ -242,7 +246,11 @@ fn calculate_votecoin_deltas(
             Rounding::Nearest,
         )
         .unwrap_or_else(|e| {
-            warn!("Loser loss calculation failed for {}: {}", address.as_base58(), e);
+            warn!(
+                "Loser loss calculation failed for {}: {}",
+                address.as_base58(),
+                e
+            );
             0
         });
         loser_deltas.push((*address, -loss));
@@ -439,7 +447,11 @@ fn adjust_deltas_for_insufficient_balances(
                         Rounding::Nearest,
                     )
                     .unwrap_or_else(|e| {
-                        warn!("Deficit reduction calculation failed for {}: {}", address.as_base58(), e);
+                        warn!(
+                            "Deficit reduction calculation failed for {}: {}",
+                            address.as_base58(),
+                            e
+                        );
                         0
                     });
                     reductions.push((*address, *original_gain, reduction));

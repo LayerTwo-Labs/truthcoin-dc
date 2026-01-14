@@ -121,10 +121,8 @@ impl BottomPanel {
             };
 
         // Calculate total confirmed balance
-        let confirmed_total: bitcoin::Amount = utxos
-            .values()
-            .map(|utxo| utxo.get_bitcoin_value())
-            .sum();
+        let confirmed_total: bitcoin::Amount =
+            utxos.values().map(|utxo| utxo.get_bitcoin_value()).sum();
 
         // Calculate amount locked in pending transactions
         let pending_spent: bitcoin::Amount = spent_in_mempool
@@ -166,7 +164,10 @@ impl BottomPanel {
                     // No pending transactions, show simple balance
                     ui.monospace_selectable_singleline(
                         false,
-                        format!("Balance: {}", show_btc_amount(balance_info.available)),
+                        format!(
+                            "Balance: {}",
+                            show_btc_amount(balance_info.available)
+                        ),
                     );
                 }
             }
@@ -331,8 +332,9 @@ impl eframe::App for EguiApp {
                     })
                 });
             });
-            egui::TopBottomPanel::bottom("bottom_panel")
-                .show(ctx, |ui| self.bottom_panel.show(&mut self.miner, self.network, ui));
+            egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+                self.bottom_panel.show(&mut self.miner, self.network, ui)
+            });
             egui::CentralPanel::default().show(ctx, |ui| match self.tab {
                 Tab::ParentChain => {
                     self.parent_chain.show(self.app.as_ref(), ui);

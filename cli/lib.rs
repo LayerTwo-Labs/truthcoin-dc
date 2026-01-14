@@ -880,10 +880,14 @@ where
             is_standard,
             fee_sats,
         } => {
-            use truthcoin_dc_app_rpc_api::{CategoryClaimRequest, CategorySlotItem};
+            use truthcoin_dc_app_rpc_api::{
+                CategoryClaimRequest, CategorySlotItem,
+            };
 
-            let slot_id_list: Vec<&str> = slot_ids.split(',').map(|s| s.trim()).collect();
-            let question_list: Vec<&str> = questions.split(',').map(|s| s.trim()).collect();
+            let slot_id_list: Vec<&str> =
+                slot_ids.split(',').map(|s| s.trim()).collect();
+            let question_list: Vec<&str> =
+                questions.split(',').map(|s| s.trim()).collect();
 
             if slot_id_list.len() != question_list.len() {
                 return Err(anyhow::anyhow!(

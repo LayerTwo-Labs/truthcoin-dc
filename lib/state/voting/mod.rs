@@ -180,11 +180,14 @@ impl VotingSystem {
 
         let reputation_vector =
             VotingWeightVector::from_voter_reputations(&voter_reputations);
-        let math_result =
-            math_calculate_consensus(&vote_matrix, &reputation_vector, &scaled_decisions)
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!("Failed to calculate consensus: {e:?}"),
-                })?;
+        let math_result = math_calculate_consensus(
+            &vote_matrix,
+            &reputation_vector,
+            &scaled_decisions,
+        )
+        .map_err(|e| Error::InvalidTransaction {
+            reason: format!("Failed to calculate consensus: {e:?}"),
+        })?;
 
         let mut period_stats = self
             .databases

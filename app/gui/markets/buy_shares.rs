@@ -1,5 +1,5 @@
 use eframe::egui::{self, Button, RichText};
-use truthcoin_dc::math::safe_math::{to_sats, Rounding};
+use truthcoin_dc::math::safe_math::{Rounding, to_sats};
 use truthcoin_dc::state::MarketId;
 
 use crate::app::App;
@@ -54,7 +54,8 @@ impl BuyShares {
             Ok(s) if s > 0.0 => s,
             Ok(_) => {
                 self.preview = None;
-                self.preview_error = Some("Shares must be positive".to_string());
+                self.preview_error =
+                    Some("Shares must be positive".to_string());
                 return;
             }
             Err(_) => {
@@ -92,7 +93,8 @@ impl BuyShares {
         let base_cost_f64 = match market.query_update_cost(new_shares.clone()) {
             Ok(cost) => cost,
             Err(e) => {
-                self.preview_error = Some(format!("Cost calculation error: {e}"));
+                self.preview_error =
+                    Some(format!("Cost calculation error: {e}"));
                 return;
             }
         };
@@ -100,7 +102,8 @@ impl BuyShares {
         let base_cost_sats = match to_sats(base_cost_f64, Rounding::Up) {
             Ok(sats) => sats,
             Err(e) => {
-                self.preview_error = Some(format!("Cost conversion error: {e}"));
+                self.preview_error =
+                    Some(format!("Cost conversion error: {e}"));
                 return;
             }
         };
@@ -125,9 +128,11 @@ impl BuyShares {
         let valid_sum: f64 = valid_prices.iter().sum();
 
         let new_price = if valid_sum > 0.0 {
-            valid_prices.get(self.outcome_index as usize)
+            valid_prices
+                .get(self.outcome_index as usize)
                 .copied()
-                .unwrap_or(0.0) / valid_sum
+                .unwrap_or(0.0)
+                / valid_sum
         } else {
             self.current_price
         };
@@ -209,8 +214,11 @@ impl BuyShares {
             ui.horizontal(|ui| {
                 ui.label("Current price:");
                 ui.label(
-                    RichText::new(format!("{:.1}%", self.current_price * 100.0))
-                        .strong(),
+                    RichText::new(format!(
+                        "{:.1}%",
+                        self.current_price * 100.0
+                    ))
+                    .strong(),
                 );
             });
 
@@ -238,9 +246,12 @@ impl BuyShares {
                 ui.add_space(5.0);
                 ui.label(RichText::new("Cost Preview:").strong());
 
-                let base_cost_btc = preview.base_cost_sats as f64 / 100_000_000.0;
-                let trading_fee_btc = preview.trading_fee_sats as f64 / 100_000_000.0;
-                let total_cost_btc = preview.total_cost_sats as f64 / 100_000_000.0;
+                let base_cost_btc =
+                    preview.base_cost_sats as f64 / 100_000_000.0;
+                let trading_fee_btc =
+                    preview.trading_fee_sats as f64 / 100_000_000.0;
+                let total_cost_btc =
+                    preview.total_cost_sats as f64 / 100_000_000.0;
 
                 egui::Grid::new("cost_preview")
                     .num_columns(2)
@@ -250,7 +261,10 @@ impl BuyShares {
                         ui.label(format!("{base_cost_btc:.8} BTC"));
                         ui.end_row();
 
-                        ui.label(format!("Fee ({:.1}%):", self.trading_fee_pct * 100.0));
+                        ui.label(format!(
+                            "Fee ({:.1}%):",
+                            self.trading_fee_pct * 100.0
+                        ));
                         ui.label(format!("{trading_fee_btc:.8} BTC"));
                         ui.end_row();
 

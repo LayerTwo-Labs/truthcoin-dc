@@ -101,7 +101,8 @@ impl Slots {
                 self.available_slots = slots;
             }
             Err(e) => {
-                self.error = Some(format!("Failed to load available slots: {e:#}"));
+                self.error =
+                    Some(format!("Failed to load available slots: {e:#}"));
                 tracing::error!("Failed to load available slots: {e:#}");
             }
         }
@@ -111,7 +112,8 @@ impl Slots {
                 self.claimed_slots = slots;
             }
             Err(e) => {
-                self.error = Some(format!("Failed to load claimed slots: {e:#}"));
+                self.error =
+                    Some(format!("Failed to load claimed slots: {e:#}"));
                 tracing::error!("Failed to load claimed slots: {e:#}");
             }
         }
@@ -121,45 +123,53 @@ impl Slots {
         self.error = None;
         self.success = None;
 
-        let (slot_id_bytes, is_standard) = match SlotId::from_hex(&self.claim_form.slot_id_input) {
-            Ok(slot_id) => {
-                let is_standard = slot_id.slot_index() < 500;
-                (slot_id.as_bytes(), is_standard)
-            }
-            Err(e) => {
-                self.error = Some(format!("Invalid slot ID: {e}"));
-                return;
-            }
-        };
+        let (slot_id_bytes, is_standard) =
+            match SlotId::from_hex(&self.claim_form.slot_id_input) {
+                Ok(slot_id) => {
+                    let is_standard = slot_id.slot_index() < 500;
+                    (slot_id.as_bytes(), is_standard)
+                }
+                Err(e) => {
+                    self.error = Some(format!("Invalid slot ID: {e}"));
+                    return;
+                }
+            };
 
         let (min, max) = if self.claim_form.is_scaled {
             let min = match self.claim_form.min_input.parse::<i64>() {
                 Ok(v) => v,
                 Err(_) if self.claim_form.min_input.is_empty() => {
-                    self.error = Some("Min value is required for scaled decisions".to_string());
+                    self.error = Some(
+                        "Min value is required for scaled decisions"
+                            .to_string(),
+                    );
                     return;
                 }
                 Err(_) => {
-                    self.error = Some("Invalid min value: must be a number".to_string());
+                    self.error =
+                        Some("Invalid min value: must be a number".to_string());
                     return;
                 }
             };
             let max = match self.claim_form.max_input.parse::<i64>() {
                 Ok(v) => v,
                 Err(_) if self.claim_form.max_input.is_empty() => {
-                    self.error = Some("Max value is required for scaled decisions".to_string());
+                    self.error = Some(
+                        "Max value is required for scaled decisions"
+                            .to_string(),
+                    );
                     return;
                 }
                 Err(_) => {
-                    self.error = Some("Invalid max value: must be a number".to_string());
+                    self.error =
+                        Some("Invalid max value: must be a number".to_string());
                     return;
                 }
             };
             // Validate min < max
             if min >= max {
-                self.error = Some(format!(
-                    "Min ({min}) must be less than max ({max})"
-                ));
+                self.error =
+                    Some(format!("Min ({min}) must be less than max ({max})"));
                 return;
             }
             (Some(min), Some(max))
@@ -179,7 +189,8 @@ impl Slots {
                 return;
             }
             Err(_) => {
-                self.error = Some("Invalid fee: must be a positive number".to_string());
+                self.error =
+                    Some("Invalid fee: must be a positive number".to_string());
                 return;
             }
         };
@@ -205,7 +216,10 @@ impl Slots {
                         "Slot {} claimed successfully!",
                         self.claim_form.slot_id_input
                     ));
-                    tracing::info!("Slot claimed: {}", self.claim_form.slot_id_input);
+                    tracing::info!(
+                        "Slot claimed: {}",
+                        self.claim_form.slot_id_input
+                    );
                     self.claim_form = ClaimForm::default();
                     if let Some(period) = self.selected_period {
                         self.refresh_slots_for_period(app, period);
@@ -230,7 +244,8 @@ impl Slots {
 
         let mut slots: Vec<([u8; 3], String)> = Vec::new();
         for entry in &self.category_form.slots {
-            let slot_id_bytes: [u8; 3] = match hex::decode(&entry.slot_id_input) {
+            let slot_id_bytes: [u8; 3] = match hex::decode(&entry.slot_id_input)
+            {
                 Ok(bytes) if bytes.len() == 3 => {
                     let mut arr = [0u8; 3];
                     arr.copy_from_slice(&bytes);
@@ -271,7 +286,8 @@ impl Slots {
                 return;
             }
             Err(_) => {
-                self.error = Some("Invalid fee: must be a positive number".to_string());
+                self.error =
+                    Some("Invalid fee: must be a positive number".to_string());
                 return;
             }
         };
@@ -306,7 +322,8 @@ impl Slots {
                 }
             }
             Err(e) => {
-                self.error = Some(format!("Failed to create category claim tx: {e:#}"));
+                self.error =
+                    Some(format!("Failed to create category claim tx: {e:#}"));
                 tracing::error!("Category claim tx creation failed: {e:#}");
             }
         }
@@ -358,8 +375,13 @@ impl Slots {
                 )
                 .show_ui(ui, |ui| {
                     for (period, available) in &self.periods {
-                        let label = format!("Period {period} ({available} available)");
-                        ui.selectable_value(&mut self.selected_period, Some(*period), label);
+                        let label =
+                            format!("Period {period} ({available} available)");
+                        ui.selectable_value(
+                            &mut self.selected_period,
+                            Some(*period),
+                            label,
+                        );
                     }
                 });
             if self.selected_period != prev_selection {
@@ -377,7 +399,11 @@ impl Slots {
             ui.columns(2, |cols| {
                 cols[0].heading("Available Slots");
                 cols[0].label(
-                    RichText::new(format!("{} unclaimed", self.available_slots.len())).weak(),
+                    RichText::new(format!(
+                        "{} unclaimed",
+                        self.available_slots.len()
+                    ))
+                    .weak(),
                 );
 
                 ScrollArea::vertical()
@@ -390,13 +416,15 @@ impl Slots {
                             for slot_id in &self.available_slots {
                                 let slot_hex = hex::encode(slot_id.as_bytes());
                                 let idx = slot_id.slot_index();
-                                let slot_type = if idx < 500 { "std" } else { "non-std" };
+                                let slot_type =
+                                    if idx < 500 { "std" } else { "non-std" };
 
                                 ui.horizontal(|ui| {
                                     ui.monospace(&slot_hex);
                                     ui.label(format!("[{slot_type}]"));
                                     if ui.small_button("Claim").clicked() {
-                                        self.claim_form.slot_id_input = slot_hex.clone();
+                                        self.claim_form.slot_id_input =
+                                            slot_hex.clone();
                                         self.claim_form.expanded = true;
                                     }
                                 });
@@ -407,7 +435,11 @@ impl Slots {
                 // Right: Claimed slots
                 cols[1].heading("Claimed Slots");
                 cols[1].label(
-                    RichText::new(format!("{} claimed", self.claimed_slots.len())).weak(),
+                    RichText::new(format!(
+                        "{} claimed",
+                        self.claimed_slots.len()
+                    ))
+                    .weak(),
                 );
 
                 ScrollArea::vertical()
@@ -418,13 +450,15 @@ impl Slots {
                             ui.label("No claimed slots in this period");
                         } else {
                             for slot in &self.claimed_slots {
-                                let slot_hex = hex::encode(slot.slot_id.as_bytes());
+                                let slot_hex =
+                                    hex::encode(slot.slot_id.as_bytes());
 
                                 ui.group(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.monospace(&slot_hex);
                                         if ui.small_button("Copy").clicked() {
-                                            ui.ctx().copy_text(slot_hex.clone());
+                                            ui.ctx()
+                                                .copy_text(slot_hex.clone());
                                         }
                                     });
 
@@ -433,7 +467,9 @@ impl Slots {
                                         ui.horizontal(|ui| {
                                             if decision.is_standard {
                                                 ui.label(
-                                                    RichText::new("Standard").small().weak(),
+                                                    RichText::new("Standard")
+                                                        .small()
+                                                        .weak(),
                                                 );
                                             }
                                             if decision.is_scaled {
@@ -442,7 +478,11 @@ impl Slots {
                                                     decision.min.unwrap_or(0),
                                                     decision.max.unwrap_or(100)
                                                 );
-                                                ui.label(RichText::new(range).small().weak());
+                                                ui.label(
+                                                    RichText::new(range)
+                                                        .small()
+                                                        .weak(),
+                                                );
                                             }
                                         });
                                     }
@@ -456,7 +496,11 @@ impl Slots {
             ui.separator();
 
             ui.columns(2, |cols| {
-                let open_override = if self.claim_form.expanded { Some(true) } else { None };
+                let open_override = if self.claim_form.expanded {
+                    Some(true)
+                } else {
+                    None
+                };
                 egui::CollapsingHeader::new(
                     RichText::new("Claim Single Slot").heading(),
                 )
@@ -489,10 +533,12 @@ impl Slots {
             .show(ui, |ui| {
                 ui.label("Slot ID (hex):");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.claim_form.slot_id_input)
-                        .hint_text("e.g., 0a1b2c")
-                        .desired_width(150.0)
-                        .font(egui::TextStyle::Monospace),
+                    egui::TextEdit::singleline(
+                        &mut self.claim_form.slot_id_input,
+                    )
+                    .hint_text("e.g., 0a1b2c")
+                    .desired_width(150.0)
+                    .font(egui::TextStyle::Monospace),
                 );
                 ui.end_row();
 
@@ -507,8 +553,16 @@ impl Slots {
 
                 ui.label("Type:");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.claim_form.is_scaled, false, "Binary");
-                    ui.selectable_value(&mut self.claim_form.is_scaled, true, "Scaled");
+                    ui.selectable_value(
+                        &mut self.claim_form.is_scaled,
+                        false,
+                        "Binary",
+                    );
+                    ui.selectable_value(
+                        &mut self.claim_form.is_scaled,
+                        true,
+                        "Scaled",
+                    );
                 });
                 ui.end_row();
 
@@ -517,15 +571,19 @@ impl Slots {
                     ui.horizontal(|ui| {
                         ui.label("Min:");
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.claim_form.min_input)
-                                .hint_text("e.g., 0")
-                                .desired_width(80.0),
+                            egui::TextEdit::singleline(
+                                &mut self.claim_form.min_input,
+                            )
+                            .hint_text("e.g., 0")
+                            .desired_width(80.0),
                         );
                         ui.label("Max:");
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.claim_form.max_input)
-                                .hint_text("e.g., 100")
-                                .desired_width(80.0),
+                            egui::TextEdit::singleline(
+                                &mut self.claim_form.max_input,
+                            )
+                            .hint_text("e.g., 100")
+                            .desired_width(80.0),
                         );
                     });
                     ui.end_row();
@@ -561,10 +619,7 @@ impl Slots {
             .iter()
             .filter_map(|slot| {
                 slot.decision.as_ref().map(|d| {
-                    (
-                        hex::encode(slot.slot_id.as_bytes()),
-                        d.question.clone(),
-                    )
+                    (hex::encode(slot.slot_id.as_bytes()), d.question.clone())
                 })
             })
             .collect()
@@ -584,13 +639,18 @@ impl Slots {
         ui.horizontal(|ui| {
             ui.label("Category Name:");
             ui.add(
-                egui::TextEdit::singleline(&mut self.category_form.category_name)
-                    .hint_text("e.g., AFC North Winner")
-                    .desired_width(250.0),
+                egui::TextEdit::singleline(
+                    &mut self.category_form.category_name,
+                )
+                .hint_text("e.g., AFC North Winner")
+                .desired_width(250.0),
             );
         });
 
-        ui.checkbox(&mut self.category_form.is_standard, "Standard slots (index 0-499)");
+        ui.checkbox(
+            &mut self.category_form.is_standard,
+            "Standard slots (index 0-499)",
+        );
 
         ui.add_space(10.0);
         ui.separator();
@@ -599,7 +659,11 @@ impl Slots {
         ui.horizontal(|ui| {
             ui.heading("Category Slots");
             ui.label(
-                RichText::new(format!("({} slots)", self.category_form.slots.len())).weak(),
+                RichText::new(format!(
+                    "({} slots)",
+                    self.category_form.slots.len()
+                ))
+                .weak(),
             );
         });
 
@@ -608,15 +672,19 @@ impl Slots {
             .id_salt("category_slots_list")
             .max_height(200.0)
             .show(ui, |ui| {
-                for (idx, entry) in self.category_form.slots.iter_mut().enumerate() {
+                for (idx, entry) in
+                    self.category_form.slots.iter_mut().enumerate()
+                {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.label(format!("Slot {}:", idx + 1));
                             ui.add(
-                                egui::TextEdit::singleline(&mut entry.slot_id_input)
-                                    .hint_text("e.g., 004008")
-                                    .desired_width(100.0)
-                                    .font(egui::TextStyle::Monospace),
+                                egui::TextEdit::singleline(
+                                    &mut entry.slot_id_input,
+                                )
+                                .hint_text("e.g., 004008")
+                                .desired_width(100.0)
+                                .font(egui::TextStyle::Monospace),
                             );
                             if ui.small_button("❌").clicked() {
                                 remove_idx = Some(idx);
@@ -653,10 +721,12 @@ impl Slots {
                         for slot_id in &self.available_slots {
                             let slot_hex = hex::encode(slot_id.as_bytes());
                             if ui.selectable_label(false, &slot_hex).clicked() {
-                                self.category_form.slots.push(CategorySlotEntry {
-                                    slot_id_input: slot_hex,
-                                    question: String::new(),
-                                });
+                                self.category_form.slots.push(
+                                    CategorySlotEntry {
+                                        slot_id_input: slot_hex,
+                                        question: String::new(),
+                                    },
+                                );
                             }
                         }
                     });
@@ -675,14 +745,18 @@ impl Slots {
 
         ui.add_space(10.0);
 
-        let can_claim = self.category_form.slots.len() >= 2
-            && self.category_form.slots.iter().all(|s| {
-                !s.slot_id_input.is_empty() && !s.question.is_empty()
-            })
-            && !self.category_form.is_processing;
+        let can_claim =
+            self.category_form.slots.len() >= 2
+                && self.category_form.slots.iter().all(|s| {
+                    !s.slot_id_input.is_empty() && !s.question.is_empty()
+                })
+                && !self.category_form.is_processing;
 
         let button_text = if self.category_form.slots.len() < 2 {
-            format!("Claim Category (need {} more slots)", 2 - self.category_form.slots.len())
+            format!(
+                "Claim Category (need {} more slots)",
+                2 - self.category_form.slots.len()
+            )
         } else {
             format!("Claim Category ({} slots)", self.category_form.slots.len())
         };

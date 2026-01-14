@@ -36,15 +36,19 @@ impl MyPositions {
             }
         };
 
-        let markets: std::collections::HashMap<MarketId, (Market, MarketState)> =
-            match app.node.get_all_markets_with_states() {
-                Ok(m) => m.into_iter().map(|(m, s)| (m.id.clone(), (m, s))).collect(),
-                Err(e) => {
-                    self.error = Some(format!("Failed to get markets: {e:#}"));
-                    self.loaded = true;
-                    return;
-                }
-            };
+        let markets: std::collections::HashMap<
+            MarketId,
+            (Market, MarketState),
+        > = match app.node.get_all_markets_with_states() {
+            Ok(m) => {
+                m.into_iter().map(|(m, s)| (m.id.clone(), (m, s))).collect()
+            }
+            Err(e) => {
+                self.error = Some(format!("Failed to get markets: {e:#}"));
+                self.loaded = true;
+                return;
+            }
+        };
 
         for address in addresses {
             match app.node.get_user_share_positions(&address) {
@@ -55,19 +59,27 @@ impl MyPositions {
                         }
 
                         let (title, state, price, label) =
-                            if let Some((market, mstate)) = markets.get(&market_id) {
-                                let prices = market.calculate_prices_for_display();
-                                let valid_combos = market.get_valid_state_combos();
+                            if let Some((market, mstate)) =
+                                markets.get(&market_id)
+                            {
+                                let prices =
+                                    market.calculate_prices_for_display();
+                                let valid_combos =
+                                    market.get_valid_state_combos();
 
                                 // Find the display index for this outcome
-                                let display_idx = valid_combos
-                                    .iter()
-                                    .position(|(idx, _)| *idx == outcome_idx as usize);
+                                let display_idx =
+                                    valid_combos.iter().position(|(idx, _)| {
+                                        *idx == outcome_idx as usize
+                                    });
 
                                 let (p, lbl) = if let Some(di) = display_idx {
-                                    let pr = prices.get(di).copied().unwrap_or(0.0);
+                                    let pr =
+                                        prices.get(di).copied().unwrap_or(0.0);
                                     let combo = &valid_combos[di].1;
-                                    let l = self.format_outcome_label(app, market, combo);
+                                    let l = self.format_outcome_label(
+                                        app, market, combo,
+                                    );
                                     (pr, l)
                                 } else {
                                     (0.0, format!("Outcome {outcome_idx}"))
@@ -96,7 +108,9 @@ impl MyPositions {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to get positions for {address}: {e:#}");
+                    tracing::warn!(
+                        "Failed to get positions for {address}: {e:#}"
+                    );
                 }
             }
         }
@@ -104,7 +118,12 @@ impl MyPositions {
         self.loaded = true;
     }
 
-    fn format_outcome_label(&self, app: &App, market: &Market, combo: &Vec<usize>) -> String {
+    fn format_outcome_label(
+        &self,
+        app: &App,
+        market: &Market,
+        combo: &Vec<usize>,
+    ) -> String {
         if market.decision_slots.len() > 1 {
             combo
                 .iter()
@@ -115,17 +134,23 @@ impl MyPositions {
                         1 => "Yes",
                         _ => "?",
                     };
-                    let question = market.decision_slots.get(dim).and_then(|slot_id| {
-                        app.node.get_slot(*slot_id).ok().flatten().and_then(|slot| {
-                            slot.decision.as_ref().map(|d| {
-                                if d.question.len() > 15 {
-                                    format!("{}...", &d.question[..15])
-                                } else {
-                                    d.question.clone()
-                                }
-                            })
+                    let question = market
+                        .decision_slots
+                        .get(dim)
+                        .and_then(|slot_id| {
+                            app.node.get_slot(*slot_id).ok().flatten().and_then(
+                                |slot| {
+                                    slot.decision.as_ref().map(|d| {
+                                        if d.question.len() > 15 {
+                                            format!("{}...", &d.question[..15])
+                                        } else {
+                                            d.question.clone()
+                                        }
+                                    })
+                                },
+                            )
                         })
-                    }).unwrap_or_else(|| format!("D{}", dim + 1));
+                        .unwrap_or_else(|| format!("D{}", dim + 1));
                     format!("{question}: {val_str}")
                 })
                 .collect::<Vec<_>>()
@@ -133,11 +158,14 @@ impl MyPositions {
         } else {
             let slot_info = market.decision_slots.first().and_then(|slot_id| {
                 app.node.get_slot(*slot_id).ok().flatten().and_then(|slot| {
-                    slot.decision.as_ref().map(|d| (d.is_scaled, d.question.clone()))
+                    slot.decision
+                        .as_ref()
+                        .map(|d| (d.is_scaled, d.question.clone()))
                 })
             });
 
-            let (is_scaled, question) = slot_info.unwrap_or((false, String::new()));
+            let (is_scaled, question) =
+                slot_info.unwrap_or((false, String::new()));
             let question_prefix = if !question.is_empty() {
                 let q = if question.len() > 20 {
                     format!("{}...", &question[..20])
@@ -150,8 +178,16 @@ impl MyPositions {
             };
 
             match combo.first() {
-                Some(0) => format!("{}{}", question_prefix, if is_scaled { "Min" } else { "No" }),
-                Some(1) => format!("{}{}", question_prefix, if is_scaled { "Max" } else { "Yes" }),
+                Some(0) => format!(
+                    "{}{}",
+                    question_prefix,
+                    if is_scaled { "Min" } else { "No" }
+                ),
+                Some(1) => format!(
+                    "{}{}",
+                    question_prefix,
+                    if is_scaled { "Max" } else { "Yes" }
+                ),
                 Some(2) => format!("{question_prefix}Abstain"),
                 _ => format!("Outcome {combo:?}"),
             }
@@ -187,7 +223,8 @@ impl MyPositions {
             return;
         }
 
-        let total_value: f64 = self.positions.iter().map(|p| p.current_value_btc).sum();
+        let total_value: f64 =
+            self.positions.iter().map(|p| p.current_value_btc).sum();
 
         ui.horizontal(|ui| {
             ui.label("Total Value:");

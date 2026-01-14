@@ -541,8 +541,10 @@ where
     pub fn get_utxos_with_mempool_status(
         &self,
         addresses: &HashSet<Address>,
-    ) -> Result<(HashMap<OutPoint, FilledOutput>, Vec<(OutPoint, InPoint)>), Error>
-    {
+    ) -> Result<
+        (HashMap<OutPoint, FilledOutput>, Vec<(OutPoint, InPoint)>),
+        Error,
+    > {
         let rotxn = self.env.read_txn()?;
 
         // Get confirmed UTXOs from state

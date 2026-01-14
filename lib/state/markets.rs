@@ -108,7 +108,9 @@ pub enum DFunction {
     True,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, BorshSerialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, BorshSerialize,
+)]
 pub enum DimensionSpec {
     Single(SlotId),
     Categorical(Vec<SlotId>),
@@ -1437,14 +1439,13 @@ impl Market {
         decisions: &HashMap<SlotId, Decision>,
     ) -> Result<Array<f64, Ix1>, MarketError> {
         // Compute axis weights for each dimension: [state_0, state_1, Abstain]
-        let mut axes: Vec<[f64; 3]> = Vec::with_capacity(self.decision_slots.len());
+        let mut axes: Vec<[f64; 3]> =
+            Vec::with_capacity(self.decision_slots.len());
 
         for slot_id in &self.decision_slots {
             let outcome = slot_outcomes.get(slot_id).copied().unwrap_or(0.5);
-            let is_scaled = decisions
-                .get(slot_id)
-                .map(|d| d.is_scaled)
-                .unwrap_or(false);
+            let is_scaled =
+                decisions.get(slot_id).map(|d| d.is_scaled).unwrap_or(false);
 
             let axis = if is_scaled {
                 [1.0 - outcome, outcome, 0.0]
@@ -2946,8 +2947,8 @@ impl MarketsDatabase {
             for (outcome_index, shares) in positions {
                 let final_price = final_prices[outcome_index as usize];
                 let weighted_shares = shares * final_price;
-                let payout_calc =
-                    weighted_shares / total_weighted_shares * treasury_sats as f64;
+                let payout_calc = weighted_shares / total_weighted_shares
+                    * treasury_sats as f64;
                 let payout_sats =
                     safe_math::to_sats(payout_calc, Rounding::Nearest).unwrap_or_else(
                         |e| {
@@ -3750,5 +3751,4 @@ mod tests {
             "Adequate liquidity should result in positive, finite shares"
         );
     }
-
 }

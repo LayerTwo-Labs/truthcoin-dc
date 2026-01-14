@@ -183,13 +183,17 @@ impl MemPool {
     }
 
     /// Extract slot IDs being claimed by this transaction
-    fn get_claimed_slot_ids(transaction: &AuthorizedTransaction) -> Vec<[u8; 3]> {
+    fn get_claimed_slot_ids(
+        transaction: &AuthorizedTransaction,
+    ) -> Vec<[u8; 3]> {
         use crate::types::TransactionData;
 
         let mut slot_ids = Vec::new();
         if let Some(ref data) = transaction.transaction.data {
             match data {
-                TransactionData::ClaimDecisionSlot { slot_id_bytes, .. } => {
+                TransactionData::ClaimDecisionSlot {
+                    slot_id_bytes, ..
+                } => {
                     slot_ids.push(*slot_id_bytes);
                 }
                 TransactionData::ClaimCategorySlots { slots, .. } => {
@@ -222,9 +226,9 @@ impl MemPool {
                 self.pending_slot_claims.try_get(rwtxn, slot_id)?
                 && existing_txid != txid
             {
-                return Err(Error::SlotAlreadyClaimedInMempool(
-                    hex::encode(slot_id),
-                ));
+                return Err(Error::SlotAlreadyClaimedInMempool(hex::encode(
+                    slot_id,
+                )));
             }
         }
         // No conflicts, add all claims

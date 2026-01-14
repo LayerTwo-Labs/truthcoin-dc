@@ -86,9 +86,7 @@ impl Browse {
                                 market.get_valid_state_combos().len()
                             );
 
-                            if ui
-                                .selectable_label(is_selected, label)
-                                .clicked()
+                            if ui.selectable_label(is_selected, label).clicked()
                             {
                                 self.selected_market = Some(market.id.clone());
                                 self.buy_shares = None;
@@ -101,19 +99,22 @@ impl Browse {
                 });
             });
 
-        let selected_data = self.selected_market.as_ref().and_then(|selected_id| {
-            match app.node.get_market_by_id(selected_id) {
-                Ok(Some(market)) => {
-                    let state = market.state();
-                    Some((market, state))
+        let selected_data =
+            self.selected_market.as_ref().and_then(|selected_id| {
+                match app.node.get_market_by_id(selected_id) {
+                    Ok(Some(market)) => {
+                        let state = market.state();
+                        Some((market, state))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to fetch market {selected_id:?}: {e:#}"
+                        );
+                        None
+                    }
                 }
-                Ok(None) => None,
-                Err(e) => {
-                    tracing::error!("Failed to fetch market {selected_id:?}: {e:#}");
-                    None
-                }
-            }
-        });
+            });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if let Some((market, state)) = selected_data {
@@ -190,7 +191,9 @@ impl Browse {
 
         let valid_combos = market.get_valid_state_combos();
 
-        let prices = if let Ok(Some(mempool_shares)) = app.node.get_mempool_shares(&market.id) {
+        let prices = if let Ok(Some(mempool_shares)) =
+            app.node.get_mempool_shares(&market.id)
+        {
             let all_prices = market.calculate_prices(&mempool_shares);
             let valid_prices: Vec<f64> = valid_combos
                 .iter()
@@ -258,86 +261,95 @@ impl Browse {
             );
             ui.add_space(5.0);
 
-            ScrollArea::vertical()
-                .max_height(300.0)
-                .show(ui, |ui| {
-                    for (i, (_outcome_idx, combo)) in valid_combos.iter().enumerate() {
-                        let price = prices.get(i).copied().unwrap_or(0.0);
+            ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                for (i, (_outcome_idx, combo)) in
+                    valid_combos.iter().enumerate()
+                {
+                    let price = prices.get(i).copied().unwrap_or(0.0);
 
-                        let yes_slot_idx = combo.iter().position(|&v| v == 1);
+                    let yes_slot_idx = combo.iter().position(|&v| v == 1);
 
-                        let outcome_label = if let Some(slot_idx) = yes_slot_idx {
-                            self.slot_questions
-                                .get(slot_idx)
-                                .map(|(_, q)| q.clone())
-                                .unwrap_or_else(|| format!("Option {}", slot_idx + 1))
-                        } else {
-                            market
-                                .residual_names
-                                .as_ref()
-                                .and_then(|names| names.first().cloned())
-                                .unwrap_or_else(|| "Other / None of the above".to_string())
-                        };
-
-                        let is_selected = self.selected_outcome == Some(i);
-
-                        let frame = egui::Frame::new()
-                            .fill(if is_selected {
-                                egui::Color32::from_rgb(60, 100, 60)
-                            } else {
-                                egui::Color32::TRANSPARENT
+                    let outcome_label = if let Some(slot_idx) = yes_slot_idx {
+                        self.slot_questions
+                            .get(slot_idx)
+                            .map(|(_, q)| q.clone())
+                            .unwrap_or_else(|| {
+                                format!("Option {}", slot_idx + 1)
                             })
-                            .inner_margin(8.0)
-                            .corner_radius(4.0);
+                    } else {
+                        market
+                            .residual_names
+                            .as_ref()
+                            .and_then(|names| names.first().cloned())
+                            .unwrap_or_else(|| {
+                                "Other / None of the above".to_string()
+                            })
+                    };
 
-                        frame.show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let indicator = if is_selected { "◉" } else { "○" };
-                                ui.label(RichText::new(indicator).size(16.0));
+                    let is_selected = self.selected_outcome == Some(i);
 
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new(&outcome_label).strong());
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{:.1}%", price * 100.0));
-                                        ui.label(
-                                            RichText::new(format!("(Price: {price:.4})"))
-                                                .small()
-                                                .color(egui::Color32::GRAY),
-                                        );
-                                    });
-                                });
+                    let frame = egui::Frame::new()
+                        .fill(if is_selected {
+                            egui::Color32::from_rgb(60, 100, 60)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .inner_margin(8.0)
+                        .corner_radius(4.0);
 
-                                if is_trading && self.buy_shares.is_none() {
-                                    let response = ui.interact(
-                                        ui.min_rect(),
-                                        ui.id().with(i),
-                                        egui::Sense::click(),
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let indicator =
+                                if is_selected { "◉" } else { "○" };
+                            ui.label(RichText::new(indicator).size(16.0));
+
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(&outcome_label).strong(),
+                                );
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{:.1}%", price * 100.0));
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "(Price: {price:.4})"
+                                        ))
+                                        .small()
+                                        .color(egui::Color32::GRAY),
                                     );
-                                    if response.clicked() {
-                                        self.selected_outcome = Some(i);
-                                    }
-                                }
+                                });
                             });
+
+                            if is_trading && self.buy_shares.is_none() {
+                                let response = ui.interact(
+                                    ui.min_rect(),
+                                    ui.id().with(i),
+                                    egui::Sense::click(),
+                                );
+                                if response.clicked() {
+                                    self.selected_outcome = Some(i);
+                                }
+                            }
                         });
+                    });
 
-                        if is_selected && is_trading && self.buy_shares.is_none() {
-                            ui.horizontal(|ui| {
-                                ui.add_space(24.0);
-                                if ui.button("Buy Selected Outcome").clicked() {
-                                    self.buy_shares = Some(BuyShares::new(
-                                        market.id.clone(),
-                                        i as u32,
-                                        outcome_label.clone(),
-                                        price,
-                                        market.trading_fee,
-                                    ));
-                                }
-                            });
-                        }
-
-                        ui.add_space(4.0);
+                    if is_selected && is_trading && self.buy_shares.is_none() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(24.0);
+                            if ui.button("Buy Selected Outcome").clicked() {
+                                self.buy_shares = Some(BuyShares::new(
+                                    market.id.clone(),
+                                    i as u32,
+                                    outcome_label.clone(),
+                                    price,
+                                    market.trading_fee,
+                                ));
+                            }
+                        });
                     }
-                });
+
+                    ui.add_space(4.0);
+                }
+            });
         } else {
             let is_dimensional = market.decision_slots.len() > 1;
 
@@ -351,81 +363,84 @@ impl Browse {
                 );
             }
 
-            ScrollArea::vertical()
-                .max_height(300.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("outcomes_grid")
-                        .num_columns(if is_trading { 4 } else { 3 })
-                        .striped(true)
-                        .spacing([10.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Outcome").strong());
-                            ui.label(RichText::new("Probability").strong());
-                            ui.label(RichText::new("Price").strong());
-                            if is_trading {
-                                ui.label(RichText::new("Action").strong());
+            ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                egui::Grid::new("outcomes_grid")
+                    .num_columns(if is_trading { 4 } else { 3 })
+                    .striped(true)
+                    .spacing([10.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Outcome").strong());
+                        ui.label(RichText::new("Probability").strong());
+                        ui.label(RichText::new("Price").strong());
+                        if is_trading {
+                            ui.label(RichText::new("Action").strong());
+                        }
+                        ui.end_row();
+
+                        for (i, (outcome_idx, combo)) in
+                            valid_combos.iter().enumerate()
+                        {
+                            let price = prices.get(i).copied().unwrap_or(0.0);
+
+                            let outcome_label = if is_dimensional {
+                                combo
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(dim, &val)| {
+                                        let val_str = match val {
+                                            0 => "No",
+                                            1 => "Yes",
+                                            _ => "?",
+                                        };
+                                        let question = self
+                                            .slot_questions
+                                            .get(dim)
+                                            .map(|(_, q)| {
+                                                if q.len() > 20 {
+                                                    format!("{}...", &q[..20])
+                                                } else {
+                                                    q.clone()
+                                                }
+                                            })
+                                            .unwrap_or_else(|| {
+                                                format!("D{}", dim + 1)
+                                            });
+                                        format!("{question}: {val_str}")
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            } else {
+                                match combo.first() {
+                                    Some(0) => "No".to_string(),
+                                    Some(1) => "Yes".to_string(),
+                                    _ => format!("Outcome {outcome_idx}"),
+                                }
+                            };
+
+                            ui.label(&outcome_label);
+                            ui.label(format!("{:.1}%", price * 100.0));
+                            ui.label(format!("{price:.4}"));
+
+                            if is_trading
+                                && ui
+                                    .add_enabled(
+                                        self.buy_shares.is_none(),
+                                        Button::new("Buy"),
+                                    )
+                                    .clicked()
+                            {
+                                self.buy_shares = Some(BuyShares::new(
+                                    market.id.clone(),
+                                    i as u32,
+                                    outcome_label.clone(),
+                                    price,
+                                    market.trading_fee,
+                                ));
                             }
                             ui.end_row();
-
-                            for (i, (outcome_idx, combo)) in valid_combos.iter().enumerate() {
-                                let price = prices.get(i).copied().unwrap_or(0.0);
-
-                                let outcome_label = if is_dimensional {
-                                    combo
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(dim, &val)| {
-                                            let val_str = match val {
-                                                0 => "No",
-                                                1 => "Yes",
-                                                _ => "?",
-                                            };
-                                            let question = self.slot_questions
-                                                .get(dim)
-                                                .map(|(_, q)| {
-                                                    if q.len() > 20 {
-                                                        format!("{}...", &q[..20])
-                                                    } else {
-                                                        q.clone()
-                                                    }
-                                                })
-                                                .unwrap_or_else(|| format!("D{}", dim + 1));
-                                            format!("{question}: {val_str}")
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                } else {
-                                    match combo.first() {
-                                        Some(0) => "No".to_string(),
-                                        Some(1) => "Yes".to_string(),
-                                        _ => format!("Outcome {outcome_idx}"),
-                                    }
-                                };
-
-                                ui.label(&outcome_label);
-                                ui.label(format!("{:.1}%", price * 100.0));
-                                ui.label(format!("{price:.4}"));
-
-                                if is_trading
-                                    && ui
-                                        .add_enabled(
-                                            self.buy_shares.is_none(),
-                                            Button::new("Buy"),
-                                        )
-                                        .clicked()
-                                {
-                                    self.buy_shares = Some(BuyShares::new(
-                                        market.id.clone(),
-                                        i as u32,
-                                        outcome_label.clone(),
-                                        price,
-                                        market.trading_fee,
-                                    ));
-                                }
-                                ui.end_row();
-                            }
-                        });
-                });
+                        }
+                    });
+            });
         }
 
         if let Some(buy_shares) = &mut self.buy_shares {
@@ -487,14 +502,14 @@ impl Browse {
                         .strong()
                         .color(egui::Color32::from_rgb(100, 200, 100)),
                 );
-                ui.label(format!(
-                    "Range: {} - {}",
-                    info.min, info.max
-                ));
+                ui.label(format!("Range: {} - {}", info.min, info.max));
                 ui.label(
-                    RichText::new(format!("({:.1}% normalized)", normalized_value * 100.0))
-                        .small()
-                        .color(egui::Color32::GRAY),
+                    RichText::new(format!(
+                        "({:.1}% normalized)",
+                        normalized_value * 100.0
+                    ))
+                    .small()
+                    .color(egui::Color32::GRAY),
                 );
             });
         });

@@ -448,7 +448,9 @@ impl RpcServerImpl {
                     .into_iter()
                     .map(|hex| {
                         let bytes = hex::decode(&hex).map_err(|_| {
-                            custom_err_msg(format!("Invalid hex for category_txid: {hex}"))
+                            custom_err_msg(format!(
+                                "Invalid hex for category_txid: {hex}"
+                            ))
                         })?;
                         if bytes.len() != 32 {
                             return Err(custom_err_msg(format!(
@@ -1164,7 +1166,7 @@ impl RpcServer for RpcServerImpl {
         &self,
         request: truthcoin_dc_app_rpc_api::CalculateInitialLiquidityRequest,
     ) -> RpcResult<truthcoin_dc_app_rpc_api::InitialLiquidityCalculation> {
-        use truthcoin_dc::state::markets::{parse_dimensions, DimensionSpec};
+        use truthcoin_dc::state::markets::{DimensionSpec, parse_dimensions};
 
         let beta = request.beta;
 
@@ -1887,10 +1889,8 @@ impl RpcServer for RpcServerImpl {
         }
 
         // Batch fetch all unique slots needed for denormalization (avoids N+1 queries)
-        let unique_slot_ids: HashSet<SlotId> = votes_to_process
-            .iter()
-            .map(|v| v.decision_id)
-            .collect();
+        let unique_slot_ids: HashSet<SlotId> =
+            votes_to_process.iter().map(|v| v.decision_id).collect();
 
         let slot_cache: HashMap<SlotId, Option<Decision>> = unique_slot_ids
             .into_iter()
@@ -1909,7 +1909,9 @@ impl RpcServer for RpcServerImpl {
                 let display_value = slot_cache
                     .get(&vote.decision_id)
                     .and_then(|opt| opt.as_ref())
-                    .map(|decision| decision.denormalize_value(vote.internal_value))
+                    .map(|decision| {
+                        decision.denormalize_value(vote.internal_value)
+                    })
                     .unwrap_or(vote.internal_value);
 
                 VoteInfo {

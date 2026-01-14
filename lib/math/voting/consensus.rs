@@ -410,8 +410,10 @@ pub fn factory(
 
         if is_scaled {
             // Scaled decisions: use weighted median, keep continuous value
-            let col_values: DVector<f64> =
-                DVector::from_iterator(filled.nrows(), filled.column(j).iter().copied());
+            let col_values: DVector<f64> = DVector::from_iterator(
+                filled.nrows(),
+                filled.column(j).iter().copied(),
+            );
 
             // Filter out NaN values and their corresponding weights
             let mut valid_values = Vec::new();

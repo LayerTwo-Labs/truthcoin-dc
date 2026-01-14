@@ -22,7 +22,7 @@ use tokio_stream::{StreamMap, wrappers::WatchStream};
 use crate::{
     authorization::{self, Authorization, Signature, get_address},
     state::markets::{
-        DimensionSpec, MarketId, DEFAULT_MARKET_BETA,
+        DEFAULT_MARKET_BETA, DimensionSpec, MarketId,
         generate_market_author_fee_address, generate_market_treasury_address,
         parse_dimensions,
     },
@@ -846,9 +846,7 @@ impl Wallet {
         for spec in &dimension_specs {
             match spec {
                 DimensionSpec::Single(_) => total_slots += 1,
-                DimensionSpec::Categorical(slots) => {
-                    total_slots += slots.len()
-                }
+                DimensionSpec::Categorical(slots) => total_slots += slots.len(),
             }
         }
 
@@ -858,13 +856,14 @@ impl Wallet {
         )?;
 
         // Calculate number of resolved outcomes for beta derivation
-        let num_outcomes: usize = dimension_specs.iter().fold(1, |acc, spec| {
-            let spec_outcomes = match spec {
-                DimensionSpec::Single(_) => 2,
-                DimensionSpec::Categorical(slots) => slots.len() + 1,
-            };
-            acc * spec_outcomes
-        });
+        let num_outcomes: usize =
+            dimension_specs.iter().fold(1, |acc, spec| {
+                let spec_outcomes = match spec {
+                    DimensionSpec::Single(_) => 2,
+                    DimensionSpec::Categorical(slots) => slots.len() + 1,
+                };
+                acc * spec_outcomes
+            });
 
         // Determine beta and treasury from inputs (mutually exclusive)
         // LMSR relationship: min_liquidity = β × ln(num_outcomes)
@@ -874,7 +873,9 @@ impl Wallet {
             // Both provided: error - use one or the other
             (Some(_), Some(_)) => {
                 return Err(Error::InvalidSlotId {
-                    reason: "Specify either beta or initial_liquidity, not both".to_string(),
+                    reason:
+                        "Specify either beta or initial_liquidity, not both"
+                            .to_string(),
                 });
             }
             // Only beta (advanced): calculate minimum liquidity
@@ -928,8 +929,12 @@ impl Wallet {
             .address;
 
         // Compute market_id deterministically from content
-        let market_id =
-            compute_market_id(&title, &description, &creator_address, &dimension_specs);
+        let market_id = compute_market_id(
+            &title,
+            &description,
+            &creator_address,
+            &dimension_specs,
+        );
         let market_id_bytes = *market_id.as_bytes();
 
         let tx_data = TxData::CreateMarket {

@@ -249,7 +249,10 @@ impl Decision {
     /// Validate that a user value is within bounds and normalize it.
     ///
     /// Returns Ok(normalized_value) or Err if out of bounds.
-    pub fn validate_and_normalize(&self, user_value: f64) -> Result<f64, Error> {
+    pub fn validate_and_normalize(
+        &self,
+        user_value: f64,
+    ) -> Result<f64, Error> {
         if user_value.is_nan() {
             return Ok(f64::NAN); // Abstain is always valid
         }
@@ -285,10 +288,7 @@ impl Decision {
     /// for scaled this is the actual min/max bounds.
     pub fn get_display_range(&self) -> (f64, f64) {
         if self.is_scaled {
-            (
-                self.min.unwrap_or(0) as f64,
-                self.max.unwrap_or(100) as f64,
-            )
+            (self.min.unwrap_or(0) as f64, self.max.unwrap_or(100) as f64)
         } else {
             (0.0, 1.0)
         }
@@ -1358,7 +1358,9 @@ mod tests {
         assert!((decision.normalize_value(0.0) - 0.0).abs() < 1e-10);
         assert!((decision.normalize_value(538.0) - 1.0).abs() < 1e-10);
         assert!((decision.normalize_value(269.0) - 0.5).abs() < 1e-10);
-        assert!((decision.normalize_value(270.0) - (270.0 / 538.0)).abs() < 1e-10);
+        assert!(
+            (decision.normalize_value(270.0) - (270.0 / 538.0)).abs() < 1e-10
+        );
     }
 
     #[test]
