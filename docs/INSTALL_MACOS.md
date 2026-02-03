@@ -375,7 +375,9 @@ market-get <MARKET_ID>      Get market details
 market-buy --market-id ID --outcome-index N --shares-amount N --max-cost N [--fee-sats N]
 market-positions [--address ADDR] [--market-id ID]
 market-create --title "T" --description "D" --dimensions "SPEC" \
-              [--beta N] [--trading-fee N] [--tags "t1,t2"] [--fee-sats N]
+              [--beta N] [--trading-fee N] [--tags "t1,t2"] \
+              [--category-txids "txid1,txid2"] [--residual-names "name1,name2"] \
+              [--fee-sats N]
 calculate-share-cost --market-id ID --outcome-index N --shares-amount N
 calculate-initial-liquidity --beta N [--market-type TYPE] [--num-outcomes N] \
                             [--decision-slots "s1,s2"] [--has-residual BOOL] [--dimensions "SPEC"]
@@ -517,18 +519,51 @@ One winner from multiple options. Use double brackets `[[...]]` and claim slots 
 --questions "Will Candidate A win?,Will Candidate B win?,Will Candidate C win?" \
 --is-standard true --fee-sats 1000
 
-# Mine and note the category txid (e.g., "abc123...")
+# Mine and note the category txid returned (e.g., "abc123def456...")
+./mine_blocks.sh 1
 
-# Create categorical market
+# Create categorical market with --category-txids referencing the claim transaction
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "2028 Presidential Election Winner" \
 --description "Which candidate will win the 2028 US Presidential Election?" \
---dimensions "[[000004,000005,000006]]" --beta 7.0 --fee-sats 1000
+--dimensions "[[000004,000005,000006]]" \
+--category-txids "abc123def456..." \
+--beta 7.0 --fee-sats 1000
 
 # Outcomes (3 mutually exclusive):
 #   0: Candidate A wins
 #   1: Candidate B wins
 #   2: Candidate C wins
+```
+
+### 4b. Categorical Market with Residual Outcome
+
+Add a "catch-all" residual outcome for options not explicitly listed.
+
+```bash
+# Claim category slots for known candidates
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 slot-claim-category \
+--slot-ids "000004,000005,000006" \
+--questions "Will Candidate A win?,Will Candidate B win?,Will Candidate C win?" \
+--is-standard true --fee-sats 1000
+
+# Mine and note the category txid
+./mine_blocks.sh 1
+
+# Create market with residual outcome for "Other candidate"
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
+--title "2028 Presidential Election Winner" \
+--description "Which candidate will win the 2028 US Presidential Election?" \
+--dimensions "[[000004,000005,000006]]" \
+--category-txids "abc123def456..." \
+--residual-names "Other" \
+--beta 7.0 --fee-sats 1000
+
+# Outcomes (4 total: 3 explicit + 1 residual):
+#   0: Candidate A wins
+#   1: Candidate B wins
+#   2: Candidate C wins
+#   3: Other (residual)
 ```
 
 ### 5. Binary + Categorical Combination
@@ -539,14 +574,22 @@ Combine an independent binary decision with a categorical group.
 # Binary slot: "Will there be a recession?"
 # Slot ID: "000007"
 
-# Category slots: "Tech sector leads?", "Finance sector leads?", "Energy sector leads?"
-# Slot IDs: "000008", "000009", "00000a"
+# Claim category slots for sector leadership
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 slot-claim-category \
+--slot-ids "000008,000009,00000a" \
+--questions "Tech sector leads?,Finance sector leads?,Energy sector leads?" \
+--is-standard true --fee-sats 1000
+# Returns category txid: "sector123..."
 
-# Create combined market
+./mine_blocks.sh 1
+
+# Create combined market with --category-txids
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "Economy & Sector Performance" \
 --description "Recession prediction combined with leading sector" \
---dimensions "[000007,[000008,000009,00000a]]" --beta 7.0 --fee-sats 1000
+--dimensions "[000007,[000008,000009,00000a]]" \
+--category-txids "sector123..." \
+--beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 3 = 6 total):
 #   0: Recession-Yes + Tech leads
@@ -578,16 +621,29 @@ Three or more independent binary decisions.
 Combine two separate categorical decisions.
 
 ```bash
-# Category 1: Conference winner (East, West)
-# Slot IDs: "00000e", "00000f"
+# Claim Category 1: Conference winner (East, West)
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 slot-claim-category \
+--slot-ids "00000e,00000f" \
+--questions "East wins conference?,West wins conference?" \
+--is-standard true --fee-sats 1000
+# Returns: "conf123..."
 
-# Category 2: MVP winner (Player A, Player B, Player C)
-# Slot IDs: "000010", "000011", "000012"
+# Claim Category 2: MVP winner (Player A, Player B, Player C)
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 slot-claim-category \
+--slot-ids "000010,000011,000012" \
+--questions "Player A MVP?,Player B MVP?,Player C MVP?" \
+--is-standard true --fee-sats 1000
+# Returns: "mvp456..."
 
+./mine_blocks.sh 1
+
+# Create market with both category txids (comma-separated, in dimension order)
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "NBA Season Predictions" \
 --description "Conference champion and MVP predictions" \
---dimensions "[[00000e,00000f],[000010,000011,000012]]" --beta 7.0 --fee-sats 1000
+--dimensions "[[00000e,00000f],[000010,000011,000012]]" \
+--category-txids "conf123...,mvp456..." \
+--beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 3 = 6 total):
 #   0: East wins + Player A MVP
@@ -652,13 +708,21 @@ Combine a numeric prediction with mutually exclusive options.
 # Scalar slot: "S&P 500 year-end value" (min=3000, max=6000)
 # Slot ID: "000017"
 
-# Category slots: "Tech leads?", "Finance leads?", "Healthcare leads?"
-# Slot IDs: "000018", "000019", "00001a"
+# Claim category slots for sector leadership
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 slot-claim-category \
+--slot-ids "000018,000019,00001a" \
+--questions "Tech leads?,Finance leads?,Healthcare leads?" \
+--is-standard true --fee-sats 1000
+# Returns: "sector789..."
+
+./mine_blocks.sh 1
 
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "Market Performance & Sector Leader" \
 --description "S&P 500 level combined with leading sector" \
---dimensions "[000017,[000018,000019,00001a]]" --beta 7.0 --fee-sats 1000
+--dimensions "[000017,[000018,000019,00001a]]" \
+--category-txids "sector789..." \
+--beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 3 = 6 total):
 #   0: S&P Under + Tech leads
@@ -680,13 +744,21 @@ Three different decision types combined.
 # Binary slot: "Will there be a spot BTC ETF approval?"
 # Slot ID: "00001c"
 
-# Category slots: "Bull market?", "Bear market?", "Sideways?"
-# Slot IDs: "00001d", "00001e", "00001f"
+# Claim category slots for market regime
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 slot-claim-category \
+--slot-ids "00001d,00001e,00001f" \
+--questions "Bull market?,Bear market?,Sideways?" \
+--is-standard true --fee-sats 1000
+# Returns: "regime123..."
+
+./mine_blocks.sh 1
 
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "Crypto Market Comprehensive" \
 --description "BTC price, ETF approval, and market regime" \
---dimensions "[00001b,00001c,[00001d,00001e,00001f]]" --beta 10.0 --fee-sats 1000
+--dimensions "[00001b,00001c,[00001d,00001e,00001f]]" \
+--category-txids "regime123..." \
+--beta 10.0 --fee-sats 1000
 
 # Outcomes (2 x 2 x 3 = 12 total):
 #   BTC price (Under/Over) x ETF (Yes/No) x Market regime (Bull/Bear/Sideways)
