@@ -118,19 +118,16 @@ impl MempoolExplorer {
                                     format!("{merkle_root}"),
                                     *vout,
                                 ),
-                                OutPoint::Market {
+                                OutPoint::MarketFunds {
                                     market_id,
                                     block_height,
+                                    is_fee,
                                 } => (
-                                    "market",
-                                    hex::encode(market_id),
-                                    *block_height,
-                                ),
-                                OutPoint::MarketAuthorFee {
-                                    market_id,
-                                    block_height,
-                                } => (
-                                    "author_fee",
+                                    if *is_fee {
+                                        "author_fee"
+                                    } else {
+                                        "market"
+                                    },
                                     hex::encode(market_id),
                                     *block_height,
                                 ),

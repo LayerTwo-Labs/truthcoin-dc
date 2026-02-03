@@ -285,15 +285,11 @@ mod content {
                 /// Votecoin with fixed supply of 1,000,000 units (u32)
                 Votecoin(u32),
                 Withdrawal(super::WithdrawalContent),
-                /// Market treasury output - holds funds for a prediction market
-                MarketTreasury {
+                /// Market funds output - treasury (is_fee=false) or author fees (is_fee=true)
+                MarketFunds {
                     market_id: [u8; 6],
                     amount: super::BitcoinContent,
-                },
-                /// Market author fee output - accumulates trading fees for the market creator
-                MarketAuthorFee {
-                    market_id: [u8; 6],
-                    amount: super::BitcoinContent,
+                    is_fee: bool,
                 },
             }
         }
@@ -341,12 +337,16 @@ mod content {
             matches!(self, Self::Withdrawal { .. })
         }
 
+        pub fn is_market_funds(&self) -> bool {
+            matches!(self, Self::MarketFunds { .. })
+        }
+
         pub fn is_market_treasury(&self) -> bool {
-            matches!(self, Self::MarketTreasury { .. })
+            matches!(self, Self::MarketFunds { is_fee: false, .. })
         }
 
         pub fn is_market_author_fee(&self) -> bool {
-            matches!(self, Self::MarketAuthorFee { .. })
+            matches!(self, Self::MarketFunds { is_fee: true, .. })
         }
 
         /// `true` if the output corresponds to an asset output
@@ -356,16 +356,14 @@ mod content {
                 Self::Votecoin(_)
                     | Self::Bitcoin(_)
                     | Self::Withdrawal { .. }
-                    | Self::MarketTreasury { .. }
-                    | Self::MarketAuthorFee { .. }
+                    | Self::MarketFunds { .. }
             )
         }
 
         pub fn as_bitcoin(self) -> Option<super::BitcoinContent> {
             match self {
                 Self::Bitcoin(value) => Some(value),
-                Self::MarketTreasury { amount, .. } => Some(amount),
-                Self::MarketAuthorFee { amount, .. } => Some(amount),
+                Self::MarketFunds { amount, .. } => Some(amount),
                 _ => None,
             }
         }
@@ -381,10 +379,7 @@ mod content {
                 Self::Withdrawal(withdrawal) => {
                     Some(super::AssetContent::Withdrawal(withdrawal))
                 }
-                Self::MarketTreasury { amount, .. } => {
-                    Some(super::AssetContent::Bitcoin(amount))
-                }
-                Self::MarketAuthorFee { amount, .. } => {
+                Self::MarketFunds { amount, .. } => {
                     Some(super::AssetContent::Bitcoin(amount))
                 }
             }
@@ -417,12 +412,15 @@ mod content {
                 DefaultRepr::Withdrawal(withdrawal) => {
                     Self::Withdrawal(withdrawal)
                 }
-                DefaultRepr::MarketTreasury { market_id, amount } => {
-                    Self::MarketTreasury { market_id, amount }
-                }
-                DefaultRepr::MarketAuthorFee { market_id, amount } => {
-                    Self::MarketAuthorFee { market_id, amount }
-                }
+                DefaultRepr::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                } => Self::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                },
             }
         }
     }
@@ -435,12 +433,15 @@ mod content {
                 HumanReadableRepr::Withdrawal(withdrawal) => {
                     Self::Withdrawal(withdrawal)
                 }
-                HumanReadableRepr::MarketTreasury { market_id, amount } => {
-                    Self::MarketTreasury { market_id, amount }
-                }
-                HumanReadableRepr::MarketAuthorFee { market_id, amount } => {
-                    Self::MarketAuthorFee { market_id, amount }
-                }
+                HumanReadableRepr::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                } => Self::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                },
             }
         }
     }
@@ -451,12 +452,15 @@ mod content {
                 Content::Votecoin(value) => Self::Votecoin(value),
                 Content::Bitcoin(value) => Self::Bitcoin(value),
                 Content::Withdrawal(withdrawal) => Self::Withdrawal(withdrawal),
-                Content::MarketTreasury { market_id, amount } => {
-                    Self::MarketTreasury { market_id, amount }
-                }
-                Content::MarketAuthorFee { market_id, amount } => {
-                    Self::MarketAuthorFee { market_id, amount }
-                }
+                Content::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                } => Self::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                },
             }
         }
     }
@@ -467,12 +471,15 @@ mod content {
                 Content::Votecoin(value) => Self::Votecoin(value),
                 Content::Bitcoin(value) => Self::Bitcoin(value),
                 Content::Withdrawal(withdrawal) => Self::Withdrawal(withdrawal),
-                Content::MarketTreasury { market_id, amount } => {
-                    Self::MarketTreasury { market_id, amount }
-                }
-                Content::MarketAuthorFee { market_id, amount } => {
-                    Self::MarketAuthorFee { market_id, amount }
-                }
+                Content::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                } => Self::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                },
             }
         }
     }
@@ -518,8 +525,7 @@ mod content {
                 Self::Votecoin(_) => bitcoin::Amount::ZERO,
                 Self::Bitcoin(value) => value.0,
                 Self::Withdrawal(withdrawal) => withdrawal.get_bitcoin_value(),
-                Self::MarketTreasury { amount, .. } => amount.0,
-                Self::MarketAuthorFee { amount, .. } => amount.0,
+                Self::MarketFunds { amount, .. } => amount.0,
             }
         }
     }
@@ -554,15 +560,11 @@ mod filled_content {
                 BitcoinWithdrawal(super::WithdrawalContent),
                 /// Votecoin amount (out of 1,000,000 fixed supply)
                 Votecoin(u32),
-                /// Market treasury UTXO - holds funds for a prediction market
-                MarketTreasury {
+                /// Market funds UTXO - treasury (is_fee=false) or author fees (is_fee=true)
+                MarketFunds {
                     market_id: [u8; 6],
                     amount: super::BitcoinContent,
-                },
-                /// Market author fee UTXO - accumulates trading fees for the market creator
-                MarketAuthorFee {
-                    market_id: [u8; 6],
-                    amount: super::BitcoinContent,
+                    is_fee: bool,
                 },
             }
         }
@@ -616,10 +618,7 @@ mod filled_content {
                 Self::Bitcoin(value) => {
                     Some((AssetId::Bitcoin, value.0.to_sat()))
                 }
-                Self::MarketTreasury { amount, .. } => {
-                    Some((AssetId::Bitcoin, amount.0.to_sat()))
-                }
-                Self::MarketAuthorFee { amount, .. } => {
+                Self::MarketFunds { amount, .. } => {
                     Some((AssetId::Bitcoin, amount.0.to_sat()))
                 }
                 _ => None,
@@ -652,14 +651,19 @@ mod filled_content {
             matches!(self, Self::BitcoinWithdrawal { .. })
         }
 
+        /// `true` if the output content corresponds to market funds
+        pub fn is_market_funds(&self) -> bool {
+            matches!(self, Self::MarketFunds { .. })
+        }
+
         /// `true` if the output content corresponds to a market treasury
         pub fn is_market_treasury(&self) -> bool {
-            matches!(self, Self::MarketTreasury { .. })
+            matches!(self, Self::MarketFunds { is_fee: false, .. })
         }
 
         /// `true` if the output content corresponds to a market author fee
         pub fn is_market_author_fee(&self) -> bool {
-            matches!(self, Self::MarketAuthorFee { .. })
+            matches!(self, Self::MarketFunds { is_fee: true, .. })
         }
     }
 
@@ -673,12 +677,8 @@ mod filled_content {
                 FilledContent::Votecoin(value) => {
                     super::Content::Votecoin(value)
                 }
-                FilledContent::MarketTreasury { amount, .. } => {
-                    // Market treasury converts to plain Bitcoin content
-                    super::Content::Bitcoin(amount)
-                }
-                FilledContent::MarketAuthorFee { amount, .. } => {
-                    // Market author fee converts to plain Bitcoin content
+                FilledContent::MarketFunds { amount, .. } => {
+                    // Market funds converts to plain Bitcoin content
                     super::Content::Bitcoin(amount)
                 }
             }
@@ -693,12 +693,15 @@ mod filled_content {
                 DefaultRepr::BitcoinWithdrawal(withdrawal) => {
                     Self::BitcoinWithdrawal(withdrawal)
                 }
-                DefaultRepr::MarketTreasury { market_id, amount } => {
-                    Self::MarketTreasury { market_id, amount }
-                }
-                DefaultRepr::MarketAuthorFee { market_id, amount } => {
-                    Self::MarketAuthorFee { market_id, amount }
-                }
+                DefaultRepr::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                } => Self::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                },
             }
         }
     }
@@ -711,12 +714,15 @@ mod filled_content {
                 HumanReadableRepr::BitcoinWithdrawal(withdrawal) => {
                     Self::BitcoinWithdrawal(withdrawal)
                 }
-                HumanReadableRepr::MarketTreasury { market_id, amount } => {
-                    Self::MarketTreasury { market_id, amount }
-                }
-                HumanReadableRepr::MarketAuthorFee { market_id, amount } => {
-                    Self::MarketAuthorFee { market_id, amount }
-                }
+                HumanReadableRepr::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                } => Self::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                },
             }
         }
     }
@@ -729,12 +735,15 @@ mod filled_content {
                 FilledContent::BitcoinWithdrawal(withdrawal) => {
                     Self::BitcoinWithdrawal(withdrawal)
                 }
-                FilledContent::MarketTreasury { market_id, amount } => {
-                    Self::MarketTreasury { market_id, amount }
-                }
-                FilledContent::MarketAuthorFee { market_id, amount } => {
-                    Self::MarketAuthorFee { market_id, amount }
-                }
+                FilledContent::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                } => Self::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                },
             }
         }
     }
@@ -747,12 +756,15 @@ mod filled_content {
                 FilledContent::BitcoinWithdrawal(withdrawal) => {
                     Self::BitcoinWithdrawal(withdrawal)
                 }
-                FilledContent::MarketTreasury { market_id, amount } => {
-                    Self::MarketTreasury { market_id, amount }
-                }
-                FilledContent::MarketAuthorFee { market_id, amount } => {
-                    Self::MarketAuthorFee { market_id, amount }
-                }
+                FilledContent::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                } => Self::MarketFunds {
+                    market_id,
+                    amount,
+                    is_fee,
+                },
             }
         }
     }

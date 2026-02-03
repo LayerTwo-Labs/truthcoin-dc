@@ -21,6 +21,10 @@ use tokio_stream::{StreamMap, wrappers::WatchStream};
 
 use crate::{
     authorization::{self, Authorization, Signature, get_address},
+    math::{
+        safe_math::{Rounding, to_sats},
+        trading,
+    },
     state::markets::{
         DEFAULT_MARKET_BETA, DimensionSpec, MarketId,
         generate_market_author_fee_address, generate_market_treasury_address,
@@ -153,6 +157,8 @@ pub enum Error {
     NoSeed,
     #[error("not enough funds")]
     NotEnoughFunds,
+    #[error("insufficient ownership proof for trader {trader}: {message}")]
+    InsufficientOwnershipProof { trader: Address, message: String },
     #[error("utxo does not exist")]
     NoUtxo,
     #[error("failed to parse mnemonic seed phrase")]
@@ -627,7 +633,82 @@ impl Wallet {
         let mut selected = HashMap::with_capacity(bitcoin_utxos.len().min(10));
         let mut total = bitcoin::Amount::ZERO;
 
-        for (outpoint, output) in bitcoin_utxos {
+        for (outpoint, output) in &bitcoin_utxos {
+            total = total
+                .checked_add(output.get_bitcoin_value())
+                .ok_or(AmountOverflowError)?;
+            selected.insert(*outpoint, output.clone());
+
+            if total >= value {
+                return Ok((total, selected));
+            }
+        }
+
+        Err(Error::NotEnoughFunds)
+    }
+
+    /// Select Bitcoin UTXOs for sell transactions.
+    /// Requires at least one UTXO from the trader address (to prove ownership)
+    pub fn select_bitcoins_for_sell(
+        &self,
+        value: bitcoin::Amount,
+        trader: Address,
+    ) -> Result<(bitcoin::Amount, HashMap<OutPoint, Output>), Error> {
+        let rotxn = self.env.read_txn()?;
+
+        let mut trader_utxos = Vec::new();
+        let mut other_utxos = Vec::new();
+
+        let mut iter = self.utxos.iter(&rotxn).map_err(DbError::from)?;
+        while let Some((outpoint, filled_output)) =
+            iter.next().map_err(DbError::from)?
+        {
+            if filled_output.is_bitcoin()
+                && !filled_output.content.is_withdrawal()
+                && !filled_output.is_votecoin()
+                && filled_output.get_bitcoin_value() > bitcoin::Amount::ZERO
+            {
+                let output: Output = filled_output.into();
+                if output.address == trader {
+                    trader_utxos.push((outpoint, output));
+                } else {
+                    other_utxos.push((outpoint, output));
+                }
+            }
+        }
+
+        // Must have at least one UTXO from trader to prove ownership
+        if trader_utxos.is_empty() {
+            return Err(Error::InsufficientOwnershipProof {
+                trader,
+                message: "Trader address has no Bitcoin UTXOs to prove ownership for sell. \
+                         Please send some Bitcoin to this address first.".to_string(),
+            });
+        }
+
+        // Sort by value (smallest first) for efficient selection
+        trader_utxos
+            .sort_unstable_by_key(|(_, output)| output.get_bitcoin_value());
+        other_utxos
+            .sort_unstable_by_key(|(_, output)| output.get_bitcoin_value());
+
+        let mut selected = HashMap::with_capacity(16);
+        let mut total = bitcoin::Amount::ZERO;
+
+        // First, add trader's UTXOs (at least one required)
+        for (outpoint, output) in trader_utxos {
+            total = total
+                .checked_add(output.get_bitcoin_value())
+                .ok_or(AmountOverflowError)?;
+            selected.insert(outpoint, output);
+
+            if total >= value {
+                return Ok((total, selected));
+            }
+        }
+
+        // If trader's UTXOs aren't enough, add from other addresses
+        for (outpoint, output) in other_utxos {
             total = total
                 .checked_add(output.get_bitcoin_value())
                 .ok_or(AmountOverflowError)?;
@@ -667,11 +748,11 @@ impl Wallet {
         let mut selected = HashMap::with_capacity(votecoin_utxos.len().min(8));
         let mut total_value: u32 = 0;
 
-        for (outpoint, output, votecoin_value) in votecoin_utxos {
+        for (outpoint, output, votecoin_value) in &votecoin_utxos {
             total_value = total_value
-                .checked_add(votecoin_value)
+                .checked_add(*votecoin_value)
                 .ok_or(Error::AmountOverflow(AmountOverflowError))?;
-            selected.insert(outpoint, output);
+            selected.insert(*outpoint, output.clone());
 
             if total_value >= value {
                 return Ok((total_value, selected));
@@ -802,7 +883,7 @@ impl Wallet {
         &self,
         input: CreateMarketInput,
         fee: bitcoin::Amount,
-    ) -> Result<Transaction, Error> {
+    ) -> Result<(Transaction, crate::state::markets::MarketId), Error> {
         use crate::state::markets::{
             compute_market_id, generate_market_treasury_address,
         };
@@ -867,8 +948,6 @@ impl Wallet {
 
         // Determine beta and treasury from inputs (mutually exclusive)
         // LMSR relationship: min_liquidity = β × ln(num_outcomes)
-        let ln_outcomes = (num_outcomes as f64).ln();
-
         let (beta, treasury_sats) = match (input_beta, initial_liquidity) {
             // Both provided: error - use one or the other
             (Some(_), Some(_)) => {
@@ -880,29 +959,26 @@ impl Wallet {
             }
             // Only beta (advanced): calculate minimum liquidity
             (Some(b), None) => {
-                let min_liq = if ln_outcomes > 0.0 {
-                    (b * ln_outcomes).ceil() as u64
-                } else {
-                    0
-                };
+                let liq_f64 =
+                    trading::calculate_lmsr_liquidity(b, num_outcomes);
+                let min_liq = to_sats(liq_f64, Rounding::Up)
+                    .map_err(|_| AmountOverflowError)?;
                 (b, min_liq)
             }
             // Only liquidity (primary user-facing): derive beta
             (None, Some(liq)) => {
-                let derived_beta = if ln_outcomes > 0.0 {
-                    liq as f64 / ln_outcomes
-                } else {
-                    DEFAULT_MARKET_BETA
-                };
+                let derived_beta =
+                    trading::derive_beta_from_liquidity(liq, num_outcomes);
                 (derived_beta, liq)
             }
             // Neither: use defaults
             (None, None) => {
-                let min_liq = if ln_outcomes > 0.0 {
-                    (DEFAULT_MARKET_BETA * ln_outcomes).ceil() as u64
-                } else {
-                    0
-                };
+                let liq_f64 = trading::calculate_lmsr_liquidity(
+                    DEFAULT_MARKET_BETA,
+                    num_outcomes,
+                );
+                let min_liq = to_sats(liq_f64, Rounding::Up)
+                    .map_err(|_| AmountOverflowError)?;
                 (DEFAULT_MARKET_BETA, min_liq)
             }
         };
@@ -951,16 +1027,17 @@ impl Wallet {
         let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
         let mut outputs = Vec::new();
 
-        // Create explicit MarketTreasury output with treasury funding
+        // Create explicit MarketFunds (treasury) output with treasury funding
         if treasury_sats > 0 {
             let treasury_address = generate_market_treasury_address(&market_id);
             outputs.push(Output::new(
                 treasury_address,
-                OutputContent::MarketTreasury {
+                OutputContent::MarketFunds {
                     market_id: market_id_bytes,
                     amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
                         treasury_sats,
                     )),
+                    is_fee: false,
                 },
             ));
         }
@@ -976,78 +1053,141 @@ impl Wallet {
         let mut tx = Transaction::new(inputs, outputs);
         tx.data = Some(tx_data);
 
-        Ok(tx)
+        Ok((tx, market_id))
     }
 
-    /// Buy shares in a prediction market using LMSR
-    ///
     /// # Arguments
     /// * `market_id` - The market to trade in
-    /// * `outcome_index` - The outcome to buy shares for
-    /// * `shares_amount` - Number of shares to buy
-    /// * `base_cost_sats` - LMSR base cost (goes to market treasury)
-    /// * `trading_fee_sats` - Trading fee (goes to market author)
+    /// * `outcome_index` - The outcome to trade shares for
+    /// * `shares` - Number of shares to trade (positive = buy, negative = sell)
+    /// * `trader` - The trader address (required for sell ownership validation)
+    /// * `limit_sats` - Slippage limit: max_cost for buy, min_proceeds for sell
+    /// * `base_sats` - LMSR base cost/proceeds (absolute)
+    /// * `fee_sats` - Trading fee (absolute)
     /// * `tx_fee` - Transaction fee for the miner
-    pub fn buy_shares(
+    #[allow(clippy::too_many_arguments)]
+    pub fn trade(
         &self,
         market_id: crate::state::markets::MarketId,
         outcome_index: usize,
-        shares_amount: f64,
-        base_cost_sats: u64,
-        trading_fee_sats: u64,
+        shares: f64,
+        trader: Address,
+        limit_sats: u64,
+        base_sats: u64,
+        fee_sats: u64,
         tx_fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
         let market_id_bytes = *market_id.as_bytes();
+        let is_buy = shares > 0.0;
 
-        let total_market_cost =
-            bitcoin::Amount::from_sat(base_cost_sats + trading_fee_sats);
-        let total_cost = tx_fee
-            .checked_add(total_market_cost)
-            .ok_or(AmountOverflowError)?;
+        let (inputs, outputs, change_address) = if is_buy {
+            // Buy: need to pay base_sats + fee_sats to market + tx_fee
+            let total_market_cost =
+                bitcoin::Amount::from_sat(base_sats + fee_sats);
+            let total_cost = tx_fee
+                .checked_add(total_market_cost)
+                .ok_or(AmountOverflowError)?;
 
-        let (total_bitcoin, bitcoin_utxos) =
-            self.select_bitcoins(total_cost)?;
-        let change = total_bitcoin - total_cost;
+            let (total_bitcoin, bitcoin_utxos) =
+                self.select_bitcoins(total_cost)?;
+            let change = total_bitcoin - total_cost;
 
-        let inputs = bitcoin_utxos.into_keys().collect();
-        let mut outputs = Vec::new();
+            // Sort UTXOs for deterministic ordering
+            let mut utxo_vec: Vec<_> = bitcoin_utxos.into_iter().collect();
+            utxo_vec.sort_by_key(|(outpoint, _)| *outpoint);
 
-        let treasury_address = generate_market_treasury_address(&market_id);
-        outputs.push(Output::new(
-            treasury_address,
-            OutputContent::MarketTreasury {
-                market_id: market_id_bytes,
-                amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
-                    base_cost_sats,
-                )),
-            },
-        ));
+            let inputs: Vec<_> =
+                utxo_vec.into_iter().map(|(outpoint, _)| outpoint).collect();
+            let mut outputs = Vec::new();
 
-        let fee_address = generate_market_author_fee_address(&market_id);
-        outputs.push(Output::new(
-            fee_address,
-            OutputContent::MarketAuthorFee {
-                market_id: market_id_bytes,
-                amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
-                    trading_fee_sats,
-                )),
-            },
-        ));
-
-        if change > bitcoin::Amount::ZERO {
+            // Treasury output (MarketFunds with is_fee=false)
+            let treasury_address = generate_market_treasury_address(&market_id);
             outputs.push(Output::new(
-                self.get_new_address()?,
-                OutputContent::Bitcoin(BitcoinOutputContent(change)),
+                treasury_address,
+                OutputContent::MarketFunds {
+                    market_id: market_id_bytes,
+                    amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
+                        base_sats,
+                    )),
+                    is_fee: false,
+                },
             ));
-        }
+
+            // Author fee output (MarketFunds with is_fee=true)
+            let fee_address = generate_market_author_fee_address(&market_id);
+            outputs.push(Output::new(
+                fee_address,
+                OutputContent::MarketFunds {
+                    market_id: market_id_bytes,
+                    amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
+                        fee_sats,
+                    )),
+                    is_fee: true,
+                },
+            ));
+
+            // Change output goes to trader address (same as where shares are credited)
+            // This ensures the address has Bitcoin for future sells
+            if change > bitcoin::Amount::ZERO {
+                outputs.push(Output::new(
+                    trader,
+                    OutputContent::Bitcoin(BitcoinOutputContent(change)),
+                ));
+            }
+
+            (inputs, outputs, trader)
+        } else {
+            // Sell: only need tx_fee, payout comes from treasury during block connection.
+            let (total_bitcoin, bitcoin_utxos) =
+                self.select_bitcoins_for_sell(tx_fee, trader)?;
+            let change = total_bitcoin - tx_fee;
+
+            // Sort UTXOs for deterministic ordering, but keep trader's UTXOs first
+            // to ensure validation sees ownership proof
+            let mut trader_utxos: Vec<_> = bitcoin_utxos
+                .iter()
+                .filter(|(_, o)| o.address == trader)
+                .map(|(op, o)| (*op, o.clone()))
+                .collect();
+            let mut other_utxos: Vec<_> = bitcoin_utxos
+                .iter()
+                .filter(|(_, o)| o.address != trader)
+                .map(|(op, o)| (*op, o.clone()))
+                .collect();
+            trader_utxos.sort_by_key(|(outpoint, _)| *outpoint);
+            other_utxos.sort_by_key(|(outpoint, _)| *outpoint);
+
+            // Combine with trader UTXOs first
+            let mut utxo_vec = trader_utxos;
+            utxo_vec.extend(other_utxos);
+
+            // Change goes back to trader address
+            let inputs: Vec<_> =
+                utxo_vec.into_iter().map(|(op, _)| op).collect();
+            let mut outputs = Vec::new();
+
+            // Only output is change (if any) - send to trader
+            if change > bitcoin::Amount::ZERO {
+                outputs.push(Output::new(
+                    trader,
+                    OutputContent::Bitcoin(BitcoinOutputContent(change)),
+                ));
+            }
+
+            (inputs, outputs, trader)
+        };
+
+        let _ = change_address; // Used for logging if needed
 
         let mut tx = Transaction::new(inputs, outputs);
-        let max_cost = base_cost_sats + trading_fee_sats;
-        tx.data = Some(TxData::BuyShares {
+        tx.data = Some(TxData::Trade {
             market_id: MarketId::new(market_id_bytes),
             outcome_index: outcome_index as u32,
-            shares_to_buy: shares_amount,
-            max_cost,
+            shares,
+            trader,
+            limit_sats,
+            base_sats,
+            fee_sats,
         });
 
         Ok(tx)
@@ -1385,6 +1525,7 @@ impl Wallet {
 
         // First input must be Votecoin UTXO to verify voting rights
         let (total_votecoin, votecoin_utxos) = self.select_votecoin_utxos(1)?;
+
         let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
         let change_bitcoin = total_bitcoin - fee;
 

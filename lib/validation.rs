@@ -1,4 +1,4 @@
-use crate::math::safe_math::{self, Rounding};
+use crate::math::trading::MIN_TRADING_FEE_SATS;
 use crate::state::Error;
 use crate::state::markets::MarketState::*;
 use crate::state::markets::{
@@ -168,7 +168,7 @@ impl SlotValidator {
         }
 
         for (slot_id_bytes, question) in &category_claim.slots {
-            if question.len() >= 1000 {
+            if question.len() > 1000 {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
                         "Question for slot {} exceeds 1000 bytes",
@@ -321,8 +321,6 @@ impl MarketValidator {
         tx: &FilledTransaction,
         _override_height: Option<u32>,
     ) -> Result<(), Error> {
-        use crate::state::markets::DimensionSpec;
-
         let market_data =
             tx.create_market()
                 .ok_or_else(|| Error::InvalidTransaction {
@@ -481,11 +479,11 @@ impl MarketValidator {
         );
         let expected_market_id_bytes = *expected_market_id.as_bytes();
 
-        // Check for MarketTreasury output with matching market_id
+        // Check for MarketFunds (treasury) output with matching market_id
         let treasury_output = tx.outputs().iter().find(|output| {
             matches!(
                 &output.content,
-                crate::types::OutputContent::MarketTreasury { market_id, .. }
+                crate::types::OutputContent::MarketFunds { market_id, is_fee: false, .. }
                     if market_id == &expected_market_id_bytes
             )
         });
@@ -493,7 +491,7 @@ impl MarketValidator {
         if treasury_output.is_none() {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "CreateMarket tx must have MarketTreasury output with market_id {}",
+                    "CreateMarket tx must have MarketFunds (treasury) output with market_id {}",
                     hex::encode(expected_market_id_bytes)
                 ),
             });
@@ -502,30 +500,7 @@ impl MarketValidator {
         Ok(())
     }
 
-    /// Validate share purchase transaction (buy_shares).
-    ///
-    /// Ensures all Bitcoin Hivemind requirements are met for buying shares:
-    /// 1. Market exists
-    /// 2. Market is in Trading state
-    /// 3. Outcome index is valid for market
-    /// 4. Shares to buy amount is positive
-    /// 5. Max cost is positive
-    /// 6. LMSR trade cost doesn't exceed max cost
-    /// 7. Trader is properly authorized
-    ///
-    /// # Arguments
-    /// * `state` - Blockchain state for validation queries
-    /// * `rotxn` - Read-only transaction
-    /// * `tx` - Filled transaction to validate
-    /// * `_override_height` - Optional height override for validation context
-    ///
-    /// # Returns
-    /// * `Ok(())` - Valid share purchase
-    /// * `Err(Error)` - Invalid trade with detailed reason
-    ///
-    /// # Specification Reference
-    /// Bitcoin Hivemind whitepaper sections on LMSR trading and market operations
-    pub fn validate_buy_shares(
+    pub fn validate_trade(
         state: &crate::state::State,
         rotxn: &RoTxn,
         tx: &FilledTransaction,
@@ -533,21 +508,22 @@ impl MarketValidator {
     ) -> Result<(), Error> {
         use crate::state::markets::MarketState;
 
-        let buy_data =
-            tx.buy_shares().ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a buy shares transaction".to_string(),
-            })?;
+        let trade = tx.trade().ok_or_else(|| Error::InvalidTransaction {
+            reason: "Not a trade transaction".to_string(),
+        })?;
 
+        let is_buy = trade.is_buy();
+        let shares_abs = trade.shares_abs();
+
+        // Market must exist
         let market = state
             .markets()
-            .get_market(rotxn, &buy_data.market_id)?
+            .get_market(rotxn, &trade.market_id)?
             .ok_or_else(|| Error::InvalidTransaction {
-                reason: format!(
-                    "Market {:?} does not exist",
-                    buy_data.market_id
-                ),
+                reason: format!("Market {:?} does not exist", trade.market_id),
             })?;
 
+        // Market must be in Trading state
         if market.state() != MarketState::Trading {
             return Err(Error::InvalidTransaction {
                 reason: format!(
@@ -557,145 +533,191 @@ impl MarketValidator {
             });
         }
 
-        if buy_data.outcome_index as usize >= market.shares().len() {
+        // Outcome index must be valid
+        if trade.outcome_index as usize >= market.shares().len() {
             return Err(Error::InvalidTransaction {
                 reason: format!(
                     "Outcome index {} out of range (market has {} outcomes)",
-                    buy_data.outcome_index,
+                    trade.outcome_index,
                     market.shares().len()
                 ),
             });
         }
 
-        if buy_data.shares_to_buy <= 0.0 {
+        // Shares must be non-zero
+        if trade.shares == 0.0 {
+            return Err(Error::InvalidTransaction {
+                reason: "Shares to trade must be non-zero".to_string(),
+            });
+        }
+
+        if is_buy && trade.limit_sats == 0 {
+            return Err(Error::InvalidTransaction {
+                reason: "Buy limit (max_cost) must be positive".to_string(),
+            });
+        }
+
+        // Trading fee must meet minimum (prevents 0-value fee UTXOs)
+        if trade.fee_sats < MIN_TRADING_FEE_SATS {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "Shares to buy must be positive, got {}",
-                    buy_data.shares_to_buy
+                    "Trading fee {} sats below minimum {} sats",
+                    trade.fee_sats, MIN_TRADING_FEE_SATS
                 ),
             });
         }
 
-        if buy_data.max_cost == 0 {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Max cost must be positive, got {}",
-                    buy_data.max_cost
-                ),
-            });
-        }
+        // Verify trader authorization (validates tx has inputs and spent_utxos)
+        let _tx_sender = Self::validate_market_maker_authorization(tx)?;
 
-        let mut new_shares = market.shares().clone();
-        new_shares[buy_data.outcome_index as usize] += buy_data.shares_to_buy;
+        if is_buy {
+            // Buy-specific validation
 
-        use crate::math::lmsr::LmsrService;
-        let trade_cost = LmsrService::calculate_update_cost(
-            market.shares(),
-            &new_shares,
-            market.b(),
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("LMSR trade cost calculation failed: {e:?}"),
-        })?;
+            // Slippage protection: embedded total cost must not exceed limit (max_cost)
+            let embedded_total = trade.base_sats + trade.fee_sats;
+            if embedded_total > trade.limit_sats {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Embedded cost {} sats (base: {}, fee: {}) exceeds max cost {} sats",
+                        embedded_total,
+                        trade.base_sats,
+                        trade.fee_sats,
+                        trade.limit_sats
+                    ),
+                });
+            }
 
-        if trade_cost > buy_data.max_cost as f64 {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Trade cost {:.4} exceeds max cost {}",
-                    trade_cost, buy_data.max_cost
-                ),
-            });
-        }
+            // Verify outputs match embedded costs (treasury + fee outputs required for buy)
+            let treasury_address =
+                generate_market_treasury_address(&trade.market_id);
+            let fee_address =
+                generate_market_author_fee_address(&trade.market_id);
+            let market_id_bytes = *trade.market_id.as_bytes();
 
-        let fee_amount = trade_cost * market.trading_fee();
-        let base_cost_sats = safe_math::to_sats(trade_cost, Rounding::Up)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Base cost conversion failed: {e}"),
-            })?;
-        let fee_sats =
-            safe_math::to_sats(fee_amount, Rounding::Up).map_err(|e| {
-                Error::InvalidTransaction {
-                    reason: format!("Fee conversion failed: {e}"),
+            let (treasury_output_amount, fee_output_amount) = tx
+                .filled_outputs()
+                .map(|outputs| {
+                    let treasury_amt = outputs
+                        .iter()
+                        .filter_map(|o| {
+                            if o.address == treasury_address {
+                                match &o.content {
+                                    FilledOutputContent::MarketFunds {
+                                        market_id,
+                                        amount,
+                                        is_fee: false,
+                                    } if *market_id == market_id_bytes => {
+                                        Some(amount.0.to_sat())
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .sum::<u64>();
+
+                    let fee_amt = outputs
+                        .iter()
+                        .filter_map(|o| {
+                            if o.address == fee_address {
+                                match &o.content {
+                                    FilledOutputContent::MarketFunds {
+                                        market_id,
+                                        amount,
+                                        is_fee: true,
+                                    } if *market_id == market_id_bytes => {
+                                        Some(amount.0.to_sat())
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .sum::<u64>();
+
+                    (treasury_amt, fee_amt)
+                })
+                .unwrap_or((0, 0));
+
+            if treasury_output_amount < trade.base_sats {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Trade tx missing treasury output: expected {} sats to {}, found {} sats",
+                        trade.base_sats,
+                        treasury_address,
+                        treasury_output_amount
+                    ),
+                });
+            }
+
+            if fee_output_amount < trade.fee_sats {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Trade tx missing fee output: expected {} sats to {}, found {} sats",
+                        trade.fee_sats, fee_address, fee_output_amount
+                    ),
+                });
+            }
+        } else {
+            // Sell-specific validation
+
+            // Verify at least one input is from trader address (proves ownership).
+            // The wallet may include inputs from other addresses to pay fees,
+            // but must include at least one from the trader who owns the shares.
+            let has_trader_input = tx
+                .spent_utxos
+                .iter()
+                .any(|utxo| utxo.address == trade.trader);
+            if !has_trader_input {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Sell transaction has no input from trader {} to prove ownership",
+                        trade.trader
+                    ),
+                });
+            }
+
+            let owned_shares = state
+                .markets()
+                .get_user_share_account(rotxn, &trade.trader)?
+                .and_then(|acc| {
+                    acc.positions
+                        .get(&(trade.market_id.clone(), trade.outcome_index))
+                        .copied()
+                })
+                .unwrap_or(0.0);
+
+            if owned_shares < shares_abs {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Insufficient shares: trying to sell {} but only own {} for outcome {}",
+                        shares_abs, owned_shares, trade.outcome_index
+                    ),
+                });
+            }
+
+            // Slippage protection: embedded net proceeds must meet limit (min_proceeds)
+            // Skip if limit_sats == 0 (no minimum proceeds requirement)
+            if trade.limit_sats > 0 {
+                let embedded_net_proceeds =
+                    trade.base_sats.saturating_sub(trade.fee_sats);
+                if embedded_net_proceeds < trade.limit_sats {
+                    return Err(Error::InvalidTransaction {
+                        reason: format!(
+                            "Embedded net proceeds {} sats below minimum {} sats (slippage protection)",
+                            embedded_net_proceeds, trade.limit_sats
+                        ),
+                    });
                 }
-            })?;
-
-        let treasury_address =
-            generate_market_treasury_address(&buy_data.market_id);
-        let fee_address =
-            generate_market_author_fee_address(&buy_data.market_id);
-        let market_id_bytes = *buy_data.market_id.as_bytes();
-
-        let (treasury_output_amount, fee_output_amount) = tx
-            .filled_outputs()
-            .map(|outputs| {
-                let treasury_amt = outputs
-                    .iter()
-                    .filter_map(|o| {
-                        if o.address == treasury_address {
-                            match &o.content {
-                                FilledOutputContent::MarketTreasury {
-                                    market_id,
-                                    amount,
-                                } if *market_id == market_id_bytes => {
-                                    Some(amount.0.to_sat())
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .sum::<u64>();
-
-                let fee_amt = outputs
-                    .iter()
-                    .filter_map(|o| {
-                        if o.address == fee_address {
-                            match &o.content {
-                                FilledOutputContent::MarketAuthorFee {
-                                    market_id,
-                                    amount,
-                                } if *market_id == market_id_bytes => {
-                                    Some(amount.0.to_sat())
-                                }
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .sum::<u64>();
-
-                (treasury_amt, fee_amt)
-            })
-            .unwrap_or((0, 0));
-
-        if treasury_output_amount < base_cost_sats {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "BuyShares tx missing treasury output: expected {base_cost_sats} sats to {treasury_address}, found {treasury_output_amount} sats"
-                ),
-            });
+            }
         }
-
-        if fee_output_amount < fee_sats {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "BuyShares tx missing fee output: expected {fee_sats} sats to {fee_address}, found {fee_output_amount} sats"
-                ),
-            });
-        }
-
-        let _trader_address = Self::validate_market_maker_authorization(tx)?;
 
         Ok(())
     }
 
     /// Validate batched market trades for atomic processing.
-    ///
-    /// Performs validation for a batch of market trades that will be applied atomically.
-    /// This is used during block application to ensure all trades in a block are valid
-    /// before applying any changes.
     ///
     /// # Arguments
     /// * `state` - Blockchain state for validation queries
@@ -705,9 +727,6 @@ impl MarketValidator {
     /// # Returns
     /// * `Ok(Vec<f64>)` - Vector of validated trade costs
     /// * `Err(Error)` - Invalid batch with detailed reason
-    ///
-    /// # Specification Reference
-    /// Bitcoin Hivemind whitepaper sections on atomic market operations
     pub fn validate_batched_trades(
         state: &crate::state::State,
         rotxn: &RoTxn,
@@ -718,7 +737,6 @@ impl MarketValidator {
         let mut trade_costs = Vec::with_capacity(batched_trades.len());
 
         for (trade_index, trade) in batched_trades.iter().enumerate() {
-            // Validate market exists
             let market = state
                 .markets()
                 .get_market(rotxn, &trade.market_id)
@@ -753,7 +771,8 @@ impl MarketValidator {
                 });
             }
 
-            let cost = trade.calculate_trade_cost().map_err(|e| {
+            // Use calculate_trade_cost_sats() which enforces MIN_TRADING_FEE_SATS
+            let buy_cost = trade.calculate_trade_cost_sats().map_err(|e| {
                 Error::InvalidTransaction {
                     reason: format!(
                         "Batch trade {trade_index}: Trade cost calculation failed: {e}"
@@ -761,6 +780,18 @@ impl MarketValidator {
                 }
             })?;
 
+            if buy_cost.trading_fee_sats < MIN_TRADING_FEE_SATS {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Batch trade {}: Trading fee {} sats below minimum {} sats",
+                        trade_index,
+                        buy_cost.trading_fee_sats,
+                        MIN_TRADING_FEE_SATS
+                    ),
+                });
+            }
+
+            let cost = buy_cost.total_cost_sats as f64;
             if cost > trade.max_cost as f64 {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
@@ -922,8 +953,7 @@ impl DFunctionValidator {
     ///
     /// # Arguments
     /// * `d_functions` - All D-functions for the market
-    /// * `dimension_specs` - Market dimension specifications
-    /// * `decision_slots` - Available decision slots
+    /// * `decision_slots_len` - Number of decision slots
     /// * `all_combos` - All possible outcome combinations
     ///
     /// # Returns
@@ -931,51 +961,24 @@ impl DFunctionValidator {
     /// * `Err(MarketError)` - Inconsistent dimensional constraints
     pub fn validate_dimensional_consistency(
         d_functions: &[DFunction],
-        dimension_specs: &[DimensionSpec],
-        decision_slots: &[SlotId],
+        decision_slots_len: usize,
         all_combos: &[Vec<usize>],
     ) -> Result<(), MarketError> {
         if d_functions.len() != all_combos.len() {
             return Err(MarketError::InvalidDimensions);
         }
 
-        for (df, combo) in d_functions.iter().zip(all_combos.iter()) {
-            Self::validate_constraint(df, decision_slots.len())?;
-
-            if !df.evaluate(combo)? {
-                return Err(MarketError::InvalidOutcomeCombination);
-            }
-
-            let mut slot_idx = 0;
-            for spec in dimension_specs {
-                match spec {
-                    DimensionSpec::Single(_) => {
-                        slot_idx += 1;
-                    }
-                    DimensionSpec::Categorical(slots) => {
-                        let categorical_indices: Vec<usize> =
-                            (slot_idx..slot_idx + slots.len()).collect();
-                        if !Self::validate_categorical_constraint(
-                            df,
-                            &categorical_indices,
-                            combo,
-                            decision_slots,
-                        )? {
-                            return Err(MarketError::InvalidOutcomeCombination);
-                        }
-                        slot_idx += slots.len();
-                    }
-                }
-            }
+        // Validate each D-function references valid decision indices
+        for df in d_functions {
+            Self::validate_constraint(df, decision_slots_len)?;
         }
 
+        // Key invariant: exactly one D-function satisfies each combo
         for combo in all_combos {
-            let mut satisfied_count = 0;
-            for df in d_functions {
-                if df.evaluate(combo)? {
-                    satisfied_count += 1;
-                }
-            }
+            let satisfied_count = d_functions
+                .iter()
+                .filter(|df| df.evaluate(combo).unwrap_or(false))
+                .count();
             if satisfied_count != 1 {
                 return Err(MarketError::InvalidOutcomeCombination);
             }
@@ -1167,42 +1170,40 @@ impl VoteValidator {
         Ok(decision)
     }
 
-    /// Validate vote value is appropriate for decision type.
+    /// Validate vote value is in valid normalized range.
     ///
-    /// Per Bitcoin Hivemind whitepaper section 3.3:
-    /// - Binary decisions: values in [0.0, 1.0] or NaN (abstain)
-    /// - Scalar decisions: values in [min, max] or NaN (abstain)
+    /// Vote values are stored internally as normalized 0-1 values:
+    /// - Binary decisions: 0.0 (No), 1.0 (Yes), 0.5 (Inconclusive), or any value in [0,1]
+    /// - Scaled decisions: 0.0-1.0 (normalized from user-facing min/max range)
+    /// - NaN represents abstention for both types
+    ///
+    /// The RPC layer normalizes user-facing values (e.g., $152,500 for BTC price
+    /// in range [10000, 200000] becomes 0.75) to internal 0-1 representation
+    /// before storage.
     ///
     /// # Arguments
     /// * `decision` - Decision to validate against
-    /// * `vote_value` - Vote value to validate
+    /// * `vote_value` - Normalized vote value to validate (0-1 range)
     ///
     /// # Returns
     /// * `Ok(())` - Vote value is valid for decision type
     /// * `Err(Error)` - Invalid vote value
     fn validate_vote_value(
-        decision: &crate::state::slots::Decision,
+        _decision: &crate::state::slots::Decision,
         vote_value: f64,
     ) -> Result<(), Error> {
-        if decision.is_scaled {
-            let min =
-                decision.min.expect("scaled decision must have min") as f64;
-            let max =
-                decision.max.expect("scaled decision must have max") as f64;
-            if !vote_value.is_nan() && (vote_value < min || vote_value > max) {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Vote value {vote_value} outside valid range [{min}, {max}]"
-                    ),
-                });
-            }
-        } else if !vote_value.is_nan() && !(0.0..=1.0).contains(&vote_value) {
+        // All vote values (binary and scaled) are stored normalized to 0-1 range
+        // - Binary: 0.0 (No), 1.0 (Yes), 0.5 (Inconclusive), or any value in between
+        // - Scaled: normalized from user-facing [min, max] to [0, 1]
+        // NaN is valid for abstaining
+        if !vote_value.is_nan() && !(0.0..=1.0).contains(&vote_value) {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "Binary decision vote must be between 0.0 and 1.0, or NaN (abstain), got {vote_value}"
+                    "Vote value {vote_value} outside valid normalized range [0.0, 1.0]"
                 ),
             });
         }
+
         Ok(())
     }
 
@@ -1318,26 +1319,12 @@ impl VoteValidator {
         let decision_id = SlotId::from_bytes(vote_data.slot_id_bytes)?;
         let decision = Self::validate_decision_slot(state, rotxn, decision_id)?;
 
-        let slot_claim_period = decision_id.period_index();
-        let expected_voting_period = decision_id.voting_period();
-
-        if vote_data.voting_period != expected_voting_period {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Vote period mismatch: slot {} was claimed in period {} and must be voted on in period {}, but transaction specifies period {}",
-                    hex::encode(vote_data.slot_id_bytes),
-                    slot_claim_period,
-                    expected_voting_period,
-                    vote_data.voting_period
-                ),
-            });
-        }
-
         Self::validate_vote_value(&decision, vote_data.vote_value)?;
 
         Self::validate_voting_period(state, rotxn, decision_id)?;
 
-        let period_id = VotingPeriodId::new(vote_data.voting_period);
+        // Voting period is deterministically derived from slot: voting_period = period_index + 1
+        let period_id = VotingPeriodId::new(decision_id.voting_period());
         Self::validate_no_duplicate_vote(
             state,
             rotxn,
@@ -1388,26 +1375,11 @@ impl VoteValidator {
         let _votecoin_balance =
             Self::validate_voter_eligibility(state, rotxn, &voter_address)?;
 
-        let period_id = VotingPeriodId::new(batch_data.voting_period);
-
         for (idx, vote_item) in batch_data.votes.iter().enumerate() {
             let decision_id = SlotId::from_bytes(vote_item.slot_id_bytes)?;
 
-            let slot_claim_period = decision_id.period_index();
-            let expected_voting_period = decision_id.voting_period();
-
-            if batch_data.voting_period != expected_voting_period {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Vote batch item {}: period mismatch - slot {} was claimed in period {} and must be voted on in period {}, but batch specifies period {}",
-                        idx,
-                        hex::encode(vote_item.slot_id_bytes),
-                        slot_claim_period,
-                        expected_voting_period,
-                        batch_data.voting_period
-                    ),
-                });
-            }
+            // Voting period is deterministically derived from slot: voting_period = period_index + 1
+            let period_id = VotingPeriodId::new(decision_id.voting_period());
 
             let decision =
                 Self::validate_decision_slot(state, rotxn, decision_id)

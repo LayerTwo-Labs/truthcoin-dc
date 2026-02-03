@@ -709,13 +709,13 @@ impl State {
         )
     }
 
-    pub fn validate_buy_shares(
+    pub fn validate_trade(
         &self,
         rotxn: &RoTxn,
         tx: &FilledTransaction,
         override_height: Option<u32>,
     ) -> Result<(), Error> {
-        MarketValidator::validate_buy_shares(self, rotxn, tx, override_height)
+        MarketValidator::validate_trade(self, rotxn, tx, override_height)
     }
 
     pub fn validate_filled_transaction(
@@ -740,13 +740,8 @@ impl State {
             self.validate_market_creation(rotxn, tx, override_height)?;
         }
 
-        if tx
-            .transaction
-            .data
-            .as_ref()
-            .is_some_and(|data| data.is_buy_shares())
-        {
-            self.validate_buy_shares(rotxn, tx, override_height)?;
+        if tx.is_trade() {
+            self.validate_trade(rotxn, tx, override_height)?;
         }
 
         if tx.is_submit_vote() {

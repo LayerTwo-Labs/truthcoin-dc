@@ -69,15 +69,12 @@ pub enum OutPoint {
         #[borsh(serialize_with = "borsh_serialize_bitcoin_outpoint")]
         bitcoin::OutPoint,
     ),
-    // Market treasury UTXO - tracks the single source of truth for market funds
-    Market {
+    /// Market funds UTXO - treasury (is_fee=false) or author fees (is_fee=true)
+    /// Unified type that replaces the separate Market and MarketAuthorFee variants
+    MarketFunds {
         market_id: [u8; 6],
         block_height: u32,
-    },
-    // Market author fee UTXO - accumulates trading fees for the market creator
-    MarketAuthorFee {
-        market_id: [u8; 6],
-        block_height: u32,
+        is_fee: bool,
     },
 }
 
@@ -91,19 +88,16 @@ impl std::fmt::Display for OutPoint {
             Self::Deposit(bitcoin::OutPoint { txid, vout }) => {
                 write!(f, "deposit {txid} {vout}")
             }
-            Self::Market {
+            Self::MarketFunds {
                 market_id,
                 block_height,
+                is_fee,
             } => {
-                write!(f, "market {} {}", hex::encode(market_id), block_height)
-            }
-            Self::MarketAuthorFee {
-                market_id,
-                block_height,
-            } => {
+                let type_str = if *is_fee { "market_fee" } else { "market" };
                 write!(
                     f,
-                    "market_author_fee {} {}",
+                    "{} {} {}",
+                    type_str,
                     hex::encode(market_id),
                     block_height
                 )
@@ -198,16 +192,23 @@ pub enum TransactionData {
         /// e.g., ["Bengals"] for AFC North when explicit slots are Steelers/Ravens/Browns
         residual_names: Option<Vec<String>>,
     },
-    /// Buy shares in a prediction market by spending Bitcoin on L2
-    BuyShares {
+    /// Trade shares in a prediction market (buy or sell)
+    /// Sign of shares determines direction: positive = buy, negative = sell
+    Trade {
         /// Market ID standardized across all transaction types per Bitcoin Hivemind specifications
         market_id: MarketId,
-        /// Outcome index to buy shares for
+        /// Outcome index to trade shares for
         outcome_index: u32,
-        /// Number of shares to buy
-        shares_to_buy: f64,
-        /// Maximum cost willing to pay (in satoshis)
-        max_cost: u64,
+        /// Number of shares to trade (positive = buy, negative = sell)
+        shares: f64,
+        /// Trader address (required for sell ownership validation)
+        trader: Address,
+        /// Slippage limit: max_cost for buy, min_proceeds for sell (in satoshis)
+        limit_sats: u64,
+        /// Pre-computed LMSR base cost/proceeds (absolute, satoshis) - used as state fingerprint
+        base_sats: u64,
+        /// Pre-computed trading fee (absolute, satoshis)
+        fee_sats: u64,
     },
     /// Submit a vote for a decision in the current voting period
     SubmitVote {
@@ -254,9 +255,9 @@ impl TxData {
         matches!(self, Self::CreateMarket { .. })
     }
 
-    /// `true` if the tx data corresponds to buying shares
-    pub fn is_buy_shares(&self) -> bool {
-        matches!(self, Self::BuyShares { .. })
+    /// `true` if the tx data corresponds to trading shares (buy or sell)
+    pub fn is_trade(&self) -> bool {
+        matches!(self, Self::Trade { .. })
     }
 
     /// `true` if the tx data corresponds to submitting a vote
@@ -318,17 +319,41 @@ pub struct CreateMarket {
     pub residual_names: Option<Vec<String>>,
 }
 
-/// Struct describing a share buy operation
+/// Struct describing a trade operation (buy or sell shares)
+/// Sign of shares determines direction: positive = buy, negative = sell
 #[derive(Clone, Debug, PartialEq)]
-pub struct BuyShares {
+pub struct Trade {
     /// Market ID standardized across all transaction types per Bitcoin Hivemind specifications
     pub market_id: MarketId,
-    /// Outcome index to buy shares for
+    /// Outcome index to trade shares for
     pub outcome_index: u32,
-    /// Number of shares to buy
-    pub shares_to_buy: f64,
-    /// Maximum cost willing to pay (in satoshis)
-    pub max_cost: u64,
+    /// Number of shares to trade (positive = buy, negative = sell)
+    pub shares: f64,
+    /// Trader address (required for sell ownership validation)
+    pub trader: Address,
+    /// Slippage limit: max_cost for buy, min_proceeds for sell (in satoshis)
+    pub limit_sats: u64,
+    /// Pre-computed LMSR base cost/proceeds (absolute, satoshis) - acts as state fingerprint
+    pub base_sats: u64,
+    /// Pre-computed trading fee (absolute, satoshis)
+    pub fee_sats: u64,
+}
+
+impl Trade {
+    /// Returns true if this is a buy trade (positive shares)
+    pub fn is_buy(&self) -> bool {
+        self.shares > 0.0
+    }
+
+    /// Returns true if this is a sell trade (negative shares)
+    pub fn is_sell(&self) -> bool {
+        self.shares < 0.0
+    }
+
+    /// Returns the absolute number of shares being traded
+    pub fn shares_abs(&self) -> f64 {
+        self.shares.abs()
+    }
 }
 
 /// Struct describing a vote submission
@@ -540,21 +565,35 @@ impl FilledTransaction {
         }
     }
 
-    /// If the tx is a share buy, returns the corresponding [`BuyShares`].
-    pub fn buy_shares(&self) -> Option<BuyShares> {
+    /// If the tx is a trade, returns the corresponding [`Trade`].
+    pub fn trade(&self) -> Option<Trade> {
         match &self.transaction.data {
-            Some(TransactionData::BuyShares {
+            Some(TransactionData::Trade {
                 market_id,
                 outcome_index,
-                shares_to_buy,
-                max_cost,
-            }) => Some(BuyShares {
+                shares,
+                trader,
+                limit_sats,
+                base_sats,
+                fee_sats,
+            }) => Some(Trade {
                 market_id: market_id.clone(),
                 outcome_index: *outcome_index,
-                shares_to_buy: *shares_to_buy,
-                max_cost: *max_cost,
+                shares: *shares,
+                trader: *trader,
+                limit_sats: *limit_sats,
+                base_sats: *base_sats,
+                fee_sats: *fee_sats,
             }),
             _ => None,
+        }
+    }
+
+    /// `true` if the tx data corresponds to trading shares (buy or sell)
+    pub fn is_trade(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_trade(),
+            None => false,
         }
     }
 
@@ -787,26 +826,20 @@ impl FilledTransaction {
                     OutputContent::Withdrawal(withdrawal) => {
                         FilledOutputContent::BitcoinWithdrawal(withdrawal)
                     }
-                    OutputContent::MarketTreasury { market_id, amount } => {
+                    OutputContent::MarketFunds {
+                        market_id,
+                        amount,
+                        is_fee,
+                    } => {
                         let new_max =
                             output_bitcoin_max_value.checked_sub(amount.0);
                         new_max?;
 
                         output_bitcoin_max_value = new_max.unwrap();
-                        FilledOutputContent::MarketTreasury {
+                        FilledOutputContent::MarketFunds {
                             market_id,
                             amount,
-                        }
-                    }
-                    OutputContent::MarketAuthorFee { market_id, amount } => {
-                        let new_max =
-                            output_bitcoin_max_value.checked_sub(amount.0);
-                        new_max?;
-
-                        output_bitcoin_max_value = new_max.unwrap();
-                        FilledOutputContent::MarketAuthorFee {
-                            market_id,
-                            amount,
+                            is_fee,
                         }
                     }
                 };
