@@ -133,9 +133,19 @@ impl BasisPoints {
         Self::new((rate * 10000.0).round() as u32)
     }
 
+    /// Apply basis points to amount using floor division (rounds down).
+    /// Use for payouts where we want to be conservative.
     #[inline]
     pub fn apply_to_u64(&self, amount: u64) -> u64 {
         ((amount as u128 * self.0 as u128) / 10000) as u64
+    }
+
+    /// Apply basis points to amount using ceiling division (rounds up).
+    /// Use for fees where we want to favor the recipient.
+    #[inline]
+    pub fn apply_to_u64_ceil(&self, amount: u64) -> u64 {
+        let numerator = amount as u128 * self.0 as u128;
+        numerator.div_ceil(10000) as u64
     }
 
     #[inline]
