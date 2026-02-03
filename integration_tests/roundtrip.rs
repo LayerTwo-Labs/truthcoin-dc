@@ -3377,6 +3377,9 @@ async fn roundtrip_task(
         "Sell should have positive proceeds"
     );
 
+    // Wait for P2P propagation before mining
+    sleep(std::time::Duration::from_secs(2)).await;
+
     truthcoin_nodes
         .issuer
         .bmm_single(&mut enforcer_post_setup)
