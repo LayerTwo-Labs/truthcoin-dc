@@ -1,3 +1,4 @@
+use crate::math::allocation;
 use crate::math::safe_math::{self, BasisPoints, Rounding};
 use crate::math::voting::constants::round_reputation;
 use crate::state::{
@@ -213,104 +214,26 @@ fn calculate_votecoin_deltas(
         return Ok(deltas);
     }
 
-    // Calculate winner allocations using round-to-nearest for fairness
-    let mut total_assigned_gain = 0i64;
-    let mut winner_deltas: Vec<(Address, i64)> = Vec::new();
+    let winner_alloc = allocation::allocate_proportionally_i64(
+        winners,
+        amount_to_redistribute,
+    )
+    .map_err(|e| Error::InvalidTransaction {
+        reason: format!("Winner allocation failed: {e:?}"),
+    })?;
 
-    for (address, rep_gain) in &winners {
-        let proportion = rep_gain / total_win;
-        let gain = safe_math::to_sats_signed(
-            proportion * amount_to_redistribute as f64,
-            Rounding::Nearest,
-        )
-        .unwrap_or_else(|e| {
-            warn!(
-                "Winner gain calculation failed for {}: {}",
-                address.as_base58(),
-                e
-            );
-            0
-        });
-        winner_deltas.push((*address, gain));
-        total_assigned_gain += gain;
-    }
+    let loser_alloc = allocation::allocate_proportionally_i64(
+        losers,
+        -amount_to_redistribute,
+    )
+    .map_err(|e| Error::InvalidTransaction {
+        reason: format!("Loser allocation failed: {e:?}"),
+    })?;
 
-    // Calculate loser allocations using round-to-nearest for fairness
-    let mut total_assigned_loss = 0i64;
-    let mut loser_deltas: Vec<(Address, i64)> = Vec::new();
-
-    for (address, rep_loss) in &losers {
-        let proportion = rep_loss / total_loss;
-        let loss = safe_math::to_sats_signed(
-            proportion * amount_to_redistribute as f64,
-            Rounding::Nearest,
-        )
-        .unwrap_or_else(|e| {
-            warn!(
-                "Loser loss calculation failed for {}: {}",
-                address.as_base58(),
-                e
-            );
-            0
-        });
-        loser_deltas.push((*address, -loss));
-        total_assigned_loss += loss;
-    }
-
-    // Adjust for rounding: round-to-nearest may over or under distribute
-    // Under: remainder to largest winner (who lost most to rounding)
-    // Over: subtract from smallest winner
-    if !winner_deltas.is_empty() {
-        if total_assigned_gain < amount_to_redistribute {
-            let remainder = amount_to_redistribute - total_assigned_gain;
-            let largest_idx = winner_deltas
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, (_, g))| *g)
-                .map(|(idx, _)| idx)
-                .unwrap();
-            winner_deltas[largest_idx].1 += remainder;
-        } else if total_assigned_gain > amount_to_redistribute {
-            let excess = total_assigned_gain - amount_to_redistribute;
-            let smallest_idx = winner_deltas
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, (_, g))| *g)
-                .map(|(idx, _)| idx)
-                .unwrap();
-            winner_deltas[smallest_idx].1 -= excess;
-        }
-    }
-
-    // Same adjustment for losers
-    // Under: remainder subtracted from largest loser (most negative)
-    // Over: add back to smallest loser (least negative)
-    if !loser_deltas.is_empty() {
-        if total_assigned_loss < amount_to_redistribute {
-            let remainder = amount_to_redistribute - total_assigned_loss;
-            let largest_idx = loser_deltas
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, (_, l))| *l) // Most negative = largest loss
-                .map(|(idx, _)| idx)
-                .unwrap();
-            loser_deltas[largest_idx].1 -= remainder as i64;
-        } else if total_assigned_loss > amount_to_redistribute {
-            let excess = total_assigned_loss - amount_to_redistribute;
-            let smallest_idx = loser_deltas
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, (_, l))| *l) // Least negative = smallest loss
-                .map(|(idx, _)| idx)
-                .unwrap();
-            loser_deltas[smallest_idx].1 += excess as i64;
-        }
-    }
-
-    for (address, delta) in winner_deltas {
+    for (address, delta) in winner_alloc.allocations {
         deltas.insert(address, delta);
     }
-    for (address, delta) in loser_deltas {
+    for (address, delta) in loser_alloc.allocations {
         deltas.insert(address, delta);
     }
     for &address in reputation_changes.keys() {
@@ -436,62 +359,28 @@ fn adjust_deltas_for_insufficient_balances(
             if total_winnings > 0 {
                 let deficit_i64 = total_deficit as i64;
 
-                let mut total_reduced = 0i64;
-                let mut reductions: Vec<(Address, i64, i64)> = Vec::new();
+                let participants: Vec<((Address, i64), f64)> = winners
+                    .iter()
+                    .map(|(addr, gain)| ((*addr, *gain), *gain as f64))
+                    .collect();
 
-                for (address, original_gain) in &winners {
-                    let proportion =
-                        *original_gain as f64 / total_winnings as f64;
-                    let reduction = safe_math::to_sats_signed(
-                        deficit_i64 as f64 * proportion,
-                        Rounding::Nearest,
+                if let Ok(alloc_result) =
+                    allocation::allocate_proportionally_i64(
+                        participants,
+                        deficit_i64,
                     )
-                    .unwrap_or_else(|e| {
-                        warn!(
-                            "Deficit reduction calculation failed for {}: {}",
-                            address.as_base58(),
-                            e
+                {
+                    for ((address, original_gain), reduction) in
+                        alloc_result.allocations
+                    {
+                        let new_gain = original_gain - reduction;
+                        votecoin_deltas.insert(address, new_gain);
+
+                        debug!(
+                            "Reduced winner {} gain from {} to {} to cover deficit",
+                            address, original_gain, new_gain
                         );
-                        0
-                    });
-                    reductions.push((*address, *original_gain, reduction));
-                    total_reduced += reduction;
-                }
-
-                // Adjust for rounding
-                // Under: largest winner absorbs remainder
-                // Over: smallest winner gets reduction decreased
-                if total_reduced < deficit_i64 {
-                    let remainder = deficit_i64 - total_reduced;
-                    if let Some(largest_idx) = reductions
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, (_, g, _))| *g)
-                        .map(|(idx, _)| idx)
-                    {
-                        reductions[largest_idx].2 += remainder;
                     }
-                } else if total_reduced > deficit_i64 {
-                    let excess = total_reduced - deficit_i64;
-                    if let Some(smallest_idx) = reductions
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, (_, g, _))| *g)
-                        .map(|(idx, _)| idx)
-                    {
-                        reductions[smallest_idx].2 -= excess;
-                    }
-                }
-
-                // Apply reductions
-                for (address, original_gain, reduction) in reductions {
-                    let new_gain = original_gain - reduction;
-                    votecoin_deltas.insert(address, new_gain);
-
-                    debug!(
-                        "Reduced winner {} gain from {} to {} to cover deficit",
-                        address, original_gain, new_gain
-                    );
                 }
             }
         }

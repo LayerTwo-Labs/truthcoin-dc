@@ -52,7 +52,9 @@ pub fn get_decision_slots_for_period(
     let voting_period = voting_period_id.as_u32();
 
     if voting_period == 0 {
-        return Ok(Vec::new());
+        return Err(Error::InvalidTransaction {
+            reason: "Voting period 0 does not exist".to_string(),
+        });
     }
 
     let claim_period = voting_period - 1;
