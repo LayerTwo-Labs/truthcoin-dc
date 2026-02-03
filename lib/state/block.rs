@@ -2066,18 +2066,14 @@ mod tests {
         let shares_to_sell = 50.0;
         assert!(
             effective_owned < shares_to_sell,
-            "Double-spend protection: should reject sell of {} when only {} effectively owned",
-            shares_to_sell,
-            effective_owned
+            "Double-spend protection: should reject sell of {shares_to_sell} when only {effective_owned} effectively owned"
         );
 
         // But selling 40 or less should be allowed
         let valid_sell = 40.0;
         assert!(
             effective_owned >= valid_sell,
-            "Should allow selling {} when {} effectively owned",
-            valid_sell,
-            effective_owned
+            "Should allow selling {valid_sell} when {effective_owned} effectively owned"
         );
     }
 
@@ -2117,8 +2113,7 @@ mod tests {
         let shares_to_sell = 50.0;
         assert!(
             effective_owned >= shares_to_sell,
-            "Should allow selling {} after buying 100 in same block",
-            shares_to_sell
+            "Should allow selling {shares_to_sell} after buying 100 in same block"
         );
     }
 
@@ -2212,9 +2207,7 @@ mod tests {
         let third_sell = 40.0;
         assert!(
             effective_owned < third_sell,
-            "Should reject third sell: {} > {} effective",
-            third_sell,
-            effective_owned
+            "Should reject third sell: {third_sell} > {effective_owned} effective"
         );
 
         // But selling 30 should work

@@ -2059,9 +2059,7 @@ async fn roundtrip_task(
         (&truthcoin_nodes.voter_6, voter_addr_6),
     ];
 
-    for (_voter_idx, (voter_node, _voter_addr)) in
-        voters_list.iter().enumerate()
-    {
+    for (voter_node, _voter_addr) in voters_list.iter() {
         let wallet_utxos = voter_node.rpc_client.get_wallet_utxos().await?;
         let balance: u32 = wallet_utxos
             .iter()
@@ -2098,7 +2096,7 @@ async fn roundtrip_task(
         &mut truthcoin_nodes.voter_6,
     ];
 
-    for (_i, voter) in voter_nodes_mut.into_iter().enumerate() {
+    for voter in voter_nodes_mut.into_iter() {
         for _ in 0..UTXOS_PER_NODE {
             let deposit_address = voter.get_deposit_address().await?;
             deposit(
@@ -2433,7 +2431,7 @@ async fn roundtrip_task(
     truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
 
     // Collect slot IDs for market creation
-    let scaled_slot_0 = format!("{:06x}", (test_period << 14) | 0);
+    let scaled_slot_0 = format!("{:06x}", test_period << 14);
     let scaled_slot_1 = format!("{:06x}", (test_period << 14) | 1);
     let cat_slot_10 = format!("{:06x}", (test_period << 14) | 10);
     let cat_slot_11 = format!("{:06x}", (test_period << 14) | 11);
@@ -2473,7 +2471,7 @@ async fn roundtrip_task(
         .market_create(CreateMarketRequest {
             title: "BTC Price Prediction Market".to_string(),
             description: "Market based on BTC price prediction".to_string(),
-            dimensions: format!("[{}]", scaled_slot_0),
+            dimensions: format!("[{scaled_slot_0}]"),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
             tags: Some(vec!["scaled".to_string(), "phase2".to_string()]),
@@ -2493,8 +2491,7 @@ async fn roundtrip_task(
             description: "Who will win the 2028 presidential election?"
                 .to_string(),
             dimensions: format!(
-                "[[{},{},{}]]",
-                cat_slot_10, cat_slot_11, cat_slot_12
+                "[[{cat_slot_10},{cat_slot_11},{cat_slot_12}]]"
             ),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
@@ -2516,8 +2513,7 @@ async fn roundtrip_task(
                 "Which chain will have the highest TVL at end of 2025?"
                     .to_string(),
             dimensions: format!(
-                "[[{},{},{},{}]]",
-                cat_slot_20, cat_slot_21, cat_slot_22, cat_slot_23
+                "[[{cat_slot_20},{cat_slot_21},{cat_slot_22},{cat_slot_23}]]"
             ),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
@@ -2537,7 +2533,7 @@ async fn roundtrip_task(
             title: "Inflation & Fed Policy".to_string(),
             description: "Combined market on inflation and Fed rate decisions"
                 .to_string(),
-            dimensions: format!("[{},{}]", bin_slot_30, bin_slot_31),
+            dimensions: format!("[{bin_slot_30},{bin_slot_31}]"),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
             tags: Some(vec!["binary".to_string(), "macro".to_string()]),
@@ -2557,10 +2553,7 @@ async fn roundtrip_task(
             description:
                 "Combined market on inflation, Fed policy, and unemployment"
                     .to_string(),
-            dimensions: format!(
-                "[{},{},{}]",
-                bin_slot_30, bin_slot_31, bin_slot_32
-            ),
+            dimensions: format!("[{bin_slot_30},{bin_slot_31},{bin_slot_32}]"),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
             tags: Some(vec!["binary".to_string(), "macro".to_string()]),
@@ -2578,17 +2571,7 @@ async fn roundtrip_task(
         .market_create(CreateMarketRequest {
             title: "2025 Macro Indicators Full".to_string(),
             description: "8-way binary market on macro indicators".to_string(),
-            dimensions: format!(
-                "[{},{},{},{},{},{},{},{}]",
-                bin_slot_30,
-                bin_slot_31,
-                bin_slot_32,
-                bin_slot_33,
-                bin_slot_34,
-                bin_slot_35,
-                bin_slot_36,
-                bin_slot_37
-            ),
+            dimensions: format!("[{bin_slot_30},{bin_slot_31},{bin_slot_32},{bin_slot_33},{bin_slot_34},{bin_slot_35},{bin_slot_36},{bin_slot_37}]"),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
             tags: Some(vec!["binary".to_string(), "stress-test".to_string()]),
@@ -2607,7 +2590,7 @@ async fn roundtrip_task(
             title: "BTC Price vs Inflation".to_string(),
             description: "Combined scaled (BTC) and binary (inflation) market"
                 .to_string(),
-            dimensions: format!("[{},{}]", scaled_slot_0, bin_slot_30),
+            dimensions: format!("[{scaled_slot_0},{bin_slot_30}]"),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
             tags: Some(vec!["mixed".to_string(), "scaled-binary".to_string()]),
@@ -2628,8 +2611,7 @@ async fn roundtrip_task(
                 "Combined scaled (BTC) and categorical (election) market"
                     .to_string(),
             dimensions: format!(
-                "[{},[{},{},{}]]",
-                scaled_slot_0, cat_slot_10, cat_slot_11, cat_slot_12
+                "[{scaled_slot_0},[{cat_slot_10},{cat_slot_11},{cat_slot_12}]]"
             ),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
@@ -2651,7 +2633,7 @@ async fn roundtrip_task(
         .market_create(CreateMarketRequest {
             title: "BTC Price vs ETH/BTC Ratio".to_string(),
             description: "Combined two-scaled market".to_string(),
-            dimensions: format!("[{},{}]", scaled_slot_0, scaled_slot_1),
+            dimensions: format!("[{scaled_slot_0},{scaled_slot_1}]"),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
             tags: Some(vec!["mixed".to_string(), "scaled-scaled".to_string()]),
@@ -2670,15 +2652,7 @@ async fn roundtrip_task(
             title: "Ultimate Macro Predictor".to_string(),
             description: "Combined scaled, binary, and categorical market"
                 .to_string(),
-            dimensions: format!(
-                "[{},{},{},[{},{},{}]]",
-                scaled_slot_0,
-                bin_slot_30,
-                bin_slot_31,
-                cat_slot_10,
-                cat_slot_11,
-                cat_slot_12
-            ),
+            dimensions: format!("[{scaled_slot_0},{bin_slot_30},{bin_slot_31},[{cat_slot_10},{cat_slot_11},{cat_slot_12}]]"),
             beta: Some(expected_costs::BETA),
             trading_fee: Some(0.005),
             tags: Some(vec!["mixed".to_string(), "ultimate".to_string()]),
@@ -2715,7 +2689,7 @@ async fn roundtrip_task(
     // Verify markets created correctly
     let phase2_markets =
         truthcoin_nodes.issuer.rpc_client.market_list().await?;
-    let phase2_market_ids = vec![
+    let phase2_market_ids = [
         &market_a_id,
         &market_b_id,
         &market_c_id,
@@ -2933,13 +2907,13 @@ async fn roundtrip_task(
         let positions = truthcoin_nodes
             .voter_3
             .rpc_client
-            .market_positions(addr.clone(), Some(market_a_id.clone()))
+            .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
             if pos.outcome_index == 0 && pos.shares > 0.0 {
                 voter_3_shares_outcome_0 += pos.shares;
                 if voter_3_seller_address.is_none() {
-                    voter_3_seller_address = Some(addr.clone());
+                    voter_3_seller_address = Some(*addr);
                 }
             }
         }
@@ -2961,7 +2935,7 @@ async fn roundtrip_task(
         let positions = truthcoin_nodes
             .voter_4
             .rpc_client
-            .market_positions(addr.clone(), Some(market_a_id.clone()))
+            .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
             if pos.outcome_index == 1 && pos.shares > 0.0 {
@@ -2985,7 +2959,7 @@ async fn roundtrip_task(
             market_id: market_a_id.clone(),
             outcome_index: 0,
             shares_amount: shares_to_sell,
-            seller_address: voter_3_seller_address.clone(),
+            seller_address: voter_3_seller_address,
             min_proceeds: Some(0), // No slippage protection for test
             fee_sats: Some(1000),
             dry_run: None,
@@ -3038,7 +3012,7 @@ async fn roundtrip_task(
         let positions = truthcoin_nodes
             .voter_3
             .rpc_client
-            .market_positions(addr.clone(), Some(market_a_id.clone()))
+            .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
             if pos.outcome_index == 0 {
@@ -3083,13 +3057,13 @@ async fn roundtrip_task(
         let positions = truthcoin_nodes
             .voter_1
             .rpc_client
-            .market_positions(addr.clone(), Some(market_b_id.clone()))
+            .market_positions(*addr, Some(market_b_id.clone()))
             .await?;
         for pos in &positions.positions {
             if pos.outcome_index == 0 && pos.shares > 0.0 {
                 voter_1_market_b_shares += pos.shares;
                 if voter_1_market_b_seller.is_none() {
-                    voter_1_market_b_seller = Some(addr.clone());
+                    voter_1_market_b_seller = Some(*addr);
                 }
             }
         }
@@ -3213,13 +3187,13 @@ async fn roundtrip_task(
         let positions = truthcoin_nodes
             .voter_4
             .rpc_client
-            .market_positions(addr.clone(), Some(market_a_id.clone()))
+            .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
             if pos.outcome_index == 0 && pos.shares > 0.0 {
                 voter_4_pre_sell += pos.shares;
                 if voter_4_test5_seller.is_none() {
-                    voter_4_test5_seller = Some(addr.clone());
+                    voter_4_test5_seller = Some(*addr);
                 }
             }
         }
@@ -3235,7 +3209,7 @@ async fn roundtrip_task(
             market_id: market_a_id.clone(),
             outcome_index: 0,
             shares_amount: voter_4_sell_amt,
-            seller_address: voter_4_test5_seller.clone(),
+            seller_address: voter_4_test5_seller,
             min_proceeds: Some(0),
             fee_sats: Some(1000),
             dry_run: None,
@@ -3270,7 +3244,7 @@ async fn roundtrip_task(
         let positions = truthcoin_nodes
             .voter_4
             .rpc_client
-            .market_positions(addr.clone(), Some(market_a_id.clone()))
+            .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
             if pos.outcome_index == 0 {
@@ -3294,7 +3268,7 @@ async fn roundtrip_task(
             market_id: market_a_id.clone(),
             outcome_index: 0,
             shares_amount: 10000.0,
-            seller_address: voter_3_seller_address.clone(),
+            seller_address: voter_3_seller_address,
             min_proceeds: Some(0),
             fee_sats: Some(1000),
             dry_run: Some(true),
@@ -3362,11 +3336,11 @@ async fn roundtrip_task(
         let positions = truthcoin_nodes
             .voter_6
             .rpc_client
-            .market_positions(addr.clone(), Some(market_a_id.clone()))
+            .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
             if pos.outcome_index == 1 && pos.shares > 0.0 {
-                seller_address = Some(addr.clone());
+                seller_address = Some(*addr);
                 shares_at_address = pos.shares;
                 break;
             }
@@ -3390,7 +3364,7 @@ async fn roundtrip_task(
             market_id: market_a_id.clone(),
             outcome_index: 1,
             shares_amount: sell_amount,
-            seller_address: seller_address.clone(),
+            seller_address,
             min_proceeds: Some(0),
             fee_sats: Some(1000),
             dry_run: None,
@@ -3428,7 +3402,7 @@ async fn roundtrip_task(
     let post_positions = truthcoin_nodes
         .voter_6
         .rpc_client
-        .market_positions(seller_address.clone(), Some(market_a_id.clone()))
+        .market_positions(seller_address, Some(market_a_id.clone()))
         .await?;
     let voter_6_post_sell = post_positions
         .positions
@@ -3691,13 +3665,13 @@ async fn roundtrip_task(
         let positions = truthcoin_nodes
             .voter_0
             .rpc_client
-            .market_positions(addr.clone(), Some(market_c_id.clone()))
+            .market_positions(*addr, Some(market_c_id.clone()))
             .await?;
         for pos in &positions.positions {
             if pos.outcome_index == 0 {
                 voter_0_shares_block1 += pos.shares;
                 if voter_0_seller_address.is_none() && pos.shares > 0.0 {
-                    voter_0_seller_address = Some(addr.clone());
+                    voter_0_seller_address = Some(*addr);
                 }
             }
         }
@@ -3711,13 +3685,13 @@ async fn roundtrip_task(
         let positions = truthcoin_nodes
             .voter_1
             .rpc_client
-            .market_positions(addr.clone(), Some(market_c_id.clone()))
+            .market_positions(*addr, Some(market_c_id.clone()))
             .await?;
         for pos in &positions.positions {
             if pos.outcome_index == 0 {
                 voter_1_shares_block1 += pos.shares;
                 if voter_1_seller_address.is_none() && pos.shares > 0.0 {
-                    voter_1_seller_address = Some(addr.clone());
+                    voter_1_seller_address = Some(*addr);
                 }
             }
         }
@@ -3751,7 +3725,7 @@ async fn roundtrip_task(
                 market_id: market_c_id.clone(),
                 outcome_index: 0,
                 shares_amount: 50000.0,
-                seller_address: voter_0_addr.clone(),
+                seller_address: voter_0_addr,
                 min_proceeds: Some(0), // No limit for dry run
                 fee_sats: Some(1000),
                 dry_run: Some(true),
@@ -3767,7 +3741,7 @@ async fn roundtrip_task(
                 market_id: market_c_id.clone(),
                 outcome_index: 0,
                 shares_amount: 50000.0,
-                seller_address: voter_0_addr.clone(),
+                seller_address: voter_0_addr,
                 min_proceeds: Some(exact_proceeds), // Tight limit
                 fee_sats: Some(1000),
                 dry_run: None,
@@ -4026,130 +4000,130 @@ async fn roundtrip_task(
         .vote_period(Some(test_period_id))
         .await?;
 
-    if let Some(info) = &period_info {
-        if let Some(consensus) = &info.consensus {
-            // Verify scaled decisions
-            if let Some(&outcome) = consensus.outcomes.get(&scaled_slot_0) {
+    if let Some(info) = &period_info
+        && let Some(consensus) = &info.consensus
+    {
+        // Verify scaled decisions
+        if let Some(&outcome) = consensus.outcomes.get(&scaled_slot_0) {
+            debug_helpers::assert_float_eq(
+                outcome,
+                expected_phase2::scaled::EXPECTED_BTC_CONSENSUS,
+                expected_phase2::FLOAT_TOLERANCE,
+                "Scaled BTC consensus",
+            )?;
+        }
+
+        if let Some(&outcome) = consensus.outcomes.get(&scaled_slot_1) {
+            debug_helpers::assert_float_eq(
+                outcome,
+                expected_phase2::scaled::EXPECTED_ETH_BTC_CONSENSUS,
+                expected_phase2::FLOAT_TOLERANCE,
+                "Scaled ETH/BTC consensus",
+            )?;
+        }
+
+        // Verify categorical decisions
+        let cat_expectations = [
+            (
+                &cat_slot_10,
+                expected_phase2::categorical::EXPECTED_CAT_10,
+                "Candidate A",
+            ),
+            (
+                &cat_slot_11,
+                expected_phase2::categorical::EXPECTED_CAT_11,
+                "Candidate B",
+            ),
+            (
+                &cat_slot_12,
+                expected_phase2::categorical::EXPECTED_CAT_12,
+                "Candidate C",
+            ),
+            (
+                &cat_slot_20,
+                expected_phase2::categorical::EXPECTED_CAT_20,
+                "Ethereum",
+            ),
+            (
+                &cat_slot_21,
+                expected_phase2::categorical::EXPECTED_CAT_21,
+                "Solana",
+            ),
+            (
+                &cat_slot_22,
+                expected_phase2::categorical::EXPECTED_CAT_22,
+                "Arbitrum",
+            ),
+            (
+                &cat_slot_23,
+                expected_phase2::categorical::EXPECTED_CAT_23,
+                "Other",
+            ),
+        ];
+
+        for (slot, expected, name) in cat_expectations {
+            if let Some(&outcome) = consensus.outcomes.get(slot) {
                 debug_helpers::assert_float_eq(
                     outcome,
-                    expected_phase2::scaled::EXPECTED_BTC_CONSENSUS,
+                    expected,
                     expected_phase2::FLOAT_TOLERANCE,
-                    "Scaled BTC consensus",
+                    &format!("Categorical {name} consensus"),
                 )?;
             }
+        }
 
-            if let Some(&outcome) = consensus.outcomes.get(&scaled_slot_1) {
+        // Verify binary decisions
+        let bin_expectations = [
+            (
+                &bin_slot_30,
+                expected_phase2::binary::EXPECTED_BIN_30,
+                "Inflation>3%",
+            ),
+            (
+                &bin_slot_31,
+                expected_phase2::binary::EXPECTED_BIN_31,
+                "Fed cuts",
+            ),
+            (
+                &bin_slot_32,
+                expected_phase2::binary::EXPECTED_BIN_32,
+                "Unemployment",
+            ),
+            (
+                &bin_slot_33,
+                expected_phase2::binary::EXPECTED_BIN_33,
+                "GDP growth",
+            ),
+            (
+                &bin_slot_34,
+                expected_phase2::binary::EXPECTED_BIN_34,
+                "Housing",
+            ),
+            (
+                &bin_slot_35,
+                expected_phase2::binary::EXPECTED_BIN_35,
+                "Consumer conf",
+            ),
+            (
+                &bin_slot_36,
+                expected_phase2::binary::EXPECTED_BIN_36,
+                "Retail",
+            ),
+            (
+                &bin_slot_37,
+                expected_phase2::binary::EXPECTED_BIN_37,
+                "Manufacturing",
+            ),
+        ];
+
+        for (slot, expected, name) in bin_expectations {
+            if let Some(&outcome) = consensus.outcomes.get(slot) {
                 debug_helpers::assert_float_eq(
                     outcome,
-                    expected_phase2::scaled::EXPECTED_ETH_BTC_CONSENSUS,
+                    expected,
                     expected_phase2::FLOAT_TOLERANCE,
-                    "Scaled ETH/BTC consensus",
+                    &format!("Binary {name} consensus"),
                 )?;
-            }
-
-            // Verify categorical decisions
-            let cat_expectations = [
-                (
-                    &cat_slot_10,
-                    expected_phase2::categorical::EXPECTED_CAT_10,
-                    "Candidate A",
-                ),
-                (
-                    &cat_slot_11,
-                    expected_phase2::categorical::EXPECTED_CAT_11,
-                    "Candidate B",
-                ),
-                (
-                    &cat_slot_12,
-                    expected_phase2::categorical::EXPECTED_CAT_12,
-                    "Candidate C",
-                ),
-                (
-                    &cat_slot_20,
-                    expected_phase2::categorical::EXPECTED_CAT_20,
-                    "Ethereum",
-                ),
-                (
-                    &cat_slot_21,
-                    expected_phase2::categorical::EXPECTED_CAT_21,
-                    "Solana",
-                ),
-                (
-                    &cat_slot_22,
-                    expected_phase2::categorical::EXPECTED_CAT_22,
-                    "Arbitrum",
-                ),
-                (
-                    &cat_slot_23,
-                    expected_phase2::categorical::EXPECTED_CAT_23,
-                    "Other",
-                ),
-            ];
-
-            for (slot, expected, name) in cat_expectations {
-                if let Some(&outcome) = consensus.outcomes.get(slot) {
-                    debug_helpers::assert_float_eq(
-                        outcome,
-                        expected,
-                        expected_phase2::FLOAT_TOLERANCE,
-                        &format!("Categorical {} consensus", name),
-                    )?;
-                }
-            }
-
-            // Verify binary decisions
-            let bin_expectations = [
-                (
-                    &bin_slot_30,
-                    expected_phase2::binary::EXPECTED_BIN_30,
-                    "Inflation>3%",
-                ),
-                (
-                    &bin_slot_31,
-                    expected_phase2::binary::EXPECTED_BIN_31,
-                    "Fed cuts",
-                ),
-                (
-                    &bin_slot_32,
-                    expected_phase2::binary::EXPECTED_BIN_32,
-                    "Unemployment",
-                ),
-                (
-                    &bin_slot_33,
-                    expected_phase2::binary::EXPECTED_BIN_33,
-                    "GDP growth",
-                ),
-                (
-                    &bin_slot_34,
-                    expected_phase2::binary::EXPECTED_BIN_34,
-                    "Housing",
-                ),
-                (
-                    &bin_slot_35,
-                    expected_phase2::binary::EXPECTED_BIN_35,
-                    "Consumer conf",
-                ),
-                (
-                    &bin_slot_36,
-                    expected_phase2::binary::EXPECTED_BIN_36,
-                    "Retail",
-                ),
-                (
-                    &bin_slot_37,
-                    expected_phase2::binary::EXPECTED_BIN_37,
-                    "Manufacturing",
-                ),
-            ];
-
-            for (slot, expected, name) in bin_expectations {
-                if let Some(&outcome) = consensus.outcomes.get(slot) {
-                    debug_helpers::assert_float_eq(
-                        outcome,
-                        expected,
-                        expected_phase2::FLOAT_TOLERANCE,
-                        &format!("Binary {} consensus", name),
-                    )?;
-                }
             }
         }
     }

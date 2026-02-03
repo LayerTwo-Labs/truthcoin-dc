@@ -567,11 +567,10 @@ fn get_current_period(
         let height = block_height.unwrap_or(0);
         // Block heights are 0-indexed and directly map to periods
         // Heights 0-9 = period 1, 10-19 = period 2, etc.
-        if config.testing_blocks_per_period == 0 {
-            Ok(0)
-        } else {
-            Ok((height / config.testing_blocks_per_period) + 1)
-        }
+        Ok(height
+            .checked_div(config.testing_blocks_per_period)
+            .map(|v| v + 1)
+            .unwrap_or(0))
     } else {
         Ok(timestamp_to_period(timestamp))
     }
@@ -753,11 +752,10 @@ impl Dbs {
     }
 
     pub fn block_height_to_testing_period(&self, block_height: u32) -> u32 {
-        if self.config.testing_blocks_per_period == 0 {
-            0
-        } else {
-            (block_height / self.config.testing_blocks_per_period) + 1
-        }
+        block_height
+            .checked_div(self.config.testing_blocks_per_period)
+            .map(|v| v + 1)
+            .unwrap_or(0)
     }
 
     pub fn get_config(&self) -> &SlotConfig {
