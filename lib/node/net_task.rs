@@ -140,21 +140,36 @@ fn connect_tip_(
     let block_hash = header.hash();
     // validate_block now returns merkle_root to avoid duplicate computation in connect_block
     let (_fees, filled_txs, merkle_root) =
-        state.validate_block(rwtxn, header, body)?;
+        state.validate_block(rwtxn, header, body).inspect_err(|e| {
+            tracing::error!(
+                %block_hash,
+                num_txs = body.transactions.len(),
+                "Block validation FAILED: {:?}",
+                e
+            );
+        })?;
 
     // Get mainchain timestamp for slot minting
     let mainchain_timestamp = archive
         .get_main_header_info(rwtxn, &header.prev_main_hash)?
         .timestamp;
 
-    state.connect_block(
-        rwtxn,
-        header,
-        body,
-        mainchain_timestamp,
-        filled_txs,
-        merkle_root,
-    )?;
+    state
+        .connect_block(
+            rwtxn,
+            header,
+            body,
+            mainchain_timestamp,
+            filled_txs,
+            merkle_root,
+        )
+        .inspect_err(|e| {
+            tracing::error!(
+                %block_hash,
+                "Block connect FAILED: {:?}",
+                e
+            );
+        })?;
     if tracing::enabled!(tracing::Level::DEBUG) {
         let height = state.try_get_height(rwtxn)?;
         tracing::debug!(?height, %merkle_root, %block_hash,
@@ -1107,17 +1122,54 @@ impl NetTask {
                                 .map_err(Error::SendNewTipReady)?;
                         }
                         PeerConnectionInfo::NewTransaction(new_tx) => {
-                            let mut rwtxn = self
-                                .ctxt
-                                .env
-                                .write_txn()
-                                .map_err(EnvError::from)?;
-                            self.ctxt.mempool.put(&mut rwtxn, &new_tx)?;
-                            rwtxn.commit().map_err(RwTxnError::from)?;
-                            let () = self
-                                .ctxt
-                                .net
-                                .push_tx(HashSet::from_iter([addr]), new_tx);
+                            let txid = new_tx.transaction.txid();
+                            let result: Result<(), crate::mempool::Error> =
+                                (|| {
+                                    let mut rwtxn =
+                                        self.ctxt.env.write_txn().map_err(
+                                            crate::mempool::Error::from,
+                                        )?;
+                                    self.ctxt
+                                        .mempool
+                                        .put(&mut rwtxn, &new_tx)?;
+                                    rwtxn
+                                        .commit()
+                                        .map_err(crate::mempool::Error::from)?;
+                                    Ok(())
+                                })();
+
+                            match result {
+                                Ok(()) => {
+                                    // Successfully added to mempool, propagate to other peers
+                                    let () = self
+                                        .ctxt
+                                        .net
+                                        .push_tx(HashSet::from_iter([addr]), new_tx);
+                                }
+                                Err(crate::mempool::Error::UtxoDoubleSpent) => {
+                                    tracing::debug!(
+                                        %txid,
+                                        %addr,
+                                        "P2P transaction rejected: UTXO already spent in mempool"
+                                    );
+                                }
+                                Err(crate::mempool::Error::SlotAlreadyClaimedInMempool(slot)) => {
+                                    tracing::debug!(
+                                        %txid,
+                                        %addr,
+                                        %slot,
+                                        "P2P transaction rejected: slot already claimed in mempool"
+                                    );
+                                }
+                                Err(ref err) => {
+                                    tracing::warn!(
+                                        %txid,
+                                        %addr,
+                                        ?err,
+                                        "Failed to add P2P transaction to mempool"
+                                    );
+                                }
+                            }
                         }
                         PeerConnectionInfo::Response(boxed) => {
                             let (resp, req) = *boxed;

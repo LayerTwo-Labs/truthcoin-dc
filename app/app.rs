@@ -91,9 +91,13 @@ fn update_wallet(node: &Node, wallet: &Wallet) -> Result<(), Error> {
         .map(|(outpoint, spent_output)| (outpoint, spent_output.inpoint));
     let unconfirmed_outpoints: Vec<_> =
         wallet.get_unconfirmed_utxos()?.into_keys().collect();
+    // Check ALL state UTXOs against mempool.spent_utxos, not just wallet UTXOs.
+    // This prevents "resurrecting" UTXOs that are spent in mempool but were
+    // already moved to wallet.stxos in a previous update cycle.
+    let state_outpoints: Vec<_> = utxos_from_state.keys().copied().collect();
     let unconfirmed_spent = node
         .get_unconfirmed_spent_utxos(
-            confirmed_outpoints.iter().chain(&unconfirmed_outpoints),
+            state_outpoints.iter().chain(&unconfirmed_outpoints),
         )?
         .into_iter();
     let spent: Vec<_> = confirmed_spent.chain(unconfirmed_spent).collect();
@@ -419,11 +423,28 @@ impl App {
                 )
             })?
         {
-            tracing::trace!(
+            tracing::info!(
                 %main_hash,
                 side_hash = %header.hash(),
-                "mine: confirmed BMM, submitting block",
+                num_txs = body.transactions.len(),
+                "mine: confirmed BMM, submitting block with {} transactions",
+                body.transactions.len()
             );
+            // Log transaction types in the block
+            for (i, tx) in body.transactions.iter().enumerate() {
+                let tx_type = match &tx.data {
+                    None => "transfer",
+                    Some(d) if d.is_trade() => "trade",
+                    Some(d) if d.is_create_market() => "create_market",
+                    Some(_) => "other",
+                };
+                tracing::info!(
+                    "mine:   tx[{}] = {:?} type={}",
+                    i,
+                    tx.txid(),
+                    tx_type
+                );
+            }
             match self
                 .node
                 .submit_block(main_hash, &header, &body)
@@ -435,16 +456,20 @@ impl App {
                     )
                 })? {
                 true => {
-                    tracing::debug!(
+                    tracing::info!(
                          %main_hash, "mine: BMM accepted as new tip",
                     );
                 }
                 false => {
-                    tracing::warn!(
-                        %main_hash, "mine: BMM not accepted as new tip",
+                    tracing::error!(
+                        %main_hash, "mine: BMM NOT ACCEPTED as new tip - block rejected!",
                     );
                 }
             }
+        } else {
+            tracing::info!(
+                "mine: confirm_bmm returned None - no BMM confirmed on mainchain"
+            );
         }
         let () = self.update()?;
         Ok(())
