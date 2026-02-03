@@ -6,7 +6,7 @@ use sneed::{RoTxn, RwTxn};
 use crate::{
     math::{
         lmsr::{LmsrError, LmsrService},
-        safe_math::{self, Rounding},
+        trading,
     },
     state::{Error, State, UtxoManager, error, markets::MarketId},
     types::{
@@ -25,6 +25,7 @@ struct StateUpdate {
     vote_submissions: Vec<VoteSubmission>,
     voter_registrations: Vec<VoterRegistration>,
     reputation_updates: Vec<ReputationUpdate>,
+    pending_sell_payouts: Vec<PendingSellPayout>,
 }
 
 struct MarketStateUpdate {
@@ -60,6 +61,24 @@ struct ReputationUpdate {
     updated_reputation: crate::state::voting::types::VoterReputation,
 }
 
+pub struct PendingSellPayout {
+    pub market_id: MarketId,
+    pub seller_address: Address,
+    pub payout_sats: u64,
+    pub fee_sats: u64,
+    pub shares_sold: f64,
+    pub outcome_index: u32,
+    pub transaction_id: [u8; 32],
+}
+
+/// Used to implement soft-fail behavior for slippage failures
+enum TradeApplyResult {
+    /// Trade was successfully applied
+    Applied,
+    /// Trade was skipped due to slippage - transaction stays in mempool
+    Skipped { reason: String },
+}
+
 impl StateUpdate {
     fn new() -> Self {
         Self {
@@ -70,6 +89,7 @@ impl StateUpdate {
             vote_submissions: Vec::new(),
             voter_registrations: Vec::new(),
             reputation_updates: Vec::new(),
+            pending_sell_payouts: Vec::new(),
         }
     }
 
@@ -100,7 +120,6 @@ impl StateUpdate {
         for ((address, market_id), outcome_changes) in
             &self.share_account_changes
         {
-            let _total_delta: f64 = outcome_changes.values().sum();
             for &delta in outcome_changes.values() {
                 if !delta.is_finite() {
                     return Err(Error::InvalidTransaction {
@@ -200,7 +219,6 @@ impl StateUpdate {
                 })?;
         }
 
-        // Aggregate share deltas per market before applying
         let mut aggregated_deltas: super::type_aliases::AggregatedDeltas =
             std::collections::HashMap::new();
 
@@ -219,7 +237,6 @@ impl StateUpdate {
             }
         }
 
-        // Apply aggregated deltas to each market
         for (market_id, deltas) in aggregated_deltas {
             let mut market = state
                 .markets()
@@ -230,7 +247,6 @@ impl StateUpdate {
 
             let mut new_shares = market.shares().clone();
 
-            // Apply all deltas for this market
             for (outcome_index, delta, volume_sats, _fee_sats, _txid) in &deltas
             {
                 new_shares[*outcome_index] += delta;
@@ -253,28 +269,11 @@ impl StateUpdate {
             state.clear_mempool_shares(rwtxn, &market_id)?;
         }
 
-        tracing::info!(
-            "apply_all_changes: Processing {} share account changes",
-            self.share_account_changes.len()
-        );
-
         for ((address, market_id), outcome_changes) in
             &self.share_account_changes
         {
-            tracing::info!(
-                "  Share account change: address={}, market={}, outcomes={:?}",
-                address,
-                market_id,
-                outcome_changes
-            );
             for (&outcome_index, &share_delta) in outcome_changes {
                 if share_delta != 0.0 {
-                    tracing::info!(
-                        "    Adding {} shares for outcome {} to address {}",
-                        share_delta,
-                        outcome_index,
-                        address
-                    );
                     if share_delta > 0.0 {
                         state.markets().add_shares_to_account(
                             rwtxn,
@@ -350,34 +349,63 @@ impl StateUpdate {
                 .put_voter_reputation(rwtxn, &update.updated_reputation)?;
         }
 
-        // Consolidate any MarketTreasury/MarketAuthorFee UTXOs from explicit tx outputs
-        // This merges new outputs from BuyShares txs with the previous Market/Fee UTXOs
-        Self::consolidate_market_utxos(state, rwtxn, height)?;
+        Self::consolidate_market_utxos(
+            state,
+            rwtxn,
+            height,
+            &self.pending_sell_payouts,
+        )?;
 
         Ok(())
     }
 
-    /// Consolidate all MarketTreasury and MarketAuthorFee UTXOs for each market
-    /// into a single UTXO per market. This is called at block end to merge:
-    /// - The previous block's Market/Fee UTXO (if exists)
-    /// - Any new outputs from BuyShares transactions in this block
-    ///
-    /// Uses pending UTXO tracking for O(m) efficiency where m = markets with trades,
-    /// instead of O(n) where n = total UTXOs.
+    /// Generate a deterministic outpoint for sell payouts.
+    /// Uses transaction_id to make the outpoint deterministically reconstructible
+    /// during revert operations (instead of block_height + sequence which is lost).
+    pub fn generate_sell_payout_outpoint(
+        market_id: &MarketId,
+        seller_address: &Address,
+        transaction_id: [u8; 32],
+    ) -> OutPoint {
+        use blake3::Hasher;
+
+        let mut hasher = Hasher::new();
+        hasher.update(b"SELL_PAYOUT");
+        hasher.update(&market_id.0);
+        hasher.update(&seller_address.0);
+        hasher.update(&transaction_id);
+
+        let hash = hasher.finalize();
+        let merkle_root = crate::types::MerkleRoot::from(*hash.as_bytes());
+
+        OutPoint::Coinbase {
+            merkle_root,
+            vout: 0,
+        }
+    }
+
     fn consolidate_market_utxos(
         state: &State,
         rwtxn: &mut RwTxn,
         height: u32,
+        pending_sell_payouts: &[PendingSellPayout],
     ) -> Result<(), Error> {
         use crate::state::markets::{
             generate_market_author_fee_address,
             generate_market_treasury_address,
         };
         use crate::types::{BitcoinOutputContent, FilledOutput, OutPoint};
+        use std::collections::HashSet;
 
-        // Get markets that have pending UTXOs to consolidate (O(m) where m = active markets)
-        let markets_to_consolidate =
+        let pending_utxo_markets =
             state.markets().get_markets_with_pending_utxos(rwtxn)?;
+
+        let sell_payout_markets: HashSet<[u8; 6]> =
+            pending_sell_payouts.iter().map(|p| p.market_id.0).collect();
+
+        let mut markets_to_consolidate: HashSet<[u8; 6]> =
+            pending_utxo_markets.into_iter().collect();
+        markets_to_consolidate.extend(sell_payout_markets);
 
         if markets_to_consolidate.is_empty() {
             return Ok(());
@@ -386,13 +414,14 @@ impl StateUpdate {
         for market_id_bytes in markets_to_consolidate {
             let market_id = MarketId::new(market_id_bytes);
 
-            // Collect treasury UTXOs: existing consolidated + pending from transactions
             let mut treasury_total = 0u64;
             let mut treasury_utxos_to_consume = Vec::new();
+            let mut fee_total = 0u64;
+            let mut fee_utxos_to_consume = Vec::new();
 
-            // Get existing consolidated treasury UTXO (if any)
-            if let Some(existing_outpoint) =
-                state.markets().get_market_utxo(rwtxn, &market_id)?
+            if let Some(existing_outpoint) = state
+                .markets()
+                .get_market_funds_utxo(rwtxn, &market_id, false)?
                 && let Some(utxo) =
                     state.utxos.try_get(rwtxn, &existing_outpoint)?
             {
@@ -400,24 +429,9 @@ impl StateUpdate {
                 treasury_utxos_to_consume.push(existing_outpoint);
             }
 
-            // Get pending treasury UTXOs from transactions
-            let pending_treasury = state
+            if let Some(existing_outpoint) = state
                 .markets()
-                .get_pending_treasury_utxos(rwtxn, &market_id)?;
-            for outpoint in pending_treasury {
-                if let Some(utxo) = state.utxos.try_get(rwtxn, &outpoint)? {
-                    treasury_total += utxo.get_bitcoin_value().to_sat();
-                    treasury_utxos_to_consume.push(outpoint);
-                }
-            }
-
-            // Collect fee UTXOs: existing consolidated + pending from transactions
-            let mut fee_total = 0u64;
-            let mut fee_utxos_to_consume = Vec::new();
-
-            // Get existing consolidated fee UTXO (if any)
-            if let Some(existing_outpoint) =
-                state.markets().get_author_fee_utxo(rwtxn, &market_id)?
+                .get_market_funds_utxo(rwtxn, &market_id, true)?
                 && let Some(utxo) =
                     state.utxos.try_get(rwtxn, &existing_outpoint)?
             {
@@ -425,71 +439,135 @@ impl StateUpdate {
                 fee_utxos_to_consume.push(existing_outpoint);
             }
 
-            // Get pending fee UTXOs from transactions
-            let pending_fees = state
+            for (outpoint, is_fee) in state
                 .markets()
-                .get_pending_author_fee_utxos(rwtxn, &market_id)?;
-            for outpoint in pending_fees {
+                .get_pending_market_funds_utxos(rwtxn, &market_id)?
+            {
                 if let Some(utxo) = state.utxos.try_get(rwtxn, &outpoint)? {
-                    fee_total += utxo.get_bitcoin_value().to_sat();
-                    fee_utxos_to_consume.push(outpoint);
+                    if is_fee {
+                        fee_total += utxo.get_bitcoin_value().to_sat();
+                        fee_utxos_to_consume.push(outpoint);
+                    } else {
+                        treasury_total += utxo.get_bitcoin_value().to_sat();
+                        treasury_utxos_to_consume.push(outpoint);
+                    }
                 }
             }
 
-            // Consolidate treasury UTXOs into a single OutPoint::Market
-            if !treasury_utxos_to_consume.is_empty() && treasury_total > 0 {
+            let market_sell_payouts: Vec<&PendingSellPayout> =
+                pending_sell_payouts
+                    .iter()
+                    .filter(|p| p.market_id == market_id)
+                    .collect();
+            let total_sell_payouts: u64 =
+                market_sell_payouts.iter().map(|p| p.payout_sats).sum();
+
+            let total_sell_fees: u64 =
+                market_sell_payouts.iter().map(|p| p.fee_sats).sum();
+            fee_total += total_sell_fees;
+
+            if total_sell_payouts > treasury_total {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Treasury underflow: sell payouts {total_sell_payouts} exceed treasury {treasury_total} for market {market_id:?}",
+                    ),
+                });
+            }
+
+            let has_treasury_work = !treasury_utxos_to_consume.is_empty()
+                || !market_sell_payouts.is_empty();
+
+            if has_treasury_work && treasury_total > 0 {
                 for outpoint in &treasury_utxos_to_consume {
                     state.delete_utxo_with_address_index(rwtxn, outpoint)?;
                 }
-                state.markets().clear_market_utxo(rwtxn, &market_id)?;
+                state
+                    .markets()
+                    .clear_market_funds_utxo(rwtxn, &market_id, false)?;
 
-                let treasury_address =
-                    generate_market_treasury_address(&market_id);
-                let new_outpoint = OutPoint::Market {
-                    market_id: market_id_bytes,
-                    block_height: height,
-                };
-                let new_output = FilledOutput::new(
-                    treasury_address,
-                    FilledOutputContent::MarketTreasury {
-                        market_id: market_id_bytes,
-                        amount: BitcoinOutputContent(
-                            bitcoin::Amount::from_sat(treasury_total),
+                for payout in market_sell_payouts.iter() {
+                    let payout_outpoint = Self::generate_sell_payout_outpoint(
+                        &market_id,
+                        &payout.seller_address,
+                        payout.transaction_id,
+                    );
+                    let payout_output = FilledOutput {
+                        address: payout.seller_address,
+                        content: FilledOutputContent::Bitcoin(
+                            BitcoinOutputContent(bitcoin::Amount::from_sat(
+                                payout.payout_sats,
+                            )),
                         ),
-                    },
-                );
-                state.insert_utxo_with_address_index(
-                    rwtxn,
-                    &new_outpoint,
-                    &new_output,
-                )?;
-                state.markets().set_market_utxo(
-                    rwtxn,
-                    &market_id,
-                    &new_outpoint,
-                )?;
+                        memo: vec![],
+                    };
+                    state.insert_utxo_with_address_index(
+                        rwtxn,
+                        &payout_outpoint,
+                        &payout_output,
+                    )?;
+                }
+
+                let remaining_treasury =
+                    treasury_total.saturating_sub(total_sell_payouts);
+
+                if remaining_treasury > 0 {
+                    let treasury_address =
+                        generate_market_treasury_address(&market_id);
+                    let new_outpoint = OutPoint::MarketFunds {
+                        market_id: market_id_bytes,
+                        block_height: height,
+                        is_fee: false,
+                    };
+                    let new_output = FilledOutput::new(
+                        treasury_address,
+                        FilledOutputContent::MarketFunds {
+                            market_id: market_id_bytes,
+                            amount: BitcoinOutputContent(
+                                bitcoin::Amount::from_sat(remaining_treasury),
+                            ),
+                            is_fee: false,
+                        },
+                    );
+                    state.insert_utxo_with_address_index(
+                        rwtxn,
+                        &new_outpoint,
+                        &new_output,
+                    )?;
+                    state.markets().set_market_funds_utxo(
+                        rwtxn,
+                        &market_id,
+                        false,
+                        &new_outpoint,
+                    )?;
+                }
             }
 
-            // Consolidate fee UTXOs into a single OutPoint::MarketAuthorFee
-            if !fee_utxos_to_consume.is_empty() && fee_total > 0 {
+            let has_fee_work =
+                !fee_utxos_to_consume.is_empty() || total_sell_fees > 0;
+
+            if has_fee_work && fee_total > 0 {
                 for outpoint in &fee_utxos_to_consume {
                     state.delete_utxo_with_address_index(rwtxn, outpoint)?;
                 }
-                state.markets().clear_author_fee_utxo(rwtxn, &market_id)?;
+                state
+                    .markets()
+                    .clear_market_funds_utxo(rwtxn, &market_id, true)?;
 
                 let fee_address =
                     generate_market_author_fee_address(&market_id);
-                let new_outpoint = OutPoint::MarketAuthorFee {
+                let new_outpoint = OutPoint::MarketFunds {
                     market_id: market_id_bytes,
                     block_height: height,
+                    is_fee: true,
                 };
                 let new_output = FilledOutput::new(
                     fee_address,
-                    FilledOutputContent::MarketAuthorFee {
+                    FilledOutputContent::MarketFunds {
                         market_id: market_id_bytes,
                         amount: BitcoinOutputContent(
                             bitcoin::Amount::from_sat(fee_total),
                         ),
+                        is_fee: true,
                     },
                 );
                 state.insert_utxo_with_address_index(
@@ -497,20 +575,17 @@ impl StateUpdate {
                     &new_outpoint,
                     &new_output,
                 )?;
-                state.markets().set_author_fee_utxo(
+                state.markets().set_market_funds_utxo(
                     rwtxn,
                     &market_id,
+                    true,
                     &new_outpoint,
                 )?;
             }
 
-            // Clear pending UTXOs after consolidation - data is now in consolidated UTXO
             state
                 .markets()
-                .clear_pending_treasury_utxos(rwtxn, &market_id)?;
-            state
-                .markets()
-                .clear_pending_author_fee_utxos(rwtxn, &market_id)?;
+                .clear_pending_market_funds_utxos(rwtxn, &market_id)?;
         }
 
         Ok(())
@@ -526,16 +601,22 @@ impl StateUpdate {
         outcome: u32,
         delta: f64,
     ) {
-        self.share_account_changes
+        *self
+            .share_account_changes
             .entry((address, market_id))
             .or_default()
-            .insert(outcome, delta);
+            .entry(outcome)
+            .or_insert(0.0) += delta;
     }
     fn add_market_creation(&mut self, creation: MarketCreation) {
         self.market_creations.push(creation);
     }
     fn add_vote_submission(&mut self, vote: crate::state::voting::types::Vote) {
         self.vote_submissions.push(VoteSubmission { vote });
+    }
+
+    fn add_pending_sell_payout(&mut self, payout: PendingSellPayout) {
+        self.pending_sell_payouts.push(payout);
     }
 }
 fn query_update_cost(
@@ -587,7 +668,8 @@ pub fn validate(
         .iter()
         .map(|t| state.fill_transaction(rotxn, t))
         .collect::<Result<_, _>>()?;
-    for filled_tx in &filled_txs {
+
+    for filled_tx in filled_txs.iter() {
         for input in &filled_tx.transaction.inputs {
             if spent_utxos.contains(input) {
                 return Err(Error::UtxoDoubleSpent);
@@ -637,7 +719,6 @@ pub fn connect(
         };
         return Err(Error::InvalidHeader(err));
     }
-    // Use pre-computed merkle root from validate() to avoid duplicate computation
     if pre_computed_merkle_root != header.merkle_root {
         let err = Error::InvalidBody {
             expected: pre_computed_merkle_root,
@@ -778,8 +859,7 @@ pub fn connect(
                     return Err(Error::BadCoinbaseOutputContent);
                 }
             }
-            OutputContent::MarketTreasury { .. }
-            | OutputContent::MarketAuthorFee { .. } => {
+            OutputContent::MarketFunds { .. } => {
                 return Err(Error::BadCoinbaseOutputContent);
             }
         };
@@ -795,17 +875,28 @@ pub fn connect(
         )?;
     }
     let mut state_update = StateUpdate::new();
+    let mut skipped_tx_indices: HashSet<usize> = HashSet::new();
 
-    for filled_tx in &filled_txs {
+    for (idx, filled_tx) in filled_txs.iter().enumerate() {
         match &filled_tx.transaction.data {
-            Some(TxData::BuyShares { .. }) => {
-                apply_market_trade(
+            Some(TxData::Trade { .. }) => {
+                match apply_trade(
                     state,
                     rwtxn,
                     filled_tx,
                     &mut state_update,
                     height,
-                )?;
+                )? {
+                    TradeApplyResult::Applied => {}
+                    TradeApplyResult::Skipped { reason } => {
+                        tracing::info!(
+                            "Trade tx {} skipped due to slippage: {}",
+                            filled_tx.txid(),
+                            reason
+                        );
+                        skipped_tx_indices.insert(idx);
+                    }
+                }
             }
             Some(TxData::CreateMarket { .. }) => {
                 apply_market_creation(
@@ -860,13 +951,13 @@ pub fn connect(
 
     state_update.validate_all_changes(state, rwtxn)?;
 
-    // First create UTXOs from transaction outputs (including MarketTreasury/MarketAuthorFee)
-    for filled_tx in &filled_txs {
+    for (idx, filled_tx) in filled_txs.iter().enumerate() {
+        if skipped_tx_indices.contains(&idx) {
+            continue;
+        }
         apply_utxo_changes(state, rwtxn, filled_tx)?;
     }
 
-    // Then apply state changes including market UTXO consolidation
-    // (consolidation merges new tx outputs with existing market UTXOs)
     state_update.apply_all_changes(state, rwtxn, height)?;
 
     let block_hash = header.hash();
@@ -915,8 +1006,8 @@ pub fn disconnect_tip(
             Some(TxData::CreateMarket { .. }) => {
                 let () = revert_create_market(state, rwtxn, &filled_tx)?;
             }
-            Some(TxData::BuyShares { .. }) => {
-                let () = revert_buy_shares(state, rwtxn, &filled_tx)?;
+            Some(TxData::Trade { .. }) => {
+                let () = revert_trade(state, rwtxn, &filled_tx)?;
             }
             Some(TxData::SubmitVote { .. }) => {
                 let () = revert_submit_vote(state, rwtxn, &filled_tx)?;
@@ -1106,11 +1197,9 @@ fn apply_claim_category_slots(
 
     let claiming_txid = filled_tx.transaction.txid();
 
-    // Claim all slots in the category with the same txid
     for (slot_id_bytes, question) in &category_claim.slots {
         let slot_id = SlotId::from_bytes(*slot_id_bytes)?;
 
-        // Category slots are always binary (is_scaled=false)
         let decision = Decision::new(
             market_maker_address_bytes,
             *slot_id_bytes,
@@ -1160,7 +1249,6 @@ fn revert_claim_category_slots(
         }
     })?;
 
-    // Revert all slots in the category
     for (slot_id_bytes, _question) in &category_claim.slots {
         let slot_id = SlotId::from_bytes(*slot_id_bytes)?;
         state.slots().revert_claim_slot(rwtxn, slot_id)?;
@@ -1221,13 +1309,10 @@ fn revert_create_market(
             })?;
 
     let creator_address = extract_creator_address(filled_tx)?;
-
-    // Use pre-parsed dimension specs from transaction data
     let dimension_specs = market_data.dimension_specs.clone();
 
     let mut decisions = HashMap::new();
 
-    // Extract slot IDs from dimension specs
     for spec in &dimension_specs {
         match spec {
             DimensionSpec::Single(slot_id) => {
@@ -1272,49 +1357,83 @@ fn revert_create_market(
 
     let market_id = market.id.clone();
 
-    // Delete the market UTXO if it exists
-    if let Some(outpoint) =
-        state.markets().get_market_utxo(rwtxn, &market_id)?
+    if let Some(outpoint) = state
+        .markets()
+        .get_market_funds_utxo(rwtxn, &market_id, false)?
     {
         state.delete_utxo_with_address_index(rwtxn, &outpoint)?;
     }
 
-    // Delete the market and all its index entries
     state.markets().delete_market(rwtxn, &market_id)?;
 
     Ok(())
 }
 
-fn revert_buy_shares(
+/// Revert a trade transaction (buy or sell).
+///
+/// Reverting a trade means:
+/// - For buy: Remove shares from trader, remove pending treasury/fee UTXOs
+/// - For sell: Add shares back to trader, delete payout UTXO
+fn revert_trade(
     state: &State,
     rwtxn: &mut RwTxn,
     filled_tx: &FilledTransaction,
 ) -> Result<(), Error> {
-    let buy_data =
-        filled_tx
-            .buy_shares()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a buy shares transaction".to_string(),
-            })?;
+    let trade = filled_tx.trade().ok_or_else(|| Error::InvalidTransaction {
+        reason: "Not a trade transaction".to_string(),
+    })?;
 
-    let trader_address = filled_tx
-        .spent_utxos
-        .first()
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "Buy shares transaction must have inputs".to_string(),
-        })?
-        .address;
-
+    let is_buy = trade.is_buy();
     let height = state.try_get_height(rwtxn)?.unwrap_or(0);
+    let market_id_bytes = *trade.market_id.as_bytes();
 
-    state.markets().revert_share_trade(
-        rwtxn,
-        &trader_address,
-        buy_data.market_id,
-        buy_data.outcome_index,
-        buy_data.shares_to_buy,
-        height as u64,
-    )?;
+    if is_buy {
+        state.markets().revert_share_trade(
+            rwtxn,
+            &trade.trader,
+            trade.market_id.clone(),
+            trade.outcome_index,
+            trade.shares_abs(),
+            height as u64,
+        )?;
+
+        let txid = filled_tx.txid();
+        for (vout, output) in filled_tx.outputs().iter().enumerate() {
+            if let OutputContent::MarketFunds {
+                market_id, is_fee, ..
+            } = &output.content
+                && *market_id == market_id_bytes
+            {
+                let outpoint = OutPoint::Regular {
+                    txid,
+                    vout: vout as u32,
+                };
+                state.markets().remove_pending_market_funds_utxo(
+                    rwtxn,
+                    &trade.market_id,
+                    &outpoint,
+                    *is_fee,
+                )?;
+            }
+        }
+    } else {
+        state.markets().add_shares_to_account(
+            rwtxn,
+            &trade.trader,
+            trade.market_id.clone(),
+            trade.outcome_index,
+            trade.shares_abs(),
+            height as u64,
+        )?;
+
+        let payout_outpoint = StateUpdate::generate_sell_payout_outpoint(
+            &trade.market_id,
+            &trade.trader,
+            filled_tx.txid().0,
+        );
+        // Ignore result - UTXO might not exist if consolidation failed
+        drop(state.delete_utxo_with_address_index(rwtxn, &payout_outpoint));
+    }
 
     Ok(())
 }
@@ -1360,46 +1479,50 @@ fn apply_utxo_changes(
             filled_output,
         )?;
 
-        // Track pending market UTXOs for efficient consolidation
-        match &filled_output.content {
-            FilledOutputContent::MarketTreasury { market_id, .. } => {
-                let market_id = MarketId::new(*market_id);
-                state
-                    .markets()
-                    .add_pending_treasury_utxo(rwtxn, &market_id, &outpoint)?;
-            }
-            FilledOutputContent::MarketAuthorFee { market_id, .. } => {
-                let market_id = MarketId::new(*market_id);
-                state.markets().add_pending_author_fee_utxo(
-                    rwtxn, &market_id, &outpoint,
-                )?;
-            }
-            _ => {}
+        if let FilledOutputContent::MarketFunds {
+            market_id, is_fee, ..
+        } = &filled_output.content
+        {
+            let market_id = MarketId::new(*market_id);
+            state.markets().add_pending_market_funds_utxo(
+                rwtxn, &market_id, &outpoint, *is_fee,
+            )?;
         }
     }
 
     Ok(())
 }
 
-fn apply_market_trade(
+/// Apply a trade transaction (buy or sell shares) to state update.
+///
+/// This unified function replaces the separate apply_market_buy and apply_market_sell.
+/// The sign of shares determines direction: positive = buy, negative = sell.
+///
+/// For buys: Treasury and fee values are tracked via explicit transaction outputs
+/// For sells: Creates pending payout (to be created during UTXO consolidation)
+///
+/// Returns `TradeApplyResult::Skipped` for slippage failures (soft-fail behavior).
+/// The transaction remains in mempool for retry in future blocks.
+fn apply_trade(
     state: &State,
     rwtxn: &mut RwTxn,
     filled_tx: &FilledTransaction,
     state_update: &mut StateUpdate,
     _height: u32,
-) -> Result<(), Error> {
-    let buy_data =
-        filled_tx
-            .buy_shares()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a buy shares transaction".to_string(),
-            })?;
+) -> Result<TradeApplyResult, Error> {
+    let trade = filled_tx.trade().ok_or_else(|| Error::InvalidTransaction {
+        reason: "Not a trade transaction".to_string(),
+    })?;
+
+    let is_buy = trade.is_buy();
+    let shares_abs = trade.shares_abs();
+    let outcome_index = trade.outcome_index as usize;
 
     let market = state
         .markets()
-        .get_market(rwtxn, &buy_data.market_id)?
+        .get_market(rwtxn, &trade.market_id)?
         .ok_or_else(|| Error::InvalidTransaction {
-            reason: format!("Market {:?} does not exist", buy_data.market_id),
+            reason: format!("Market {:?} does not exist", trade.market_id),
         })?;
 
     let market_state = market.state();
@@ -1411,84 +1534,143 @@ fn apply_market_trade(
         });
     }
 
-    let outcome_index = buy_data.outcome_index as usize;
-    let shares_to_buy = buy_data.shares_to_buy;
-
-    // Calculate cost based on current market state
     let mut new_shares = market.shares().clone();
-    new_shares[outcome_index] += shares_to_buy;
+    new_shares[outcome_index] += trade.shares;
 
-    let base_cost = query_update_cost(market.shares(), &new_shares, market.b())
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Failed to calculate trade cost: {e:?}"),
-        })?;
-
-    // Calculate fee for market author
-    let fee_amount = base_cost * market.trading_fee();
-    let total_cost = base_cost + fee_amount;
-
-    if total_cost > buy_data.max_cost as f64 {
+    if new_shares[outcome_index] < 0.0 {
         return Err(Error::InvalidTransaction {
             reason: format!(
-                "Trade cost {} (base: {}, fee: {}) exceeds max cost {}",
-                total_cost, base_cost, fee_amount, buy_data.max_cost
+                "Trade would result in negative market shares: {} for outcome {}",
+                new_shares[outcome_index], outcome_index
             ),
         });
     }
 
-    let trader_address = filled_tx
-        .spent_utxos
-        .first()
-        .map(|utxo| utxo.address)
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "No spent UTXOs found for trade".to_string(),
-        })?;
+    let (volume_sats, fee_sats) = if is_buy {
+        // Buy: cost = LMSR(current -> new)
+        let base_cost =
+            query_update_cost(market.shares(), &new_shares, market.b())
+                .map_err(|e| Error::InvalidTransaction {
+                    reason: format!("Failed to calculate trade cost: {e:?}"),
+                })?;
 
-    let volume_sats =
-        safe_math::to_sats(total_cost, Rounding::Up).map_err(|e| {
-            Error::InvalidTransaction {
-                reason: format!("Volume conversion failed: {e}"),
-            }
-        })?;
-    let fee_sats = safe_math::to_sats_signed(fee_amount, Rounding::Up)
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Fee conversion failed: {e}"),
-        })?;
-    // Note: base_cost_sats is used for validation of explicit tx outputs
-    let _base_cost_sats = safe_math::to_sats_signed(base_cost, Rounding::Up)
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Base cost conversion failed: {e}"),
-        })?;
+        let buy_cost =
+            trading::calculate_buy_cost(base_cost, market.trading_fee())
+                .map_err(|e| Error::InvalidTransaction {
+                    reason: format!("Buy cost calculation failed: {e}"),
+                })?;
+
+        // Slippage protection - soft-fail: skip transaction, don't fail the block
+        if buy_cost.total_cost_sats > trade.limit_sats {
+            return Ok(TradeApplyResult::Skipped {
+                reason: format!(
+                    "Buy cost {} sats (base: {}, fee: {}) exceeds max cost {} sats",
+                    buy_cost.total_cost_sats,
+                    buy_cost.base_cost_sats,
+                    buy_cost.trading_fee_sats,
+                    trade.limit_sats
+                ),
+            });
+        }
+
+        (buy_cost.total_cost_sats, buy_cost.trading_fee_sats)
+    } else {
+        let seller_account = state
+            .markets()
+            .get_user_share_account(rwtxn, &trade.trader)?;
+
+        let owned_shares = seller_account
+            .as_ref()
+            .and_then(|account| {
+                account
+                    .positions
+                    .get(&(trade.market_id.clone(), trade.outcome_index))
+                    .copied()
+            })
+            .unwrap_or(0.0);
+
+        // Check pending share changes from earlier transactions in this block
+        // to prevent double-spend of shares within the same block
+        let pending_delta = state_update
+            .share_account_changes
+            .get(&(trade.trader, trade.market_id.clone()))
+            .and_then(|outcomes| outcomes.get(&trade.outcome_index))
+            .copied()
+            .unwrap_or(0.0);
+
+        // pending_delta is negative for pending sells, positive for pending buys
+        let effective_owned = owned_shares + pending_delta;
+
+        if effective_owned < shares_abs {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Insufficient shares: trying to sell {} but only own {} (effective: {}) for outcome {}",
+                    shares_abs,
+                    owned_shares,
+                    effective_owned,
+                    trade.outcome_index
+                ),
+            });
+        }
+
+        // Sell: proceeds = LMSR(new -> current) since shares decreased
+        let proceeds =
+            query_update_cost(&new_shares, market.shares(), market.b())
+                .map_err(|e| Error::InvalidTransaction {
+                    reason: format!("Failed to calculate sell proceeds: {e:?}"),
+                })?;
+
+        let sell_proceeds =
+            trading::calculate_sell_proceeds(proceeds, market.trading_fee())
+                .map_err(|e| Error::InvalidTransaction {
+                    reason: format!("Sell proceeds calculation failed: {e}"),
+                })?;
+
+        let net_proceeds_sats = sell_proceeds.net_proceeds_sats;
+        let fee_sats = sell_proceeds.trading_fee_sats;
+
+        // Slippage protection - soft-fail: skip transaction, don't fail the block
+        if net_proceeds_sats < trade.limit_sats {
+            return Ok(TradeApplyResult::Skipped {
+                reason: format!(
+                    "Sell proceeds {} sats below minimum {} sats",
+                    net_proceeds_sats, trade.limit_sats
+                ),
+            });
+        }
+
+        state_update.add_pending_sell_payout(PendingSellPayout {
+            market_id: trade.market_id.clone(),
+            seller_address: trade.trader,
+            payout_sats: net_proceeds_sats,
+            fee_sats,
+            shares_sold: shares_abs,
+            outcome_index: trade.outcome_index,
+            transaction_id: filled_tx.transaction.txid().0,
+        });
+
+        (net_proceeds_sats, fee_sats)
+    };
 
     state_update.add_market_update(MarketStateUpdate {
-        market_id: buy_data.market_id.clone(),
-        share_delta: Some((outcome_index, shares_to_buy)),
+        market_id: trade.market_id.clone(),
+        share_delta: Some((outcome_index, trade.shares)),
         new_beta: None,
         transaction_id: Some(filled_tx.transaction.txid().0),
         volume_sats: Some(volume_sats),
-        fee_sats: Some(fee_sats as u64),
+        fee_sats: Some(fee_sats),
     });
 
-    // Note: Treasury and fee values are now tracked via explicit transaction outputs
-    // (MarketTreasury and MarketAuthorFee UTXOs) rather than accumulators
-
-    tracing::info!(
-        "apply_market_trade: Adding share account change - trader={}, market={}, outcome={}, shares={}",
-        trader_address,
-        buy_data.market_id,
-        buy_data.outcome_index,
-        buy_data.shares_to_buy
-    );
-
     state_update.add_share_account_change(
-        trader_address,
-        buy_data.market_id,
-        buy_data.outcome_index,
-        buy_data.shares_to_buy,
+        trade.trader,
+        trade.market_id,
+        trade.outcome_index,
+        trade.shares,
     );
 
-    Ok(())
+    Ok(TradeApplyResult::Applied)
 }
+
 fn apply_market_creation(
     state: &State,
     rwtxn: &mut RwTxn,
@@ -1507,8 +1689,6 @@ fn apply_market_creation(
             })?;
 
     let creator_address = extract_creator_address(filled_tx)?;
-
-    // Use pre-parsed dimension specs from transaction data
     let dimension_specs = market_data.dimension_specs.clone();
 
     let mut decisions = HashMap::new();
@@ -1546,7 +1726,7 @@ fn apply_market_creation(
     );
 
     let builder = builder
-        .with_dimensions(dimension_specs)
+        .with_dimensions(dimension_specs.clone())
         .with_residual_names(market_data.residual_names.clone());
 
     let market =
@@ -1560,12 +1740,11 @@ fn apply_market_creation(
     let market_id_bytes = *market_id.as_bytes();
     let txid = filled_tx.txid();
 
-    // Find the MarketTreasury output in the transaction and register it
-    // The UTXO will be created by apply_utxo_changes later
     for (vout, output) in filled_tx.outputs().iter().enumerate() {
-        if let OutputContent::MarketTreasury {
+        if let OutputContent::MarketFunds {
             market_id: output_market_id,
             amount,
+            is_fee: false,
         } = &output.content
             && output_market_id == &market_id_bytes
         {
@@ -1575,10 +1754,10 @@ fn apply_market_creation(
             };
             state
                 .markets()
-                .set_market_utxo(rwtxn, &market_id, &outpoint)?;
+                .set_market_funds_utxo(rwtxn, &market_id, false, &outpoint)?;
 
             tracing::debug!(
-                "Registered MarketTreasury UTXO for market {:?} with {} sats at {:?}",
+                "Registered MarketFunds (treasury) UTXO for market {:?} with {} sats at {:?}",
                 market_id,
                 amount.0.to_sat(),
                 outpoint
@@ -1840,4 +2019,205 @@ fn revert_submit_vote_batch(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_double_spend_protection_same_block() {
+        // This test verifies that the effective ownership calculation
+        // correctly accounts for pending share changes in the same block,
+        // preventing double-spend of shares.
+
+        let mut state_update = StateUpdate::new();
+        let trader = Address::ALL_ZEROS;
+        let market_id = MarketId::new([1u8; 6]);
+        let outcome_index: u32 = 0;
+
+        // Simulate: trader owns 100 shares in database
+        let owned_shares_from_db = 100.0;
+
+        // Simulate: first sell of 60 shares already recorded in state_update
+        // (negative delta because selling reduces shares)
+        state_update.add_share_account_change(
+            trader,
+            market_id.clone(),
+            outcome_index,
+            -60.0, // Sold 60 shares
+        );
+
+        // Calculate effective ownership (same logic as in apply_trade)
+        let pending_delta = state_update
+            .share_account_changes
+            .get(&(trader, market_id.clone()))
+            .and_then(|outcomes| outcomes.get(&outcome_index))
+            .copied()
+            .unwrap_or(0.0);
+
+        let effective_owned = owned_shares_from_db + pending_delta;
+
+        // Effective ownership should be 100 - 60 = 40
+        assert_eq!(effective_owned, 40.0);
+
+        // Attempting to sell 50 more shares should fail
+        // because effective_owned (40) < shares_to_sell (50)
+        let shares_to_sell = 50.0;
+        assert!(
+            effective_owned < shares_to_sell,
+            "Double-spend protection: should reject sell of {} when only {} effectively owned",
+            shares_to_sell,
+            effective_owned
+        );
+
+        // But selling 40 or less should be allowed
+        let valid_sell = 40.0;
+        assert!(
+            effective_owned >= valid_sell,
+            "Should allow selling {} when {} effectively owned",
+            valid_sell,
+            effective_owned
+        );
+    }
+
+    #[test]
+    fn test_buy_then_sell_same_block_allowed() {
+        // Verify that buying shares and then selling some of them
+        // in the same block works correctly.
+
+        let mut state_update = StateUpdate::new();
+        let trader = Address::ALL_ZEROS;
+        let market_id = MarketId::new([2u8; 6]);
+        let outcome_index: u32 = 1;
+
+        // Trader starts with 0 shares in database
+        let owned_shares_from_db = 0.0;
+
+        // First transaction: buy 100 shares (positive delta)
+        state_update.add_share_account_change(
+            trader,
+            market_id.clone(),
+            outcome_index,
+            100.0,
+        );
+
+        // Calculate effective ownership after buy
+        let pending_delta = state_update
+            .share_account_changes
+            .get(&(trader, market_id.clone()))
+            .and_then(|outcomes| outcomes.get(&outcome_index))
+            .copied()
+            .unwrap_or(0.0);
+
+        let effective_owned = owned_shares_from_db + pending_delta;
+        assert_eq!(effective_owned, 100.0);
+
+        // Should be able to sell up to 100 shares
+        let shares_to_sell = 50.0;
+        assert!(
+            effective_owned >= shares_to_sell,
+            "Should allow selling {} after buying 100 in same block",
+            shares_to_sell
+        );
+    }
+
+    #[test]
+    fn test_multiple_sells_different_outcomes_same_block() {
+        // Verify that selling shares of different outcomes
+        // in the same block works independently.
+
+        let mut state_update = StateUpdate::new();
+        let trader = Address::ALL_ZEROS;
+        let market_id = MarketId::new([3u8; 6]);
+
+        // Trader owns 100 shares of outcome 0 and 100 shares of outcome 1
+        let owned_outcome_0 = 100.0;
+        let owned_outcome_1 = 100.0;
+
+        // Sell 80 shares of outcome 0
+        state_update.add_share_account_change(
+            trader,
+            market_id.clone(),
+            0,
+            -80.0,
+        );
+
+        // Check effective ownership for outcome 0
+        let pending_delta_0 = state_update
+            .share_account_changes
+            .get(&(trader, market_id.clone()))
+            .and_then(|outcomes| outcomes.get(&0))
+            .copied()
+            .unwrap_or(0.0);
+        let effective_owned_0 = owned_outcome_0 + pending_delta_0;
+        assert_eq!(effective_owned_0, 20.0);
+
+        // Check effective ownership for outcome 1 (should be unaffected)
+        let pending_delta_1 = state_update
+            .share_account_changes
+            .get(&(trader, market_id.clone()))
+            .and_then(|outcomes| outcomes.get(&1))
+            .copied()
+            .unwrap_or(0.0);
+        let effective_owned_1 = owned_outcome_1 + pending_delta_1;
+        assert_eq!(effective_owned_1, 100.0);
+
+        // Should still be able to sell 100 shares of outcome 1
+        assert!(effective_owned_1 >= 100.0);
+    }
+
+    #[test]
+    fn test_cumulative_sells_same_outcome_same_block() {
+        // Verify that multiple sells of the same outcome accumulate correctly.
+
+        let mut state_update = StateUpdate::new();
+        let trader = Address::ALL_ZEROS;
+        let market_id = MarketId::new([4u8; 6]);
+        let outcome_index: u32 = 0;
+
+        // Trader owns 100 shares
+        let owned_shares_from_db = 100.0;
+
+        // First sell: 30 shares
+        state_update.add_share_account_change(
+            trader,
+            market_id.clone(),
+            outcome_index,
+            -30.0,
+        );
+
+        // Second sell: 40 shares
+        state_update.add_share_account_change(
+            trader,
+            market_id.clone(),
+            outcome_index,
+            -40.0,
+        );
+
+        // Total pending delta should be -70
+        let pending_delta = state_update
+            .share_account_changes
+            .get(&(trader, market_id.clone()))
+            .and_then(|outcomes| outcomes.get(&outcome_index))
+            .copied()
+            .unwrap_or(0.0);
+
+        assert_eq!(pending_delta, -70.0);
+
+        let effective_owned = owned_shares_from_db + pending_delta;
+        assert_eq!(effective_owned, 30.0);
+
+        // Third sell of 40 should fail (only 30 effectively owned)
+        let third_sell = 40.0;
+        assert!(
+            effective_owned < third_sell,
+            "Should reject third sell: {} > {} effective",
+            third_sell,
+            effective_owned
+        );
+
+        // But selling 30 should work
+        assert!(effective_owned >= 30.0);
+    }
 }

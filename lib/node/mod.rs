@@ -13,8 +13,11 @@ use sneed::{DbError, Env, EnvError, RwTxnError, env};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
+use ndarray::Array1;
+
 use crate::{
     archive::{self, Archive},
+    math::{lmsr::LmsrService, trading},
     mempool::{self, MemPool},
     net::{self, Net, Peer},
     state::{self, State, markets::MarketId},
@@ -22,7 +25,8 @@ use crate::{
         Address, AmountOverflowError, AmountUnderflowError, Authorized,
         AuthorizedTransaction, Block, BlockHash, BmmResult, Body, FilledOutput,
         FilledTransaction, GetBitcoinValue, Header, InPoint, Network, OutPoint,
-        Output, SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
+        Output, SpentOutput, Tip, Transaction, TxData, TxIn, Txid,
+        WithdrawalBundle,
         proto::{self, mainchain},
     },
     util::Watchable,
@@ -336,19 +340,28 @@ where
             self.mempool.put(&mut rwtxn, &transaction)?;
 
             if let Some(data) = transaction.transaction.data.as_ref()
-                && let crate::types::TxData::BuyShares {
+                && let crate::types::TxData::Trade {
                     market_id,
                     outcome_index,
-                    shares_to_buy,
+                    shares,
                     ..
                 } = data
             {
-                self.update_mempool_buy(
-                    &mut rwtxn,
-                    market_id.clone(),
-                    *outcome_index,
-                    *shares_to_buy,
-                )?;
+                if *shares > 0.0 {
+                    self.update_mempool_buy(
+                        &mut rwtxn,
+                        market_id.clone(),
+                        *outcome_index,
+                        *shares,
+                    )?;
+                } else {
+                    self.update_mempool_sell(
+                        &mut rwtxn,
+                        market_id.clone(),
+                        *outcome_index,
+                        shares.abs(),
+                    )?;
+                }
             }
 
             rwtxn.commit().map_err(RwTxnError::from)?;
@@ -448,6 +461,75 @@ where
             hex::encode(market_id),
             outcome_index,
             shares_to_buy
+        );
+
+        Ok(())
+    }
+
+    fn update_mempool_sell(
+        &self,
+        rwtxn: &mut RwTxn,
+        market_id: MarketId,
+        outcome_index: u32,
+        shares_to_sell: f64,
+    ) -> Result<(), Error> {
+        use crate::math::lmsr::LmsrService;
+        use crate::state;
+
+        let market = self
+            .state
+            .markets()
+            .get_market(rwtxn, &market_id)?
+            .ok_or_else(|| {
+                Error::State(Box::new(state::Error::InvalidSlotId {
+                    reason: format!("Market {market_id:?} does not exist"),
+                }))
+            })?;
+
+        if market.state() != crate::state::markets::MarketState::Trading {
+            return Ok(());
+        }
+
+        if outcome_index as usize >= market.shares().len() {
+            return Err(Error::State(Box::new(state::Error::InvalidSlotId {
+                reason: format!(
+                    "Outcome index {} exceeds market outcomes {}",
+                    outcome_index,
+                    market.shares().len()
+                ),
+            })));
+        }
+
+        // Get existing mempool shares or use current market shares as base
+        let current_shares = if let Some(existing_mempool_shares) =
+            self.state.get_mempool_shares(rwtxn, &market_id)?
+        {
+            existing_mempool_shares
+        } else {
+            market.shares().clone()
+        };
+
+        let mut new_shares = current_shares.clone();
+        new_shares[outcome_index as usize] -= shares_to_sell; // SUBTRACT for sell
+
+        LmsrService::validate_lmsr_parameters(market.b(), &new_shares)
+            .map_err(|e| {
+                Error::State(Box::new(state::Error::InvalidSlotId {
+                    reason: format!(
+                        "Invalid LMSR state after mempool sell update: {e:?}"
+                    ),
+                }))
+            })?;
+
+        self.state
+            .put_mempool_shares(rwtxn, &market_id, &new_shares)
+            .map_err(|e| Error::State(Box::new(e)))?;
+
+        tracing::debug!(
+            "Updated mempool shares for market {}: outcome {} decreased by {} shares (sell)",
+            hex::encode(market_id),
+            outcome_index,
+            shares_to_sell
         );
 
         Ok(())
@@ -664,29 +746,30 @@ where
     {
         let mut rwtxn = self.env.write_txn()?;
         let transactions = self.mempool.take(&rwtxn, number)?;
+
         let mut fee = bitcoin::Amount::ZERO;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
-        for transaction in transactions {
+        let mut cumulative_market_states: HashMap<MarketId, Array1<f64>> =
+            HashMap::new();
+
+        for transaction in transactions.into_iter() {
+            let txid = transaction.transaction.txid();
+
             let inputs: HashSet<_> =
                 transaction.transaction.inputs.iter().copied().collect();
             if !spent_utxos.is_disjoint(&inputs) {
-                // UTXO double spent
-                self.mempool
-                    .delete(&mut rwtxn, transaction.transaction.txid())?;
+                self.mempool.delete(&mut rwtxn, txid)?;
                 continue;
             }
-            // Transactions are validated before entering mempool in submit_transaction().
-            // We only need to check if UTXOs are still available (done by fill below).
-            let txid = transaction.transaction.txid();
             let filled_transaction = match self
                 .state
-                .fill_authorized_transaction(&rwtxn, transaction)
+                .fill_authorized_transaction(&rwtxn, transaction.clone())
             {
                 Ok(filled_tx) => filled_tx,
                 Err(err) => {
                     tracing::warn!(
-                        "Cannot fill transaction {} during block construction (missing UTXOs?): {:?}. Removing from mempool.",
+                        "Cannot fill transaction {} during block construction: {:?}. Removing from mempool.",
                         txid,
                         err
                     );
@@ -694,6 +777,30 @@ where
                     continue;
                 }
             };
+
+            match self.check_trade_slippage(
+                &rwtxn,
+                &filled_transaction,
+                &mut cumulative_market_states,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        "Skipping tx {} due to slippage - will retry next block",
+                        txid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Slippage check error for {}: {:?} - skipping",
+                        txid,
+                        e
+                    );
+                    continue;
+                }
+            }
+
             let value_in: bitcoin::Amount = filled_transaction
                 .transaction
                 .spent_utxos
@@ -721,6 +828,230 @@ where
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok((returned_transactions, fee))
+    }
+
+    /// Check if a trade transaction passes slippage validation against cumulative market state.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the tx passes slippage check (or is not a market trade)
+    /// - `Ok(false)` if slippage exceeded (tx should be skipped, not deleted)
+    /// - `Err(...)` if there's an error checking (tx should be skipped)
+    ///
+    /// For Trade transactions, this checks the cost/proceeds against
+    /// the cumulative market state (accounting for prior txs in this block) and updates
+    /// the cumulative state if the check passes.
+    fn check_trade_slippage(
+        &self,
+        rotxn: &sneed::RoTxn,
+        filled_tx: &Authorized<FilledTransaction>,
+        cumulative_states: &mut HashMap<MarketId, Array1<f64>>,
+    ) -> Result<bool, Error> {
+        let tx_data = match &filled_tx.transaction.transaction.data {
+            Some(data) => data,
+            None => return Ok(true), // Non-data txs always pass
+        };
+
+        match tx_data {
+            TxData::Trade {
+                market_id,
+                outcome_index,
+                shares,
+                trader,
+                limit_sats,
+                base_sats: _, // Not used - fingerprint check removed per plan
+                fee_sats: _,  // Not used - fingerprint check removed per plan
+            } => {
+                let is_buy = *shares > 0.0;
+                let shares_abs = shares.abs();
+
+                tracing::debug!(
+                    "check_trade_slippage: Trade ({}) market={}, outcome={}, shares={}, limit={}",
+                    if is_buy { "buy" } else { "sell" },
+                    market_id,
+                    outcome_index,
+                    shares,
+                    limit_sats
+                );
+
+                let market =
+                    match self.state.markets().get_market(rotxn, market_id)? {
+                        Some(m) => m,
+                        None => {
+                            tracing::warn!(
+                                "Market {} not found for slippage check",
+                                market_id
+                            );
+                            return Ok(false);
+                        }
+                    };
+
+                tracing::debug!(
+                    "check_trade_slippage: found market with {} outcomes, beta={}",
+                    market.shares().len(),
+                    market.b()
+                );
+
+                // For sells, verify trader owns sufficient shares
+                if !is_buy {
+                    let seller_account = self
+                        .state
+                        .markets()
+                        .get_user_share_account(rotxn, trader)?;
+
+                    let owned_shares = seller_account
+                        .as_ref()
+                        .and_then(|account| {
+                            account
+                                .positions
+                                .get(&(market_id.clone(), *outcome_index))
+                                .copied()
+                        })
+                        .unwrap_or(0.0);
+
+                    tracing::debug!(
+                        "check_trade_slippage: seller {} owns {} shares, trying to sell {}",
+                        trader,
+                        owned_shares,
+                        shares_abs
+                    );
+
+                    if owned_shares < shares_abs {
+                        tracing::info!(
+                            "Insufficient shares for sell: {} owns {} but trying to sell {} - skipping",
+                            trader,
+                            owned_shares,
+                            shares_abs
+                        );
+                        return Ok(false);
+                    }
+                }
+
+                // Get cumulative state (or confirmed state if first tx for this market)
+                let current_shares = cumulative_states
+                    .get(market_id)
+                    .cloned()
+                    .unwrap_or_else(|| market.shares().clone());
+                tracing::debug!(
+                    "check_trade_slippage: current_shares={:?}",
+                    current_shares
+                );
+
+                // Calculate new shares after trade (sign of shares handles direction)
+                let mut new_shares = current_shares.clone();
+                new_shares[*outcome_index as usize] += shares;
+                tracing::debug!(
+                    "check_trade_slippage: new_shares={:?}",
+                    new_shares
+                );
+
+                if is_buy {
+                    // Buy: cost = LMSR(current -> new)
+                    let base_cost = LmsrService::calculate_update_cost(
+                        &current_shares,
+                        &new_shares,
+                        market.b(),
+                    )
+                    .map_err(|e| {
+                        Error::State(Box::new(
+                            state::Error::InvalidTransaction {
+                                reason: format!(
+                                    "LMSR calculation failed: {e:?}"
+                                ),
+                            },
+                        ))
+                    })?;
+                    tracing::debug!(
+                        "check_trade_slippage: base_cost={}",
+                        base_cost
+                    );
+
+                    let buy_cost = trading::calculate_buy_cost(
+                        base_cost,
+                        market.trading_fee(),
+                    )
+                    .map_err(|e| {
+                        Error::State(Box::new(
+                            state::Error::InvalidTransaction {
+                                reason: format!(
+                                    "Buy cost calculation failed: {e}"
+                                ),
+                            },
+                        ))
+                    })?;
+                    tracing::debug!(
+                        "check_trade_slippage: total_cost={}, limit={}",
+                        buy_cost.total_cost_sats,
+                        limit_sats
+                    );
+
+                    if buy_cost.total_cost_sats > *limit_sats {
+                        tracing::info!(
+                            "Slippage exceeded for buy tx: cost {} sats > max {} sats",
+                            buy_cost.total_cost_sats,
+                            limit_sats
+                        );
+                        return Ok(false);
+                    }
+                    // Note: We intentionally do NOT check if embedded costs match recalculated costs.
+                    // Multiple transactions targeting the same market in a block will have different
+                    // cumulative costs. The slippage check (above) is sufficient - if the cost is
+                    // within the user's limit_sats, the transaction is valid.
+                } else {
+                    // Sell: proceeds = LMSR(new -> current)
+                    let gross_proceeds = LmsrService::calculate_update_cost(
+                        &new_shares,
+                        &current_shares,
+                        market.b(),
+                    )
+                    .map_err(|e| {
+                        Error::State(Box::new(
+                            state::Error::InvalidTransaction {
+                                reason: format!(
+                                    "LMSR calculation failed: {e:?}"
+                                ),
+                            },
+                        ))
+                    })?;
+
+                    let sell_proceeds = trading::calculate_sell_proceeds(
+                        gross_proceeds,
+                        market.trading_fee(),
+                    )
+                    .map_err(|e| {
+                        Error::State(Box::new(
+                            state::Error::InvalidTransaction {
+                                reason: format!(
+                                    "Sell proceeds calculation failed: {e}"
+                                ),
+                            },
+                        ))
+                    })?;
+
+                    // Only check slippage limit if limit_sats > 0
+                    // (limit_sats = 0 means "no minimum proceeds requirement")
+                    if *limit_sats > 0
+                        && sell_proceeds.net_proceeds_sats < *limit_sats
+                    {
+                        tracing::info!(
+                            "Slippage exceeded for sell tx: proceeds {} sats < min {} sats",
+                            sell_proceeds.net_proceeds_sats,
+                            limit_sats
+                        );
+                        return Ok(false);
+                    }
+                    // Note: We intentionally do NOT check if embedded costs match recalculated costs.
+                    // Multiple transactions targeting the same market in a block will have different
+                    // cumulative proceeds. The slippage check (above) is sufficient - if proceeds
+                    // meet the user's limit_sats minimum, the transaction is valid.
+                }
+
+                // Update cumulative state for subsequent txs
+                cumulative_states.insert(market_id.clone(), new_shares);
+                tracing::debug!("check_trade_slippage: Trade passed");
+                Ok(true)
+            }
+            _ => Ok(true), // Non-market txs always pass
+        }
     }
 
     pub fn try_get_transaction(
@@ -853,6 +1184,7 @@ where
             .await
             .map_err(|_| Error::ReceiveMainchainTaskResponse)?;
         if !res.map_err(Error::MainchainAncestors)? {
+            tracing::error!(%block_hash, "submit_block: Mainchain ancestor infos check failed");
             return Ok(false);
         };
         tracing::trace!("Storing header: {block_hash}");
@@ -909,7 +1241,7 @@ where
             main_block_hash,
         };
         if !self.net_task.new_tip_ready_confirm(new_tip).await? {
-            tracing::warn!(%block_hash, "Not ready to reorg");
+            tracing::error!(%block_hash, "submit_block: new_tip_ready_confirm returned false - reorg failed!");
             return Ok(false);
         };
         let rotxn = self.env.read_txn()?;
@@ -1154,6 +1486,27 @@ where
             .get_market_user_positions(&rotxn, address, market_id)?)
     }
 
+    /// Get share positions for multiple addresses for a specific market/outcome.
+    /// Returns a map of address -> shares for addresses that have positions.
+    pub fn get_wallet_positions_for_market_outcome(
+        &self,
+        addresses: &std::collections::HashSet<crate::types::Address>,
+        market_id: &crate::state::MarketId,
+        outcome_index: u32,
+    ) -> Result<std::collections::HashMap<crate::types::Address, f64>, Error>
+    {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .markets()
+            .get_wallet_positions_for_market_outcome(
+                &rotxn,
+                addresses,
+                market_id,
+                outcome_index,
+            )?)
+    }
+
     pub fn get_all_share_accounts(
         &self,
     ) -> Result<crate::state::type_aliases::AllShareAccounts, Error> {
@@ -1166,10 +1519,11 @@ where
         market_id: &crate::state::MarketId,
     ) -> Result<u64, Error> {
         let rotxn = self.env.read_txn()?;
-        Ok(self.state.markets().get_market_treasury_sats(
+        Ok(self.state.markets().get_market_funds_sats(
             &rotxn,
             &self.state,
             market_id,
+            false,
         )?)
     }
 
@@ -1250,6 +1604,34 @@ where
             .databases()
             .get_consensus_outcomes_for_period(&rotxn, period_id)
             .map_err(Into::into)
+    }
+
+    /// Trigger a sync/reorg to a specific block hash.
+    /// The block must exist in the archive (received via P2P or locally mined).
+    /// Returns true if reorg was successful, false if not needed or failed.
+    pub async fn sync_to_tip(
+        &self,
+        block_hash: crate::types::BlockHash,
+    ) -> Result<bool, Error> {
+        // Get the new tip info synchronously, then await the reorg
+        let new_tip = {
+            let rotxn = self.env.read_txn()?;
+
+            let main_block_hash = self
+                .archive
+                .get_best_main_verification(&rotxn, block_hash)?;
+
+            Tip {
+                block_hash,
+                main_block_hash,
+            }
+        }; // rotxn is dropped here before the await
+
+        // Trigger the reorg via net_task
+        self.net_task
+            .new_tip_ready_confirm(new_tip)
+            .await
+            .map_err(Error::from)
     }
 }
 

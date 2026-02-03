@@ -5,9 +5,8 @@ use ndarray::{Array, Ix1};
 use serde::{Deserialize, Serialize};
 use sneed::{DatabaseUnique, Env, RoTxn, RwTxn};
 use std::collections::{HashMap, HashSet};
-use tracing::warn;
 
-use crate::math::safe_math::{self, Rounding};
+use crate::math::allocation;
 use crate::state::Error;
 use crate::state::UtxoManager;
 use crate::state::slots::{Decision, SlotId};
@@ -389,20 +388,20 @@ impl BatchedMarketTrade {
     }
 
     pub fn calculate_trade_cost(&self) -> Result<f64, MarketError> {
-        let (total_cost, _fee) = self.calculate_trade_cost_with_fee()?;
-        Ok(total_cost)
+        let cost = self.calculate_trade_cost_sats()?;
+        Ok(cost.total_cost_sats as f64)
     }
 
-    /// Calculate trade cost and return both total cost and fee amount separately
-    pub fn calculate_trade_cost_with_fee(
+    pub fn calculate_trade_cost_sats(
         &self,
-    ) -> Result<(f64, f64), MarketError> {
+    ) -> Result<crate::math::trading::BuyCost, MarketError> {
         use crate::math::lmsr::LmsrService;
+        use crate::math::trading;
 
         let mut new_shares = self.market_snapshot.shares.clone();
         new_shares[self.outcome_index as usize] += self.shares_to_buy;
 
-        let base_cost = LmsrService::calculate_update_cost(
+        let base_cost_f64 = LmsrService::calculate_update_cost(
             &self.market_snapshot.shares,
             &new_shares,
             self.market_snapshot.b,
@@ -413,9 +412,13 @@ impl BatchedMarketTrade {
             ))
         })?;
 
-        let fee_cost = base_cost * self.market_snapshot.trading_fee;
-
-        Ok((base_cost + fee_cost, fee_cost))
+        trading::calculate_buy_cost(
+            base_cost_f64,
+            self.market_snapshot.trading_fee,
+        )
+        .map_err(|e| {
+            MarketError::DatabaseError(format!("Fee calculation failed: {e:?}"))
+        })
     }
 }
 
@@ -483,8 +486,6 @@ pub struct MarketBuilder {
     description: String,
     tags: Vec<String>,
     creator_address: Address,
-    decision_slots: Vec<SlotId>,
-    categorical_slots: Option<(Vec<SlotId>, bool)>,
     dimension_specs: Option<Vec<DimensionSpec>>,
     residual_names: Option<Vec<String>>,
     b: f64,
@@ -498,32 +499,11 @@ impl MarketBuilder {
             description: String::new(),
             tags: Vec::new(),
             creator_address,
-            decision_slots: Vec::new(),
-            categorical_slots: None,
             dimension_specs: None,
             residual_names: None,
             b: DEFAULT_MARKET_BETA,
             trading_fee: DEFAULT_TRADING_FEE,
         }
-    }
-
-    pub fn add_decision(mut self, slot_id: SlotId) -> Self {
-        self.decision_slots.push(slot_id);
-        self
-    }
-
-    pub fn add_decisions(mut self, slot_ids: Vec<SlotId>) -> Self {
-        self.decision_slots.extend(slot_ids);
-        self
-    }
-
-    pub fn set_categorical(
-        mut self,
-        slot_ids: Vec<SlotId>,
-        has_residual: bool,
-    ) -> Self {
-        self.categorical_slots = Some((slot_ids, has_residual));
-        self
     }
 
     pub fn with_description(mut self, desc: String) -> Self {
@@ -568,40 +548,19 @@ impl MarketBuilder {
         expires_at_height: Option<u64>,
         decisions: &HashMap<SlotId, Decision>,
     ) -> Result<Market, MarketError> {
-        let (all_slots, d_functions, state_combos) =
-            if let Some(ref dimension_specs) = self.dimension_specs {
-                let (d_funcs, combos) =
-                    generate_mixed_dimensional(dimension_specs, decisions)?;
+        let dimension_specs =
+            self.dimension_specs.ok_or(MarketError::InvalidDimensions)?;
 
-                let mut slots = Vec::new();
-                for spec in dimension_specs {
-                    match spec {
-                        DimensionSpec::Single(slot_id) => slots.push(*slot_id),
-                        DimensionSpec::Categorical(slot_ids) => {
-                            slots.extend(slot_ids)
-                        }
-                    }
-                }
-                (slots, d_funcs, combos)
-            } else if let Some((ref cat_slots, has_residual)) =
-                self.categorical_slots
-            {
-                if !self.decision_slots.is_empty() {
-                    return Err(MarketError::InvalidDimensions);
-                }
-                let (d_funcs, combos) = generate_categorical_functions(
-                    cat_slots,
-                    has_residual,
-                    decisions,
-                )?;
-                (cat_slots.clone(), d_funcs, combos)
-            } else {
-                let (d_funcs, combos) =
-                    generate_full_product(&self.decision_slots, decisions)?;
-                (self.decision_slots.clone(), d_funcs, combos)
-            };
+        let (d_functions, state_combos) =
+            generate_mixed_dimensional(&dimension_specs, decisions)?;
 
-        let dimension_specs = self.dimension_specs.clone().unwrap_or_default();
+        let all_slots: Vec<SlotId> = dimension_specs
+            .iter()
+            .flat_map(|spec| match spec {
+                DimensionSpec::Single(slot_id) => vec![*slot_id],
+                DimensionSpec::Categorical(slot_ids) => slot_ids.clone(),
+            })
+            .collect();
 
         Market::new(
             self.title,
@@ -692,14 +651,12 @@ impl DFunction {
 
     pub fn validate_dimensional_consistency(
         d_functions: &[DFunction],
-        dimension_specs: &[DimensionSpec],
-        decision_slots: &[SlotId],
+        decision_slots_len: usize,
         all_combos: &[Vec<usize>],
     ) -> Result<(), MarketError> {
         crate::validation::DFunctionValidator::validate_dimensional_consistency(
             d_functions,
-            dimension_specs,
-            decision_slots,
+            decision_slots_len,
             all_combos,
         )
     }
@@ -731,18 +688,11 @@ impl DFunction {
     }
 }
 
-fn calculate_storage_fee_with_scaling(
-    share_vector_length: usize,
-) -> Result<u64, MarketError> {
-    if share_vector_length > MAX_MARKET_OUTCOMES {
-        return Err(MarketError::TooManyStates(share_vector_length));
-    }
-
+fn calculate_storage_fee_with_scaling(share_vector_length: usize) -> u64 {
     let base_cost = BASE_MARKET_STORAGE_COST_SATS;
-
     let quadratic_cost =
         (share_vector_length as u64).pow(2) * L2_STORAGE_RATE_SATS_PER_BYTE;
-    Ok(base_cost + quadratic_cost)
+    base_cost + quadratic_cost
 }
 
 pub fn generate_mixed_dimensional(
@@ -755,7 +705,6 @@ pub fn generate_mixed_dimensional(
         return Err(MarketError::InvalidDimensions);
     }
 
-    // Check for duplicate slots across all dimensions
     let mut seen_slots = HashSet::new();
     for spec in dimension_specs {
         let slots = match spec {
@@ -769,19 +718,22 @@ pub fn generate_mixed_dimensional(
         }
     }
 
-    let mut expected_outcomes = 1usize;
+    // Validate tradeable outcome count (excludes ABSTAIN states).
+
+    let mut tradeable_outcomes = 1usize;
     for spec in dimension_specs {
-        let spec_outcomes = match spec {
-            DimensionSpec::Single(_) => 3,
-            DimensionSpec::Categorical(slots) => slots.len() + 2,
+        let tradeable_per_dim = match spec {
+            DimensionSpec::Single(_) => 2, // No, Yes (excludes Abstain)
+            DimensionSpec::Categorical(slots) => slots.len() + 1, // slots + residual (excludes Abstain)
         };
 
-        if let Some(new_expected) = expected_outcomes.checked_mul(spec_outcomes)
+        if let Some(new_tradeable) =
+            tradeable_outcomes.checked_mul(tradeable_per_dim)
         {
-            if new_expected > MAX_MARKET_OUTCOMES {
-                return Err(MarketError::TooManyStates(new_expected));
+            if new_tradeable > MAX_MARKET_OUTCOMES {
+                return Err(MarketError::TooManyStates(new_tradeable));
             }
-            expected_outcomes = new_expected;
+            tradeable_outcomes = new_tradeable;
         } else {
             return Err(MarketError::TooManyStates(usize::MAX));
         }
@@ -804,7 +756,6 @@ pub fn generate_mixed_dimensional(
                 // Both binary and scaled decisions have 3 outcomes for LMSR consistency:
                 // Binary: 0=No, 1=Yes, 2=Abstain
                 // Scaled: 0=Min bound, 1=Max bound, 2=Abstain
-                // For scaled, the continuous value (0-1) determines payout distribution during resolution
                 let outcomes = 3;
                 dimension_ranges.push(outcomes);
             }
@@ -821,14 +772,6 @@ pub fn generate_mixed_dimensional(
     }
 
     let state_combos = generate_cartesian_product(&dimension_ranges);
-
-    if state_combos.is_empty() && expected_outcomes > MAX_MARKET_OUTCOMES {
-        return Err(MarketError::TooManyStates(expected_outcomes));
-    }
-
-    if state_combos.len() > MAX_MARKET_OUTCOMES {
-        return Err(MarketError::TooManyStates(state_combos.len()));
-    }
 
     let mut d_functions = Vec::with_capacity(state_combos.len());
 
@@ -896,119 +839,11 @@ pub fn generate_mixed_dimensional(
 
     DFunction::validate_dimensional_consistency(
         &d_functions,
-        dimension_specs,
-        &all_slots,
+        all_slots.len(),
         &state_combos,
     )?;
 
     Ok((d_functions, state_combos))
-}
-
-pub fn generate_full_product(
-    slots: &[SlotId],
-    decisions: &HashMap<SlotId, Decision>,
-) -> Result<(Vec<DFunction>, Vec<Vec<usize>>), MarketError> {
-    if slots.is_empty() {
-        return Err(MarketError::InvalidDimensions);
-    }
-
-    let dimensions = get_raw_dimensions(slots, decisions)?;
-
-    let state_combos = generate_cartesian_product(&dimensions);
-
-    if state_combos.len() > MAX_MARKET_OUTCOMES {
-        return Err(MarketError::TooManyStates(state_combos.len()));
-    }
-
-    let d_functions = vec![DFunction::True; state_combos.len()];
-
-    Ok((d_functions, state_combos))
-}
-
-fn generate_categorical_functions(
-    slots: &[SlotId],
-    has_residual: bool,
-    decisions: &HashMap<SlotId, Decision>,
-) -> Result<(Vec<DFunction>, Vec<Vec<usize>>), MarketError> {
-    for slot_id in slots {
-        if let Some(decision) = decisions.get(slot_id)
-            && decision.is_scaled
-        {
-            return Err(MarketError::InvalidDimensions);
-        }
-    }
-
-    let mut d_functions = Vec::new();
-    let mut state_combos = Vec::new();
-
-    for (i, _slot_id) in slots.iter().enumerate() {
-        let mut others = Vec::new();
-        for (j, _) in slots.iter().enumerate() {
-            if i != j {
-                others.push(DFunction::Decision(j));
-            }
-        }
-
-        let not_others = if others.is_empty() {
-            DFunction::True
-        } else {
-            let or_others = others
-                .into_iter()
-                .reduce(|acc, func| {
-                    DFunction::Or(Box::new(acc), Box::new(func))
-                })
-                .expect("others vector is non-empty");
-            DFunction::Not(Box::new(or_others))
-        };
-
-        let function = DFunction::And(
-            Box::new(DFunction::Decision(i)),
-            Box::new(not_others),
-        );
-        let mut combo = vec![0; slots.len()];
-        combo[i] = 1;
-
-        d_functions.push(function);
-        state_combos.push(combo);
-    }
-    if has_residual {
-        let all_decisions: Vec<DFunction> =
-            (0..slots.len()).map(DFunction::Decision).collect();
-
-        let or_all = all_decisions
-            .into_iter()
-            .reduce(|acc, func| DFunction::Or(Box::new(acc), Box::new(func)))
-            .unwrap_or(DFunction::True);
-
-        let residual_function = DFunction::Not(Box::new(or_all));
-        let residual_combo = vec![0; slots.len()];
-
-        d_functions.push(residual_function);
-        state_combos.push(residual_combo);
-    }
-
-    Ok((d_functions, state_combos))
-}
-
-fn get_raw_dimensions(
-    slots: &[SlotId],
-    decisions: &HashMap<SlotId, Decision>,
-) -> Result<Vec<usize>, MarketError> {
-    let mut dimensions = Vec::new();
-
-    for slot_id in slots {
-        decisions
-            .get(slot_id)
-            .ok_or(MarketError::DecisionSlotNotFound { slot_id: *slot_id })?;
-
-        // Both binary and scaled have 3 outcomes for LMSR consistency
-        // Binary: 0=No, 1=Yes, 2=Abstain
-        // Scaled: 0=Min, 1=Max, 2=Abstain (continuous 0-1 value determines payout)
-        let outcomes = 3;
-        dimensions.push(outcomes);
-    }
-
-    Ok(dimensions)
 }
 
 fn generate_cartesian_product(dimensions: &[usize]) -> Vec<Vec<usize>> {
@@ -1017,11 +852,6 @@ fn generate_cartesian_product(dimensions: &[usize]) -> Vec<Vec<usize>> {
     }
 
     let expected_size: usize = dimensions.iter().product();
-
-    if expected_size > MAX_MARKET_OUTCOMES {
-        return Vec::new();
-    }
-
     let mut result = Vec::with_capacity(expected_size);
     result.push(vec![]);
 
@@ -1030,10 +860,6 @@ fn generate_cartesian_product(dimensions: &[usize]) -> Vec<Vec<usize>> {
 
         for combo in result {
             for value in 0..dim_size {
-                if new_result.len() >= MAX_MARKET_OUTCOMES {
-                    return Vec::new();
-                }
-
                 let mut new_combo = combo.clone();
                 new_combo.push(value);
                 new_result.push(new_combo);
@@ -1087,17 +913,13 @@ impl Market {
             return Err(MarketError::InvalidDimensions);
         }
 
-        if d_functions.len() > MAX_MARKET_OUTCOMES {
-            return Err(MarketError::TooManyStates(d_functions.len()));
-        }
-
         if b <= 0.0 {
             return Err(MarketError::InvalidBeta(b));
         }
 
         let share_vector_length = d_functions.len();
         let storage_fee_sats =
-            calculate_storage_fee_with_scaling(share_vector_length)?;
+            calculate_storage_fee_with_scaling(share_vector_length);
 
         let mut market = Market {
             id: MarketId([0; 6]),
@@ -1190,7 +1012,6 @@ impl Market {
         &self.final_prices
     }
 
-    /// Update market state - replaces create_new_state_version
     pub fn update_state(
         &mut self,
         height: u64,
@@ -1286,7 +1107,6 @@ impl Market {
     ///
     /// Returns None if market has multiple decision slots or invalid structure.
     pub fn get_implied_value_normalized(&self) -> Option<f64> {
-        // Only works for single-slot markets (3 outcomes: min/no, max/yes, abstain)
         if self.decision_slots.len() != 1 || self.state_combos.len() != 3 {
             return None;
         }
@@ -1296,7 +1116,6 @@ impl Market {
             return None;
         }
 
-        // prices[0] = min/no, prices[1] = max/yes, prices[2] = abstain
         let p_min = prices[0];
         let p_max = prices[1];
         let sum = p_min + p_max;
@@ -1308,13 +1127,10 @@ impl Market {
         }
     }
 
-    /// Denormalize an implied value (0-1) to the actual [min, max] range.
-    /// Use with scaled decisions where min/max are defined.
     pub fn denormalize_value(normalized: f64, min: i64, max: i64) -> f64 {
         min as f64 + normalized * (max - min) as f64
     }
 
-    /// Normalize a real-world value to 0-1 range.
     pub fn normalize_value(value: f64, min: i64, max: i64) -> f64 {
         if max == min {
             return 0.5;
@@ -1430,9 +1246,6 @@ impl Market {
     ///
     /// # Returns
     /// Array of final prices, one per market outcome, summing to 1.0
-    ///
-    /// Binary: threshold-based (>0.7→Yes, <0.3→No, else split)
-    /// Scaled: proportional (outcome→Max, 1-outcome→Min)
     pub fn calculate_final_prices(
         &self,
         slot_outcomes: &std::collections::HashMap<SlotId, f64>,
@@ -1460,7 +1273,6 @@ impl Market {
             axes.push(axis);
         }
 
-        // Tensor product: multiply axis weights for each state_combo
         let mut prices = Array::zeros(self.state_combos.len());
 
         for (i, state_combo) in self.state_combos.iter().enumerate() {
@@ -1486,14 +1298,11 @@ impl Market {
     }
 
     /// Returns the number of tradeable outcomes (excludes ABSTAIN states).
-    /// This is the single source of truth for LMSR calculations.
-    /// For a binary market, this returns 2 (No/Yes), not 3 (No/Yes/Abstain).
     pub fn get_outcome_count(&self) -> usize {
         self.get_valid_state_combos().len()
     }
 
     /// Returns the total number of state combinations including ABSTAIN.
-    /// Use this for array indexing, not for LMSR calculations.
     pub fn get_total_state_count(&self) -> usize {
         self.shares().len()
     }
@@ -1534,24 +1343,6 @@ impl Market {
 
     pub fn get_current_prices(&self) -> Array<f64, Ix1> {
         self.current_prices()
-    }
-
-    pub fn calculate_buy_cost(
-        &self,
-        outcome_index: u32,
-        shares_to_buy: f64,
-    ) -> Result<u64, MarketError> {
-        if outcome_index as usize >= self.shares().len() {
-            return Err(MarketError::InvalidOutcomeCombination);
-        }
-
-        let mut new_shares = self.shares().clone();
-        new_shares[outcome_index as usize] += shares_to_buy;
-
-        let cost = self.query_update_cost(new_shares)?;
-        let fee_cost = cost * self.trading_fee();
-
-        Ok((cost + fee_cost) as u64)
     }
 
     pub fn get_outcome_index(
@@ -1652,6 +1443,7 @@ fn mempool_address(market_id: &MarketId) -> Address {
 }
 
 #[derive(Clone)]
+#[allow(clippy::type_complexity)]
 pub struct MarketsDatabase {
     markets: DatabaseUnique<SerdeBincode<[u8; 6]>, SerdeBincode<Market>>,
     state_index:
@@ -1662,17 +1454,13 @@ pub struct MarketsDatabase {
         DatabaseUnique<SerdeBincode<SlotId>, SerdeBincode<Vec<MarketId>>>,
     share_accounts:
         DatabaseUnique<SerdeBincode<Address>, SerdeBincode<ShareAccount>>,
-    /// Maps MarketId -> Current UTXO OutPoint for the market's treasury
-    market_utxos: DatabaseUnique<SerdeBincode<[u8; 6]>, SerdeBincode<OutPoint>>,
-    /// Maps MarketId -> Current UTXO OutPoint for accumulated author fees
-    market_author_fee_utxos:
-        DatabaseUnique<SerdeBincode<[u8; 6]>, SerdeBincode<OutPoint>>,
-    /// Maps MarketId -> Pending treasury UTXOs from transactions (not yet consolidated)
-    pending_treasury_utxos:
-        DatabaseUnique<SerdeBincode<[u8; 6]>, SerdeBincode<Vec<OutPoint>>>,
-    /// Maps MarketId -> Pending author fee UTXOs from transactions (not yet consolidated)
-    pending_author_fee_utxos:
-        DatabaseUnique<SerdeBincode<[u8; 6]>, SerdeBincode<Vec<OutPoint>>>,
+    /// is_fee=false for treasury, is_fee=true for author fees
+    market_funds_utxos:
+        DatabaseUnique<SerdeBincode<([u8; 6], bool)>, SerdeBincode<OutPoint>>,
+    pending_market_funds_utxos: DatabaseUnique<
+        SerdeBincode<[u8; 6]>,
+        SerdeBincode<Vec<(OutPoint, bool)>>,
+    >,
 }
 
 impl MarketsDatabase {
@@ -1860,7 +1648,7 @@ impl MarketsDatabase {
     ) -> Result<(), Error> {
         crate::validation::MarketStateValidator::validate_market_state_transition(from_state, to_state)
     }
-    pub const NUM_DBS: u32 = 9;
+    pub const NUM_DBS: u32 = 7;
 
     pub fn new(env: &Env, rwtxn: &mut RwTxn) -> Result<Self, Error> {
         let markets = DatabaseUnique::create(env, rwtxn, "markets")?;
@@ -1871,13 +1659,10 @@ impl MarketsDatabase {
         let slot_index = DatabaseUnique::create(env, rwtxn, "markets_by_slot")?;
         let share_accounts =
             DatabaseUnique::create(env, rwtxn, "share_accounts")?;
-        let market_utxos = DatabaseUnique::create(env, rwtxn, "market_utxos")?;
-        let market_author_fee_utxos =
-            DatabaseUnique::create(env, rwtxn, "market_author_fee_utxos")?;
-        let pending_treasury_utxos =
-            DatabaseUnique::create(env, rwtxn, "pending_treasury_utxos")?;
-        let pending_author_fee_utxos =
-            DatabaseUnique::create(env, rwtxn, "pending_author_fee_utxos")?;
+        let market_funds_utxos =
+            DatabaseUnique::create(env, rwtxn, "market_funds_utxos")?;
+        let pending_market_funds_utxos =
+            DatabaseUnique::create(env, rwtxn, "pending_market_funds_utxos")?;
 
         Ok(MarketsDatabase {
             markets,
@@ -1885,10 +1670,8 @@ impl MarketsDatabase {
             expiry_index,
             slot_index,
             share_accounts,
-            market_utxos,
-            market_author_fee_utxos,
-            pending_treasury_utxos,
-            pending_author_fee_utxos,
+            market_funds_utxos,
+            pending_market_funds_utxos,
         })
     }
 
@@ -1912,8 +1695,6 @@ impl MarketsDatabase {
         Ok(())
     }
 
-    /// Delete a market and all its associated index entries.
-    /// Used when reverting a market creation on reorg.
     pub fn delete_market(
         &self,
         txn: &mut RwTxn,
@@ -1925,33 +1706,24 @@ impl MarketsDatabase {
             return Ok(false);
         };
 
-        // Remove from state index
         self.update_state_index(txn, market_id, Some(market.state()), None)?;
 
-        // Remove from expiry index if applicable
         if let Some(expires_at) = market.expires_at_height {
             self.update_expiry_index(txn, market_id, Some(expires_at), None)?;
         }
 
-        // Remove from slot index for each decision slot
         for &slot_id in &market.decision_slots {
             self.update_slot_index(txn, market_id, slot_id, false)?;
         }
 
-        // Clear market UTXO reference
-        self.market_utxos.delete(txn, market_id.as_bytes())?;
+        self.market_funds_utxos
+            .delete(txn, &(*market_id.as_bytes(), false))?;
+        self.market_funds_utxos
+            .delete(txn, &(*market_id.as_bytes(), true))?;
 
-        // Clear author fee UTXO reference
-        self.market_author_fee_utxos
+        self.pending_market_funds_utxos
             .delete(txn, market_id.as_bytes())?;
 
-        // Clear any pending UTXOs
-        self.pending_treasury_utxos
-            .delete(txn, market_id.as_bytes())?;
-        self.pending_author_fee_utxos
-            .delete(txn, market_id.as_bytes())?;
-
-        // Delete the market itself
         self.markets.delete(txn, market_id.as_bytes())?;
 
         Ok(true)
@@ -2257,20 +2029,9 @@ impl MarketsDatabase {
         Ok(())
     }
 
-    /// SINGLE SOURCE OF TRUTH: Transition resolved markets directly from Trading → Ossified
-    /// with automatic share payouts.
-    ///
+    /// Transition resolved markets directly from Trading → Ossified with automatic share payouts.
     /// Called every block from connect_body. Checks ALL trading markets to see if
     /// their decision slots are now Resolved in the SlotStateHistory database.
-    /// When all slots are resolved:
-    /// 1. Calculate final prices from slot outcomes
-    /// 2. Calculate and apply share payouts (creates Bitcoin UTXOs for shareholders)
-    /// 3. Auto-pay collected fees to market creator
-    /// 4. Transition market directly to Ossified with zero treasury
-    ///
-    /// # Bitcoin Hivemind Specification
-    /// Per whitepaper Section 3.2, markets are resolved when all their
-    /// decision slots have been resolved through the voting consensus process.
     pub fn transition_and_payout_resolved_markets(
         &self,
         txn: &mut RwTxn,
@@ -2301,7 +2062,6 @@ impl MarketsDatabase {
                     break;
                 }
 
-                // Get consensus outcome from the voting database (canonical source)
                 let voting_period_id =
                     crate::state::voting::types::VotingPeriodId::new(
                         slot_id.voting_period(),
@@ -2314,7 +2074,6 @@ impl MarketsDatabase {
                     slot_outcomes.insert(*slot_id, outcome);
                 }
 
-                // Get decision for scaled handling
                 if let Some(slot) = slots_db.get_slot(txn, *slot_id)?
                     && let Some(decision) = slot.decision
                 {
@@ -2325,7 +2084,6 @@ impl MarketsDatabase {
             if all_slots_resolved {
                 let market_id = market.id.clone();
 
-                // Calculate final prices from slot outcomes
                 let final_prices = market
                     .calculate_final_prices(&slot_outcomes, &decisions)
                     .map_err(|e| {
@@ -2334,7 +2092,6 @@ impl MarketsDatabase {
                         ))
                     })?;
 
-                // Set final prices for payout calculation
                 market
                     .update_state(
                         current_height as u64,
@@ -2349,7 +2106,6 @@ impl MarketsDatabase {
                         ))
                     })?;
 
-                // Calculate payouts based on shares and final prices
                 let payout_summary = self.calculate_share_payouts(
                     txn,
                     state,
@@ -2357,7 +2113,7 @@ impl MarketsDatabase {
                     current_height as u64,
                 )?;
 
-                // Apply payouts (creates Bitcoin UTXOs, removes shares)
+                // Apply payouts
                 self.apply_automatic_share_payouts(
                     state,
                     txn,
@@ -2366,7 +2122,6 @@ impl MarketsDatabase {
                     current_height as u64,
                 )?;
 
-                // Transition directly to Ossified
                 market
                     .update_state(
                         current_height as u64,
@@ -2829,6 +2584,26 @@ impl MarketsDatabase {
         }
     }
 
+    pub fn get_wallet_positions_for_market_outcome(
+        &self,
+        txn: &RoTxn,
+        addresses: &std::collections::HashSet<Address>,
+        market_id: &MarketId,
+        outcome_index: u32,
+    ) -> Result<std::collections::HashMap<Address, f64>, Error> {
+        let mut result = std::collections::HashMap::new();
+        for address in addresses {
+            if let Some(account) = self.get_user_share_account(txn, address)?
+                && let Some(&shares) =
+                    account.positions.get(&(market_id.clone(), outcome_index))
+                && shares > 0.0
+            {
+                result.insert(*address, shares);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn revert_share_trade(
         &self,
         txn: &mut RwTxn,
@@ -2872,7 +2647,6 @@ impl MarketsDatabase {
         }
     }
 
-    /// Get all shareholders who have positions in a specific market
     pub fn get_shareholders_for_market(
         &self,
         txn: &RoTxn,
@@ -2897,12 +2671,7 @@ impl MarketsDatabase {
         Ok(shareholders)
     }
 
-    /// Calculate share payouts for a resolved market
-    ///
     /// Payout formula: payout_i = (shares_i * final_price_i / total_weighted_shares) * treasury
-    /// where total_weighted_shares = sum over all positions of (shares * final_price)
-    ///
-    /// This ensures the entire treasury is distributed proportionally to winning positions.
     pub fn calculate_share_payouts(
         &self,
         txn: &RoTxn,
@@ -2911,7 +2680,7 @@ impl MarketsDatabase {
         block_height: u64,
     ) -> Result<MarketPayoutSummary, Error> {
         let treasury_sats =
-            self.get_market_treasury_sats(txn, state, &market.id)?;
+            self.get_market_funds_sats(txn, state, &market.id, false)?;
         let final_prices = market.final_prices();
 
         let shareholders = self.get_shareholders_for_market(txn, &market.id)?;
@@ -2938,82 +2707,52 @@ impl MarketsDatabase {
             });
         }
 
-        // Calculate payouts using round-to-nearest for fairness
-        // This minimizes dust by having rounding errors cancel out (some up, some down)
-        let mut payouts = Vec::new();
-        let mut total_distributed: u64 = 0;
+        let participants: Vec<((Address, u32, f64, f64), f64)> = shareholders
+            .into_iter()
+            .flat_map(|(address, positions)| {
+                positions.into_iter().map(move |(outcome_index, shares)| {
+                    let final_price = final_prices[outcome_index as usize];
+                    let weighted_shares = shares * final_price;
+                    (
+                        (address, outcome_index, shares, final_price),
+                        weighted_shares,
+                    )
+                })
+            })
+            .collect();
 
-        for (address, positions) in shareholders {
-            for (outcome_index, shares) in positions {
-                let final_price = final_prices[outcome_index as usize];
-                let weighted_shares = shares * final_price;
-                let payout_calc = weighted_shares / total_weighted_shares
-                    * treasury_sats as f64;
-                let payout_sats =
-                    safe_math::to_sats(payout_calc, Rounding::Nearest).unwrap_or_else(
-                        |e| {
-                            warn!(
-                                "Payout conversion failed for {} (market {}, outcome {}): {}. Defaulting to 0.",
-                                address.as_base58(),
-                                market.id,
-                                outcome_index,
-                                e
-                            );
-                            0
-                        },
-                    );
+        let alloc_result = allocation::allocate_proportionally_u64(
+            participants,
+            treasury_sats,
+        )
+        .map_err(|e| Error::InvalidTransaction {
+            reason: format!("Payout allocation failed: {e}"),
+        })?;
 
-                if payout_sats > 0 {
-                    payouts.push(SharePayoutRecord {
+        let payouts: Vec<SharePayoutRecord> = alloc_result
+            .allocations
+            .into_iter()
+            .map(
+                |(
+                    (address, outcome_index, shares, final_price),
+                    payout_sats,
+                )| {
+                    SharePayoutRecord {
                         market_id: market.id.clone(),
                         address,
                         outcome_index,
                         shares_redeemed: shares,
                         final_price,
                         payout_sats,
-                    });
-                    total_distributed += payout_sats;
-                }
-            }
-        }
+                    }
+                },
+            )
+            .collect();
 
-        // Adjust for rounding: round-to-nearest may over or under distribute
-        // Under: remainder to largest shareholder (who lost most to rounding)
-        // Over: subtract from smallest shareholder (who gained most from rounding)
-        if !payouts.is_empty() {
-            if total_distributed < treasury_sats {
-                let remainder = treasury_sats - total_distributed;
-                let largest_idx = payouts
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, p)| p.payout_sats)
-                    .map(|(idx, _)| idx)
-                    .unwrap();
-                payouts[largest_idx].payout_sats += remainder;
-                total_distributed += remainder;
-            } else if total_distributed > treasury_sats {
-                let excess = total_distributed - treasury_sats;
-                let smallest_idx = payouts
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, p)| p.payout_sats)
-                    .map(|(idx, _)| idx)
-                    .unwrap();
-                payouts[smallest_idx].payout_sats =
-                    payouts[smallest_idx].payout_sats.saturating_sub(excess);
-                total_distributed -= excess;
-            }
-        }
+        let total_distributed = alloc_result.total_allocated;
 
-        // Conservation invariant: all treasury satoshis are distributed
-        debug_assert_eq!(
-            total_distributed, treasury_sats,
-            "Conservation invariant violated: {total_distributed} distributed but treasury was {treasury_sats}"
-        );
-
-        // Get author fees from Author Fee UTXO
         let author_fees_distributed =
-            self.get_author_fee_sats(txn, state, &market.id)?;
+            self.get_market_funds_sats(txn, state, &market.id, true)?;
 
         Ok(MarketPayoutSummary {
             market_id: market.id.clone(),
@@ -3025,8 +2764,6 @@ impl MarketsDatabase {
         })
     }
 
-    /// Apply automatic share payouts - creates Bitcoin UTXOs for shareholders
-    /// Always consumes the Market UTXO when called, even if no payouts to distribute
     pub fn apply_automatic_share_payouts(
         &self,
         state: &crate::state::State,
@@ -3041,7 +2778,6 @@ impl MarketsDatabase {
 
         let mut sequence = 0u32;
 
-        // Create Bitcoin UTXOs for each shareholder
         for payout in &payout_summary.payouts {
             let outpoint = generate_share_payout_outpoint(
                 &payout.market_id,
@@ -3072,7 +2808,6 @@ impl MarketsDatabase {
             sequence += 1;
         }
 
-        // Pay accumulated author fees from Author Fee UTXO to market creator
         if payout_summary.author_fees_distributed > 0 {
             let fee_outpoint = generate_share_payout_outpoint(
                 &payout_summary.market_id,
@@ -3100,42 +2835,27 @@ impl MarketsDatabase {
 
         // Consume the Market UTXO (treasury is now distributed to shareholders)
         if let Some(market_utxo) =
-            self.get_market_utxo(txn, &payout_summary.market_id)?
+            self.get_market_funds_utxo(txn, &payout_summary.market_id, false)?
         {
             state.delete_utxo_with_address_index(txn, &market_utxo)?;
-            self.clear_market_utxo(txn, &payout_summary.market_id)?;
-            tracing::debug!(
-                "Consumed market UTXO {:?} during payout for market {}",
-                market_utxo,
-                payout_summary.market_id
-            );
+            self.clear_market_funds_utxo(
+                txn,
+                &payout_summary.market_id,
+                false,
+            )?;
         }
 
         // Consume the Author Fee UTXO (fees now paid to market creator)
         if let Some(fee_utxo) =
-            self.get_author_fee_utxo(txn, &payout_summary.market_id)?
+            self.get_market_funds_utxo(txn, &payout_summary.market_id, true)?
         {
             state.delete_utxo_with_address_index(txn, &fee_utxo)?;
-            self.clear_author_fee_utxo(txn, &payout_summary.market_id)?;
-            tracing::debug!(
-                "Consumed author fee UTXO {:?} during payout for market {}",
-                fee_utxo,
-                payout_summary.market_id
-            );
+            self.clear_market_funds_utxo(txn, &payout_summary.market_id, true)?;
         }
-
-        tracing::info!(
-            "Applied automatic share payouts for market {}: {} sats treasury + {} sats fees to {} shareholders",
-            payout_summary.market_id,
-            payout_summary.treasury_distributed,
-            payout_summary.author_fees_distributed,
-            payout_summary.shareholder_count
-        );
 
         Ok(())
     }
 
-    /// Revert automatic share payouts - removes Bitcoin UTXOs and restores shares
     pub fn revert_automatic_share_payouts(
         &self,
         state: &crate::state::State,
@@ -3146,7 +2866,6 @@ impl MarketsDatabase {
     ) -> Result<(), Error> {
         let mut sequence = 0u32;
 
-        // Remove Bitcoin UTXOs for each shareholder and restore shares
         for payout in &payout_summary.payouts {
             let outpoint = generate_share_payout_outpoint(
                 &payout.market_id,
@@ -3192,100 +2911,51 @@ impl MarketsDatabase {
         Ok(())
     }
 
-    /// Get the current UTXO OutPoint for a market's treasury
-    pub fn get_market_utxo(
+    pub fn get_market_funds_utxo(
         &self,
         txn: &RoTxn,
         market_id: &MarketId,
-    ) -> Result<Option<OutPoint>, Error> {
-        Ok(self.market_utxos.try_get(txn, market_id.as_bytes())?)
-    }
-
-    /// Set the current UTXO OutPoint for a market's treasury
-    pub fn set_market_utxo(
-        &self,
-        txn: &mut RwTxn,
-        market_id: &MarketId,
-        outpoint: &OutPoint,
-    ) -> Result<(), Error> {
-        self.market_utxos.put(txn, market_id.as_bytes(), outpoint)?;
-        Ok(())
-    }
-
-    /// Clear the market UTXO (when market is fully drained/ossified)
-    pub fn clear_market_utxo(
-        &self,
-        txn: &mut RwTxn,
-        market_id: &MarketId,
-    ) -> Result<(), Error> {
-        self.market_utxos.delete(txn, market_id.as_bytes())?;
-        Ok(())
-    }
-
-    /// Get the actual treasury balance for a market from its UTXO
-    pub fn get_market_treasury_sats(
-        &self,
-        txn: &RoTxn,
-        state: &crate::state::State,
-        market_id: &MarketId,
-    ) -> Result<u64, Error> {
-        match self.get_market_utxo(txn, market_id)? {
-            Some(outpoint) => {
-                let utxo = state
-                    .utxos
-                    .try_get(txn, &outpoint)?
-                    .ok_or(Error::NoUtxo { outpoint })?;
-                Ok(utxo.get_bitcoin_value().to_sat())
-            }
-            None => Ok(0),
-        }
-    }
-
-    /// Get the current UTXO OutPoint for a market's author fees
-    pub fn get_author_fee_utxo(
-        &self,
-        txn: &RoTxn,
-        market_id: &MarketId,
+        is_fee: bool,
     ) -> Result<Option<OutPoint>, Error> {
         Ok(self
-            .market_author_fee_utxos
-            .try_get(txn, market_id.as_bytes())?)
+            .market_funds_utxos
+            .try_get(txn, &(*market_id.as_bytes(), is_fee))?)
     }
 
-    /// Set the current UTXO OutPoint for a market's author fees
-    pub fn set_author_fee_utxo(
+    pub fn set_market_funds_utxo(
         &self,
         txn: &mut RwTxn,
         market_id: &MarketId,
+        is_fee: bool,
         outpoint: &OutPoint,
     ) -> Result<(), Error> {
-        self.market_author_fee_utxos.put(
+        self.market_funds_utxos.put(
             txn,
-            market_id.as_bytes(),
+            &(*market_id.as_bytes(), is_fee),
             outpoint,
         )?;
         Ok(())
     }
 
-    /// Clear the author fee UTXO (when fees are paid out to author)
-    pub fn clear_author_fee_utxo(
+    pub fn clear_market_funds_utxo(
         &self,
         txn: &mut RwTxn,
         market_id: &MarketId,
+        is_fee: bool,
     ) -> Result<(), Error> {
-        self.market_author_fee_utxos
-            .delete(txn, market_id.as_bytes())?;
+        self.market_funds_utxos
+            .delete(txn, &(*market_id.as_bytes(), is_fee))?;
         Ok(())
     }
 
-    /// Get the actual author fee balance for a market from its UTXO
-    pub fn get_author_fee_sats(
+    pub fn get_market_funds_sats(
         &self,
         txn: &RoTxn,
         state: &crate::state::State,
         market_id: &MarketId,
+        is_fee: bool,
     ) -> Result<u64, Error> {
-        match self.get_author_fee_utxo(txn, market_id)? {
+        match self.get_market_funds_utxo(txn, market_id, is_fee)? {
             Some(outpoint) => {
                 let utxo = state
                     .utxos
@@ -3297,36 +2967,23 @@ impl MarketsDatabase {
         }
     }
 
-    /// Register a pending treasury UTXO from a BuyShares transaction
-    pub fn add_pending_treasury_utxo(
-        &self,
-        txn: &mut RwTxn,
-        market_id: &MarketId,
-        outpoint: &OutPoint,
-    ) -> Result<(), Error> {
-        let mut pending = self
-            .pending_treasury_utxos
-            .try_get(txn, market_id.as_bytes())?
-            .unwrap_or_default();
-        pending.push(*outpoint);
-        self.pending_treasury_utxos
-            .put(txn, market_id.as_bytes(), &pending)?;
-        Ok(())
-    }
+    // ========== PENDING MARKET FUNDS UTXO ACCESSORS ==========
 
-    /// Register a pending author fee UTXO from a BuyShares transaction
-    pub fn add_pending_author_fee_utxo(
+    /// Register a pending market funds UTXO from a trade transaction
+    /// is_fee=false for treasury, is_fee=true for author fees
+    pub fn add_pending_market_funds_utxo(
         &self,
         txn: &mut RwTxn,
         market_id: &MarketId,
         outpoint: &OutPoint,
+        is_fee: bool,
     ) -> Result<(), Error> {
         let mut pending = self
-            .pending_author_fee_utxos
+            .pending_market_funds_utxos
             .try_get(txn, market_id.as_bytes())?
             .unwrap_or_default();
-        pending.push(*outpoint);
-        self.pending_author_fee_utxos.put(
+        pending.push((*outpoint, is_fee));
+        self.pending_market_funds_utxos.put(
             txn,
             market_id.as_bytes(),
             &pending,
@@ -3334,49 +2991,51 @@ impl MarketsDatabase {
         Ok(())
     }
 
-    /// Get all pending treasury UTXOs for a market
-    pub fn get_pending_treasury_utxos(
+    /// Get all pending market funds UTXOs for a market
+    /// Returns Vec of (OutPoint, is_fee) tuples
+    pub fn get_pending_market_funds_utxos(
         &self,
         txn: &RoTxn,
         market_id: &MarketId,
-    ) -> Result<Vec<OutPoint>, Error> {
+    ) -> Result<Vec<(OutPoint, bool)>, Error> {
         Ok(self
-            .pending_treasury_utxos
+            .pending_market_funds_utxos
             .try_get(txn, market_id.as_bytes())?
             .unwrap_or_default())
     }
 
-    /// Get all pending author fee UTXOs for a market
-    pub fn get_pending_author_fee_utxos(
-        &self,
-        txn: &RoTxn,
-        market_id: &MarketId,
-    ) -> Result<Vec<OutPoint>, Error> {
-        Ok(self
-            .pending_author_fee_utxos
-            .try_get(txn, market_id.as_bytes())?
-            .unwrap_or_default())
-    }
-
-    /// Clear pending treasury UTXOs after consolidation
-    pub fn clear_pending_treasury_utxos(
+    pub fn clear_pending_market_funds_utxos(
         &self,
         txn: &mut RwTxn,
         market_id: &MarketId,
     ) -> Result<(), Error> {
-        self.pending_treasury_utxos
+        self.pending_market_funds_utxos
             .delete(txn, market_id.as_bytes())?;
         Ok(())
     }
 
-    /// Clear pending author fee UTXOs after consolidation
-    pub fn clear_pending_author_fee_utxos(
+    pub fn remove_pending_market_funds_utxo(
         &self,
         txn: &mut RwTxn,
         market_id: &MarketId,
+        outpoint: &OutPoint,
+        is_fee: bool,
     ) -> Result<(), Error> {
-        self.pending_author_fee_utxos
-            .delete(txn, market_id.as_bytes())?;
+        let mut pending = self
+            .pending_market_funds_utxos
+            .try_get(txn, market_id.as_bytes())?
+            .unwrap_or_default();
+        pending.retain(|(o, fee)| o != outpoint || *fee != is_fee);
+        if pending.is_empty() {
+            self.pending_market_funds_utxos
+                .delete(txn, market_id.as_bytes())?;
+        } else {
+            self.pending_market_funds_utxos.put(
+                txn,
+                market_id.as_bytes(),
+                &pending,
+            )?;
+        }
         Ok(())
     }
 
@@ -3387,17 +3046,136 @@ impl MarketsDatabase {
     ) -> Result<HashSet<[u8; 6]>, Error> {
         let mut markets = HashSet::new();
 
-        let mut treasury_iter = self.pending_treasury_utxos.iter(txn)?;
-        while let Some((market_id_bytes, _)) = treasury_iter.next()? {
-            markets.insert(market_id_bytes);
-        }
-
-        let mut fee_iter = self.pending_author_fee_utxos.iter(txn)?;
-        while let Some((market_id_bytes, _)) = fee_iter.next()? {
+        let mut iter = self.pending_market_funds_utxos.iter(txn)?;
+        while let Some((market_id_bytes, _)) = iter.next()? {
             markets.insert(market_id_bytes);
         }
 
         Ok(markets)
+    }
+
+    // ========== BACKWARD COMPATIBILITY WRAPPERS FOR PENDING UTXOS ==========
+
+    /// Register a pending treasury UTXO from a buy Trade transaction
+    pub fn add_pending_treasury_utxo(
+        &self,
+        txn: &mut RwTxn,
+        market_id: &MarketId,
+        outpoint: &OutPoint,
+    ) -> Result<(), Error> {
+        self.add_pending_market_funds_utxo(txn, market_id, outpoint, false)
+    }
+
+    /// Register a pending author fee UTXO from a buy Trade transaction
+    pub fn add_pending_author_fee_utxo(
+        &self,
+        txn: &mut RwTxn,
+        market_id: &MarketId,
+        outpoint: &OutPoint,
+    ) -> Result<(), Error> {
+        self.add_pending_market_funds_utxo(txn, market_id, outpoint, true)
+    }
+
+    /// Get all pending treasury UTXOs for a market
+    pub fn get_pending_treasury_utxos(
+        &self,
+        txn: &RoTxn,
+        market_id: &MarketId,
+    ) -> Result<Vec<OutPoint>, Error> {
+        let all_pending =
+            self.get_pending_market_funds_utxos(txn, market_id)?;
+        Ok(all_pending
+            .into_iter()
+            .filter(|(_, is_fee)| !*is_fee)
+            .map(|(outpoint, _)| outpoint)
+            .collect())
+    }
+
+    /// Get all pending author fee UTXOs for a market
+    pub fn get_pending_author_fee_utxos(
+        &self,
+        txn: &RoTxn,
+        market_id: &MarketId,
+    ) -> Result<Vec<OutPoint>, Error> {
+        let all_pending =
+            self.get_pending_market_funds_utxos(txn, market_id)?;
+        Ok(all_pending
+            .into_iter()
+            .filter(|(_, is_fee)| *is_fee)
+            .map(|(outpoint, _)| outpoint)
+            .collect())
+    }
+
+    /// Clear pending treasury UTXOs after consolidation
+    pub fn clear_pending_treasury_utxos(
+        &self,
+        txn: &mut RwTxn,
+        market_id: &MarketId,
+    ) -> Result<(), Error> {
+        // Get all pending, keep only the fee ones
+        let all_pending =
+            self.get_pending_market_funds_utxos(txn, market_id)?;
+        let fee_only: Vec<_> = all_pending
+            .into_iter()
+            .filter(|(_, is_fee)| *is_fee)
+            .collect();
+        if fee_only.is_empty() {
+            self.pending_market_funds_utxos
+                .delete(txn, market_id.as_bytes())?;
+        } else {
+            self.pending_market_funds_utxos.put(
+                txn,
+                market_id.as_bytes(),
+                &fee_only,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Clear pending author fee UTXOs after consolidation
+    pub fn clear_pending_author_fee_utxos(
+        &self,
+        txn: &mut RwTxn,
+        market_id: &MarketId,
+    ) -> Result<(), Error> {
+        // Get all pending, keep only the treasury ones
+        let all_pending =
+            self.get_pending_market_funds_utxos(txn, market_id)?;
+        let treasury_only: Vec<_> = all_pending
+            .into_iter()
+            .filter(|(_, is_fee)| !*is_fee)
+            .collect();
+        if treasury_only.is_empty() {
+            self.pending_market_funds_utxos
+                .delete(txn, market_id.as_bytes())?;
+        } else {
+            self.pending_market_funds_utxos.put(
+                txn,
+                market_id.as_bytes(),
+                &treasury_only,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remove a specific pending treasury UTXO (for revert operations)
+    pub fn remove_pending_treasury_utxo(
+        &self,
+        txn: &mut RwTxn,
+        market_id: &MarketId,
+        outpoint: &OutPoint,
+    ) -> Result<(), Error> {
+        self.remove_pending_market_funds_utxo(txn, market_id, outpoint, false)
+    }
+
+    /// Remove a specific pending author fee UTXO (for revert operations)
+    pub fn remove_pending_author_fee_utxo(
+        &self,
+        txn: &mut RwTxn,
+        market_id: &MarketId,
+        outpoint: &OutPoint,
+    ) -> Result<(), Error> {
+        self.remove_pending_market_funds_utxo(txn, market_id, outpoint, true)
     }
 }
 
