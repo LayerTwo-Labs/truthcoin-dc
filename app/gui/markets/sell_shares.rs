@@ -1,39 +1,50 @@
 use eframe::egui::{self, Button, RichText};
+use truthcoin_dc::math::lmsr::LmsrService;
 use truthcoin_dc::math::trading;
 use truthcoin_dc::state::MarketId;
+use truthcoin_dc::types::Address;
 
 use crate::app::App;
 
-use super::browse::BuySharesResult;
-
-pub struct BuyShares {
+pub struct SellShares {
     market_id: MarketId,
     outcome_index: u32,
     outcome_label: String,
     current_price: f64,
     trading_fee_pct: f64,
+    max_shares: f64,
+    seller_address: Address,
     shares_input: String,
-    preview: Option<CostPreview>,
+    preview: Option<ProceedsPreview>,
     preview_error: Option<String>,
     is_processing: bool,
     tx_error: Option<String>,
 }
 
-struct CostPreview {
+struct ProceedsPreview {
     shares: f64,
-    base_cost_sats: u64,
+    gross_proceeds_sats: u64,
     trading_fee_sats: u64,
-    total_cost_sats: u64,
+    net_proceeds_sats: u64,
     new_price: f64,
 }
 
-impl BuyShares {
+#[derive(PartialEq)]
+pub enum SellSharesResult {
+    Pending,
+    Cancelled,
+    Completed,
+}
+
+impl SellShares {
     pub fn new(
         market_id: MarketId,
         outcome_index: u32,
         outcome_label: String,
         current_price: f64,
         trading_fee_pct: f64,
+        max_shares: f64,
+        seller_address: Address,
     ) -> Self {
         Self {
             market_id,
@@ -41,6 +52,8 @@ impl BuyShares {
             outcome_label,
             current_price,
             trading_fee_pct,
+            max_shares,
+            seller_address,
             shares_input: String::new(),
             preview: None,
             preview_error: None,
@@ -65,6 +78,15 @@ impl BuyShares {
             }
         };
 
+        if shares > self.max_shares {
+            self.preview = None;
+            self.preview_error = Some(format!(
+                "Cannot sell more than {:.2} shares",
+                self.max_shares
+            ));
+            return;
+        }
+
         let market = match app.node.get_market_by_id(&self.market_id) {
             Ok(Some(m)) => m,
             Ok(None) => {
@@ -77,47 +99,83 @@ impl BuyShares {
             }
         };
 
+        // outcome_index is already the actual state index (not a display index)
+        let actual_idx = self.outcome_index as usize;
+
+        // Validate the index is within bounds
+        if actual_idx >= market.shares.len() {
+            self.preview_error = Some("Invalid outcome index".to_string());
+            return;
+        }
+
+        // Calculate proceeds: C(current_shares) - C(new_shares)
         let mut new_shares = market.shares.clone();
+        new_shares[actual_idx] -= shares;
 
-        let valid_combos = market.get_valid_state_combos();
-        let actual_idx = match valid_combos.get(self.outcome_index as usize) {
-            Some((idx, _)) => *idx,
-            None => {
-                self.preview_error = Some("Invalid outcome index".to_string());
-                return;
-            }
-        };
+        // Check for negative shares
+        if new_shares[actual_idx] < 0.0 {
+            self.preview_error =
+                Some("Would result in negative market shares".to_string());
+            return;
+        }
 
-        new_shares[actual_idx] += shares;
+        let old_cost =
+            match LmsrService::calculate_treasury(&market.shares, market.b()) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.preview_error =
+                        Some(format!("Cost calculation error: {e:?}"));
+                    return;
+                }
+            };
 
-        let base_cost_f64 = match market.query_update_cost(new_shares.clone()) {
-            Ok(cost) => cost,
-            Err(e) => {
-                self.preview_error =
-                    Some(format!("Cost calculation error: {e}"));
-                return;
-            }
-        };
+        let new_cost =
+            match LmsrService::calculate_treasury(&new_shares, market.b()) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.preview_error =
+                        Some(format!("Cost calculation error: {e:?}"));
+                    return;
+                }
+            };
+
+        let gross_proceeds_f64 = old_cost - new_cost;
+        if gross_proceeds_f64 < 0.0 {
+            self.preview_error =
+                Some("Invalid proceeds calculation".to_string());
+            return;
+        }
 
         // Use shared trading calculation for consistency
-        let buy_cost = match trading::calculate_buy_cost(
-            base_cost_f64,
+        let sell_proceeds = match trading::calculate_sell_proceeds(
+            gross_proceeds_f64,
             self.trading_fee_pct,
         ) {
-            Ok(cost) => cost,
+            Ok(proceeds) => proceeds,
             Err(e) => {
                 self.preview_error =
-                    Some(format!("Cost calculation error: {e}"));
+                    Some(format!("Proceeds calculation error: {e}"));
                 return;
             }
         };
-        let base_cost_sats = buy_cost.base_cost_sats;
-        let trading_fee_sats = buy_cost.trading_fee_sats;
-        let total_cost_sats = buy_cost.total_cost_sats;
+
+        // Check for fee >= proceeds (would result in 0 or negative net proceeds)
+        if sell_proceeds.trading_fee_sats >= sell_proceeds.gross_proceeds_sats {
+            self.preview_error =
+                Some("Trade too small: fee would exceed proceeds".to_string());
+            return;
+        }
+
+        let gross_proceeds_sats = sell_proceeds.gross_proceeds_sats;
+        let trading_fee_sats = sell_proceeds.trading_fee_sats;
+        let net_proceeds_sats = sell_proceeds.net_proceeds_sats;
 
         // Use shared post-trade price calculation
-        let valid_indices: Vec<usize> =
-            valid_combos.iter().map(|(idx, _)| *idx).collect();
+        let valid_indices: Vec<usize> = market
+            .get_valid_state_combos()
+            .iter()
+            .map(|(idx, _)| *idx)
+            .collect();
         let new_price = trading::calculate_post_trade_price(
             &new_shares,
             market.b(),
@@ -131,79 +189,47 @@ impl BuyShares {
             self.current_price
         };
 
-        self.preview = Some(CostPreview {
+        self.preview = Some(ProceedsPreview {
             shares,
-            base_cost_sats,
+            gross_proceeds_sats,
             trading_fee_sats,
-            total_cost_sats,
+            net_proceeds_sats,
             new_price,
         });
         self.preview_error = None;
     }
 
-    fn execute_buy(&mut self, app: &App) {
+    fn execute_sell(&mut self, app: &App) {
         let Some(preview) = &self.preview else {
             return;
         };
 
-        let market = match app.node.get_market_by_id(&self.market_id) {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                self.tx_error = Some("Market not found".to_string());
-                return;
-            }
-            Err(e) => {
-                self.tx_error = Some(format!("Error: {e:#}"));
-                return;
-            }
-        };
-
-        let valid_combos = market.get_valid_state_combos();
-        let actual_idx = match valid_combos.get(self.outcome_index as usize) {
-            Some((idx, _)) => *idx,
-            None => {
-                self.tx_error = Some("Invalid outcome index".to_string());
-                return;
-            }
-        };
+        // outcome_index is already the actual state index (not a display index)
+        let actual_idx = self.outcome_index as usize;
 
         let tx_fee = bitcoin::Amount::from_sat(1000);
 
-        // Get trader address from wallet (first address)
-        let trader = match app.wallet.get_addresses() {
-            Ok(addrs) => match addrs.into_iter().next() {
-                Some(addr) => addr,
-                None => {
-                    self.tx_error = Some("Wallet has no addresses".to_string());
-                    return;
-                }
-            },
-            Err(e) => {
-                self.tx_error =
-                    Some(format!("Failed to get wallet addresses: {e:#}"));
-                return;
-            }
-        };
+        // Use exact preview value for slippage protection (consistent with buy)
+        // Transaction will fail if market conditions change and proceeds fall below this
+        let min_proceeds = preview.net_proceeds_sats;
 
-        // Use calculated cost as max_cost (GUI shows exact cost before user confirms)
-        let max_cost = preview.total_cost_sats;
         match app.wallet.trade(
             self.market_id.clone(),
             actual_idx,
-            preview.shares, // Positive for buy
-            trader,
-            max_cost, // limit_sats = max_cost for buy
-            preview.base_cost_sats,
+            -preview.shares, // Negative for sell
+            self.seller_address,
+            min_proceeds, // limit_sats = min_proceeds for sell
+            preview.gross_proceeds_sats,
             preview.trading_fee_sats,
             tx_fee,
         ) {
             Ok(tx) => {
                 if let Err(e) = app.sign_and_send(tx) {
                     self.tx_error = Some(format!("Failed to send: {e:#}"));
-                    tracing::error!("Buy shares failed: {e:#}");
+                    tracing::error!("Sell shares failed: {e:#}");
                 } else {
                     tracing::info!(
-                        "Bought {} shares of outcome {} in market {:?}",
+                        "Sold {} shares of outcome {} in market {:?}",
                         preview.shares,
                         self.outcome_label,
                         self.market_id
@@ -213,16 +239,16 @@ impl BuyShares {
             }
             Err(e) => {
                 self.tx_error = Some(format!("Failed to create tx: {e:#}"));
-                tracing::error!("Buy shares tx creation failed: {e:#}");
+                tracing::error!("Sell shares tx creation failed: {e:#}");
             }
         }
     }
 
-    pub fn show(&mut self, app: &App, ui: &mut egui::Ui) -> BuySharesResult {
-        let mut result = BuySharesResult::Pending;
+    pub fn show(&mut self, app: &App, ui: &mut egui::Ui) -> SellSharesResult {
+        let mut result = SellSharesResult::Pending;
 
         ui.group(|ui| {
-            ui.heading(format!("Buy Shares: {}", self.outcome_label));
+            ui.heading(format!("Sell Shares: {}", self.outcome_label));
             ui.add_space(5.0);
 
             ui.horizontal(|ui| {
@@ -236,10 +262,17 @@ impl BuyShares {
                 );
             });
 
+            ui.horizontal(|ui| {
+                ui.label("Your shares:");
+                ui.label(
+                    RichText::new(format!("{:.2}", self.max_shares)).strong(),
+                );
+            });
+
             ui.add_space(5.0);
 
             ui.horizontal(|ui| {
-                ui.label("Shares to buy:");
+                ui.label("Shares to sell:");
                 let old_input = self.shares_input.clone();
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.shares_input)
@@ -250,6 +283,11 @@ impl BuyShares {
                 if self.shares_input != old_input || response.changed() {
                     self.calculate_preview(app);
                 }
+
+                if ui.button("Max").clicked() {
+                    self.shares_input = format!("{:.2}", self.max_shares);
+                    self.calculate_preview(app);
+                }
             });
 
             if let Some(err) = &self.preview_error {
@@ -258,34 +296,35 @@ impl BuyShares {
 
             if let Some(preview) = &self.preview {
                 ui.add_space(5.0);
-                ui.label(RichText::new("Cost Preview:").strong());
+                ui.label(RichText::new("Proceeds Preview:").strong());
 
-                let base_cost_btc =
-                    preview.base_cost_sats as f64 / 100_000_000.0;
+                let gross_proceeds_btc =
+                    preview.gross_proceeds_sats as f64 / 100_000_000.0;
                 let trading_fee_btc =
                     preview.trading_fee_sats as f64 / 100_000_000.0;
-                let total_cost_btc =
-                    preview.total_cost_sats as f64 / 100_000_000.0;
+                let net_proceeds_btc =
+                    preview.net_proceeds_sats as f64 / 100_000_000.0;
 
-                egui::Grid::new("cost_preview")
+                egui::Grid::new("proceeds_preview")
                     .num_columns(2)
                     .spacing([10.0, 2.0])
                     .show(ui, |ui| {
-                        ui.label("Base cost:");
-                        ui.label(format!("{base_cost_btc:.8} BTC"));
+                        ui.label("Gross proceeds:");
+                        ui.label(format!("{gross_proceeds_btc:.8} BTC"));
                         ui.end_row();
 
                         ui.label(format!(
                             "Fee ({:.1}%):",
                             self.trading_fee_pct * 100.0
                         ));
-                        ui.label(format!("{trading_fee_btc:.8} BTC"));
+                        ui.label(format!("-{trading_fee_btc:.8} BTC"));
                         ui.end_row();
 
-                        ui.label(RichText::new("Total:").strong());
+                        ui.label(RichText::new("Net proceeds:").strong());
                         ui.label(
-                            RichText::new(format!("{total_cost_btc:.8} BTC"))
-                                .strong(),
+                            RichText::new(format!("{net_proceeds_btc:.8} BTC"))
+                                .strong()
+                                .color(egui::Color32::GREEN),
                         );
                         ui.end_row();
 
@@ -304,22 +343,22 @@ impl BuyShares {
 
             ui.horizontal(|ui| {
                 if ui.button("Cancel").clicked() {
-                    result = BuySharesResult::Cancelled;
+                    result = SellSharesResult::Cancelled;
                 }
 
-                let can_buy = self.preview.is_some()
+                let can_sell = self.preview.is_some()
                     && !self.is_processing
                     && self.tx_error.is_none();
 
                 if ui
-                    .add_enabled(can_buy, Button::new("Confirm Purchase"))
+                    .add_enabled(can_sell, Button::new("Confirm Sale"))
                     .clicked()
                 {
                     self.is_processing = true;
-                    self.execute_buy(app);
+                    self.execute_sell(app);
 
                     if self.tx_error.is_none() {
-                        result = BuySharesResult::Completed;
+                        result = SellSharesResult::Completed;
                     } else {
                         self.is_processing = false;
                     }

@@ -304,7 +304,7 @@ impl CreateMarket {
         let tx_fee = bitcoin::Amount::from_sat(1000);
 
         match app.wallet.create_market(input, tx_fee) {
-            Ok(tx) => {
+            Ok((tx, _market_id)) => {
                 if let Err(e) = app.sign_and_send(tx) {
                     self.error = Some(format!("Failed to send: {e:#}"));
                     tracing::error!("Create market failed: {e:#}");

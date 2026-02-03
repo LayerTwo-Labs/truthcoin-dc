@@ -15,7 +15,11 @@ use tower_http::{
 };
 use truthcoin_dc::{
     authorization::{self, Dst, Signature},
-    math::safe_math::{self, Rounding},
+    math::{
+        lmsr::LmsrService,
+        safe_math::{self, Rounding},
+        trading,
+    },
     net::Peer,
     node::Node,
     state::{period_to_name, timestamp_to_period},
@@ -29,9 +33,10 @@ use truthcoin_dc::{
 };
 use truthcoin_dc_app_rpc_api::{
     CategoryClaimRequest, ConsensusResults, DecisionSummary, MarketBuyRequest,
-    MarketBuyResponse, ParticipationStats, PeriodStats, RegisterVoterRequest,
-    RpcServer, SlotFilter, SlotListItem, SlotState, SubmitVoteBatchRequest,
-    TxInfo, VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
+    MarketBuyResponse, MarketSellRequest, MarketSellResponse,
+    ParticipationStats, PeriodStats, RegisterVoterRequest, RpcServer,
+    SlotFilter, SlotListItem, SlotState, SubmitVoteBatchRequest, TxInfo,
+    VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
 };
 
 use crate::app::App;
@@ -502,7 +507,7 @@ impl RpcServerImpl {
             }
         }
 
-        let tx = self
+        let (tx, market_id) = self
             .app
             .wallet
             .create_market(
@@ -521,11 +526,9 @@ impl RpcServerImpl {
             )
             .map_err(custom_err)?;
 
-        let txid = tx.txid();
-
         self.app.sign_and_send(tx).map_err(custom_err)?;
 
-        Ok(txid.to_string())
+        Ok(market_id.to_string())
     }
 
     async fn get_user_share_positions_impl(
@@ -569,8 +572,8 @@ impl RpcServerImpl {
                     .get(outcome_index as usize)
                     .copied()
                     .unwrap_or(0.0);
-                let shares_held = position_data;
-                let current_value = shares_held * outcome_price;
+                let shares = position_data;
+                let current_value = shares * outcome_price;
 
                 let outcome_name = if let Some(combo) =
                     market.state_combos.get(outcome_index as usize)
@@ -584,7 +587,7 @@ impl RpcServerImpl {
                     market_id: market_id.to_string(),
                     outcome_index: outcome_index as usize,
                     outcome_name,
-                    shares_held,
+                    shares,
                     avg_purchase_price: outcome_price,
                     current_price: outcome_price,
                     current_value,
@@ -634,8 +637,8 @@ impl RpcServerImpl {
                     .get(outcome_index as usize)
                     .copied()
                     .unwrap_or(0.0);
-                let shares_held = position_data;
-                let current_value = shares_held * outcome_price;
+                let shares = position_data;
+                let current_value = shares * outcome_price;
 
                 let outcome_name = if let Some(combo) =
                     market.state_combos.get(outcome_index as usize)
@@ -649,7 +652,7 @@ impl RpcServerImpl {
                     market_id: market_id.clone(),
                     outcome_index: outcome_index as usize,
                     outcome_name,
-                    shares_held,
+                    shares,
                     avg_purchase_price: outcome_price,
                     current_price: outcome_price,
                     current_value,
@@ -741,6 +744,12 @@ impl RpcServerImpl {
 
         let period_id = period_id.unwrap();
         let fee = bitcoin::Amount::from_sat(request.fee_sats);
+
+        tracing::info!(
+            "vote_submit: Voter attempting to submit {} votes for period {}",
+            batch_items.len(),
+            period_id
+        );
 
         let tx = self
             .app
@@ -1235,13 +1244,13 @@ impl RpcServer for RpcServerImpl {
                 ));
             };
 
-        let initial_liquidity_f64 = beta * (num_outcomes as f64).ln();
-        let initial_liquidity_sats =
-            safe_math::to_sats(initial_liquidity_f64, Rounding::Up).map_err(
-                |e| {
-                    custom_err_msg(format!("Liquidity calculation failed: {e}"))
-                },
-            )?;
+        let initial_liquidity_sats = safe_math::to_sats(
+            trading::calculate_lmsr_liquidity(beta, num_outcomes),
+            Rounding::Up,
+        )
+        .map_err(|e| {
+            custom_err_msg(format!("Liquidity calculation failed: {e}"))
+        })?;
 
         Ok(truthcoin_dc_app_rpc_api::InitialLiquidityCalculation {
             beta,
@@ -1338,6 +1347,59 @@ impl RpcServer for RpcServerImpl {
 
     async fn refresh_wallet(&self) -> RpcResult<()> {
         self.app.update().map_err(custom_err)
+    }
+
+    async fn await_block_height(
+        &self,
+        target_height: u32,
+        timeout_ms: Option<u64>,
+    ) -> RpcResult<u32> {
+        use tokio::time::{Duration, sleep, timeout};
+
+        let timeout_duration =
+            Duration::from_millis(timeout_ms.unwrap_or(10000));
+
+        let result = timeout(timeout_duration, async {
+            loop {
+                let current_height = self
+                    .node()
+                    .try_get_tip_height()
+                    .map_err(custom_err)?
+                    .unwrap_or(0);
+
+                if current_height >= target_height {
+                    return Ok::<u32, jsonrpsee::types::ErrorObjectOwned>(
+                        current_height,
+                    );
+                }
+
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(height)) => Ok(height),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                // Timeout - return current height
+                let current_height = self
+                    .node()
+                    .try_get_tip_height()
+                    .map_err(custom_err)?
+                    .unwrap_or(0);
+                Err(custom_err_msg(format!(
+                    "Timeout waiting for block height {target_height}. Current height: {current_height}"
+                )))
+            }
+        }
+    }
+
+    async fn sync_to_tip(&self, block_hash: BlockHash) -> RpcResult<bool> {
+        self.node()
+            .sync_to_tip(block_hash)
+            .await
+            .map_err(custom_err)
     }
 
     async fn slot_status(
@@ -1540,26 +1602,49 @@ impl RpcServer for RpcServerImpl {
             .map_err(custom_err)?
             .ok_or_else(|| custom_err_msg("Market not found"))?;
 
-        // Calculate base cost and trading fee separately for explicit outputs
-        let mut new_shares = market.shares().clone();
-        new_shares[request.outcome_index] += request.shares_amount;
-        let trade_cost =
-            market.query_update_cost(new_shares).map_err(custom_err)?;
-        let fee_amount = trade_cost * market.trading_fee();
-        let base_cost_sats = safe_math::to_sats(trade_cost, Rounding::Up)
-            .map_err(|e| {
-                custom_err_msg(format!("Cost calculation failed: {e}"))
-            })?;
-        let trading_fee_sats = safe_math::to_sats(fee_amount, Rounding::Up)
-            .map_err(|e| {
-                custom_err_msg(format!("Fee calculation failed: {e}"))
-            })?;
-        let cost_sats = base_cost_sats + trading_fee_sats;
+        // Use mempool shares (if any pending txs) for cost calculation
+        // This ensures the tx is created with correct cost for its expected position
+        let current_shares = self
+            .app
+            .node
+            .get_mempool_shares(&market_id_struct)
+            .map_err(custom_err)?
+            .unwrap_or_else(|| market.shares().clone());
 
-        // Calculate new price after trade
-        let prices = market.get_current_prices();
-        let new_price =
-            prices.get(request.outcome_index).copied().unwrap_or(0.0);
+        // Calculate base cost and trading fee using shared module
+        let mut new_shares = current_shares.clone();
+        new_shares[request.outcome_index] += request.shares_amount;
+        let trade_cost = LmsrService::calculate_update_cost(
+            &current_shares,
+            &new_shares,
+            market.b(),
+        )
+        .map_err(|e| {
+            custom_err_msg(format!("LMSR cost calculation failed: {e:?}"))
+        })?;
+
+        // Use shared trading calculation for consistency
+        let buy_cost =
+            trading::calculate_buy_cost(trade_cost, market.trading_fee())
+                .map_err(|e| {
+                    custom_err_msg(format!("Cost calculation failed: {e}"))
+                })?;
+        let base_cost_sats = buy_cost.base_cost_sats;
+        let trading_fee_sats = buy_cost.trading_fee_sats;
+        let cost_sats = buy_cost.total_cost_sats;
+
+        // Calculate new price AFTER trade (not current price)
+        let valid_indices: Vec<usize> = market
+            .get_valid_state_combos()
+            .iter()
+            .map(|(idx, _)| *idx)
+            .collect();
+        let new_price = trading::calculate_post_trade_price(
+            &new_shares,
+            market.b(),
+            request.outcome_index,
+            &valid_indices,
+        );
 
         // If dry_run, return cost without executing
         if request.dry_run.unwrap_or(false) {
@@ -1587,14 +1672,26 @@ impl RpcServer for RpcServerImpl {
             )));
         }
 
-        // Execute trade
+        // Get trader address from wallet (first address)
+        let trader = self
+            .app
+            .wallet
+            .get_addresses()
+            .map_err(custom_err)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| custom_err_msg("Wallet has no addresses"))?;
+
+        // Execute trade (positive shares = buy)
         let tx = self
             .app
             .wallet
-            .buy_shares(
+            .trade(
                 market_id_struct,
                 request.outcome_index,
-                request.shares_amount,
+                request.shares_amount, // Positive for buy
+                trader,
+                max_cost, // limit_sats = max_cost for buy
                 base_cost_sats,
                 trading_fee_sats,
                 bitcoin::Amount::from_sat(fee_sats),
@@ -1609,6 +1706,143 @@ impl RpcServer for RpcServerImpl {
             cost_sats,
             base_cost_sats,
             trading_fee_sats,
+            new_price,
+        })
+    }
+
+    async fn market_sell(
+        &self,
+        request: MarketSellRequest,
+    ) -> RpcResult<MarketSellResponse> {
+        let market_id_struct = parse_market_id(&request.market_id)?;
+
+        // Get market
+        let market = self
+            .node()
+            .get_market_by_id(&market_id_struct)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Market not found"))?;
+
+        // Verify seller owns sufficient shares
+        let seller_positions = self
+            .node()
+            .get_user_share_positions(&request.seller_address)
+            .map_err(custom_err)?;
+
+        let owned_shares = seller_positions
+            .iter()
+            .find(|(mid, oidx, _)| {
+                *mid == market_id_struct
+                    && *oidx == request.outcome_index as u32
+            })
+            .map(|(_, _, shares)| *shares)
+            .unwrap_or(0.0);
+
+        if owned_shares < request.shares_amount {
+            return Err(custom_err_msg(format!(
+                "Insufficient shares: address {} owns {} but trying to sell {}",
+                request.seller_address, owned_shares, request.shares_amount
+            )));
+        }
+
+        // Use mempool shares (if any pending txs) for proceeds calculation
+        let current_shares = self
+            .app
+            .node
+            .get_mempool_shares(&market_id_struct)
+            .map_err(custom_err)?
+            .unwrap_or_else(|| market.shares().clone());
+
+        // Calculate proceeds: C(current_shares) - C(new_shares)
+        let mut new_shares = current_shares.clone();
+        new_shares[request.outcome_index] -= request.shares_amount;
+
+        // Calculate cost difference: old_cost - new_cost = proceeds (positive when selling)
+        let old_cost =
+            LmsrService::calculate_treasury(&current_shares, market.b())
+                .map_err(|e| {
+                    custom_err_msg(format!("Cost calculation error: {e:?}"))
+                })?;
+        let new_cost = LmsrService::calculate_treasury(&new_shares, market.b())
+            .map_err(|e| {
+                custom_err_msg(format!("Cost calculation error: {e:?}"))
+            })?;
+
+        let proceeds_btc = old_cost - new_cost;
+
+        // Use shared trading calculation for consistency
+        let sell_proceeds = trading::calculate_sell_proceeds(
+            proceeds_btc,
+            market.trading_fee(),
+        )
+        .map_err(|e| {
+            custom_err_msg(format!("Proceeds calculation failed: {e}"))
+        })?;
+        let proceeds_sats = sell_proceeds.gross_proceeds_sats;
+        let trading_fee_sats = sell_proceeds.trading_fee_sats;
+        let net_proceeds_sats = sell_proceeds.net_proceeds_sats;
+
+        // Calculate new price after trade with normalization
+        let valid_indices: Vec<usize> = market
+            .get_valid_state_combos()
+            .iter()
+            .map(|(idx, _)| *idx)
+            .collect();
+        let new_price = trading::calculate_post_trade_price(
+            &new_shares,
+            market.b(),
+            request.outcome_index,
+            &valid_indices,
+        );
+
+        // If dry_run, return proceeds without executing
+        if request.dry_run.unwrap_or(false) {
+            return Ok(MarketSellResponse {
+                txid: None,
+                proceeds_sats,
+                trading_fee_sats,
+                net_proceeds_sats,
+                new_price,
+            });
+        }
+
+        // Validate required params for actual trade
+        let min_proceeds = request.min_proceeds.unwrap_or(0);
+        let fee_sats = request.fee_sats.ok_or_else(|| {
+            custom_err_msg("fee_sats is required when dry_run is false")
+        })?;
+
+        // Slippage check
+        if net_proceeds_sats < min_proceeds {
+            return Err(custom_err_msg(format!(
+                "Net proceeds {net_proceeds_sats} below minimum {min_proceeds} (slippage protection)",
+            )));
+        }
+
+        // Create and submit the sell transaction
+        let tx = self
+            .app
+            .wallet
+            .trade(
+                market_id_struct,
+                request.outcome_index,
+                -request.shares_amount, // Negative for sell
+                request.seller_address,
+                min_proceeds,
+                proceeds_sats,
+                trading_fee_sats,
+                bitcoin::Amount::from_sat(fee_sats),
+            )
+            .map_err(custom_err)?;
+
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+
+        Ok(MarketSellResponse {
+            txid: Some(txid.to_string()),
+            proceeds_sats,
+            trading_fee_sats,
+            net_proceeds_sats,
             new_price,
         })
     }

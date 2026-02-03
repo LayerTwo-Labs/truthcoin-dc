@@ -7,6 +7,7 @@ mod browse;
 mod buy_shares;
 mod create_market;
 mod my_positions;
+mod sell_shares;
 mod slots;
 
 use browse::Browse;

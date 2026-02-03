@@ -1,4 +1,5 @@
 use eframe::egui::{self, Button, RichText, ScrollArea};
+use truthcoin_dc::math::trading;
 use truthcoin_dc::state::slots::SlotId;
 use truthcoin_dc::state::{Market, MarketId, MarketState};
 
@@ -153,8 +154,8 @@ impl Browse {
                 ui.label(state_text);
                 ui.end_row();
 
-                let n_outcomes = market.get_valid_state_combos().len() as f64;
-                let liquidity_sats = market.b * n_outcomes.ln();
+                let n_outcomes = market.get_valid_state_combos().len();
+                let liquidity_sats = trading::calculate_lmsr_liquidity(market.b, n_outcomes);
                 let liquidity_btc = liquidity_sats / 100_000_000.0;
 
                 ui.label("Liquidity Pool:");

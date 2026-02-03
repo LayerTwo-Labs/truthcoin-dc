@@ -1,16 +1,19 @@
 use eframe::egui::{self, RichText, ScrollArea};
 use truthcoin_dc::state::{Market, MarketId, MarketState};
+use truthcoin_dc::types::Address;
 
 use crate::app::App;
+
+use super::sell_shares::{SellShares, SellSharesResult};
 
 #[derive(Default)]
 pub struct MyPositions {
     positions: Vec<PositionInfo>,
     error: Option<String>,
     loaded: bool,
+    sell_shares: Option<SellShares>,
 }
 
-#[allow(dead_code)]
 struct PositionInfo {
     market_id: MarketId,
     market_title: String,
@@ -20,6 +23,8 @@ struct PositionInfo {
     shares: f64,
     current_price: f64,
     current_value_btc: f64,
+    trading_fee_pct: f64,
+    seller_address: Address,
 }
 
 impl MyPositions {
@@ -58,7 +63,7 @@ impl MyPositions {
                             continue;
                         }
 
-                        let (title, state, price, label) =
+                        let (title, state, price, label, fee_pct) =
                             if let Some((market, mstate)) =
                                 markets.get(&market_id)
                             {
@@ -85,13 +90,20 @@ impl MyPositions {
                                     (0.0, format!("Outcome {outcome_idx}"))
                                 };
 
-                                (market.title.clone(), *mstate, p, lbl)
+                                (
+                                    market.title.clone(),
+                                    *mstate,
+                                    p,
+                                    lbl,
+                                    market.trading_fee,
+                                )
                             } else {
                                 (
                                     "Unknown Market".to_string(),
                                     MarketState::Invalid,
                                     0.0,
                                     format!("Outcome {outcome_idx}"),
+                                    0.0,
                                 )
                             };
 
@@ -104,6 +116,8 @@ impl MyPositions {
                             shares,
                             current_price: price,
                             current_value_btc: shares * price / 100_000_000.0,
+                            trading_fee_pct: fee_pct,
+                            seller_address: address,
                         });
                     }
                 }
@@ -200,16 +214,34 @@ impl MyPositions {
             return;
         };
 
+        // If we're in sell mode, show the sell dialog
+        if let Some(sell_shares) = &mut self.sell_shares {
+            let result = sell_shares.show(app, ui);
+            match result {
+                SellSharesResult::Pending => {}
+                SellSharesResult::Cancelled => {
+                    self.sell_shares = None;
+                }
+                SellSharesResult::Completed => {
+                    self.sell_shares = None;
+                    self.loaded = false; // Force refresh after sell
+                }
+            }
+            return;
+        }
+
         ui.horizontal(|ui| {
             ui.heading("My Positions");
             if ui.button("Refresh").clicked() {
-                self.refresh_positions(app);
+                self.loaded = false; // Force refresh on button click
             }
         });
         ui.separator();
 
-        // Always refresh from node to show latest state after blocks
-        self.refresh_positions(app);
+        // Only refresh once on first load or when explicitly requested
+        if !self.loaded {
+            self.refresh_positions(app);
+        }
 
         if let Some(err) = &self.error {
             ui.colored_label(egui::Color32::RED, err);
@@ -233,9 +265,12 @@ impl MyPositions {
 
         ui.add_space(10.0);
 
+        // Collect positions that user wants to sell
+        let mut position_to_sell: Option<usize> = None;
+
         ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("positions_grid")
-                .num_columns(5)
+                .num_columns(6)
                 .striped(true)
                 .spacing([10.0, 4.0])
                 .show(ui, |ui| {
@@ -244,9 +279,10 @@ impl MyPositions {
                     ui.label(RichText::new("Shares").strong());
                     ui.label(RichText::new("Price").strong());
                     ui.label(RichText::new("Value").strong());
+                    ui.label(RichText::new("Action").strong());
                     ui.end_row();
 
-                    for pos in &self.positions {
+                    for (idx, pos) in self.positions.iter().enumerate() {
                         let state_str = match pos.market_state {
                             MarketState::Trading => "",
                             MarketState::Ossified => " [Resolved]",
@@ -259,9 +295,33 @@ impl MyPositions {
                         ui.label(format!("{:.2}", pos.shares));
                         ui.label(format!("{:.1}%", pos.current_price * 100.0));
                         ui.label(format!("{:.8} BTC", pos.current_value_btc));
+
+                        // Only show sell button if market is trading
+                        if pos.market_state == MarketState::Trading {
+                            if ui.button("Sell").clicked() {
+                                position_to_sell = Some(idx);
+                            }
+                        } else {
+                            ui.label("-");
+                        }
                         ui.end_row();
                     }
                 });
         });
+
+        // Handle sell button clicks (outside the grid to avoid borrow issues)
+        if let Some(idx) = position_to_sell
+            && let Some(pos) = self.positions.get(idx)
+        {
+            self.sell_shares = Some(SellShares::new(
+                pos.market_id.clone(),
+                pos.outcome_index,
+                pos.outcome_label.clone(),
+                pos.current_price,
+                pos.trading_fee_pct,
+                pos.shares,
+                pos.seller_address,
+            ));
+        }
     }
 }

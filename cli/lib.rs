@@ -10,6 +10,7 @@ use serde::Serialize;
 use tracing_subscriber::layer::SubscriberExt as _;
 use truthcoin_dc::{
     authorization::{Dst, Signature},
+    math::trading,
     types::{
         Address, BlockHash, EncryptionPubKey, THIS_SIDECHAIN, Txid,
         VerifyingKey,
@@ -395,6 +396,12 @@ pub enum Command {
         trading_fee: f64,
         #[arg(long)]
         tags: Option<String>,
+        /// Category txids for [[...]] dimensions (comma-separated hex txids)
+        #[arg(long)]
+        category_txids: Option<String>,
+        /// Residual outcome names for categorical dimensions (comma-separated)
+        #[arg(long)]
+        residual_names: Option<String>,
         #[arg(long, default_value = "1000")]
         fee_sats: u64,
     },
@@ -407,7 +414,7 @@ pub enum Command {
     #[command(name = "market-get")]
     MarketGet { market_id: String },
 
-    /// Buy/sell shares (use negative amount to sell)
+    /// Buy shares in a market
     #[command(name = "market-buy", alias = "buy")]
     MarketBuy {
         #[arg(long)]
@@ -418,6 +425,25 @@ pub enum Command {
         shares_amount: f64,
         #[arg(long)]
         max_cost: u64,
+        #[arg(long, default_value = "1000")]
+        fee_sats: u64,
+    },
+
+    /// Sell shares in a market
+    #[command(name = "market-sell", alias = "sell")]
+    MarketSell {
+        #[arg(long)]
+        market_id: String,
+        #[arg(long)]
+        outcome_index: usize,
+        #[arg(long)]
+        shares_amount: f64,
+        /// Address holding the shares to sell
+        #[arg(long)]
+        seller_address: Address,
+        /// Minimum proceeds to accept (slippage protection)
+        #[arg(long, default_value = "0")]
+        min_proceeds: u64,
         #[arg(long, default_value = "1000")]
         fee_sats: u64,
     },
@@ -931,10 +957,16 @@ where
             beta,
             trading_fee,
             tags,
+            category_txids,
+            residual_names,
             fee_sats,
         } => {
             use truthcoin_dc_app_rpc_api::CreateMarketRequest;
             let parsed_tags = tags.map(|t| parse_comma_separated(&t));
+            let parsed_category_txids =
+                category_txids.map(|t| parse_comma_separated(&t));
+            let parsed_residual_names =
+                residual_names.map(|t| parse_comma_separated(&t));
             let request = CreateMarketRequest {
                 title: title.clone(),
                 description,
@@ -943,8 +975,8 @@ where
                 trading_fee: Some(trading_fee),
                 tags: parsed_tags,
                 initial_liquidity: None,
-                category_txids: None, // TODO: Add CLI support for category claims
-                residual_names: None, // TODO: Add CLI support for residual names
+                category_txids: parsed_category_txids,
+                residual_names: parsed_residual_names,
                 fee_sats,
             };
             let txid = rpc_client.market_create(request).await?;
@@ -1038,6 +1070,47 @@ where
                 result.txid.unwrap_or_default()
             )
         }
+        Command::MarketSell {
+            market_id,
+            outcome_index,
+            shares_amount,
+            seller_address,
+            min_proceeds,
+            fee_sats,
+        } => {
+            use truthcoin_dc_app_rpc_api::MarketSellRequest;
+            let request = MarketSellRequest {
+                market_id: market_id.clone(),
+                outcome_index,
+                shares_amount,
+                seller_address,
+                min_proceeds: Some(min_proceeds),
+                fee_sats: Some(fee_sats),
+                dry_run: Some(false),
+            };
+            let result = rpc_client.market_sell(request).await?;
+            let txid_display = match &result.txid {
+                Some(txid) => txid.clone(),
+                None => "None (dry run)".to_string(),
+            };
+            format!(
+                "Successfully submitted sell shares transaction!\n\
+                Market: {}\n\
+                Outcome Index: {}\n\
+                Shares Sold: {:.4}\n\
+                Gross Proceeds: {} sats\n\
+                Trading Fee: {} sats\n\
+                Net Proceeds: {} sats\n\
+                Transaction ID: {}",
+                market_id,
+                outcome_index,
+                shares_amount,
+                result.proceeds_sats,
+                result.trading_fee_sats,
+                result.net_proceeds_sats,
+                txid_display
+            )
+        }
         Command::CalculateShareCost {
             market_id,
             outcome_index,
@@ -1116,7 +1189,10 @@ where
                 result.min_treasury_sats,
                 result.beta,
                 result.num_outcomes,
-                result.beta * (result.num_outcomes as f64).ln(),
+                trading::calculate_lmsr_liquidity(
+                    result.beta,
+                    result.num_outcomes
+                ),
                 result.initial_liquidity_sats
             )
         }

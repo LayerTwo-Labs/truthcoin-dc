@@ -100,6 +100,34 @@ pub struct MarketBuyResponse {
     pub new_price: f64,
 }
 
+/// Request to sell shares in a prediction market
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketSellRequest {
+    pub market_id: String,
+    pub outcome_index: usize,
+    pub shares_amount: f64,
+    /// Address holding the shares to sell (required)
+    pub seller_address: Address,
+    /// Minimum proceeds required (slippage protection)
+    pub min_proceeds: Option<u64>,
+    pub fee_sats: Option<u64>,
+    pub dry_run: Option<bool>,
+}
+
+/// Response from selling shares in a prediction market
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketSellResponse {
+    /// Transaction ID for the sell transaction (None for dry runs)
+    pub txid: Option<String>,
+    /// Gross proceeds before trading fee (LMSR payout)
+    pub proceeds_sats: u64,
+    /// Trading fee deducted from proceeds
+    pub trading_fee_sats: u64,
+    /// Net proceeds seller will receive (proceeds_sats - trading_fee_sats)
+    pub net_proceeds_sats: u64,
+    pub new_price: f64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VoteFilter {
     pub voter: Option<Address>,
@@ -311,7 +339,7 @@ pub struct SharePosition {
     pub market_id: String,
     pub outcome_index: usize,
     pub outcome_name: String,
-    pub shares_held: f64,
+    pub shares: f64,
     pub avg_purchase_price: f64,
     pub current_price: f64,
     pub current_value: f64,
@@ -489,7 +517,8 @@ pub struct VotingConsensusResults {
     CalculateInitialLiquidityRequest, CategoryClaimRequest, CategorySlotItem,
     ConsensusResults, CreateMarketRequest, DecisionSummary,
     EncryptionPubKey, FilledOutputContent, Header, InitialLiquidityCalculation,
-    MarketBuyRequest, MarketBuyResponse, MarketData, MarketOutcome, MarketSummary,
+    MarketBuyRequest, MarketBuyResponse, MarketData, MarketOutcome,
+    MarketSellRequest, MarketSellResponse, MarketSummary,
     MerkleRoot, OutPoint, Output, OutputContent,
     ParticipationStats, PeerConnectionStatus, PeriodStats,
     RedistributionInfo, RegisterVoterRequest, ReputationUpdate,
@@ -749,6 +778,22 @@ pub trait Rpc {
     #[method(name = "refresh_wallet")]
     async fn refresh_wallet(&self) -> RpcResult<()>;
 
+    /// Wait until the node reaches a specific block height (for sync)
+    /// Returns the actual height reached (may be higher than requested)
+    /// Times out after the specified milliseconds (default 10000ms)
+    #[method(name = "await_block_height")]
+    async fn await_block_height(
+        &self,
+        target_height: u32,
+        timeout_ms: Option<u64>,
+    ) -> RpcResult<u32>;
+
+    /// Trigger a sync to a specific tip block hash.
+    /// The block must already exist in our archive (received via P2P).
+    /// Returns true if reorg was successful, false if not needed or failed.
+    #[method(name = "sync_to_tip")]
+    async fn sync_to_tip(&self, block_hash: BlockHash) -> RpcResult<bool>;
+
     /// Get slot system status and configuration
     #[open_api_method(output_schema(ToSchema))]
     #[method(name = "slot_status")]
@@ -819,6 +864,15 @@ pub trait Rpc {
         &self,
         request: MarketBuyRequest,
     ) -> RpcResult<MarketBuyResponse>;
+
+    /// Sell shares (with dry_run support for proceeds calculation)
+    /// Payout is created during block connection from market treasury
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "market_sell")]
+    async fn market_sell(
+        &self,
+        request: MarketSellRequest,
+    ) -> RpcResult<MarketSellResponse>;
 
     /// Get share positions for an address (optionally filtered by market)
     #[open_api_method(output_schema(ToSchema))]
