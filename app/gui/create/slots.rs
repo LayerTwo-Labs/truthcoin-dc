@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use eframe::egui::{self, Button, RichText, ScrollArea};
 use truthcoin_dc::state::slots::{Slot, SlotId};
 use truthcoin_dc::state::voting::types::VotingPeriodId;
@@ -7,8 +9,8 @@ use crate::app::App;
 
 const DEFAULT_FEE_SATS: u64 = 1000;
 
-#[derive(Default)]
 pub struct Slots {
+    current_period: u32,
     periods: Vec<(u32, u64)>,
     selected_period: Option<u32>,
     available_slots: Vec<SlotId>,
@@ -17,7 +19,26 @@ pub struct Slots {
     category_form: CategoryClaimForm,
     error: Option<String>,
     success: Option<String>,
-    loaded: bool,
+    last_refresh: Instant,
+    is_blocks_mode: bool,
+}
+
+impl Default for Slots {
+    fn default() -> Self {
+        Self {
+            current_period: 0,
+            periods: Vec::new(),
+            selected_period: None,
+            available_slots: Vec::new(),
+            claimed_slots: Vec::new(),
+            claim_form: ClaimForm::default(),
+            category_form: CategoryClaimForm::default(),
+            error: None,
+            success: None,
+            last_refresh: Instant::now() - Duration::from_secs(10), // Force initial refresh
+            is_blocks_mode: true,
+        }
+    }
 }
 
 struct ClaimForm {
@@ -26,6 +47,8 @@ struct ClaimForm {
     is_scaled: bool,
     min_input: String,
     max_input: String,
+    option_0_label: String,
+    option_1_label: String,
     fee_input: String,
     expanded: bool,
     is_processing: bool,
@@ -39,6 +62,8 @@ impl Default for ClaimForm {
             is_scaled: false,
             min_input: String::new(),
             max_input: String::new(),
+            option_0_label: String::new(),
+            option_1_label: String::new(),
             fee_input: DEFAULT_FEE_SATS.to_string(),
             expanded: false,
             is_processing: false,
@@ -73,24 +98,59 @@ impl Default for CategoryClaimForm {
 }
 
 impl Slots {
-    fn refresh_periods(&mut self, app: &App) {
-        match app.node.get_all_slot_quarters() {
-            Ok(quarters) => {
-                self.periods = quarters;
+    fn refresh_data(&mut self, app: &App) {
+        if self.last_refresh.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_refresh = Instant::now();
+
+        let config = app.node.get_slot_config();
+        self.is_blocks_mode = config.is_blocks_mode();
+
+        let mainchain_ts = app.node.get_mainchain_timestamp().unwrap_or(0);
+
+        match app.node.get_current_period(mainchain_ts) {
+            Ok(period) => {
+                let period_changed = self.current_period != period;
+                self.current_period = period;
+
+                if period_changed || self.selected_period.is_none() {
+                    self.selected_period = Some(period);
+                }
+            }
+            Err(e) => {
+                self.error =
+                    Some(format!("Failed to get current period: {e:#}"));
+                return;
+            }
+        }
+
+        match app.node.get_all_slot_periods() {
+            Ok(periods) => {
+                let current = self.current_period;
+                self.periods = periods
+                    .into_iter()
+                    .filter(|(p, _)| *p >= current)
+                    .collect();
                 self.error = None;
-                if self.selected_period.is_none()
-                    && let Some((first_period, _)) = self.periods.first()
-                {
-                    self.selected_period = Some(*first_period);
-                    self.refresh_slots_for_period(app, *first_period);
+
+                if let Some(selected) = self.selected_period {
+                    let is_valid =
+                        self.periods.iter().any(|(p, _)| *p == selected);
+                    if !is_valid {
+                        self.selected_period = Some(self.current_period);
+                    }
                 }
             }
             Err(e) => {
                 self.error = Some(format!("Failed to load periods: {e:#}"));
-                tracing::error!("Failed to load slot quarters: {e:#}");
+                tracing::error!("Failed to load slot periods: {e:#}");
             }
         }
-        self.loaded = true;
+
+        if let Some(period) = self.selected_period {
+            self.refresh_slots_for_period(app, period);
+        }
     }
 
     fn refresh_slots_for_period(&mut self, app: &App, period: u32) {
@@ -166,7 +226,6 @@ impl Slots {
                     return;
                 }
             };
-            // Validate min < max
             if min >= max {
                 self.error =
                     Some(format!("Min ({min}) must be less than max ({max})"));
@@ -195,6 +254,19 @@ impl Slots {
             }
         };
 
+        let option_0_label = if self.claim_form.option_0_label.trim().is_empty()
+        {
+            None
+        } else {
+            Some(self.claim_form.option_0_label.trim().to_string())
+        };
+        let option_1_label = if self.claim_form.option_1_label.trim().is_empty()
+        {
+            None
+        } else {
+            Some(self.claim_form.option_1_label.trim().to_string())
+        };
+
         let input = SlotClaimInput {
             slot_id_bytes,
             is_standard,
@@ -202,6 +274,8 @@ impl Slots {
             question: self.claim_form.question.clone(),
             min,
             max,
+            option_0_label,
+            option_1_label,
         };
 
         let tx_fee = bitcoin::Amount::from_sat(fee_sats);
@@ -335,25 +409,29 @@ impl Slots {
             return;
         };
 
-        if !self.loaded {
-            self.refresh_periods(app);
-        }
-        if let Some(period) = self.selected_period {
-            self.refresh_slots_for_period(app, period);
+        self.refresh_data(app);
+
+        if !self.is_blocks_mode {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
 
         ui.horizontal(|ui| {
             ui.heading("Decision Slots");
+            ui.label(
+                RichText::new(format!(
+                    "(Current: Period {})",
+                    self.current_period
+                ))
+                .weak()
+                .italics(),
+            );
             if ui.button("Refresh").clicked() {
-                self.refresh_periods(app);
-                if let Some(period) = self.selected_period {
-                    self.refresh_slots_for_period(app, period);
-                }
+                self.last_refresh = Instant::now() - Duration::from_secs(10);
+                self.refresh_data(app);
             }
         });
         ui.separator();
 
-        // Success/error messages
         if let Some(msg) = &self.success {
             ui.colored_label(egui::Color32::GREEN, msg);
         }
@@ -363,20 +441,30 @@ impl Slots {
 
         ui.add_space(5.0);
 
-        let mut newly_selected_period = None;
         ui.horizontal(|ui| {
             ui.label("Period:");
             let prev_selection = self.selected_period;
             egui::ComboBox::from_id_salt("period_selector")
                 .selected_text(
                     self.selected_period
-                        .map(|p| format!("Period {p}"))
+                        .map(|p| {
+                            let is_current = p == self.current_period;
+                            if is_current {
+                                format!("Period {p} (current)")
+                            } else {
+                                format!("Period {p}")
+                            }
+                        })
                         .unwrap_or_else(|| "Select a period".to_string()),
                 )
                 .show_ui(ui, |ui| {
                     for (period, available) in &self.periods {
-                        let label =
-                            format!("Period {period} ({available} available)");
+                        let is_current = *period == self.current_period;
+                        let label = if is_current {
+                            format!("Period {period} ({available} available) \u{2190} current")
+                        } else {
+                            format!("Period {period} ({available} available)")
+                        };
                         ui.selectable_value(
                             &mut self.selected_period,
                             Some(*period),
@@ -384,14 +472,12 @@ impl Slots {
                         );
                     }
                 });
-            if self.selected_period != prev_selection {
-                newly_selected_period = self.selected_period;
+            if self.selected_period != prev_selection
+                && let Some(period) = self.selected_period
+            {
+                self.refresh_slots_for_period(app, period);
             }
         });
-
-        if let Some(period) = newly_selected_period {
-            self.refresh_slots_for_period(app, period);
-        }
 
         ui.add_space(10.0);
 
@@ -432,7 +518,6 @@ impl Slots {
                         }
                     });
 
-                // Right: Claimed slots
                 cols[1].heading("Claimed Slots");
                 cols[1].label(
                     RichText::new(format!(
@@ -482,6 +567,16 @@ impl Slots {
                                                     RichText::new(range)
                                                         .small()
                                                         .weak(),
+                                                );
+                                            } else {
+                                                let (label0, label1) = decision
+                                                    .get_binary_labels();
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "Binary [{label0}/{label1}]"
+                                                    ))
+                                                    .small()
+                                                    .weak(),
                                                 );
                                             }
                                         });
@@ -586,6 +681,26 @@ impl Slots {
                             .desired_width(80.0),
                         );
                     });
+                    ui.end_row();
+                } else {
+                    ui.label("Option 0 label:");
+                    ui.add(
+                        egui::TextEdit::singleline(
+                            &mut self.claim_form.option_0_label,
+                        )
+                        .hint_text("e.g., False (default: No)")
+                        .desired_width(200.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("Option 1 label:");
+                    ui.add(
+                        egui::TextEdit::singleline(
+                            &mut self.claim_form.option_1_label,
+                        )
+                        .hint_text("e.g., True (default: Yes)")
+                        .desired_width(200.0),
+                    );
                     ui.end_row();
                 }
 
@@ -702,7 +817,6 @@ impl Slots {
                 }
             });
 
-        // Remove slot if requested
         if let Some(idx) = remove_idx {
             self.category_form.slots.remove(idx);
         }

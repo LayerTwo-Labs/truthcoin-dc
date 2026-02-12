@@ -163,6 +163,10 @@ pub enum TransactionData {
         min: Option<i64>,
         /// Max value (only for scaled decisions)
         max: Option<i64>,
+        /// Custom label for option 0 (binary decisions). Defaults to "No".
+        option_0_label: Option<String>,
+        /// Custom label for option 1 (binary decisions). Defaults to "Yes".
+        option_1_label: Option<String>,
     },
     /// Create a prediction market using dimension bracket notation
     ///
@@ -199,16 +203,12 @@ pub enum TransactionData {
         market_id: MarketId,
         /// Outcome index to trade shares for
         outcome_index: u32,
-        /// Number of shares to trade (positive = buy, negative = sell)
-        shares: f64,
+        /// Number of whole shares to trade (positive = buy, negative = sell)
+        shares: i64,
         /// Trader address (required for sell ownership validation)
         trader: Address,
-        /// Slippage limit: max_cost for buy, min_proceeds for sell (in satoshis)
+        /// Slippage limit: max total cost for buy, min net proceeds for sell (in satoshis)
         limit_sats: u64,
-        /// Pre-computed LMSR base cost/proceeds (absolute, satoshis) - used as state fingerprint
-        base_sats: u64,
-        /// Pre-computed trading fee (absolute, satoshis)
-        fee_sats: u64,
     },
     /// Submit a vote for a decision in the current voting period
     SubmitVote {
@@ -296,6 +296,10 @@ pub struct ClaimDecisionSlot {
     pub min: Option<i64>,
     /// Max value (only for scaled decisions)
     pub max: Option<i64>,
+    /// Custom label for option 0 (binary decisions). Defaults to "No".
+    pub option_0_label: Option<String>,
+    /// Custom label for option 1 (binary decisions). Defaults to "Yes".
+    pub option_1_label: Option<String>,
 }
 
 /// Struct describing a market creation using dimension specifications
@@ -327,32 +331,28 @@ pub struct Trade {
     pub market_id: MarketId,
     /// Outcome index to trade shares for
     pub outcome_index: u32,
-    /// Number of shares to trade (positive = buy, negative = sell)
-    pub shares: f64,
+    /// Number of whole shares to trade (positive = buy, negative = sell)
+    pub shares: i64,
     /// Trader address (required for sell ownership validation)
     pub trader: Address,
-    /// Slippage limit: max_cost for buy, min_proceeds for sell (in satoshis)
+    /// Slippage limit: max total cost for buy, min net proceeds for sell (in satoshis)
     pub limit_sats: u64,
-    /// Pre-computed LMSR base cost/proceeds (absolute, satoshis) - acts as state fingerprint
-    pub base_sats: u64,
-    /// Pre-computed trading fee (absolute, satoshis)
-    pub fee_sats: u64,
 }
 
 impl Trade {
     /// Returns true if this is a buy trade (positive shares)
     pub fn is_buy(&self) -> bool {
-        self.shares > 0.0
+        self.shares > 0
     }
 
     /// Returns true if this is a sell trade (negative shares)
     pub fn is_sell(&self) -> bool {
-        self.shares < 0.0
+        self.shares < 0
     }
 
-    /// Returns the absolute number of shares being traded
-    pub fn shares_abs(&self) -> f64 {
-        self.shares.abs()
+    /// Returns the absolute number of shares
+    pub fn shares_abs(&self) -> u64 {
+        self.shares.unsigned_abs()
     }
 }
 
@@ -527,6 +527,8 @@ impl FilledTransaction {
                 question,
                 min,
                 max,
+                option_0_label,
+                option_1_label,
             }) => Some(ClaimDecisionSlot {
                 slot_id_bytes: *slot_id_bytes,
                 is_standard: *is_standard,
@@ -534,6 +536,8 @@ impl FilledTransaction {
                 question: question.clone(),
                 min: *min,
                 max: *max,
+                option_0_label: option_0_label.clone(),
+                option_1_label: option_1_label.clone(),
             }),
             _ => None,
         }
@@ -574,16 +578,12 @@ impl FilledTransaction {
                 shares,
                 trader,
                 limit_sats,
-                base_sats,
-                fee_sats,
             }) => Some(Trade {
                 market_id: market_id.clone(),
                 outcome_index: *outcome_index,
                 shares: *shares,
                 trader: *trader,
                 limit_sats: *limit_sats,
-                base_sats: *base_sats,
-                fee_sats: *fee_sats,
             }),
             _ => None,
         }
@@ -784,17 +784,6 @@ impl FilledTransaction {
             .unwrap_or(Some(bitcoin::Amount::ZERO))
     }
 
-    /** Returns an iterator over total amount for each LP token that must
-     *  appear in the outputs, in order.
-     *  The total output value can possibly over/underflow,
-     *  so the total output values are [`Option<u64>`],
-     *  where `None` indicates over/underflow. */
-    fn output_lp_token_total_amounts(
-        &self,
-    ) -> impl Iterator<Item = (AssetId, AssetId, Option<u64>)> + '_ {
-        std::iter::empty()
-    }
-
     /// Compute the filled outputs.
     /// Returns None if the outputs cannot be filled because the tx is invalid.
     ///
@@ -804,11 +793,8 @@ impl FilledTransaction {
     /// per Bitcoin Hivemind transaction consistency requirements.
     pub fn filled_outputs(&self) -> Option<Vec<FilledOutput>> {
         let mut output_bitcoin_max_value = self.output_bitcoin_max_value()?;
-        let mut output_lp_token_total_amounts =
-            self.output_lp_token_total_amounts().peekable();
 
-        let outputs = self
-            .outputs()
+        self.outputs()
             .iter()
             .map(|output| {
                 let content = match output.content.clone() {
@@ -849,18 +835,7 @@ impl FilledTransaction {
                     memo: output.memo.clone(),
                 })
             })
-            .collect::<Option<Vec<FilledOutput>>>();
-
-        let outputs = outputs?;
-
-        // Validate that all LP token iterators are fully consumed.
-        // If there are remaining unconsumed elements, the transaction has
-        // inconsistent LP token allocations and must be marked invalid.
-        if output_lp_token_total_amounts.peek().is_some() {
-            return None;
-        }
-
-        Some(outputs)
+            .collect()
     }
 }
 

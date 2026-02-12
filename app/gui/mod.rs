@@ -2,7 +2,6 @@ use std::{pin::Pin, task::Poll};
 
 use eframe::egui::{self, Color32, RichText};
 use futures::Stream;
-use strum::{EnumIter, IntoEnumIterator};
 use truthcoin_dc::types::{GetBitcoinValue, Network};
 
 use crate::{app::App, line_buffer::LineBuffer, util::PromiseStream};
@@ -10,6 +9,7 @@ use crate::{app::App, line_buffer::LineBuffer, util::PromiseStream};
 mod activity;
 mod coins;
 mod console_logs;
+mod create;
 mod fonts;
 mod markets;
 mod miner;
@@ -21,6 +21,7 @@ mod votecoin;
 use activity::Activity;
 use coins::Coins;
 use console_logs::ConsoleLogs;
+use create::Create;
 use fonts::FONT_DEFINITIONS;
 use markets::Markets;
 use miner::Miner;
@@ -29,10 +30,8 @@ use seed::SetSeed;
 use util::{BITCOIN_LOGO_FA, BITCOIN_ORANGE, UiExt, show_btc_amount};
 use votecoin::Votecoin;
 
-/// Bottom panel, if initialized
 struct BottomPanelInitialized {
     app: App,
-    /// Single unified watch - fires on state or mempool changes
     node_updated: PromiseStream<Pin<Box<dyn Stream<Item = ()> + Send>>>,
 }
 
@@ -48,11 +47,8 @@ impl BottomPanelInitialized {
     }
 }
 
-/// Balance information for display
 struct BalanceInfo {
-    /// Available balance (confirmed minus UTXOs spent in mempool)
     available: bitcoin::Amount,
-    /// Amount locked in pending transactions (spent UTXOs waiting for confirmation)
     pending_spent: bitcoin::Amount,
 }
 
@@ -67,7 +63,6 @@ impl BottomPanel {
     /// MUST be run from within a tokio runtime
     fn new(app: Option<App>) -> Self {
         let initialized = app.map(BottomPanelInitialized::new);
-        // Calculate initial balance including mempool state
         let balance = initialized
             .as_ref()
             .and_then(|init| Self::calculate_balance(&init.app));
@@ -77,7 +72,6 @@ impl BottomPanel {
         }
     }
 
-    /// Updates balance values when node state or mempool changes
     fn update(&mut self) {
         let Some(initialized) = &mut self.initialized else {
             return;
@@ -96,10 +90,7 @@ impl BottomPanel {
         drop(rt_guard);
     }
 
-    /// Calculate available balance by subtracting pending-spent UTXOs from confirmed balance.
-    /// Uses atomic read to ensure consistency between confirmed UTXOs and mempool state.
     fn calculate_balance(app: &App) -> Option<Option<BalanceInfo>> {
-        // Get wallet addresses
         let addresses = match app.wallet.get_addresses() {
             Ok(addrs) => addrs,
             Err(err) => {
@@ -109,7 +100,6 @@ impl BottomPanel {
             }
         };
 
-        // Single atomic call - both reads use same LMDB transaction
         let (utxos, spent_in_mempool) =
             match app.node.get_utxos_with_mempool_status(&addresses) {
                 Ok(result) => result,
@@ -120,11 +110,9 @@ impl BottomPanel {
                 }
             };
 
-        // Calculate total confirmed balance
         let confirmed_total: bitcoin::Amount =
             utxos.values().map(|utxo| utxo.get_bitcoin_value()).sum();
 
-        // Calculate amount locked in pending transactions
         let pending_spent: bitcoin::Amount = spent_in_mempool
             .iter()
             .filter_map(|(outpoint, _inpoint)| {
@@ -132,7 +120,6 @@ impl BottomPanel {
             })
             .sum();
 
-        // Available = confirmed - pending_spent
         let available = confirmed_total
             .checked_sub(pending_spent)
             .unwrap_or(bitcoin::Amount::ZERO);
@@ -151,7 +138,6 @@ impl BottomPanel {
                         .color(BITCOIN_ORANGE),
                 );
                 if balance_info.pending_spent > bitcoin::Amount::ZERO {
-                    // Show available balance with pending indicator
                     ui.monospace_selectable_singleline(
                         false,
                         format!(
@@ -161,7 +147,6 @@ impl BottomPanel {
                         ),
                     );
                 } else {
-                    // No pending transactions, show simple balance
                     ui.monospace_selectable_singleline(
                         false,
                         format!(
@@ -226,19 +211,20 @@ impl BottomPanel {
 pub struct EguiApp {
     activity: Activity,
     app: Option<App>,
-    votecoin: Votecoin,
     bottom_panel: BottomPanel,
     coins: Coins,
     console_logs: ConsoleLogs,
+    create: Create,
     markets: Markets,
     miner: Miner,
     network: Network,
     parent_chain: ParentChain,
     set_seed: SetSeed,
     tab: Tab,
+    votecoin: Votecoin,
 }
 
-#[derive(Default, EnumIter, Eq, PartialEq, strum::Display)]
+#[derive(Clone, Copy, Default, Eq, PartialEq, strum::Display)]
 enum Tab {
     #[default]
     #[strum(to_string = "Parent Chain")]
@@ -247,12 +233,24 @@ enum Tab {
     Coins,
     #[strum(to_string = "Markets")]
     Markets,
+    #[strum(to_string = "Create")]
+    Create,
     #[strum(to_string = "Votecoin")]
     Votecoin,
     #[strum(to_string = "Activity")]
     Activity,
     #[strum(to_string = "Console / Logs")]
     ConsoleLogs,
+}
+
+impl Tab {
+    fn sections() -> &'static [[Tab; 2]] {
+        &[
+            [Tab::Coins, Tab::Markets],
+            [Tab::Create, Tab::Votecoin],
+            [Tab::Activity, Tab::ConsoleLogs],
+        ]
+    }
 }
 
 impl EguiApp {
@@ -289,21 +287,23 @@ impl EguiApp {
         let bottom_panel = BottomPanel::new(app.clone());
         let coins = Coins::new(app.as_ref());
         let console_logs = ConsoleLogs::new(logs_capture, rpc_host, rpc_port);
+        let create = Create::default();
         let markets = Markets::new(app.as_ref());
         let parent_chain = ParentChain::new(app.as_ref());
         Self {
             activity,
             app,
-            votecoin: Votecoin::default(),
             bottom_panel,
             coins,
             console_logs,
+            create,
             markets,
             miner: Miner::default(),
             network,
             parent_chain,
             set_seed: SetSeed::default(),
             tab: Tab::default(),
+            votecoin: Votecoin::default(),
         }
     }
 }
@@ -322,14 +322,21 @@ impl eframe::App for EguiApp {
         } else {
             egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    Tab::iter().for_each(|tab_variant| {
-                        let tab_name = tab_variant.to_string();
-                        ui.selectable_value(
-                            &mut self.tab,
-                            tab_variant,
-                            tab_name,
-                        );
-                    })
+                    ui.selectable_value(
+                        &mut self.tab,
+                        Tab::ParentChain,
+                        Tab::ParentChain.to_string(),
+                    );
+                    for section in Tab::sections() {
+                        ui.separator();
+                        for tab in section {
+                            ui.selectable_value(
+                                &mut self.tab,
+                                *tab,
+                                tab.to_string(),
+                            );
+                        }
+                    }
                 });
             });
             egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
@@ -344,6 +351,9 @@ impl eframe::App for EguiApp {
                 }
                 Tab::Markets => {
                     self.markets.show(self.app.as_ref(), ui);
+                }
+                Tab::Create => {
+                    self.create.show(self.app.as_ref(), ui);
                 }
                 Tab::Votecoin => {
                     self.votecoin.show(self.app.as_ref(), ui);

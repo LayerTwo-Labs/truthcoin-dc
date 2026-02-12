@@ -82,11 +82,12 @@ impl VotingSystem {
     fn compute_consensus(
         &self,
         rwtxn: &mut RwTxn,
-        period_id: VotingPeriodId,
+        period: &VotingPeriod,
         state: &crate::state::State,
         current_timestamp: u64,
         current_height: u64,
     ) -> Result<Option<ConsensusResult>, Error> {
+        let period_id = period.id;
         use crate::math::voting::{
             SparseVoteMatrix, VotingWeightVector,
             calculate_consensus as math_calculate_consensus,
@@ -104,14 +105,86 @@ impl VotingSystem {
             return Ok(None);
         }
 
+        let all_decision_slots = &period.decision_slots;
+        let total_slot_count = all_decision_slots.len();
+
+        // Categorical slots (2+ sharing a txid) default to 1/N instead of 0.5.
+        let mut category_sizes: HashMap<crate::types::Txid, usize> =
+            HashMap::new();
+        let mut slot_category: HashMap<SlotId, crate::types::Txid> =
+            HashMap::new();
+        for &slot_id in all_decision_slots {
+            if let Some(slot) = state.slots().get_slot(rwtxn, slot_id)? {
+                *category_sizes.entry(slot.claiming_txid).or_insert(0) += 1;
+                slot_category.insert(slot_id, slot.claiming_txid);
+            }
+        }
+        let categorical_default = |slot_id: SlotId| -> f64 {
+            if let Some(txid) = slot_category.get(&slot_id) {
+                let size = category_sizes.get(txid).copied().unwrap_or(1);
+                if size >= 2 { 1.0 / size as f64 } else { 0.5 }
+            } else {
+                0.5
+            }
+        };
+
         let all_votes =
             self.databases.get_votes_for_period(rwtxn, period_id)?;
+
         if all_votes.is_empty() {
-            tracing::warn!(
-                "compute_consensus: No votes found for period {}, returning empty",
-                period_id.0
+            tracing::info!(
+                "compute_consensus: No votes for period {}, assigning defaults to all {} slots",
+                period_id.0,
+                total_slot_count
             );
-            return Ok(None);
+
+            let mut result = ConsensusResult::new(
+                period_id,
+                current_height,
+                current_timestamp,
+                total_slot_count,
+            );
+
+            for &slot_id in all_decision_slots {
+                let default_value = categorical_default(slot_id);
+
+                tracing::info!(
+                    "Slot {} no votes — using default {:.4}",
+                    hex::encode(slot_id.as_bytes()),
+                    default_value
+                );
+
+                let mut resolution =
+                    DecisionResolution::new(slot_id, period_id, 0, 0, 0, 0);
+                resolution.mark_outcome_ready();
+
+                let outcome = DecisionOutcome::new(
+                    slot_id,
+                    period_id,
+                    default_value,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0,
+                    0.0,
+                    0,
+                    0,
+                    true,
+                    resolution,
+                );
+
+                result.decision_outcomes.push(outcome);
+                result.slot_resolutions.push(SlotResolution {
+                    slot_id,
+                    outcome_value: default_value,
+                });
+            }
+
+            let mut period_stats = VotingPeriodStats::new(period_id, 0);
+            period_stats.certainty = Some(0.0);
+            result.period_stats = period_stats;
+
+            return Ok(Some(result));
         }
 
         // Collect unique voters and decisions from votes
@@ -234,16 +307,24 @@ impl VotingSystem {
 
         let mut decision_outcomes = Vec::new();
         let mut slot_resolutions = Vec::new();
-        let total_slot_count = math_result.outcomes.len();
+
+        let mut resolved_by_svd: HashSet<SlotId> = HashSet::new();
 
         for (slot_id, outcome_value) in &math_result.outcomes {
-            let Some(outcome_f64) = outcome_value else {
-                tracing::warn!(
-                    "Slot {} has unanimous abstention - no consensus outcome stored",
-                    hex::encode(slot_id.as_bytes())
-                );
-                continue;
+            let outcome_f64 = match outcome_value {
+                Some(v) => *v,
+                None => {
+                    let default_value = categorical_default(*slot_id);
+                    tracing::info!(
+                        "Slot {} has unanimous abstention — using default {:.4}",
+                        hex::encode(slot_id.as_bytes()),
+                        default_value
+                    );
+                    default_value
+                }
             };
+
+            resolved_by_svd.insert(*slot_id);
 
             let mut resolution =
                 DecisionResolution::new(*slot_id, period_id, 0, 1, 0, 0);
@@ -252,7 +333,7 @@ impl VotingSystem {
             let outcome = DecisionOutcome::new(
                 *slot_id,
                 period_id,
-                *outcome_f64,
+                outcome_f64,
                 0.0,
                 1.0,
                 1.0,
@@ -267,8 +348,45 @@ impl VotingSystem {
             decision_outcomes.push(outcome);
             slot_resolutions.push(SlotResolution {
                 slot_id: *slot_id,
-                outcome_value: *outcome_f64,
+                outcome_value: outcome_f64,
             });
+        }
+
+        for &slot_id in all_decision_slots {
+            if !resolved_by_svd.contains(&slot_id) {
+                let default_value = categorical_default(slot_id);
+
+                tracing::info!(
+                    "Slot {} had no votes — using default {:.4}",
+                    hex::encode(slot_id.as_bytes()),
+                    default_value
+                );
+
+                let mut resolution =
+                    DecisionResolution::new(slot_id, period_id, 0, 0, 0, 0);
+                resolution.mark_outcome_ready();
+
+                let outcome = DecisionOutcome::new(
+                    slot_id,
+                    period_id,
+                    default_value,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0,
+                    0.0,
+                    0,
+                    0,
+                    true,
+                    resolution,
+                );
+
+                decision_outcomes.push(outcome);
+                slot_resolutions.push(SlotResolution {
+                    slot_id,
+                    outcome_value: default_value,
+                });
+            }
         }
 
         let redistribution_summary =
@@ -373,7 +491,7 @@ impl VotingSystem {
         result: ConsensusResult,
         state: &crate::state::State,
         slots_db: &crate::state::slots::Dbs,
-    ) -> Result<(), Error> {
+    ) -> Result<crate::state::undo::ConsensusUndoEntry, Error> {
         tracing::debug!(
             period_id = result.period_id.0,
             block_height = result.block_height,
@@ -383,6 +501,46 @@ impl VotingSystem {
         );
 
         self.validate_consensus_commit(rwtxn, &result, state, slots_db)?;
+
+        // Capture previous voter reputations before overwriting
+        let previous_voter_reputations: Vec<(
+            crate::types::Address,
+            Option<VoterReputation>,
+        )> = result
+            .voter_reputations
+            .iter()
+            .map(|vr| {
+                let prev =
+                    self.databases.get_voter_reputation(rwtxn, vr.address);
+                Ok((vr.address, prev.ok().flatten()))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        // Capture whether period stats already existed
+        let had_period_stats = self
+            .databases
+            .get_period_stats(rwtxn, result.period_id)?
+            .is_some();
+
+        // Capture previous pending redistribution
+        let previous_pending_redistribution = self
+            .databases
+            .get_pending_redistribution(rwtxn, result.period_id)?;
+
+        // Collect decision outcome slot IDs
+        let decision_outcome_slot_ids: Vec<crate::state::slots::SlotId> =
+            result
+                .decision_outcomes
+                .iter()
+                .map(|o| o.decision_id)
+                .collect();
+
+        // Collect resolved slot IDs
+        let resolved_slot_ids: Vec<crate::state::slots::SlotId> = result
+            .slot_resolutions
+            .iter()
+            .map(|sr| sr.slot_id)
+            .collect();
 
         // Phase 1: Write voter reputations
         for voter_rep in &result.voter_reputations {
@@ -408,40 +566,38 @@ impl VotingSystem {
         );
 
         // Phase 4: Apply votecoin redistribution
+        // Track UTXOs created/consumed during redistribution
+        let mut created_votecoin_utxos = Vec::new();
+        let mut consumed_votecoin_utxos = Vec::new();
+
         if let Some(ref redistribution_summary) = result.redistribution_summary
         {
-            if let Some(existing) = self
-                .databases
-                .get_pending_redistribution(rwtxn, result.period_id)?
-            {
-                if existing.applied {
-                    tracing::trace!(
-                        period_id = result.period_id.0,
-                        applied_at = ?existing.applied_at_height,
-                        "Redistribution already applied, skipping"
-                    );
+            let should_apply =
+                if let Some(ref existing) = previous_pending_redistribution {
+                    !existing.applied
                 } else {
-                    redistribution::apply_votecoin_redistribution(
+                    true
+                };
+
+            if should_apply {
+                // Capture votecoin UTXOs before redistribution for undo
+                let (created, consumed) =
+                    redistribution::apply_votecoin_redistribution_with_undo(
                         state,
                         rwtxn,
                         redistribution_summary,
                         result.block_height,
                     )?;
-                    tracing::trace!(
-                        transfer_count = redistribution_summary.transfers.len(),
-                        "Applied votecoin redistribution"
-                    );
-                }
-            } else {
-                redistribution::apply_votecoin_redistribution(
-                    state,
-                    rwtxn,
-                    redistribution_summary,
-                    result.block_height,
-                )?;
+                created_votecoin_utxos = created;
+                consumed_votecoin_utxos = consumed;
                 tracing::trace!(
                     transfer_count = redistribution_summary.transfers.len(),
                     "Applied votecoin redistribution"
+                );
+            } else {
+                tracing::trace!(
+                    period_id = result.period_id.0,
+                    "Redistribution already applied, skipping"
                 );
             }
         }
@@ -466,6 +622,7 @@ impl VotingSystem {
         let abstained_count = result.abstained_slot_count();
 
         // Phase 6: Record redistribution as applied
+        let had_pending_redistribution = result.period_redistribution.is_some();
         if let Some(mut period_redistribution) = result.period_redistribution {
             period_redistribution.mark_applied(result.block_height);
             self.databases
@@ -480,45 +637,56 @@ impl VotingSystem {
             "Consensus commit completed successfully"
         );
 
-        Ok(())
+        Ok(crate::state::undo::ConsensusUndoEntry {
+            period_id: result.period_id,
+            previous_voter_reputations,
+            decision_outcome_slot_ids,
+            had_period_stats,
+            resolved_slot_ids,
+            created_votecoin_utxos,
+            consumed_votecoin_utxos,
+            had_pending_redistribution,
+            previous_pending_redistribution,
+        })
     }
 
     pub(crate) fn calculate_and_store_consensus(
         &self,
         rwtxn: &mut RwTxn,
-        period_id: VotingPeriodId,
+        period: &VotingPeriod,
         state: &crate::state::State,
         current_timestamp: u64,
         current_height: u64,
         slots_db: &crate::state::slots::Dbs,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<crate::state::undo::ConsensusUndoEntry>, Error> {
         // Acquire consensus lock to prevent concurrent consensus calculations.
         // This ensures votecoin balance reads during validation match state at application time.
         let _consensus_guard = self.consensus_lock.lock();
 
         tracing::debug!(
-            period_id = period_id.0,
+            period_id = period.id.0,
             "calculate_and_store_consensus: Starting"
         );
 
         let result = self.compute_consensus(
             rwtxn,
-            period_id,
+            period,
             state,
             current_timestamp,
             current_height,
         )?;
 
         if let Some(consensus_result) = result {
-            self.commit_consensus_result(
+            let undo_entry = self.commit_consensus_result(
                 rwtxn,
                 consensus_result,
                 state,
                 slots_db,
             )?;
+            Ok(Some(undo_entry))
+        } else {
+            Ok(None)
         }
-
-        Ok(())
     }
 
     pub fn get_all_periods(
@@ -528,6 +696,7 @@ impl VotingSystem {
         current_height: u32,
         config: &crate::state::slots::SlotConfig,
         slots_db: &crate::state::slots::Dbs,
+        genesis_ts: u64,
     ) -> Result<HashMap<VotingPeriodId, VotingPeriod>, Error> {
         period_calculator::get_all_active_periods(
             rotxn,
@@ -536,6 +705,7 @@ impl VotingSystem {
             current_timestamp,
             current_height,
             &self.databases,
+            genesis_ts,
         )
     }
 
@@ -546,6 +716,7 @@ impl VotingSystem {
         current_height: u32,
         config: &crate::state::slots::SlotConfig,
         slots_db: &crate::state::slots::Dbs,
+        genesis_ts: u64,
     ) -> Result<Option<VotingPeriod>, Error> {
         let all_periods = self.get_all_periods(
             rotxn,
@@ -553,6 +724,7 @@ impl VotingSystem {
             current_height,
             config,
             slots_db,
+            genesis_ts,
         )?;
 
         for period in all_periods.values() {
@@ -577,6 +749,7 @@ impl VotingSystem {
         tx_hash: [u8; 32],
         config: &crate::state::slots::SlotConfig,
         slots_db: &crate::state::slots::Dbs,
+        genesis_ts: u64,
     ) -> Result<(), Error> {
         let has_outcomes = self.databases.has_consensus(rwtxn, period_id)?;
         let period = period_calculator::calculate_voting_period(
@@ -587,6 +760,7 @@ impl VotingSystem {
             config,
             slots_db,
             has_outcomes,
+            genesis_ts,
         )?;
 
         if !period_calculator::can_accept_votes(&period) {
@@ -812,6 +986,7 @@ impl VotingSystem {
         state: &crate::state::State,
         config: &crate::state::slots::SlotConfig,
         slots_db: &crate::state::slots::Dbs,
+        genesis_ts: u64,
     ) -> Result<Vec<DecisionOutcome>, Error> {
         let has_outcomes = self.databases.has_consensus(rwtxn, period_id)?;
         let period = period_calculator::calculate_voting_period(
@@ -822,9 +997,10 @@ impl VotingSystem {
             config,
             slots_db,
             has_outcomes,
+            genesis_ts,
         )?;
 
-        let effective_time = if config.testing_mode {
+        let effective_time = if config.is_blocks {
             block_height
         } else {
             current_timestamp
@@ -925,6 +1101,7 @@ impl VotingSystem {
         self.databases.get_outcomes_for_period(rotxn, period_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn calculate_period_statistics(
         &self,
         rotxn: &RoTxn,
@@ -933,6 +1110,7 @@ impl VotingSystem {
         current_timestamp: u64,
         config: &crate::state::slots::SlotConfig,
         slots_db: &crate::state::slots::Dbs,
+        genesis_ts: u64,
     ) -> Result<VotingPeriodStats, Error> {
         let (total_voters, total_votes, participation_rate) =
             self.get_participation_stats(rotxn, period_id, config, slots_db)?;
@@ -946,6 +1124,7 @@ impl VotingSystem {
             config,
             slots_db,
             has_outcomes,
+            genesis_ts,
         )?;
 
         let reputation_weights =

@@ -537,7 +537,7 @@ async fn roundtrip_task(
         truthcoin_nodes
             .issuer
             .rpc_client
-            .votecoin_transfer(voter_addr, VOTER_ALLOCATION, 0, None)
+            .transfer_votecoin(voter_addr, VOTER_ALLOCATION, 0, None)
             .await?;
 
         truthcoin_nodes
@@ -3600,6 +3600,28 @@ async fn roundtrip_task(
     }
 
     sleep(std::time::Duration::from_secs(2)).await;
+
+    // Sync all voters to the issuer's tip before voting
+    let issuer_tip = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .get_best_sidechain_block_hash()
+        .await?
+        .expect("Issuer should have a tip after advancing to voting period");
+
+    for voter in [
+        &truthcoin_nodes.voter_0,
+        &truthcoin_nodes.voter_1,
+        &truthcoin_nodes.voter_2,
+        &truthcoin_nodes.voter_3,
+        &truthcoin_nodes.voter_4,
+        &truthcoin_nodes.voter_5,
+        &truthcoin_nodes.voter_6,
+    ] {
+        drop(voter.rpc_client.sync_to_tip(issuer_tip).await);
+        voter.rpc_client.refresh_wallet().await?;
+    }
+    sleep(std::time::Duration::from_secs(1)).await;
 
     // Verify slots are in voting state
     let voting_slots = truthcoin_nodes

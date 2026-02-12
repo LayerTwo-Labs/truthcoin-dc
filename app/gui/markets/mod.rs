@@ -4,36 +4,35 @@ use strum::{EnumIter, IntoEnumIterator};
 use crate::app::App;
 
 mod browse;
-mod buy_shares;
-mod create_market;
+mod list;
 mod my_positions;
+mod my_views;
 mod sell_shares;
-mod slots;
 
 use browse::Browse;
-use create_market::CreateMarket;
+use list::List;
 use my_positions::MyPositions;
-use slots::Slots;
+use my_views::MyViews;
 
 #[derive(Default, EnumIter, Eq, PartialEq, strum::Display)]
 enum Tab {
     #[default]
-    #[strum(to_string = "Browse Markets")]
+    #[strum(to_string = "Browse")]
     Browse,
-    #[strum(to_string = "My Positions")]
-    MyPositions,
-    #[strum(to_string = "Slots")]
-    Slots,
-    #[strum(to_string = "Create Market")]
-    CreateMarket,
+    #[strum(to_string = "List")]
+    List,
+    #[strum(to_string = "My Trades")]
+    MyTrades,
+    #[strum(to_string = "My Views")]
+    MyViews,
 }
 
 pub struct Markets {
     tab: Tab,
     browse: Browse,
-    my_positions: MyPositions,
-    slots: Slots,
-    create_market: CreateMarket,
+    list: List,
+    my_trades: MyPositions,
+    my_views: MyViews,
 }
 
 impl Markets {
@@ -41,9 +40,9 @@ impl Markets {
         Self {
             tab: Tab::default(),
             browse: Browse::default(),
-            my_positions: MyPositions::default(),
-            slots: Slots::default(),
-            create_market: CreateMarket::default(),
+            list: List::default(),
+            my_trades: MyPositions::default(),
+            my_views: MyViews::default(),
         }
     }
 
@@ -60,14 +59,14 @@ impl Markets {
             Tab::Browse => {
                 self.browse.show(app, ui);
             }
-            Tab::MyPositions => {
-                self.my_positions.show(app, ui);
+            Tab::List => {
+                self.list.show(app, ui);
             }
-            Tab::Slots => {
-                self.slots.show(app, ui);
+            Tab::MyTrades => {
+                self.my_trades.show(app, ui);
             }
-            Tab::CreateMarket => {
-                self.create_market.show(app, ui);
+            Tab::MyViews => {
+                self.my_views.show(app, ui);
             }
         });
     }

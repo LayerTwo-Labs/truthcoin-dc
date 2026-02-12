@@ -17,7 +17,7 @@ use ndarray::Array1;
 
 use crate::{
     archive::{self, Archive},
-    math::{lmsr::LmsrService, trading},
+    math::trading,
     mempool::{self, MemPool},
     net::{self, Net, Peer},
     state::{self, State, markets::MarketId},
@@ -143,6 +143,7 @@ where
             mainchain::WalletClient<MainchainTransport>,
         >,
         runtime: &tokio::runtime::Runtime,
+        slot_config_testing: Option<u32>,
         #[cfg(feature = "zmq")] zmq_addr: SocketAddr,
     ) -> Result<Self, Error>
     where
@@ -164,7 +165,7 @@ where
             );
             unsafe { Env::open(&env_open_opts, &env_path) }?
         };
-        let state = State::new(&env)?;
+        let state = State::new(&env, slot_config_testing)?;
         #[cfg(feature = "zmq")]
         let zmq_pub_handler = Arc::new(ZmqPubHandler::new(zmq_addr).await?);
         let archive = Archive::new(&env)?;
@@ -347,7 +348,7 @@ where
                     ..
                 } = data
             {
-                if *shares > 0.0 {
+                if *shares > 0 {
                     self.update_mempool_buy(
                         &mut rwtxn,
                         market_id.clone(),
@@ -359,7 +360,7 @@ where
                         &mut rwtxn,
                         market_id.clone(),
                         *outcome_index,
-                        shares.abs(),
+                        shares.unsigned_abs() as i64,
                     )?;
                 }
             }
@@ -373,7 +374,7 @@ where
     pub fn get_mempool_shares(
         &self,
         market_id: &crate::state::markets::MarketId,
-    ) -> Result<Option<ndarray::Array1<f64>>, Error> {
+    ) -> Result<Option<ndarray::Array1<i64>>, Error> {
         let rotxn = self.env.read_txn()?;
         self.state
             .get_mempool_shares(&rotxn, market_id)
@@ -402,9 +403,8 @@ where
         rwtxn: &mut RwTxn,
         market_id: MarketId,
         outcome_index: u32,
-        shares_to_buy: f64,
+        shares_to_buy: i64,
     ) -> Result<(), Error> {
-        use crate::math::lmsr::LmsrService;
         use crate::state;
 
         let market = self
@@ -431,7 +431,6 @@ where
             })));
         }
 
-        // Get existing mempool shares or use current market shares as base
         let current_shares = if let Some(existing_mempool_shares) =
             self.state.get_mempool_shares(rwtxn, &market_id)?
         {
@@ -443,14 +442,15 @@ where
         let mut new_shares = current_shares.clone();
         new_shares[outcome_index as usize] += shares_to_buy;
 
-        LmsrService::validate_lmsr_parameters(market.b(), &new_shares)
-            .map_err(|e| {
+        trading::validate_lmsr_parameters(market.b(), &new_shares).map_err(
+            |e| {
                 Error::State(Box::new(state::Error::InvalidSlotId {
                     reason: format!(
                         "Invalid LMSR state after mempool update: {e:?}"
                     ),
                 }))
-            })?;
+            },
+        )?;
 
         self.state
             .put_mempool_shares(rwtxn, &market_id, &new_shares)
@@ -471,9 +471,8 @@ where
         rwtxn: &mut RwTxn,
         market_id: MarketId,
         outcome_index: u32,
-        shares_to_sell: f64,
+        shares_to_sell: i64,
     ) -> Result<(), Error> {
-        use crate::math::lmsr::LmsrService;
         use crate::state;
 
         let market = self
@@ -500,7 +499,6 @@ where
             })));
         }
 
-        // Get existing mempool shares or use current market shares as base
         let current_shares = if let Some(existing_mempool_shares) =
             self.state.get_mempool_shares(rwtxn, &market_id)?
         {
@@ -510,16 +508,17 @@ where
         };
 
         let mut new_shares = current_shares.clone();
-        new_shares[outcome_index as usize] -= shares_to_sell; // SUBTRACT for sell
+        new_shares[outcome_index as usize] -= shares_to_sell;
 
-        LmsrService::validate_lmsr_parameters(market.b(), &new_shares)
-            .map_err(|e| {
+        trading::validate_lmsr_parameters(market.b(), &new_shares).map_err(
+            |e| {
                 Error::State(Box::new(state::Error::InvalidSlotId {
                     reason: format!(
                         "Invalid LMSR state after mempool sell update: {e:?}"
                     ),
                 }))
-            })?;
+            },
+        )?;
 
         self.state
             .put_mempool_shares(rwtxn, &market_id, &new_shares)
@@ -744,17 +743,39 @@ where
         number: usize,
     ) -> Result<(Vec<Authorized<FilledTransaction>>, bitcoin::Amount), Error>
     {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
         let mut rwtxn = self.env.write_txn()?;
-        let transactions = self.mempool.take(&rwtxn, number)?;
+
+        // Take non-trade TXs first, then trade TXs in chronological order
+        let all_txs = self.mempool.take(&rwtxn, number)?;
+        let trade_txs = self.mempool.take_trades_ordered(&rwtxn)?;
+
+        // Separate non-trade TXs (those not in the trade list)
+        let trade_txids: HashSet<_> =
+            trade_txs.iter().map(|tx| tx.transaction.txid()).collect();
+        let non_trade_txs: Vec<_> = all_txs
+            .into_iter()
+            .filter(|tx| !trade_txids.contains(&tx.transaction.txid()))
+            .collect();
+
+        // Process non-trade TXs first, then trade TXs in insertion order
+        let combined_txs =
+            non_trade_txs.into_iter().chain(trade_txs).take(number);
 
         let mut fee = bitcoin::Amount::ZERO;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
-        let mut cumulative_market_states: HashMap<MarketId, Array1<f64>> =
+        let mut cumulative_market_states: HashMap<MarketId, Array1<i64>> =
             HashMap::new();
 
-        for transaction in transactions.into_iter() {
+        for transaction in combined_txs {
             let txid = transaction.transaction.txid();
+            let is_trade = transaction
+                .transaction
+                .data
+                .as_ref()
+                .is_some_and(|d| d.is_trade());
 
             let inputs: HashSet<_> =
                 transaction.transaction.inputs.iter().copied().collect();
@@ -801,28 +822,29 @@ where
                 }
             }
 
-            let value_in: bitcoin::Amount = filled_transaction
-                .transaction
-                .spent_utxos
-                .iter()
-                .map(GetBitcoinValue::get_bitcoin_value)
-                .checked_sum()
-                .ok_or(AmountOverflowError)?;
-            let value_out: bitcoin::Amount = filled_transaction
-                .transaction
-                .transaction
-                .outputs
-                .iter()
-                .map(GetBitcoinValue::get_bitcoin_value)
-                .checked_sum()
-                .ok_or(AmountOverflowError)?;
-            fee = fee
-                .checked_add(
-                    value_in
-                        .checked_sub(value_out)
-                        .ok_or(AmountOverflowError)?,
-                )
-                .ok_or(AmountUnderflowError)?;
+            // Compute fee: constant for trade TXs, input-output for others
+            let tx_fee = if is_trade {
+                bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
+            } else {
+                let value_in: bitcoin::Amount = filled_transaction
+                    .transaction
+                    .spent_utxos
+                    .iter()
+                    .map(GetBitcoinValue::get_bitcoin_value)
+                    .checked_sum()
+                    .ok_or(AmountOverflowError)?;
+                let value_out: bitcoin::Amount = filled_transaction
+                    .transaction
+                    .transaction
+                    .outputs
+                    .iter()
+                    .map(GetBitcoinValue::get_bitcoin_value)
+                    .checked_sum()
+                    .ok_or(AmountOverflowError)?;
+                value_in.checked_sub(value_out).ok_or(AmountOverflowError)?
+            };
+
+            fee = fee.checked_add(tx_fee).ok_or(AmountUnderflowError)?;
             spent_utxos.extend(filled_transaction.transaction.inputs());
             returned_transactions.push(filled_transaction);
         }
@@ -844,7 +866,7 @@ where
         &self,
         rotxn: &sneed::RoTxn,
         filled_tx: &Authorized<FilledTransaction>,
-        cumulative_states: &mut HashMap<MarketId, Array1<f64>>,
+        cumulative_states: &mut HashMap<MarketId, Array1<i64>>,
     ) -> Result<bool, Error> {
         let tx_data = match &filled_tx.transaction.transaction.data {
             Some(data) => data,
@@ -858,11 +880,9 @@ where
                 shares,
                 trader,
                 limit_sats,
-                base_sats: _, // Not used - fingerprint check removed per plan
-                fee_sats: _,  // Not used - fingerprint check removed per plan
             } => {
-                let is_buy = *shares > 0.0;
-                let shares_abs = shares.abs();
+                let is_buy = *shares > 0;
+                let shares_abs = shares.unsigned_abs();
 
                 tracing::debug!(
                     "check_trade_slippage: Trade ({}) market={}, outcome={}, shares={}, limit={}",
@@ -906,7 +926,7 @@ where
                                 .get(&(market_id.clone(), *outcome_index))
                                 .copied()
                         })
-                        .unwrap_or(0.0);
+                        .unwrap_or(0);
 
                     tracing::debug!(
                         "check_trade_slippage: seller {} owns {} shares, trying to sell {}",
@@ -915,7 +935,7 @@ where
                         shares_abs
                     );
 
-                    if owned_shares < shares_abs {
+                    if owned_shares < 0 || (owned_shares as u64) < shares_abs {
                         tracing::info!(
                             "Insufficient shares for sell: {} owns {} but trying to sell {} - skipping",
                             trader,
@@ -938,7 +958,7 @@ where
 
                 // Calculate new shares after trade (sign of shares handles direction)
                 let mut new_shares = current_shares.clone();
-                new_shares[*outcome_index as usize] += shares;
+                new_shares[*outcome_index as usize] += *shares;
                 tracing::debug!(
                     "check_trade_slippage: new_shares={:?}",
                     new_shares
@@ -946,7 +966,7 @@ where
 
                 if is_buy {
                     // Buy: cost = LMSR(current -> new)
-                    let base_cost = LmsrService::calculate_update_cost(
+                    let base_cost = trading::calculate_update_cost(
                         &current_shares,
                         &new_shares,
                         market.b(),
@@ -998,7 +1018,7 @@ where
                     // within the user's limit_sats, the transaction is valid.
                 } else {
                     // Sell: proceeds = LMSR(new -> current)
-                    let gross_proceeds = LmsrService::calculate_update_cost(
+                    let gross_proceeds = trading::calculate_update_cost(
                         &new_shares,
                         &current_shares,
                         market.b(),
@@ -1273,14 +1293,24 @@ where
         Ok(true)
     }
 
-    pub fn get_all_slot_quarters(&self) -> Result<Vec<(u32, u64)>, Error> {
+    pub fn get_all_slot_periods(&self) -> Result<Vec<(u32, u64)>, Error> {
         let rotxn = self.env.read_txn()?;
-        Ok(self.state.get_all_slot_quarters(&rotxn)?)
+        Ok(self.state.get_all_slot_periods(&rotxn)?)
     }
 
-    pub fn get_slots_for_quarter(&self, quarter: u32) -> Result<u64, Error> {
+    pub fn get_slots_for_period(&self, period: u32) -> Result<u64, Error> {
         let rotxn = self.env.read_txn()?;
-        Ok(self.state.get_slots_for_quarter(&rotxn, quarter)?)
+        Ok(self.state.get_slots_for_period(&rotxn, period)?)
+    }
+
+    pub fn get_genesis_timestamp(&self) -> Result<Option<u64>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.try_get_genesis_timestamp(&rotxn)?)
+    }
+
+    pub fn get_mainchain_timestamp(&self) -> Result<u64, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.try_get_mainchain_timestamp(&rotxn)?.unwrap_or(0))
     }
 
     pub fn get_slot(
@@ -1361,6 +1391,20 @@ where
         self.state.slots().get_config()
     }
 
+    pub fn get_current_period(&self, _ts_secs: u64) -> Result<u32, Error> {
+        let rotxn = self.env.read_txn()?;
+        let block_height = self.state.try_get_height(&rotxn)?;
+        let genesis_ts =
+            self.state.try_get_genesis_timestamp(&rotxn)?.unwrap_or(0);
+        let mainchain_ts =
+            self.state.try_get_mainchain_timestamp(&rotxn)?.unwrap_or(0);
+        Ok(self.state.slots().get_current_period(
+            mainchain_ts,
+            block_height,
+            genesis_ts,
+        )?)
+    }
+
     pub fn get_slots_db(&self) -> &crate::state::slots::Dbs {
         self.state.slots()
     }
@@ -1369,10 +1413,6 @@ where
         self.state
             .slots()
             .block_height_to_testing_period(block_height)
-    }
-
-    pub fn quarter_to_string(&self, quarter: u32) -> String {
-        self.state.slots().quarter_to_string(quarter)
     }
 
     pub fn get_all_markets(&self) -> Result<Vec<crate::state::Market>, Error> {
@@ -1466,7 +1506,7 @@ where
     pub fn get_user_share_positions(
         &self,
         address: &crate::types::Address,
-    ) -> Result<Vec<(crate::state::MarketId, u32, f64)>, Error> {
+    ) -> Result<Vec<(crate::state::MarketId, u32, i64)>, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self
             .state
@@ -1478,7 +1518,7 @@ where
         &self,
         address: &crate::types::Address,
         market_id: &crate::state::MarketId,
-    ) -> Result<Vec<(u32, f64)>, Error> {
+    ) -> Result<Vec<(u32, i64)>, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self
             .state
@@ -1493,7 +1533,7 @@ where
         addresses: &std::collections::HashSet<crate::types::Address>,
         market_id: &crate::state::MarketId,
         outcome_index: u32,
-    ) -> Result<std::collections::HashMap<crate::types::Address, f64>, Error>
+    ) -> Result<std::collections::HashMap<crate::types::Address, i64>, Error>
     {
         let rotxn = self.env.read_txn()?;
         Ok(self
@@ -1554,14 +1594,7 @@ where
     }
 
     pub fn get_last_block_timestamp(&self) -> Result<u64, Error> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp =
-            SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| {
-                Error::State(Box::new(state::Error::InvalidTransaction {
-                    reason: format!("Failed to get current time: {e}"),
-                }))
-            })?;
-        Ok(timestamp.as_secs())
+        self.get_mainchain_timestamp()
     }
 
     pub fn resolve_voting_period(
@@ -1575,6 +1608,9 @@ where
         let config = self.state.slots().get_config();
         let slots_db = self.state.slots();
 
+        let genesis_ts =
+            self.state.try_get_genesis_timestamp(&rwtxn)?.unwrap_or(0);
+
         let outcomes = self.state.voting().resolve_period_decisions(
             &mut rwtxn,
             period_id,
@@ -1583,6 +1619,7 @@ where
             &self.state,
             config,
             slots_db,
+            genesis_ts,
         )?;
 
         rwtxn
@@ -1633,9 +1670,4 @@ where
             .await
             .map_err(Error::from)
     }
-}
-
-pub fn quarter_to_string(quarter: u32) -> String {
-    let config = crate::state::slots::SlotConfig::production();
-    crate::state::slots::quarter_to_string(quarter, &config)
 }

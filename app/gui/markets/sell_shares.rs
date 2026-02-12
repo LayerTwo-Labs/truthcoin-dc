@@ -1,5 +1,4 @@
 use eframe::egui::{self, Button, RichText};
-use truthcoin_dc::math::lmsr::LmsrService;
 use truthcoin_dc::math::trading;
 use truthcoin_dc::state::MarketId;
 use truthcoin_dc::types::Address;
@@ -12,7 +11,7 @@ pub struct SellShares {
     outcome_label: String,
     current_price: f64,
     trading_fee_pct: f64,
-    max_shares: f64,
+    max_shares: i64,
     seller_address: Address,
     shares_input: String,
     preview: Option<ProceedsPreview>,
@@ -22,7 +21,7 @@ pub struct SellShares {
 }
 
 struct ProceedsPreview {
-    shares: f64,
+    shares: i64,
     gross_proceeds_sats: u64,
     trading_fee_sats: u64,
     net_proceeds_sats: u64,
@@ -43,7 +42,7 @@ impl SellShares {
         outcome_label: String,
         current_price: f64,
         trading_fee_pct: f64,
-        max_shares: f64,
+        max_shares: i64,
         seller_address: Address,
     ) -> Self {
         Self {
@@ -63,8 +62,8 @@ impl SellShares {
     }
 
     fn calculate_preview(&mut self, app: &App) {
-        let shares: f64 = match self.shares_input.parse() {
-            Ok(s) if s > 0.0 => s,
+        let shares: i64 = match self.shares_input.parse() {
+            Ok(s) if s > 0 => s,
             Ok(_) => {
                 self.preview = None;
                 self.preview_error =
@@ -81,7 +80,7 @@ impl SellShares {
         if shares > self.max_shares {
             self.preview = None;
             self.preview_error = Some(format!(
-                "Cannot sell more than {:.2} shares",
+                "Cannot sell more than {} shares",
                 self.max_shares
             ));
             return;
@@ -113,14 +112,14 @@ impl SellShares {
         new_shares[actual_idx] -= shares;
 
         // Check for negative shares
-        if new_shares[actual_idx] < 0.0 {
+        if new_shares[actual_idx] < 0 {
             self.preview_error =
                 Some("Would result in negative market shares".to_string());
             return;
         }
 
         let old_cost =
-            match LmsrService::calculate_treasury(&market.shares, market.b()) {
+            match trading::calculate_treasury(&market.shares, market.b()) {
                 Ok(c) => c,
                 Err(e) => {
                     self.preview_error =
@@ -130,7 +129,7 @@ impl SellShares {
             };
 
         let new_cost =
-            match LmsrService::calculate_treasury(&new_shares, market.b()) {
+            match trading::calculate_treasury(&new_shares, market.b()) {
                 Ok(c) => c,
                 Err(e) => {
                     self.preview_error =
@@ -207,8 +206,6 @@ impl SellShares {
         // outcome_index is already the actual state index (not a display index)
         let actual_idx = self.outcome_index as usize;
 
-        let tx_fee = bitcoin::Amount::from_sat(1000);
-
         // Use exact preview value for slippage protection (consistent with buy)
         // Transaction will fail if market conditions change and proceeds fall below this
         let min_proceeds = preview.net_proceeds_sats;
@@ -218,10 +215,7 @@ impl SellShares {
             actual_idx,
             -preview.shares, // Negative for sell
             self.seller_address,
-            min_proceeds, // limit_sats = min_proceeds for sell
-            preview.gross_proceeds_sats,
-            preview.trading_fee_sats,
-            tx_fee,
+            min_proceeds,
         ) {
             Ok(tx) => {
                 if let Err(e) = app.sign_and_send(tx) {
@@ -265,7 +259,7 @@ impl SellShares {
             ui.horizontal(|ui| {
                 ui.label("Your shares:");
                 ui.label(
-                    RichText::new(format!("{:.2}", self.max_shares)).strong(),
+                    RichText::new(format!("{}", self.max_shares)).strong(),
                 );
             });
 
@@ -285,7 +279,7 @@ impl SellShares {
                 }
 
                 if ui.button("Max").clicked() {
-                    self.shares_input = format!("{:.2}", self.max_shares);
+                    self.shares_input = format!("{}", self.max_shares);
                     self.calculate_preview(app);
                 }
             });

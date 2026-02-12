@@ -52,11 +52,14 @@ pub struct MemPool {
     /// Tracks pending slot claims: slot_id_bytes -> claiming txid
     pending_slot_claims:
         DatabaseUnique<SerdeBincode<[u8; 3]>, SerdeBincode<Txid>>,
+    trade_insertion_order:
+        DatabaseUnique<SerdeBincode<u64>, SerdeBincode<Txid>>,
+    trade_order_counter: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
 }
 
 impl MemPool {
-    pub const NUM_DBS: u32 = 5;
+    pub const NUM_DBS: u32 = 7;
 
     pub fn new(env: &sneed::Env) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
@@ -68,6 +71,10 @@ impl MemPool {
             DatabaseUnique::create(env, &mut rwtxn, "address_to_txs")?;
         let pending_slot_claims =
             DatabaseUnique::create(env, &mut rwtxn, "pending_slot_claims")?;
+        let trade_insertion_order =
+            DatabaseUnique::create(env, &mut rwtxn, "trade_insertion_order")?;
+        let trade_order_counter =
+            DatabaseUnique::create(env, &mut rwtxn, "trade_order_counter")?;
         let version =
             DatabaseUnique::create(env, &mut rwtxn, "mempool_version")?;
         if version.try_get(&rwtxn, &())?.is_none() {
@@ -79,6 +86,8 @@ impl MemPool {
             spent_utxos,
             address_to_txs,
             pending_slot_claims,
+            trade_insertion_order,
+            trade_order_counter,
             _version: version,
         })
     }
@@ -182,6 +191,13 @@ impl MemPool {
         })
     }
 
+    fn is_trade_tx(transaction: &AuthorizedTransaction) -> bool {
+        matches!(
+            &transaction.transaction.data,
+            Some(crate::types::TransactionData::Trade { .. })
+        )
+    }
+
     /// Extract slot IDs being claimed by this transaction
     fn get_claimed_slot_ids(
         transaction: &AuthorizedTransaction,
@@ -282,6 +298,15 @@ impl MemPool {
         let () = self.put_stxos(rwtxn, stxos)?;
         self.transactions.put(rwtxn, &txid, transaction)?;
         let () = self.assoc_tx_with_relevant_addresses(rwtxn, transaction)?;
+
+        if Self::is_trade_tx(transaction) {
+            let counter =
+                self.trade_order_counter.try_get(rwtxn, &())?.unwrap_or(0);
+            let next = counter + 1;
+            self.trade_insertion_order.put(rwtxn, &next, &txid)?;
+            self.trade_order_counter.put(rwtxn, &(), &next)?;
+        }
+
         Ok(())
     }
 
@@ -292,6 +317,11 @@ impl MemPool {
                 let () = self.delete_stxos(rwtxn, &tx.transaction.inputs)?;
                 let () = self.unassoc_tx_with_relevant_addresses(rwtxn, &tx)?;
                 let () = self.delete_slot_claims(rwtxn, &tx)?;
+
+                if Self::is_trade_tx(&tx) {
+                    self.delete_trade_order(rwtxn, &txid)?;
+                }
+
                 self.transactions.delete(rwtxn, &txid)?;
                 for vout in 0..tx.transaction.outputs.len() {
                     let outpoint = OutPoint::Regular {
@@ -306,6 +336,31 @@ impl MemPool {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn delete_trade_order(
+        &self,
+        rwtxn: &mut RwTxn,
+        txid: &Txid,
+    ) -> Result<(), Error> {
+        let mut iter = self
+            .trade_insertion_order
+            .iter(rwtxn)
+            .map_err(DbError::from)?;
+        let mut key_to_delete = None;
+        while let Some((counter, stored_txid)) =
+            iter.next().map_err(DbError::from)?
+        {
+            if stored_txid == *txid {
+                key_to_delete = Some(counter);
+                break;
+            }
+        }
+        drop(iter);
+        if let Some(key) = key_to_delete {
+            self.trade_insertion_order.delete(rwtxn, &key)?;
         }
         Ok(())
     }
@@ -334,6 +389,23 @@ impl MemPool {
             .map(|(_, transaction)| Ok(transaction))
             .collect()
             .map_err(|err| DbError::from(err).into())
+    }
+
+    pub fn take_trades_ordered(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<AuthorizedTransaction>, Error> {
+        let mut trades = Vec::new();
+        let mut iter = self
+            .trade_insertion_order
+            .iter(rotxn)
+            .map_err(DbError::from)?;
+        while let Some((_counter, txid)) = iter.next().map_err(DbError::from)? {
+            if let Some(tx) = self.transactions.try_get(rotxn, &txid)? {
+                trades.push(tx);
+            }
+        }
+        Ok(trades)
     }
 
     /// Get [`Txid`]s relevant to a particular address

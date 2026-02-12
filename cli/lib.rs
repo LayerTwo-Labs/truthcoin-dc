@@ -358,6 +358,12 @@ pub enum Command {
         min: Option<i64>,
         #[arg(long)]
         max: Option<i64>,
+        /// Custom label for option 0 (binary decisions). Defaults to "No".
+        #[arg(long)]
+        option_0_label: Option<String>,
+        /// Custom label for option 1 (binary decisions). Defaults to "Yes".
+        #[arg(long)]
+        option_1_label: Option<String>,
         #[arg(long, default_value = "1000")]
         fee_sats: u64,
     },
@@ -422,11 +428,9 @@ pub enum Command {
         #[arg(long)]
         outcome_index: usize,
         #[arg(long)]
-        shares_amount: f64,
+        shares_amount: i64,
         #[arg(long)]
         max_cost: u64,
-        #[arg(long, default_value = "1000")]
-        fee_sats: u64,
     },
 
     /// Sell shares in a market
@@ -437,15 +441,13 @@ pub enum Command {
         #[arg(long)]
         outcome_index: usize,
         #[arg(long)]
-        shares_amount: f64,
+        shares_amount: i64,
         /// Address holding the shares to sell
         #[arg(long)]
         seller_address: Address,
         /// Minimum proceeds to accept (slippage protection)
         #[arg(long, default_value = "0")]
         min_proceeds: u64,
-        #[arg(long, default_value = "1000")]
-        fee_sats: u64,
     },
 
     /// Get share positions for an address
@@ -465,7 +467,7 @@ pub enum Command {
         #[arg(long)]
         outcome_index: usize,
         #[arg(long)]
-        shares_amount: f64,
+        shares_amount: i64,
     },
 
     /// Calculate initial liquidity required
@@ -679,7 +681,7 @@ where
             json_response(&addresses)?
         }
         Command::MyUtxos => {
-            let utxos = rpc_client.my_utxos().await?;
+            let utxos = rpc_client.get_wallet_utxos().await?;
             json_response(&utxos)?
         }
         Command::MyUnconfirmedUtxos => {
@@ -855,12 +857,15 @@ where
         Command::SlotList { period, status } => {
             use truthcoin_dc_app_rpc_api::{SlotFilter, SlotState};
             let slot_status = status.map(|s| match s.to_lowercase().as_str() {
-                "available" => SlotState::Available,
-                "claimed" => SlotState::Claimed,
-                "voting" => SlotState::Voting,
-                "ossified" => SlotState::Ossified,
-                _ => SlotState::Available,
-            });
+                "available" => Ok(SlotState::Available),
+                "claimed" => Ok(SlotState::Claimed),
+                "voting" => Ok(SlotState::Voting),
+                "ossified" => Ok(SlotState::Ossified),
+                other => Err(anyhow::anyhow!(
+                    "Unrecognized slot status: '{}'. Valid values: available, claimed, voting, ossified",
+                    other
+                )),
+            }).transpose()?;
             let filter = if period.is_some() || slot_status.is_some() {
                 Some(SlotFilter {
                     period,
@@ -884,6 +889,8 @@ where
             question,
             min,
             max,
+            option_0_label,
+            option_1_label,
             fee_sats,
         } => {
             let txid = rpc_client
@@ -895,6 +902,8 @@ where
                     question,
                     min,
                     max,
+                    option_0_label,
+                    option_1_label,
                     fee_sats,
                 )
                 .await?;
@@ -1013,7 +1022,7 @@ where
                     };
 
                     // Show volume
-                    let volume_display = format!("{:.1}", market.volume);
+                    let volume_display = format!("{}", market.volume_sats);
                     let short_volume = if volume_display.len() > 12 {
                         format!("{}...", &volume_display[..9])
                     } else {
@@ -1044,7 +1053,6 @@ where
             outcome_index,
             shares_amount,
             max_cost,
-            fee_sats,
         } => {
             use truthcoin_dc_app_rpc_api::MarketBuyRequest;
             let request = MarketBuyRequest {
@@ -1052,7 +1060,6 @@ where
                 outcome_index,
                 shares_amount,
                 max_cost: Some(max_cost),
-                fee_sats: Some(fee_sats),
                 dry_run: Some(false),
             };
             let result = rpc_client.market_buy(request).await?;
@@ -1076,7 +1083,6 @@ where
             shares_amount,
             seller_address,
             min_proceeds,
-            fee_sats,
         } => {
             use truthcoin_dc_app_rpc_api::MarketSellRequest;
             let request = MarketSellRequest {
@@ -1085,7 +1091,6 @@ where
                 shares_amount,
                 seller_address,
                 min_proceeds: Some(min_proceeds),
-                fee_sats: Some(fee_sats),
                 dry_run: Some(false),
             };
             let result = rpc_client.market_sell(request).await?;
@@ -1122,7 +1127,6 @@ where
                 outcome_index,
                 shares_amount,
                 max_cost: None,
-                fee_sats: Some(0),
                 dry_run: Some(true),
             };
             let result = rpc_client.market_buy(request).await?;
@@ -1282,7 +1286,7 @@ where
             fee_sats,
         } => {
             let txid = rpc_client
-                .votecoin_transfer(dest, amount, fee_sats, None)
+                .transfer_votecoin(dest, amount, fee_sats, None)
                 .await?;
             format!("Votecoin transferred: {txid}")
         }

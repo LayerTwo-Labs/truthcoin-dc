@@ -30,12 +30,6 @@ pub struct TxInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct SlotInfo {
-    pub period: u32,
-    pub slots: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub enum SlotState {
     Available,
     Claimed,
@@ -62,9 +56,8 @@ pub struct SlotListItem {
 pub struct MarketBuyRequest {
     pub market_id: String,
     pub outcome_index: usize,
-    pub shares_amount: f64,
+    pub shares_amount: i64,
     pub max_cost: Option<u64>,
-    pub fee_sats: Option<u64>,
     pub dry_run: Option<bool>,
 }
 
@@ -91,10 +84,8 @@ pub struct CategoryClaimRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct MarketBuyResponse {
     pub txid: Option<String>,
-    /// Total cost in satoshis (base_cost_sats + trading_fee_sats)
+    /// Total estimated cost in satoshis (LMSR cost + trading fee)
     pub cost_sats: u64,
-    /// Base LMSR cost that goes to market treasury
-    pub base_cost_sats: u64,
     /// Trading fee that goes to market author
     pub trading_fee_sats: u64,
     pub new_price: f64,
@@ -105,12 +96,11 @@ pub struct MarketBuyResponse {
 pub struct MarketSellRequest {
     pub market_id: String,
     pub outcome_index: usize,
-    pub shares_amount: f64,
+    pub shares_amount: i64,
     /// Address holding the shares to sell (required)
     pub seller_address: Address,
     /// Minimum proceeds required (slippage protection)
     pub min_proceeds: Option<u64>,
-    pub fee_sats: Option<u64>,
     pub dry_run: Option<bool>,
 }
 
@@ -228,24 +218,6 @@ pub struct DecisionInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct ClaimedSlotSummary {
-    pub slot_id_hex: String,
-    pub period_index: u32,
-    pub slot_index: u32,
-    pub market_maker_pubkey_hash: String,
-    pub is_standard: bool,
-    pub is_scaled: bool,
-    pub question_preview: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct VotingPeriodInfo {
-    pub period: u32,
-    pub claimed_slots: u64,
-    pub total_slots: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct RedistributionInfo {
     pub period_id: u32,
     pub total_redistributed: u64,
@@ -259,13 +231,6 @@ pub struct RedistributionInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct AvailableSlotId {
-    pub period_index: u32,
-    pub slot_index: u32,
-    pub slot_id_hex: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct SlotStatus {
     pub is_testing_mode: bool,
     pub blocks_per_period: u32,
@@ -274,20 +239,15 @@ pub struct SlotStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct OssifiedSlotInfo {
-    pub slot_id_hex: String,
-    pub period_index: u32,
-    pub slot_index: u32,
-    pub decision: Option<DecisionInfo>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct MarketOutcome {
     pub name: String,
     pub current_price: f64,
     pub probability: f64,
-    pub volume: f64,
+    pub volume_sats: u64,
+    /// The internal state array index used by market_buy/market_sell
     pub index: usize,
+    /// The ordinal display position (0-based) among valid outcomes
+    pub display_index: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -304,7 +264,7 @@ pub struct MarketData {
     pub tags: Vec<String>,
     pub created_at_height: u64,
     pub treasury: f64,
-    pub total_volume: f64,
+    pub total_volume_sats: u64,
     pub liquidity: f64,
     pub decision_slots: Vec<String>,
     pub resolution: Option<MarketResolution>,
@@ -330,7 +290,7 @@ pub struct MarketSummary {
     pub description: String,
     pub outcome_count: usize,
     pub state: String,
-    pub volume: f64,
+    pub volume_sats: u64,
     pub created_at_height: u64,
 }
 
@@ -339,7 +299,7 @@ pub struct SharePosition {
     pub market_id: String,
     pub outcome_index: usize,
     pub outcome_name: String,
-    pub shares: f64,
+    pub shares: i64,
     pub avg_purchase_price: f64,
     pub current_price: f64,
     pub current_value: f64,
@@ -409,18 +369,6 @@ pub struct RegisterVoterRequest {
     pub fee_sats: u64,
 }
 
-/// Request to submit a single vote.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct SubmitVoteRequest {
-    pub decision_id: String,
-    /// The vote value in real units (e.g., 270 for electoral votes).
-    /// For scaled decisions with min/max bounds, enter the actual value
-    /// within those bounds. The system handles internal normalization.
-    /// For binary decisions, use 0.0 (No) or 1.0 (Yes).
-    pub vote_value: f64,
-    pub fee_sats: u64,
-}
-
 /// A single vote in a batch submission.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VoteBatchItem {
@@ -465,48 +413,11 @@ pub struct VoteInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct VotingPeriodDetails {
-    pub period_id: u32,
-    pub start_time: u64,
-    pub end_time: u64,
-    pub status: String,
-    pub decision_slots: Vec<String>,
-    pub created_at_height: u64,
-    pub total_voters: u64,
-    pub active_voters: u64,
-    pub total_votes: u64,
-    pub consensus_reached: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct VoterParticipation {
-    pub address: String,
-    pub period_id: u32,
-    pub votes_cast: u32,
-    pub decisions_available: u32,
-    pub participation_rate: f64,
-    pub participated_in_consensus: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ReputationUpdate {
     pub old_reputation: f64,
     pub new_reputation: f64,
     pub votecoin_proportion: f64,
     pub compliance_score: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct VotingConsensusResults {
-    pub period_id: u32,
-    pub status: String,
-    pub outcomes: std::collections::HashMap<String, f64>,
-    pub first_loading: Vec<f64>,
-    pub certainty: f64,
-    pub reputation_updates: std::collections::HashMap<String, ReputationUpdate>,
-    pub outliers: Vec<String>,
-    pub vote_matrix_dimensions: (usize, usize),
-    pub algorithm_version: String,
 }
 
 #[open_api(ref_schemas[
@@ -522,7 +433,7 @@ pub struct VotingConsensusResults {
     MerkleRoot, OutPoint, Output, OutputContent,
     ParticipationStats, PeerConnectionStatus, PeriodStats,
     RedistributionInfo, RegisterVoterRequest, ReputationUpdate,
-    SharePosition, Signature, SlotDetails, SlotFilter, SlotInfo, SlotListItem, SlotState, SlotStatus,
+    SharePosition, Signature, SlotDetails, SlotFilter, SlotListItem, SlotState, SlotStatus,
     Transaction, TxData, Txid, TxIn, UserHoldings,
     VoteBatchItem, VoteFilter, VoteInfo, VoterInfo, VoterInfoFull,
     VotingPeriodFull, WithdrawalOutputContent, VerifyingKey,
@@ -676,12 +587,6 @@ pub trait Rpc {
     #[method(name = "my_unconfirmed_utxos")]
     async fn my_unconfirmed_utxos(&self) -> RpcResult<Vec<PointedOutput>>;
 
-    /// List owned UTXOs
-    #[method(name = "my_utxos")]
-    async fn my_utxos(
-        &self,
-    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>>;
-
     /// Get pending withdrawal bundle
     #[open_api_method(output_schema(ToSchema))]
     #[method(name = "pending_withdrawal_bundle")]
@@ -824,6 +729,8 @@ pub trait Rpc {
         question: String,
         min: Option<i64>,
         max: Option<i64>,
+        option_0_label: Option<String>,
+        option_1_label: Option<String>,
         fee_sats: u64,
     ) -> RpcResult<Txid>;
 
@@ -925,16 +832,6 @@ pub trait Rpc {
         &self,
         period_id: Option<u32>,
     ) -> RpcResult<Option<VotingPeriodFull>>;
-
-    /// Transfer votecoin
-    #[method(name = "votecoin_transfer")]
-    async fn votecoin_transfer(
-        &self,
-        dest: Address,
-        amount: u32,
-        fee_sats: u64,
-        memo: Option<String>,
-    ) -> RpcResult<Txid>;
 
     /// Get votecoin balance for an address
     #[open_api_method(output_schema(ToSchema = "u32"))]

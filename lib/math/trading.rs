@@ -1,16 +1,7 @@
-//! Single source of truth for all trading fee and cost calculations.
-//!
-//! All conversions use `Rounding::Nearest` for fairness and consistency.
-//! Conservation is ensured by deriving totals: `total = part1 + part2`.
-//!
-//! This module consolidates duplicate calculations from:
-//! - `lib/validation.rs` (buy/sell validation)
-//! - `lib/state/block.rs` (block application)
-//! - `app/rpc_server.rs` (RPC endpoints)
-//! - `app/gui/markets/buy_shares.rs` (GUI preview)
-//! - `app/gui/markets/sell_shares.rs` (GUI preview)
+//! All LMSR and trading fee calculations. No code outside `lib/math/`
+//! should call `lmsr.rs` directly.
 
-use super::lmsr::LmsrService;
+use super::lmsr::{LmsrError, LmsrService};
 use super::safe_math::{Rounding, SatoshiError, to_sats};
 use ndarray::Array1;
 
@@ -19,58 +10,151 @@ use ndarray::Array1;
 /// This ensures fee UTXOs always have meaningful value for tracking/cleanup.
 pub const MIN_TRADING_FEE_SATS: u64 = 1000;
 
-/// Result of buy cost calculation.
-///
-/// `total_cost_sats` is derived as `base_cost_sats + trading_fee_sats`
-/// to ensure exact conservation.
+pub const TRADE_MINER_FEE_SATS: u64 = 1000;
+
+fn shares_to_f64(shares: &Array1<i64>) -> Array1<f64> {
+    shares.mapv(|s| s as f64)
+}
+
+pub fn calculate_prices(
+    shares: &Array1<i64>,
+    beta: f64,
+) -> Result<Array1<f64>, LmsrError> {
+    LmsrService::calculate_prices(&shares_to_f64(shares), beta)
+}
+
+pub fn calculate_display_prices(
+    shares: &Array1<i64>,
+    beta: f64,
+    valid_state_indices: &[usize],
+) -> Vec<f64> {
+    let all_prices = match calculate_prices(shares, beta) {
+        Ok(p) => p,
+        Err(_) => {
+            let count = valid_state_indices.len();
+            return if count > 0 {
+                vec![1.0 / count as f64; count]
+            } else {
+                vec![]
+            };
+        }
+    };
+
+    let valid_prices: Vec<f64> = valid_state_indices
+        .iter()
+        .map(|&idx| all_prices.get(idx).copied().unwrap_or(0.0))
+        .collect();
+
+    let valid_sum: f64 = valid_prices.iter().sum();
+    if valid_sum > 0.0 {
+        valid_prices.iter().map(|p| p / valid_sum).collect()
+    } else {
+        let count = valid_prices.len();
+        if count > 0 {
+            vec![1.0 / count as f64; count]
+        } else {
+            vec![]
+        }
+    }
+}
+
+pub fn calculate_update_cost(
+    current_shares: &Array1<i64>,
+    new_shares: &Array1<i64>,
+    beta: f64,
+) -> Result<f64, LmsrError> {
+    LmsrService::calculate_update_cost(
+        &shares_to_f64(current_shares),
+        &shares_to_f64(new_shares),
+        beta,
+    )
+}
+
+pub fn calculate_treasury(
+    shares: &Array1<i64>,
+    beta: f64,
+) -> Result<f64, LmsrError> {
+    LmsrService::calculate_treasury(&shares_to_f64(shares), beta)
+}
+
+pub fn calculate_amp_b_cost(
+    shares: &Array1<i64>,
+    current_b: f64,
+    new_b: f64,
+) -> Result<f64, LmsrError> {
+    let shares_f64 = shares_to_f64(shares);
+    let current_cost = LmsrService::calculate_treasury(&shares_f64, current_b)?;
+    let new_cost = LmsrService::calculate_treasury(&shares_f64, new_b)?;
+    Ok(new_cost - current_cost)
+}
+
+pub fn validate_lmsr_parameters(
+    beta: f64,
+    shares: &Array1<i64>,
+) -> Result<(), LmsrError> {
+    LmsrService::validate_lmsr_parameters(beta, &shares_to_f64(shares))
+}
+
+pub fn calculate_post_trade_price(
+    new_shares: &Array1<i64>,
+    beta: f64,
+    outcome_index: usize,
+    valid_indices: &[usize],
+) -> f64 {
+    let new_shares_f64 = shares_to_f64(new_shares);
+    let new_prices = match LmsrService::calculate_prices(&new_shares_f64, beta)
+    {
+        Ok(prices) => prices,
+        Err(_) => return 0.0,
+    };
+
+    let valid_prices: Vec<f64> = valid_indices
+        .iter()
+        .map(|idx| new_prices.get(*idx).copied().unwrap_or(0.0))
+        .collect();
+
+    let valid_sum: f64 = valid_prices.iter().sum();
+
+    if valid_sum <= 0.0 {
+        return 0.0;
+    }
+
+    let display_idx =
+        valid_indices.iter().position(|idx| *idx == outcome_index);
+
+    display_idx
+        .and_then(|di| valid_prices.get(di).copied())
+        .unwrap_or(0.0)
+        / valid_sum
+}
+
+/// `total_cost_sats` = `base_cost_sats + trading_fee_sats`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuyCost {
     pub base_cost_sats: u64,
     pub trading_fee_sats: u64,
-    /// DERIVED: base_cost_sats + trading_fee_sats (ensures conservation)
     pub total_cost_sats: u64,
 }
 
-/// Result of sell proceeds calculation.
-///
-/// `net_proceeds_sats` is derived as `gross_proceeds_sats - trading_fee_sats`
-/// to ensure exact conservation.
+/// `net_proceeds_sats` = `gross_proceeds_sats - trading_fee_sats`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SellProceeds {
     pub gross_proceeds_sats: u64,
     pub trading_fee_sats: u64,
-    /// DERIVED: gross_proceeds_sats - trading_fee_sats (ensures conservation)
     pub net_proceeds_sats: u64,
 }
 
-/// Calculate buy cost with `Rounding::Nearest`, derive total for conservation.
-///
-/// # Arguments
-/// * `base_cost_f64` - The raw LMSR cost in satoshis (as f64)
-/// * `trading_fee_pct` - Trading fee as a decimal (e.g., 0.005 for 0.5%)
-///
-/// # Returns
-/// `BuyCost` with base, fee, and derived total (base + fee)
-///
-/// # Example
-/// ```ignore
-/// let cost = calculate_buy_cost(1000.5, 0.01)?;
-/// assert_eq!(cost.total_cost_sats, cost.base_cost_sats + cost.trading_fee_sats);
-/// ```
+/// Calculate buy cost, derive total for conservation.
 pub fn calculate_buy_cost(
     base_cost_f64: f64,
     trading_fee_pct: f64,
 ) -> Result<BuyCost, SatoshiError> {
-    // Convert base cost using Nearest rounding
     let base_cost_sats = to_sats(base_cost_f64, Rounding::Nearest)?;
 
-    // Calculate fee on the f64 value, convert with Nearest rounding
-    // Enforce minimum fee to ensure fee UTXOs always have meaningful value
     let fee_f64 = base_cost_f64 * trading_fee_pct;
     let calculated_fee_sats = to_sats(fee_f64, Rounding::Nearest)?;
     let trading_fee_sats = calculated_fee_sats.max(MIN_TRADING_FEE_SATS);
 
-    // Derive total to ensure conservation: total = base + fee exactly
     let total_cost_sats = base_cost_sats + trading_fee_sats;
 
     Ok(BuyCost {
@@ -80,42 +164,21 @@ pub fn calculate_buy_cost(
     })
 }
 
-/// Calculate sell proceeds with `Rounding::Nearest`, derive net for conservation.
-///
-/// # Arguments
-/// * `gross_proceeds_f64` - The raw LMSR proceeds in satoshis (as f64)
-/// * `trading_fee_pct` - Trading fee as a decimal (e.g., 0.005 for 0.5%)
-///
-/// # Returns
-/// `SellProceeds` with gross, fee, and derived net (gross - fee)
-///
-/// # Errors
-/// Returns error if fee would exceed gross proceeds (trade too small)
-///
-/// # Example
-/// ```ignore
-/// let proceeds = calculate_sell_proceeds(1000.5, 0.01)?;
-/// assert_eq!(proceeds.gross_proceeds_sats, proceeds.net_proceeds_sats + proceeds.trading_fee_sats);
-/// ```
+/// Calculate sell proceeds, derive net for conservation.
 pub fn calculate_sell_proceeds(
     gross_proceeds_f64: f64,
     trading_fee_pct: f64,
 ) -> Result<SellProceeds, SatoshiError> {
-    // Convert gross proceeds using Nearest rounding
     let gross_proceeds_sats = to_sats(gross_proceeds_f64, Rounding::Nearest)?;
 
-    // Calculate fee on the f64 value for consistency with buy, convert with Nearest rounding
-    // Enforce minimum fee to ensure fee UTXOs always have meaningful value
     let fee_f64 = gross_proceeds_f64 * trading_fee_pct;
     let calculated_fee_sats = to_sats(fee_f64, Rounding::Nearest)?;
     let trading_fee_sats = calculated_fee_sats.max(MIN_TRADING_FEE_SATS);
 
-    // Check that fee doesn't exceed gross proceeds
     if trading_fee_sats > gross_proceeds_sats {
         return Err(SatoshiError::Overflow(gross_proceeds_f64));
     }
 
-    // Derive net to ensure conservation: gross = net + fee exactly
     let net_proceeds_sats = gross_proceeds_sats - trading_fee_sats;
 
     Ok(SellProceeds {
@@ -125,12 +188,7 @@ pub fn calculate_sell_proceeds(
     })
 }
 
-/// Calculate LMSR liquidity from beta.
-///
-/// Formula: `liquidity = beta * ln(num_outcomes)`
-///
-/// This is the minimum treasury required for a market with the given beta
-/// and number of outcomes.
+/// `liquidity = beta * ln(num_outcomes)`
 pub fn calculate_lmsr_liquidity(beta: f64, num_outcomes: usize) -> f64 {
     if num_outcomes <= 1 {
         return 0.0;
@@ -138,16 +196,7 @@ pub fn calculate_lmsr_liquidity(beta: f64, num_outcomes: usize) -> f64 {
     beta * (num_outcomes as f64).ln()
 }
 
-/// Derive beta from target liquidity.
-///
-/// Formula: `beta = liquidity / ln(num_outcomes)`
-///
-/// # Arguments
-/// * `liquidity_sats` - Target liquidity in satoshis
-/// * `num_outcomes` - Number of market outcomes
-///
-/// # Returns
-/// The beta value, or a default if calculation is not possible
+/// `beta = liquidity / ln(num_outcomes)`
 pub fn derive_beta_from_liquidity(
     liquidity_sats: u64,
     num_outcomes: usize,
@@ -162,62 +211,12 @@ pub fn derive_beta_from_liquidity(
     liquidity_sats as f64 / ln_outcomes
 }
 
-/// Calculate normalized post-trade price for a specific outcome.
-///
-/// This function calculates what the price will be AFTER a trade is executed,
-/// accounting for valid outcome combinations (for multi-decision markets).
-///
-/// # Arguments
-/// * `new_shares` - Share quantities after the trade
-/// * `beta` - Market liquidity parameter
-/// * `outcome_index` - The state index of the outcome to get price for
-/// * `valid_indices` - List of valid state indices (outcomes that haven't been invalidated)
-///
-/// # Returns
-/// Normalized price (0.0 to 1.0) for the specified outcome
-pub fn calculate_post_trade_price(
-    new_shares: &Array1<f64>,
-    beta: f64,
-    outcome_index: usize,
-    valid_indices: &[usize],
-) -> f64 {
-    // Calculate raw prices for new share state
-    let new_prices = match LmsrService::calculate_prices(new_shares, beta) {
-        Ok(prices) => prices,
-        Err(_) => return 0.0,
-    };
-
-    // Extract prices for valid outcomes only
-    let valid_prices: Vec<f64> = valid_indices
-        .iter()
-        .map(|idx| new_prices.get(*idx).copied().unwrap_or(0.0))
-        .collect();
-
-    let valid_sum: f64 = valid_prices.iter().sum();
-
-    if valid_sum <= 0.0 {
-        return 0.0;
-    }
-
-    // Find the display index for our outcome in the valid indices
-    let display_idx =
-        valid_indices.iter().position(|idx| *idx == outcome_index);
-
-    // Return normalized price
-    display_idx
-        .and_then(|di| valid_prices.get(di).copied())
-        .unwrap_or(0.0)
-        / valid_sum
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_buy_cost_uses_nearest_rounding() {
-        // Use large enough values so percentage fee exceeds minimum
-        // 1_000_000.4 should round to 1_000_000, 1_000_000.5 to 1_000_001
         let cost1 = calculate_buy_cost(1_000_000.4, 0.01).unwrap();
         assert_eq!(cost1.base_cost_sats, 1_000_000);
 
@@ -228,7 +227,6 @@ mod tests {
     #[test]
     fn test_buy_cost_conservation() {
         let cost = calculate_buy_cost(100_000.0, 0.01).unwrap();
-        // Conservation: total = base + fee
         assert_eq!(
             cost.total_cost_sats,
             cost.base_cost_sats + cost.trading_fee_sats
@@ -237,7 +235,6 @@ mod tests {
 
     #[test]
     fn test_sell_proceeds_uses_nearest_rounding() {
-        // Use large enough values so percentage fee exceeds minimum
         let proceeds1 = calculate_sell_proceeds(1_000_000.4, 0.01).unwrap();
         assert_eq!(proceeds1.gross_proceeds_sats, 1_000_000);
 
@@ -248,7 +245,6 @@ mod tests {
     #[test]
     fn test_sell_proceeds_conservation() {
         let proceeds = calculate_sell_proceeds(100_000.0, 0.01).unwrap();
-        // Conservation: gross = net + fee
         assert_eq!(
             proceeds.gross_proceeds_sats,
             proceeds.net_proceeds_sats + proceeds.trading_fee_sats
@@ -257,40 +253,32 @@ mod tests {
 
     #[test]
     fn test_sell_proceeds_fee_exceeds_gross() {
-        // Small proceeds that can't cover minimum fee should error
-        let result = calculate_sell_proceeds(500.0, 0.01); // Min fee 1000 > gross 500
+        let result = calculate_sell_proceeds(500.0, 0.01);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_minimum_trading_fee_enforced_buy() {
-        // Small trade where percentage fee < minimum
-        let cost = calculate_buy_cost(100.0, 0.01).unwrap(); // 1% of 100 = 1 sat
-        // Should enforce minimum fee of 1000 sats
+        let cost = calculate_buy_cost(100.0, 0.01).unwrap();
         assert_eq!(cost.trading_fee_sats, MIN_TRADING_FEE_SATS);
         assert_eq!(cost.total_cost_sats, 100 + MIN_TRADING_FEE_SATS);
     }
 
     #[test]
     fn test_minimum_trading_fee_enforced_sell() {
-        // Trade where percentage fee < minimum but gross can cover it
-        let proceeds = calculate_sell_proceeds(10_000.0, 0.01).unwrap(); // 1% of 10k = 100 sat
-        // Should enforce minimum fee of 1000 sats
+        let proceeds = calculate_sell_proceeds(10_000.0, 0.01).unwrap();
         assert_eq!(proceeds.trading_fee_sats, MIN_TRADING_FEE_SATS);
         assert_eq!(proceeds.net_proceeds_sats, 10_000 - MIN_TRADING_FEE_SATS);
     }
 
     #[test]
     fn test_buy_sell_roundtrip_fair() {
-        // Test that buying and selling the same amount doesn't systematically favor either party
-        // Use large enough values so percentage fee exceeds minimum
         let base_cost = 1_000_000.0;
         let fee_pct = 0.01;
 
         let buy = calculate_buy_cost(base_cost, fee_pct).unwrap();
         let sell = calculate_sell_proceeds(base_cost, fee_pct).unwrap();
 
-        // Both should use same rounding, so fees should be equal
         assert_eq!(buy.trading_fee_sats, sell.trading_fee_sats);
     }
 
@@ -303,18 +291,42 @@ mod tests {
         let derived_beta =
             derive_beta_from_liquidity(liquidity as u64, num_outcomes);
 
-        // Should be approximately equal (within 1 sat of rounding)
         assert!((original_beta - derived_beta).abs() < 1.0);
     }
 
     #[test]
     fn test_liquidity_edge_cases() {
-        // Single outcome should return 0
         assert_eq!(calculate_lmsr_liquidity(100.0, 1), 0.0);
         assert_eq!(calculate_lmsr_liquidity(100.0, 0), 0.0);
 
-        // Two outcomes: liquidity = beta * ln(2) ≈ beta * 0.693
         let liq = calculate_lmsr_liquidity(100.0, 2);
         assert!((liq - 69.3).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_calculate_prices_i64() {
+        use ndarray::array;
+        let shares = array![0i64, 0i64];
+        let prices = calculate_prices(&shares, 100.0).unwrap();
+        assert!((prices[0] - 0.5).abs() < 1e-6);
+        assert!((prices[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_calculate_update_cost_i64() {
+        use ndarray::array;
+        let current = array![0i64, 0i64];
+        let new = array![10i64, 0i64];
+        let cost = calculate_update_cost(&current, &new, 100.0).unwrap();
+        assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn test_calculate_display_prices_i64() {
+        use ndarray::array;
+        let shares = array![0i64, 0i64, 0i64];
+        let prices = calculate_display_prices(&shares, 100.0, &[0, 1]);
+        assert_eq!(prices.len(), 2);
+        assert!((prices[0] - 0.5).abs() < 1e-6);
     }
 }

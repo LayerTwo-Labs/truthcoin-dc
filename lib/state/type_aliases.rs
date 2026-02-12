@@ -14,16 +14,16 @@ pub type PeriodSlotPair = (u32, u64);
 pub type PeriodSummary = (Vec<PeriodSlotPair>, Vec<PeriodSlotPair>);
 
 /// A position in a market: (market_id, outcome_index, share_balance).
-pub type MarketPosition = (MarketId, u32, f64);
+pub type MarketPosition = (MarketId, u32, i64);
 
 /// All share accounts: a list of (address, positions) pairs.
 pub type AllShareAccounts = Vec<(Address, Vec<MarketPosition>)>;
 
 /// Shareholders of a specific market: (address, positions) where positions are (outcome_index, share_balance).
-pub type MarketShareholders = Vec<(Address, Vec<(u32, f64)>)>;
+pub type MarketShareholders = Vec<(Address, Vec<(u32, i64)>)>;
 
 /// A single market delta: (outcome_index, share_delta, volume_sats, fee_sats, transaction_id).
-pub type MarketDelta = (usize, f64, Option<u64>, Option<u64>, Option<[u8; 32]>);
+pub type MarketDelta = (usize, i64, Option<u64>, Option<u64>, Option<[u8; 32]>);
 
 /// Aggregated deltas per market for block processing.
 pub type AggregatedDeltas = HashMap<MarketId, Vec<MarketDelta>>;

@@ -169,6 +169,7 @@ impl Sidechain for PostSetup {
                 .port(),
             net_port: reserved_ports.net.port(),
             rpc_port: reserved_ports.rpc.port(),
+            slot_config_testing: Some(10),
             zmq_port: reserved_ports.zmq.port(),
         };
         let truthcoin_app_task = truthcoin_app

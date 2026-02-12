@@ -20,7 +20,7 @@ struct PositionInfo {
     market_state: MarketState,
     outcome_index: u32,
     outcome_label: String,
-    shares: f64,
+    shares: i64,
     current_price: f64,
     current_value_btc: f64,
     trading_fee_pct: f64,
@@ -59,7 +59,7 @@ impl MyPositions {
             match app.node.get_user_share_positions(&address) {
                 Ok(user_positions) => {
                     for (market_id, outcome_idx, shares) in user_positions {
-                        if shares <= 0.0 {
+                        if shares <= 0 {
                             continue;
                         }
 
@@ -115,7 +115,8 @@ impl MyPositions {
                             outcome_label: label,
                             shares,
                             current_price: price,
-                            current_value_btc: shares * price / 100_000_000.0,
+                            current_value_btc: shares as f64 * price
+                                / 100_000_000.0,
                             trading_fee_pct: fee_pct,
                             seller_address: address,
                         });

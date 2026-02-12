@@ -270,6 +270,7 @@ impl App {
             cusf_mainchain,
             cusf_mainchain_wallet,
             &runtime,
+            config.slot_config_testing,
             #[cfg(feature = "zmq")]
             config.zmq_addr,
         ))?;

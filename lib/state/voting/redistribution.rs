@@ -306,7 +306,12 @@ fn adjust_deltas_for_insufficient_balances(
         );
 
         if delta < 0 {
-            let amount_to_lose = (-delta) as u32;
+            let amount_to_lose = u32::try_from((-delta).unsigned_abs())
+                .map_err(|_| {
+                    Error::DatabaseError(format!(
+                        "Votecoin delta overflow: {delta} exceeds u32 range"
+                    ))
+                })?;
 
             debug!(
                 "Checking VoteCoin balance for voter {}: has {}, needs to lose {}",
@@ -602,7 +607,11 @@ pub fn apply_votecoin_redistribution(
         );
 
         if net_change < 0 {
-            let amount_to_remove = (-net_change) as u32;
+            let amount_to_remove = u32::try_from((-net_change).unsigned_abs()).map_err(|_| {
+                Error::DatabaseError(format!(
+                    "Votecoin net_change overflow: {net_change} exceeds u32 range"
+                ))
+            })?;
 
             global_sequence = remove_votecoin_from_voter(
                 state,
@@ -613,9 +622,13 @@ pub fn apply_votecoin_redistribution(
                 global_sequence,
             )?;
         } else {
-            let amount_to_add = net_change as u32;
+            let amount_to_add = u32::try_from(net_change).map_err(|_| {
+                Error::DatabaseError(format!(
+                    "Votecoin net_change overflow: {net_change} exceeds u32 range"
+                ))
+            })?;
 
-            add_votecoin_to_voter(
+            let _ = add_votecoin_to_voter(
                 state,
                 rwtxn,
                 &address,
@@ -637,6 +650,212 @@ pub fn apply_votecoin_redistribution(
     );
 
     Ok(())
+}
+
+/// Like `apply_votecoin_redistribution` but also returns lists of created and consumed
+/// votecoin UTXOs for undo support during disconnect_tip.
+#[allow(clippy::type_complexity)]
+pub fn apply_votecoin_redistribution_with_undo(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    redistribution: &RedistributionSummary,
+    block_height: u64,
+) -> Result<(Vec<OutPoint>, Vec<(OutPoint, crate::types::FilledOutput)>), Error>
+{
+    info!(
+        "Applying VoteCoin redistribution (with undo) for period {} at block height {}",
+        redistribution.period_id.0, block_height
+    );
+
+    if redistribution.transfers.is_empty() {
+        debug!("No redistribution transfers to apply");
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut voter_net_changes = HashMap::new();
+
+    for transfer in &redistribution.transfers {
+        let address = transfer.from_address;
+        *voter_net_changes.entry(address).or_insert(0i64) += transfer.amount;
+    }
+
+    let total_delta: i64 = voter_net_changes.values().sum();
+
+    if total_delta != 0 {
+        return Err(Error::InvalidTransaction {
+            reason: format!(
+                "VoteCoin redistribution conservation violation: total delta = {total_delta} (expected 0)"
+            ),
+        });
+    }
+
+    let mut sorted_voters: Vec<(Address, i64)> =
+        voter_net_changes.into_iter().collect();
+    sorted_voters.sort_by_key(|(address, _)| *address);
+
+    let mut global_sequence = 0u32;
+    let mut all_created = Vec::new();
+    let mut all_consumed = Vec::new();
+
+    for (address, net_change) in sorted_voters {
+        if net_change == 0 {
+            continue;
+        }
+
+        if net_change < 0 {
+            let amount_to_remove = u32::try_from((-net_change).unsigned_abs()).map_err(|_| {
+                Error::DatabaseError(format!(
+                    "Votecoin net_change overflow: {net_change} exceeds u32 range"
+                ))
+            })?;
+
+            let (new_seq, created, consumed) =
+                remove_votecoin_from_voter_with_undo(
+                    state,
+                    rwtxn,
+                    &address,
+                    amount_to_remove,
+                    redistribution,
+                    global_sequence,
+                )?;
+            global_sequence = new_seq;
+            all_created.extend(created);
+            all_consumed.extend(consumed);
+        } else {
+            let amount_to_add = u32::try_from(net_change).map_err(|_| {
+                Error::DatabaseError(format!(
+                    "Votecoin net_change overflow: {net_change} exceeds u32 range"
+                ))
+            })?;
+
+            let outpoint = add_votecoin_to_voter(
+                state,
+                rwtxn,
+                &address,
+                amount_to_add,
+                redistribution.period_id,
+                block_height,
+                global_sequence,
+            )?;
+
+            all_created.push(outpoint);
+            global_sequence += 1;
+        }
+    }
+
+    Ok((all_created, all_consumed))
+}
+
+/// Like `remove_votecoin_from_voter` but also tracks created/consumed UTXOs
+#[allow(clippy::type_complexity)]
+fn remove_votecoin_from_voter_with_undo(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    voter_address: &Address,
+    amount: u32,
+    redistribution: &RedistributionSummary,
+    change_sequence_start: u32,
+) -> Result<
+    (
+        u32,
+        Vec<OutPoint>,
+        Vec<(OutPoint, crate::types::FilledOutput)>,
+    ),
+    Error,
+> {
+    let mut voter_addresses = std::collections::HashSet::new();
+    voter_addresses.insert(*voter_address);
+
+    let utxos = state.get_utxos_by_addresses(rwtxn, &voter_addresses)?;
+
+    let mut votecoin_utxos: Vec<(OutPoint, u32, Address)> = utxos
+        .into_iter()
+        .filter_map(|(outpoint, filled_output)| {
+            if let FilledOutputContent::Votecoin(votecoin_amount) =
+                filled_output.content
+            {
+                Some((outpoint, votecoin_amount, filled_output.address))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    votecoin_utxos.sort_by_key(|(outpoint, _, _)| *outpoint);
+
+    let total_available: u32 =
+        votecoin_utxos.iter().map(|(_, amt, _)| amt).sum();
+
+    if total_available < amount {
+        return Err(Error::InvalidTransaction {
+            reason: format!(
+                "Insufficient VoteCoin for redistribution: address has {total_available}, needs {amount}"
+            ),
+        });
+    }
+
+    let mut removed = 0u32;
+    let mut remaining_amount = amount;
+    let mut change_sequence_counter = change_sequence_start;
+    let mut created = Vec::new();
+    let mut consumed = Vec::new();
+
+    for (outpoint, votecoin_amount, original_address) in votecoin_utxos {
+        if remaining_amount == 0 {
+            break;
+        }
+
+        // Capture the UTXO before consuming it
+        let filled_output = state.utxos.try_get(rwtxn, &outpoint)?
+            .ok_or_else(|| Error::DatabaseError(
+                format!("Votecoin UTXO not found during redistribution: {outpoint:?}")
+            ))?;
+        consumed.push((outpoint, filled_output));
+
+        if votecoin_amount <= remaining_amount {
+            state.delete_utxo_supply_neutral(rwtxn, &outpoint)?;
+            removed += votecoin_amount;
+            remaining_amount -= votecoin_amount;
+        } else {
+            state.delete_utxo_supply_neutral(rwtxn, &outpoint)?;
+
+            let change_amount = votecoin_amount - remaining_amount;
+            let change_output = crate::types::FilledOutput {
+                address: original_address,
+                content: FilledOutputContent::Votecoin(change_amount),
+                memo: vec![],
+            };
+
+            let change_outpoint = generate_redistribution_outpoint(
+                redistribution.period_id,
+                &original_address,
+                redistribution.block_height,
+                change_sequence_counter,
+            );
+            change_sequence_counter += 1;
+
+            state.insert_utxo_supply_neutral(
+                rwtxn,
+                &change_outpoint,
+                &change_output,
+            )?;
+
+            created.push(change_outpoint);
+
+            removed += remaining_amount;
+            remaining_amount = 0;
+        }
+    }
+
+    if removed != amount {
+        return Err(Error::InvalidTransaction {
+            reason: format!(
+                "VoteCoin removal mismatch: removed {removed}, expected {amount}"
+            ),
+        });
+    }
+
+    Ok((change_sequence_counter, created, consumed))
 }
 
 fn remove_votecoin_from_voter(
@@ -755,7 +974,7 @@ fn add_votecoin_to_voter(
     period_id: VotingPeriodId,
     block_height: u64,
     sequence: u32,
-) -> Result<(), Error> {
+) -> Result<OutPoint, Error> {
     let outpoint = generate_redistribution_outpoint(
         period_id,
         voter_address,
@@ -776,7 +995,7 @@ fn add_votecoin_to_voter(
         outpoint, amount, voter_address, period_id.0, sequence
     );
 
-    Ok(())
+    Ok(outpoint)
 }
 
 #[cfg(test)]

@@ -595,4 +595,40 @@ impl VotingDatabases {
         }
         Ok(())
     }
+
+    // --- Undo/revert methods for disconnect_tip ---
+
+    pub fn delete_decision_outcome(
+        &self,
+        rwtxn: &mut RwTxn,
+        slot_id: crate::state::slots::SlotId,
+    ) -> Result<bool, Error> {
+        Ok(self.decision_outcomes.delete(rwtxn, &slot_id)?)
+    }
+
+    pub fn delete_period_stats(
+        &self,
+        rwtxn: &mut RwTxn,
+        period_id: VotingPeriodId,
+    ) -> Result<bool, Error> {
+        Ok(self.period_stats.delete(rwtxn, &period_id)?)
+    }
+
+    pub fn delete_voter_reputation(
+        &self,
+        rwtxn: &mut RwTxn,
+        address: crate::types::Address,
+    ) -> Result<bool, Error> {
+        Ok(self.voter_reputation.delete(rwtxn, &address)?)
+    }
+
+    pub fn delete_pending_redistribution(
+        &self,
+        rwtxn: &mut RwTxn,
+        period_id: VotingPeriodId,
+    ) -> Result<bool, Error> {
+        Ok(self
+            .pending_period_redistributions
+            .delete(rwtxn, &period_id)?)
+    }
 }

@@ -16,13 +16,12 @@ use tower_http::{
 use truthcoin_dc::{
     authorization::{self, Dst, Signature},
     math::{
-        lmsr::LmsrService,
         safe_math::{self, Rounding},
         trading,
     },
     net::Peer,
     node::Node,
-    state::{period_to_name, timestamp_to_period},
+    state::period_to_name,
     types::{
         Address, Authorization, Block, BlockHash, EncryptionPubKey,
         FilledOutputContent, PointedOutput, Transaction, Txid, VerifyingKey,
@@ -81,28 +80,17 @@ impl RpcServerImpl {
     async fn slots_status(
         &self,
     ) -> RpcResult<truthcoin_dc_app_rpc_api::SlotStatus> {
-        let is_testing_mode = self.node().is_slots_testing_mode();
-        let blocks_per_period = if is_testing_mode {
-            self.node().get_slots_testing_config()
-        } else {
-            0
-        };
+        let config = self.node().get_slot_config();
+        let is_testing_mode = config.is_blocks;
+        let blocks_per_period =
+            if is_testing_mode { config.quantity } else { 0 };
 
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let current_period = if is_testing_mode {
-            let tip_height = self
-                .app
-                .node
-                .try_get_tip_height()
-                .map_err(custom_err)?
-                .unwrap_or(0);
-            self.node().block_height_to_testing_period(tip_height)
-        } else {
-            timestamp_to_period(current_timestamp)
-        };
+        let mainchain_ts =
+            self.node().get_mainchain_timestamp().map_err(custom_err)?;
+        let current_period = self
+            .node()
+            .get_current_period(mainchain_ts)
+            .map_err(custom_err)?;
 
         let current_period_name = period_to_name(current_period);
 
@@ -124,6 +112,8 @@ impl RpcServerImpl {
         question: String,
         min: Option<i64>,
         max: Option<i64>,
+        option_0_label: Option<String>,
+        option_1_label: Option<String>,
         fee_sats: u64,
     ) -> RpcResult<Txid> {
         use truthcoin_dc::state::slots::SlotId;
@@ -149,6 +139,8 @@ impl RpcServerImpl {
                     question,
                     min,
                     max,
+                    option_0_label,
+                    option_1_label,
                 },
                 fee,
             )
@@ -259,8 +251,6 @@ impl RpcServerImpl {
             .map(|(market, computed_state)| {
                 let market_id_hex = hex::encode(market.id.as_bytes());
 
-                let volume_btc =
-                    (market.total_volume_sats as f64) / 100_000_000.0;
                 truthcoin_dc_app_rpc_api::MarketSummary {
                     market_id: market_id_hex,
                     title: market.title.clone(),
@@ -271,7 +261,7 @@ impl RpcServerImpl {
                     },
                     outcome_count: market.get_outcome_count(),
                     state: format!("{computed_state:?}"),
-                    volume: volume_btc,
+                    volume_sats: market.total_volume_sats,
                     created_at_height: market.created_at_height,
                 }
             })
@@ -305,29 +295,25 @@ impl RpcServerImpl {
         let mut outcomes = Vec::new();
         let valid_state_combos = market.get_valid_state_combos();
 
+        let valid_state_indices: Vec<usize> =
+            valid_state_combos.iter().map(|(idx, _)| *idx).collect();
+
         let prices = if let Some(mempool_shares) = self
             .app
             .node
             .get_mempool_shares(&market_id_struct)
             .map_err(custom_err)?
         {
-            let all_prices = market.calculate_prices(&mempool_shares);
-            let valid_prices: Vec<f64> = valid_state_combos
-                .iter()
-                .map(|(state_idx, _)| all_prices[*state_idx])
-                .collect();
-
-            let valid_sum: f64 = valid_prices.iter().sum();
-            if valid_sum > 0.0 {
-                valid_prices.iter().map(|p| p / valid_sum).collect()
-            } else {
-                vec![1.0 / valid_prices.len() as f64; valid_prices.len()]
-            }
+            trading::calculate_display_prices(
+                &mempool_shares,
+                market.b(),
+                &valid_state_indices,
+            )
         } else {
             market.calculate_prices_for_display()
         };
 
-        let total_volume = market.total_volume_sats as f64;
+        let total_volume_sats = market.total_volume_sats;
 
         for (i, (state_idx, _combo)) in valid_state_combos.iter().enumerate() {
             let name = match market
@@ -339,18 +325,20 @@ impl RpcServerImpl {
 
             let current_price = prices[i];
             let probability = current_price;
-            let volume = if i < market.outcome_volumes_sats.len() {
-                market.outcome_volumes_sats[i] as f64
+            let volume_sats = if *state_idx < market.outcome_volumes_sats.len()
+            {
+                market.outcome_volumes_sats[*state_idx]
             } else {
-                0.0
+                0
             };
 
             outcomes.push(truthcoin_dc_app_rpc_api::MarketOutcome {
                 name,
                 current_price,
                 probability,
-                volume,
-                index: i,
+                volume_sats,
+                index: *state_idx,
+                display_index: i,
             });
         }
 
@@ -433,7 +421,7 @@ impl RpcServerImpl {
             tags: market.tags.clone(),
             created_at_height: market.created_at_height,
             treasury: treasury_btc,
-            total_volume,
+            total_volume_sats,
             liquidity: treasury_btc,
             decision_slots,
             resolution,
@@ -561,7 +549,7 @@ impl RpcServerImpl {
 
         let mut prices_cache = std::collections::HashMap::new();
         for (market_id, market) in &markets_map {
-            prices_cache.insert(market_id.clone(), market.get_current_prices());
+            prices_cache.insert(market_id.clone(), market.current_prices());
         }
 
         for (market_id, outcome_index, position_data) in positions_data {
@@ -573,7 +561,7 @@ impl RpcServerImpl {
                     .copied()
                     .unwrap_or(0.0);
                 let shares = position_data;
-                let current_value = shares * outcome_price;
+                let current_value = shares as f64 * outcome_price;
 
                 let outcome_name = if let Some(combo) =
                     market.state_combos.get(outcome_index as usize)
@@ -630,7 +618,7 @@ impl RpcServerImpl {
         let mut positions = Vec::new();
 
         if let Ok(Some(market)) = node.get_market_by_id(&market_id_struct) {
-            let current_prices = market.get_current_prices();
+            let current_prices = market.current_prices();
 
             for (outcome_index, position_data) in positions_data {
                 let outcome_price = current_prices
@@ -638,7 +626,7 @@ impl RpcServerImpl {
                     .copied()
                     .unwrap_or(0.0);
                 let shares = position_data;
-                let current_value = shares * outcome_price;
+                let current_value = shares as f64 * outcome_price;
 
                 let outcome_name = if let Some(combo) =
                     market.state_combos.get(outcome_index as usize)
@@ -996,20 +984,6 @@ impl RpcServer for RpcServerImpl {
             .app
             .node
             .get_unconfirmed_utxos_by_addresses(&addresses)
-            .map_err(custom_err)?
-            .into_iter()
-            .map(|(outpoint, output)| PointedOutput { outpoint, output })
-            .collect();
-        Ok(utxos)
-    }
-
-    async fn my_utxos(
-        &self,
-    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>> {
-        let utxos = self
-            .app
-            .wallet
-            .get_utxos()
             .map_err(custom_err)?
             .into_iter()
             .map(|(outpoint, output)| PointedOutput { outpoint, output })
@@ -1416,33 +1390,24 @@ impl RpcServer for RpcServerImpl {
 
         let mut results = Vec::new();
 
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let is_testing = self.node().is_slots_testing_mode();
-        let current_period = if is_testing {
-            let tip_height = self
-                .node()
-                .try_get_tip_height()
-                .map_err(custom_err)?
-                .unwrap_or(0);
-            self.node().block_height_to_testing_period(tip_height)
-        } else {
-            timestamp_to_period(current_timestamp)
-        };
+        let mainchain_ts =
+            self.node().get_mainchain_timestamp().map_err(custom_err)?;
+        let current_period = self
+            .node()
+            .get_current_period(mainchain_ts)
+            .map_err(custom_err)?;
 
         let periods_to_check: Vec<u32> = if let Some(ref f) = filter {
             if let Some(p) = f.period {
                 vec![p]
             } else {
                 let all_slots =
-                    self.node().get_all_slot_quarters().map_err(custom_err)?;
+                    self.node().get_all_slot_periods().map_err(custom_err)?;
                 all_slots.into_iter().map(|(p, _)| p).collect()
             }
         } else {
             let all_slots =
-                self.node().get_all_slot_quarters().map_err(custom_err)?;
+                self.node().get_all_slot_periods().map_err(custom_err)?;
             all_slots.into_iter().map(|(p, _)| p).collect()
         };
 
@@ -1545,6 +1510,8 @@ impl RpcServer for RpcServerImpl {
         question: String,
         min: Option<i64>,
         max: Option<i64>,
+        option_0_label: Option<String>,
+        option_1_label: Option<String>,
         fee_sats: u64,
     ) -> RpcResult<Txid> {
         self.claim_decision_slot(
@@ -1555,6 +1522,8 @@ impl RpcServer for RpcServerImpl {
             question,
             min,
             max,
+            option_0_label,
+            option_1_label,
             fee_sats,
         )
         .await
@@ -1614,7 +1583,7 @@ impl RpcServer for RpcServerImpl {
         // Calculate base cost and trading fee using shared module
         let mut new_shares = current_shares.clone();
         new_shares[request.outcome_index] += request.shares_amount;
-        let trade_cost = LmsrService::calculate_update_cost(
+        let trade_cost = trading::calculate_update_cost(
             &current_shares,
             &new_shares,
             market.b(),
@@ -1629,7 +1598,6 @@ impl RpcServer for RpcServerImpl {
                 .map_err(|e| {
                     custom_err_msg(format!("Cost calculation failed: {e}"))
                 })?;
-        let base_cost_sats = buy_cost.base_cost_sats;
         let trading_fee_sats = buy_cost.trading_fee_sats;
         let cost_sats = buy_cost.total_cost_sats;
 
@@ -1651,7 +1619,6 @@ impl RpcServer for RpcServerImpl {
             return Ok(MarketBuyResponse {
                 txid: None,
                 cost_sats,
-                base_cost_sats,
                 trading_fee_sats,
                 new_price,
             });
@@ -1660,9 +1627,6 @@ impl RpcServer for RpcServerImpl {
         // Validate required params for actual trade
         let max_cost = request.max_cost.ok_or_else(|| {
             custom_err_msg("max_cost is required when dry_run is false")
-        })?;
-        let fee_sats = request.fee_sats.ok_or_else(|| {
-            custom_err_msg("fee_sats is required when dry_run is false")
         })?;
 
         // Slippage check
@@ -1692,9 +1656,6 @@ impl RpcServer for RpcServerImpl {
                 request.shares_amount, // Positive for buy
                 trader,
                 max_cost, // limit_sats = max_cost for buy
-                base_cost_sats,
-                trading_fee_sats,
-                bitcoin::Amount::from_sat(fee_sats),
             )
             .map_err(custom_err)?;
 
@@ -1704,7 +1665,6 @@ impl RpcServer for RpcServerImpl {
         Ok(MarketBuyResponse {
             txid: Some(txid.to_string()),
             cost_sats,
-            base_cost_sats,
             trading_fee_sats,
             new_price,
         })
@@ -1736,7 +1696,7 @@ impl RpcServer for RpcServerImpl {
                     && *oidx == request.outcome_index as u32
             })
             .map(|(_, _, shares)| *shares)
-            .unwrap_or(0.0);
+            .unwrap_or(0);
 
         if owned_shares < request.shares_amount {
             return Err(custom_err_msg(format!(
@@ -1758,12 +1718,11 @@ impl RpcServer for RpcServerImpl {
         new_shares[request.outcome_index] -= request.shares_amount;
 
         // Calculate cost difference: old_cost - new_cost = proceeds (positive when selling)
-        let old_cost =
-            LmsrService::calculate_treasury(&current_shares, market.b())
-                .map_err(|e| {
-                    custom_err_msg(format!("Cost calculation error: {e:?}"))
-                })?;
-        let new_cost = LmsrService::calculate_treasury(&new_shares, market.b())
+        let old_cost = trading::calculate_treasury(&current_shares, market.b())
+            .map_err(|e| {
+                custom_err_msg(format!("Cost calculation error: {e:?}"))
+            })?;
+        let new_cost = trading::calculate_treasury(&new_shares, market.b())
             .map_err(|e| {
                 custom_err_msg(format!("Cost calculation error: {e:?}"))
             })?;
@@ -1808,9 +1767,6 @@ impl RpcServer for RpcServerImpl {
 
         // Validate required params for actual trade
         let min_proceeds = request.min_proceeds.unwrap_or(0);
-        let fee_sats = request.fee_sats.ok_or_else(|| {
-            custom_err_msg("fee_sats is required when dry_run is false")
-        })?;
 
         // Slippage check
         if net_proceeds_sats < min_proceeds {
@@ -1829,9 +1785,6 @@ impl RpcServer for RpcServerImpl {
                 -request.shares_amount, // Negative for sell
                 request.seller_address,
                 min_proceeds,
-                proceeds_sats,
-                trading_fee_sats,
-                bitcoin::Amount::from_sat(fee_sats),
             )
             .map_err(custom_err)?;
 
@@ -1889,10 +1842,8 @@ impl RpcServer for RpcServerImpl {
         &self,
         address: Address,
     ) -> RpcResult<Option<VoterInfoFull>> {
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let current_timestamp =
+            self.node().get_mainchain_timestamp().map_err(custom_err)?;
         let current_height = self
             .node()
             .try_get_tip_height()
@@ -1944,6 +1895,12 @@ impl RpcServer for RpcServerImpl {
             .get_votes_by_voter(&rotxn, address)
             .map_err(custom_err)?;
 
+        let genesis_ts_voter = self
+            .node()
+            .get_genesis_timestamp()
+            .map_err(custom_err)?
+            .unwrap_or(0);
+
         let active_period_opt = self
             .app
             .node
@@ -1954,6 +1911,7 @@ impl RpcServer for RpcServerImpl {
                 current_height,
                 config,
                 slots_db,
+                genesis_ts_voter,
             )
             .map_err(custom_err)?;
 
@@ -2176,18 +2134,22 @@ impl RpcServer for RpcServerImpl {
             .map_err(custom_err)?
             .unwrap_or(0);
         let current_timestamp_for_period =
-            self.node().get_last_block_timestamp().map_err(custom_err)?;
+            self.node().get_mainchain_timestamp().map_err(custom_err)?;
         let config = self.node().get_slot_config();
         let slots_db = self.node().get_slots_db();
+
+        let genesis_ts = self
+            .node()
+            .get_genesis_timestamp()
+            .map_err(custom_err)?
+            .unwrap_or(0);
 
         let period_id = if let Some(pid) = period_id {
             pid
         } else {
             let rotxn = self.node().read_txn().map_err(custom_err)?;
-            let current_timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| custom_err_msg(format!("System time error: {e}")))?
-                .as_secs();
+            let mainchain_ts =
+                self.node().get_mainchain_timestamp().map_err(custom_err)?;
 
             let active_period_opt = self
                 .app
@@ -2195,10 +2157,11 @@ impl RpcServer for RpcServerImpl {
                 .voting_state()
                 .get_active_period(
                     &rotxn,
-                    current_timestamp,
+                    mainchain_ts,
                     current_height,
                     config,
                     slots_db,
+                    genesis_ts,
                 )
                 .map_err(custom_err)?;
 
@@ -2230,6 +2193,7 @@ impl RpcServer for RpcServerImpl {
             config,
             slots_db,
             has_consensus,
+            genesis_ts,
         ) {
             Ok(p) => p,
             Err(_) => return Ok(None),
@@ -2413,16 +2377,6 @@ impl RpcServer for RpcServerImpl {
     }
 
     // --- VOTECOIN ---
-
-    async fn votecoin_transfer(
-        &self,
-        dest: Address,
-        amount: u32,
-        fee_sats: u64,
-        memo: Option<String>,
-    ) -> RpcResult<Txid> {
-        self.transfer_votecoin(dest, amount, fee_sats, memo).await
-    }
 
     async fn votecoin_balance(&self, address: Address) -> RpcResult<u32> {
         self.get_votecoin_balance_impl(address).await

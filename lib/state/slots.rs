@@ -1,5 +1,5 @@
 use crate::state::Error;
-use crate::types::{BITCOIN_GENESIS_TIMESTAMP, SECONDS_PER_QUARTER, Txid};
+use crate::types::{SECONDS_PER_QUARTER, Txid};
 use crate::validation::SlotValidationInterface;
 use borsh::BorshSerialize;
 use fallible_iterator::FallibleIterator;
@@ -138,9 +138,12 @@ pub struct Decision {
     pub question: String,
     pub min: Option<i64>,
     pub max: Option<i64>,
+    pub option_0_label: Option<String>,
+    pub option_1_label: Option<String>,
 }
 
 impl Decision {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         market_maker_pubkey_hash: [u8; 20],
         slot_id_bytes: [u8; 3],
@@ -149,6 +152,8 @@ impl Decision {
         question: String,
         min: Option<i64>,
         max: Option<i64>,
+        option_0_label: Option<String>,
+        option_1_label: Option<String>,
     ) -> Result<Self, Error> {
         if question.len() > 1000 {
             return Err(Error::InvalidSlotId {
@@ -174,6 +179,8 @@ impl Decision {
             question,
             min,
             max,
+            option_0_label,
+            option_1_label,
         })
     }
 
@@ -189,9 +196,18 @@ impl Decision {
             &self.question,
             self.min,
             self.max,
+            &self.option_0_label,
+            &self.option_1_label,
         );
 
         hashes::hash(&hash_data)
+    }
+
+    pub fn get_binary_labels(&self) -> (String, String) {
+        let label0 = self.option_0_label.as_deref().unwrap_or("No").to_string();
+        let label1 =
+            self.option_1_label.as_deref().unwrap_or("Yes").to_string();
+        (label0, label1)
     }
 
     /// Normalize a user-facing value to internal 0-1 range.
@@ -486,15 +502,15 @@ const INITIAL_SLOTS_PER_PERIOD: u64 = 500;
 
 #[derive(Clone, Debug)]
 pub struct SlotConfig {
-    pub testing_mode: bool,
-    pub testing_blocks_per_period: u32,
+    pub is_blocks: bool,
+    pub quantity: u32,
 }
 
 impl Default for SlotConfig {
     fn default() -> Self {
         Self {
-            testing_mode: true,
-            testing_blocks_per_period: 10,
+            is_blocks: false,
+            quantity: 120,
         }
     }
 }
@@ -502,8 +518,8 @@ impl Default for SlotConfig {
 impl SlotConfig {
     pub fn production() -> Self {
         Self {
-            testing_mode: false,
-            testing_blocks_per_period: 1,
+            is_blocks: false,
+            quantity: SECONDS_PER_QUARTER as u32,
         }
     }
 
@@ -512,21 +528,30 @@ impl SlotConfig {
             panic!("blocks_per_period must be > 0");
         }
         Self {
-            testing_mode: true,
-            testing_blocks_per_period: blocks_per_period,
+            is_blocks: true,
+            quantity: blocks_per_period,
         }
     }
-}
 
-/// Convert timestamp to period index (single source of truth).
-/// Used by RPC and other layers for consistent period calculation.
-#[inline]
-pub fn timestamp_to_period(timestamp: u64) -> u32 {
-    if timestamp < BITCOIN_GENESIS_TIMESTAMP {
-        return 0;
+    pub fn is_blocks_mode(&self) -> bool {
+        self.is_blocks
     }
-    let elapsed_seconds = timestamp - BITCOIN_GENESIS_TIMESTAMP;
-    (elapsed_seconds / SECONDS_PER_QUARTER) as u32
+
+    pub fn blocks_per_period(&self) -> Option<u32> {
+        if self.is_blocks {
+            Some(self.quantity)
+        } else {
+            None
+        }
+    }
+
+    pub fn seconds_per_period(&self) -> Option<u64> {
+        if !self.is_blocks {
+            Some(self.quantity as u64)
+        } else {
+            None
+        }
+    }
 }
 
 /// Convert period index to human-readable name (single source of truth).
@@ -541,38 +566,11 @@ pub fn period_to_name(period: u32) -> String {
     format!("Q{quarter} Y{year}")
 }
 
-pub fn quarter_to_string(quarter_idx: u32, config: &SlotConfig) -> String {
-    if config.testing_mode {
-        format!("Testing Period {quarter_idx}")
+pub fn period_to_string(period_idx: u32, config: &SlotConfig) -> String {
+    if config.is_blocks {
+        format!("Testing Period {period_idx}")
     } else {
-        let year = quarter_idx / 4;
-        let quarter = quarter_idx % 4;
-        let quarter_name = match quarter {
-            0 => "Q1",
-            1 => "Q2",
-            2 => "Q3",
-            3 => "Q4",
-            _ => unreachable!(),
-        };
-        format!("{quarter_name} {year}")
-    }
-}
-
-fn get_current_period(
-    timestamp: u64,
-    block_height: Option<u32>,
-    config: &SlotConfig,
-) -> Result<u32, Error> {
-    if config.testing_mode {
-        let height = block_height.unwrap_or(0);
-        // Block heights are 0-indexed and directly map to periods
-        // Heights 0-9 = period 1, 10-19 = period 2, etc.
-        Ok(height
-            .checked_div(config.testing_blocks_per_period)
-            .map(|v| v + 1)
-            .unwrap_or(0))
-    } else {
-        Ok(timestamp_to_period(timestamp))
+        period_to_name(period_idx)
     }
 }
 
@@ -629,16 +627,24 @@ impl Dbs {
         &self,
         ts_secs: u64,
         block_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<u32, Error> {
-        get_current_period(ts_secs, block_height, &self.config)
+        crate::state::voting::period_calculator::get_current_period(
+            ts_secs,
+            block_height,
+            genesis_ts,
+            &self.config,
+        )
     }
 
     fn get_active_window(
         &self,
         ts_secs: u64,
         block_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<(u32, u32), Error> {
-        let current = self.get_current_period(ts_secs, block_height)?;
+        let current =
+            self.get_current_period(ts_secs, block_height, genesis_ts)?;
         Ok((current, current + FUTURE_PERIODS - 1))
     }
 
@@ -666,9 +672,10 @@ impl Dbs {
         rwtxn: &mut RwTxn<'_>,
         ts_secs: u64,
         block_height: u32,
+        genesis_ts: u64,
     ) -> Result<(), Error> {
         let current_period =
-            self.get_current_period(ts_secs, Some(block_height))?;
+            self.get_current_period(ts_secs, Some(block_height), genesis_ts)?;
         self.mint_periods_up_to(rwtxn, current_period + FUTURE_PERIODS - 1)?;
         Ok(())
     }
@@ -678,9 +685,10 @@ impl Dbs {
         rwtxn: &mut RwTxn<'_>,
         ts_secs: u64,
         block_height: u32,
+        genesis_ts: u64,
     ) -> Result<(), Error> {
         let current_period =
-            self.get_current_period(ts_secs, Some(block_height))?;
+            self.get_current_period(ts_secs, Some(block_height), genesis_ts)?;
         let target_period = current_period + FUTURE_PERIODS - 1;
         self.mint_periods_up_to(rwtxn, target_period)?;
         Ok(())
@@ -717,9 +725,10 @@ impl Dbs {
         period: u32,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<u64, Error> {
         let current_period =
-            self.get_current_period(current_ts, current_height)?;
+            self.get_current_period(current_ts, current_height, genesis_ts)?;
         Ok(self.calculate_available_slots(period, current_period))
     }
 
@@ -728,9 +737,10 @@ impl Dbs {
         _rotxn: &sneed::RoTxn,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<Vec<(u32, u64)>, Error> {
         let current_period =
-            self.get_current_period(current_ts, current_height)?;
+            self.get_current_period(current_ts, current_height, genesis_ts)?;
         let mut periods = Vec::new();
 
         for period in current_period..=(current_period + FUTURE_PERIODS - 1) {
@@ -744,26 +754,29 @@ impl Dbs {
     }
 
     pub fn is_testing_mode(&self) -> bool {
-        self.config.testing_mode
+        self.config.is_blocks
     }
 
     pub fn get_testing_blocks_per_period(&self) -> u32 {
-        self.config.testing_blocks_per_period
+        self.config.quantity
     }
 
     pub fn block_height_to_testing_period(&self, block_height: u32) -> u32 {
-        block_height
-            .checked_div(self.config.testing_blocks_per_period)
-            .map(|v| v + 1)
-            .unwrap_or(0)
+        crate::state::voting::period_calculator::get_current_period(
+            0,
+            Some(block_height),
+            0,
+            &self.config,
+        )
+        .unwrap_or(0)
     }
 
     pub fn get_config(&self) -> &SlotConfig {
         &self.config
     }
 
-    pub fn quarter_to_string(&self, quarter_idx: u32) -> String {
-        quarter_to_string(quarter_idx, &self.config)
+    pub fn period_to_string(&self, period_idx: u32) -> String {
+        period_to_string(period_idx, &self.config)
     }
 
     pub fn is_period_ossified(
@@ -771,9 +784,10 @@ impl Dbs {
         slot_period: u32,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> bool {
         let current_period = self
-            .get_current_period(current_ts, current_height)
+            .get_current_period(current_ts, current_height, genesis_ts)
             .unwrap_or(0);
         current_period > slot_period.saturating_add(7)
     }
@@ -783,9 +797,10 @@ impl Dbs {
         slot_id: SlotId,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> bool {
         let period = slot_id.period_index();
-        self.is_period_ossified(period, current_ts, current_height)
+        self.is_period_ossified(period, current_ts, current_height, genesis_ts)
     }
 
     pub fn is_slot_in_voting(
@@ -796,17 +811,74 @@ impl Dbs {
         Ok(self.get_slot_current_state(rotxn, slot_id)? == SlotState::Voting)
     }
 
+    /// Get Claimed slots ready to transition to Voting.
+    /// Returns slots where state == Claimed AND current_period > period_index.
+    pub fn get_claimed_slots_needing_voting(
+        &self,
+        rotxn: &RoTxn,
+        current_period: u32,
+    ) -> Result<Vec<SlotId>, Error> {
+        let mut result = Vec::new();
+        let mut iter = self.slot_state_histories.iter(rotxn)?;
+        while let Some((slot_id, history)) = iter.next()? {
+            if history.current_state() == SlotState::Claimed
+                && current_period > slot_id.period_index()
+            {
+                result.push(slot_id);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get Voting slots ready to resolve.
+    /// Returns slots where state == Voting AND current_period > voting_period.
+    pub fn get_voting_slots_needing_resolution(
+        &self,
+        rotxn: &RoTxn,
+        current_period: u32,
+    ) -> Result<Vec<SlotId>, Error> {
+        let mut result = Vec::new();
+        let mut iter = self.slot_state_histories.iter(rotxn)?;
+        while let Some((slot_id, history)) = iter.next()? {
+            if history.current_state() == SlotState::Voting
+                && current_period > slot_id.voting_period()
+            {
+                result.push(slot_id);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Debug helper: returns all (SlotId, current SlotState) pairs.
+    pub fn get_all_slot_states(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<(SlotId, SlotState)>, Error> {
+        let mut result = Vec::new();
+        let mut iter = self.slot_state_histories.iter(rotxn)?;
+        while let Some((slot_id, history)) = iter.next()? {
+            result.push((slot_id, history.current_state()));
+        }
+        Ok(result)
+    }
+
     pub fn get_ossified_slots(
         &self,
         rotxn: &sneed::RoTxn,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<Vec<Slot>, Error> {
         let mut ossified_slots = Vec::new();
 
         let mut iter = self.period_slots.iter(rotxn)?;
         while let Some((period, slots)) = iter.next()? {
-            if self.is_period_ossified(period, current_ts, current_height) {
+            if self.is_period_ossified(
+                period,
+                current_ts,
+                current_height,
+                genesis_ts,
+            ) {
                 ossified_slots.extend(slots.iter().cloned());
             }
         }
@@ -821,13 +893,19 @@ impl Dbs {
         decision: &Decision,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<(), Error> {
         let period_index = slot_id.period_index();
         let slot_index = slot_id.slot_index();
         let current_period =
-            self.get_current_period(current_ts, current_height)?;
+            self.get_current_period(current_ts, current_height, genesis_ts)?;
 
-        if self.is_slot_ossified(slot_id, current_ts, current_height) {
+        if self.is_slot_ossified(
+            slot_id,
+            current_ts,
+            current_height,
+            genesis_ts,
+        ) {
             return Err(Error::SlotNotAvailable {
                 slot_id,
                 reason: format!("Slot period {period_index} is ossified"),
@@ -865,7 +943,7 @@ impl Dbs {
             }
 
             let (start_period, end_period) =
-                self.get_active_window(current_ts, current_height)?;
+                self.get_active_window(current_ts, current_height, genesis_ts)?;
             if period_index < start_period || period_index > end_period {
                 return Err(Error::SlotNotAvailable {
                     slot_id,
@@ -880,6 +958,7 @@ impl Dbs {
                 period_index,
                 current_ts,
                 current_height,
+                genesis_ts,
             )?;
             if slot_index as u64 >= total_slots {
                 return Err(Error::SlotNotAvailable {
@@ -908,6 +987,7 @@ impl Dbs {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn claim_slot(
         &self,
         rwtxn: &mut RwTxn<'_>,
@@ -916,6 +996,7 @@ impl Dbs {
         claiming_txid: Txid,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<(), Error> {
         self.validate_slot_claim(
             rwtxn,
@@ -923,6 +1004,7 @@ impl Dbs {
             &decision,
             current_ts,
             current_height,
+            genesis_ts,
         )?;
 
         let period_index = slot_id.period_index();
@@ -988,9 +1070,15 @@ impl Dbs {
         period_index: u32,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<Vec<SlotId>, Error> {
-        let total_slots =
-            self.total_for(rotxn, period_index, current_ts, current_height)?;
+        let total_slots = self.total_for(
+            rotxn,
+            period_index,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )?;
 
         let max_slot_index =
             std::cmp::min(total_slots, (STANDARD_SLOT_MAX + 1) as u64);
@@ -1059,11 +1147,15 @@ impl Dbs {
         Ok(all_claimed_slots)
     }
 
+    /// Returns periods that have slots currently in voting state.
+    /// Each tuple is (claim_period, voting_slot_count, total_slots).
+    /// claim_period = period_index = the period in which the slots were claimed.
     pub fn get_voting_periods(
         &self,
         rotxn: &sneed::RoTxn,
         _current_ts: u64,
         _current_height: Option<u32>,
+        _genesis_ts: u64,
     ) -> Result<Vec<(u32, u64, u64)>, Error> {
         use std::collections::HashMap;
 
@@ -1072,8 +1164,8 @@ impl Dbs {
         let mut iter = self.slot_state_histories.iter(rotxn)?;
         while let Some((slot_id, history)) = iter.next()? {
             if history.current_state() == SlotState::Voting {
-                let period = slot_id.period_index();
-                *period_voting_counts.entry(period).or_insert(0) += 1;
+                let claim_period = slot_id.period_index();
+                *period_voting_counts.entry(claim_period).or_insert(0) += 1;
             }
         }
 
@@ -1094,11 +1186,20 @@ impl Dbs {
         rotxn: &sneed::RoTxn,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<super::type_aliases::PeriodSummary, Error> {
-        let active_periods =
-            self.get_active_periods(rotxn, current_ts, current_height)?;
-        let voting_periods_full =
-            self.get_voting_periods(rotxn, current_ts, current_height)?;
+        let active_periods = self.get_active_periods(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )?;
+        let voting_periods_full = self.get_voting_periods(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )?;
         let voting_periods = voting_periods_full
             .into_iter()
             .map(|(period, claimed, _total)| (period, claimed))
@@ -1290,6 +1391,7 @@ impl SlotValidationInterface for Dbs {
         decision: &Decision,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<(), Error> {
         self.validate_slot_claim(
             rotxn,
@@ -1297,10 +1399,25 @@ impl SlotValidationInterface for Dbs {
             decision,
             current_ts,
             current_height,
+            genesis_ts,
         )
     }
 
     fn try_get_height(&self, _rotxn: &RoTxn) -> Result<Option<u32>, Error> {
+        Ok(None)
+    }
+
+    fn try_get_genesis_timestamp(
+        &self,
+        _rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
+
+    fn try_get_mainchain_timestamp(
+        &self,
+        _rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
         Ok(None)
     }
 }
@@ -1318,6 +1435,8 @@ mod tests {
             is_scaled: false,
             min: None,
             max: None,
+            option_0_label: None,
+            option_1_label: None,
         }
     }
 
@@ -1330,6 +1449,8 @@ mod tests {
             is_scaled: true,
             min: Some(min),
             max: Some(max),
+            option_0_label: None,
+            option_1_label: None,
         }
     }
 

@@ -32,7 +32,7 @@ fatality = "0.1.1"
 futures = { workspace = true }
 hashlink = { version = "0.10.0", features = ["serde_impl"] }
 fraction = { workspace = true }
-heed = "0.21.0"
+heed = { version = "0.21.0", features = ["read-txn-no-tls"] }
 hex = { workspace = true, features = ["serde"] }
 hex-literal = "0.4.1"
 itertools = { workspace = true }

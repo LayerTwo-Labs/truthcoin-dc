@@ -9,11 +9,11 @@ use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
 use crate::{
     authorization::Authorization,
     types::{
-        Address, AmountOverflowError, Authorized, AuthorizedTransaction,
-        BlockHash, Body, FilledOutput, FilledTransaction, GetAddress as _,
-        GetBitcoinValue as _, Header, InPoint, M6id, MerkleRoot, OutPoint,
-        SpentOutput, Transaction, VERSION, Verify as _, Version,
-        WithdrawalBundle, WithdrawalBundleStatus,
+        Address, AmountOverflowError, AmountUnderflowError, Authorized,
+        AuthorizedTransaction, BlockHash, Body, FilledOutput,
+        FilledTransaction, GetAddress as _, GetBitcoinValue as _, Header,
+        InPoint, M6id, MerkleRoot, OutPoint, SpentOutput, Transaction, VERSION,
+        Verify as _, Version, WithdrawalBundle, WithdrawalBundleStatus,
         proto::mainchain::TwoWayPegData,
     },
     util::Watchable,
@@ -57,6 +57,7 @@ pub mod markets;
 mod rollback;
 pub mod slots;
 pub mod type_aliases;
+pub mod undo;
 use slots::{Decision, SlotId};
 mod two_way_peg_data;
 pub mod votecoin;
@@ -68,7 +69,7 @@ pub use markets::{
     MarketsDatabase, ShareAccount,
 };
 use rollback::{HeightStamped, RollBack};
-pub use slots::{period_to_name, timestamp_to_period};
+pub use slots::period_to_name;
 pub use voting::VotingSystem;
 
 pub const WITHDRAWAL_BUNDLE_FAILURE_GAP: u32 = 4;
@@ -104,6 +105,7 @@ pub struct State {
     tip: DatabaseUnique<UnitKey, SerdeBincode<BlockHash>>,
     height: DatabaseUnique<UnitKey, SerdeBincode<u32>>,
     mainchain_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
+    genesis_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
     votecoin: votecoin::Dbs,
     slots: slots::Dbs,
     markets: MarketsDatabase,
@@ -127,6 +129,19 @@ pub struct State {
     >,
     votecoin_balances: DatabaseUnique<SerdeBincode<Address>, SerdeBincode<u32>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
+    // Undo databases for disconnect_tip chain reorganization support
+    ossification_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::OssificationUndoData>,
+    >,
+    consensus_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::ConsensusUndoData>,
+    >,
+    consolidation_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::ConsolidationUndoData>,
+    >,
 }
 
 impl SlotValidationInterface for State {
@@ -137,6 +152,7 @@ impl SlotValidationInterface for State {
         decision: &Decision,
         current_ts: u64,
         current_height: Option<u32>,
+        genesis_ts: u64,
     ) -> Result<(), Error> {
         self.slots().validate_slot_claim(
             rotxn,
@@ -144,11 +160,26 @@ impl SlotValidationInterface for State {
             decision,
             current_ts,
             current_height,
+            genesis_ts,
         )
     }
 
     fn try_get_height(&self, rotxn: &RoTxn) -> Result<Option<u32>, Error> {
         self.try_get_height(rotxn)
+    }
+
+    fn try_get_genesis_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        self.try_get_genesis_timestamp(rotxn)
+    }
+
+    fn try_get_mainchain_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        self.try_get_mainchain_timestamp(rotxn)
     }
 }
 
@@ -157,16 +188,29 @@ impl State {
         + slots::Dbs::NUM_DBS
         + MarketsDatabase::NUM_DBS
         + VotingSystem::NUM_DBS
-        + 15;
+        + 19; // 16 base + 3 undo databases
 
-    pub fn new(env: &sneed::Env) -> Result<Self, Error> {
+    pub fn new(
+        env: &sneed::Env,
+        slot_config_testing: Option<u32>,
+    ) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
         let tip = DatabaseUnique::create(env, &mut rwtxn, "tip")?;
         let height = DatabaseUnique::create(env, &mut rwtxn, "height")?;
         let mainchain_timestamp =
             DatabaseUnique::create(env, &mut rwtxn, "mainchain_timestamp")?;
+        let genesis_timestamp =
+            DatabaseUnique::create(env, &mut rwtxn, "genesis_timestamp")?;
         let votecoin = votecoin::Dbs::new(env, &mut rwtxn)?;
-        let slots = slots::Dbs::new(env, &mut rwtxn)?;
+        let slots = if let Some(blocks_per_period) = slot_config_testing {
+            slots::Dbs::new_with_config(
+                env,
+                &mut rwtxn,
+                slots::SlotConfig::testing(blocks_per_period),
+            )?
+        } else {
+            slots::Dbs::new(env, &mut rwtxn)?
+        };
         let markets = MarketsDatabase::new(env, &mut rwtxn)?;
         let voting = VotingSystem::new(env, &mut rwtxn)?;
         let utxos = DatabaseUnique::create(env, &mut rwtxn, "utxos")?;
@@ -198,11 +242,18 @@ impl State {
         if version.try_get(&rwtxn, &())?.is_none() {
             version.put(&mut rwtxn, &(), &*VERSION)?;
         }
+        let ossification_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "ossification_undo")?;
+        let consensus_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "consensus_undo")?;
+        let consolidation_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "consolidation_undo")?;
         rwtxn.commit()?;
         Ok(Self {
             tip,
             height,
             mainchain_timestamp,
+            genesis_timestamp,
             votecoin,
             slots,
             markets,
@@ -217,6 +268,9 @@ impl State {
             deposit_blocks,
             votecoin_balances,
             _version: version,
+            ossification_undo,
+            consensus_undo,
+            consolidation_undo,
         })
     }
 
@@ -286,6 +340,14 @@ impl State {
         Ok(timestamp)
     }
 
+    pub fn try_get_genesis_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        let timestamp = self.genesis_timestamp.try_get(rotxn, &())?;
+        Ok(timestamp)
+    }
+
     pub fn get_utxos(
         &self,
         rotxn: &RoTxn,
@@ -342,7 +404,9 @@ impl UtxoManager for State {
                 .votecoin_balances
                 .try_get(rwtxn, &filled_output.address)?
                 .unwrap_or(0);
-            let new_balance = current_balance.saturating_add(*amount);
+            let new_balance = current_balance
+                .checked_add(*amount)
+                .ok_or(AmountOverflowError)?;
             self.votecoin_balances.put(
                 rwtxn,
                 &filled_output.address,
@@ -373,7 +437,9 @@ impl UtxoManager for State {
                 .votecoin_balances
                 .try_get(rwtxn, &filled_output.address)?
                 .unwrap_or(0);
-            let new_balance = current_balance.saturating_sub(*amount);
+            let new_balance = current_balance
+                .checked_sub(*amount)
+                .ok_or(AmountUnderflowError)?;
             self.votecoin_balances.put(
                 rwtxn,
                 &filled_output.address,
@@ -401,7 +467,9 @@ impl UtxoManager for State {
                     .votecoin_balances
                     .try_get(rwtxn, &filled_output.address)?
                     .unwrap_or(0);
-                let restored_balance = current_balance.saturating_add(*amount);
+                let restored_balance = current_balance
+                    .checked_add(*amount)
+                    .ok_or(AmountOverflowError)?;
                 self.votecoin_balances.put(
                     rwtxn,
                     &filled_output.address,
@@ -445,7 +513,9 @@ impl UtxoManager for State {
                 .votecoin_balances
                 .try_get(rwtxn, &filled_output.address)?
                 .unwrap_or(0);
-            let new_balance = current_balance.saturating_add(*amount);
+            let new_balance = current_balance
+                .checked_add(*amount)
+                .ok_or(AmountOverflowError)?;
             self.votecoin_balances.put(
                 rwtxn,
                 &filled_output.address,
@@ -475,7 +545,9 @@ impl UtxoManager for State {
                 .votecoin_balances
                 .try_get(rwtxn, &filled_output.address)?
                 .unwrap_or(0);
-            let new_balance = current_balance.saturating_sub(*amount);
+            let new_balance = current_balance
+                .checked_sub(*amount)
+                .ok_or(AmountUnderflowError)?;
             self.votecoin_balances.put(
                 rwtxn,
                 &filled_output.address,
@@ -501,7 +573,9 @@ impl UtxoManager for State {
                     .votecoin_balances
                     .try_get(rwtxn, &filled_output.address)?
                     .unwrap_or(0);
-                let restored_balance = current_balance.saturating_add(*amount);
+                let restored_balance = current_balance
+                    .checked_add(*amount)
+                    .ok_or(AmountOverflowError)?;
                 self.votecoin_balances.put(
                     rwtxn,
                     &filled_output.address,
@@ -519,7 +593,7 @@ impl State {
         &self,
         rotxn: &RoTxn,
         market_id: &crate::state::markets::MarketId,
-    ) -> Result<Option<ndarray::Array1<f64>>, Error> {
+    ) -> Result<Option<ndarray::Array1<i64>>, Error> {
         self.markets.get_mempool_shares(rotxn, market_id)
     }
 
@@ -527,7 +601,7 @@ impl State {
         &self,
         rwtxn: &mut RwTxn,
         market_id: &crate::state::markets::MarketId,
-        shares: &ndarray::Array1<f64>,
+        shares: &ndarray::Array1<i64>,
     ) -> Result<(), Error> {
         self.markets.put_mempool_shares(rwtxn, market_id, shares)
     }
@@ -724,6 +798,7 @@ impl State {
         tx: &FilledTransaction,
         override_height: Option<u32>,
     ) -> Result<bitcoin::Amount, Error> {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
         use crate::validation::VoteValidator;
 
         let () = self.validate_votecoin(rotxn, tx, override_height)?;
@@ -742,6 +817,7 @@ impl State {
 
         if tx.is_trade() {
             self.validate_trade(rotxn, tx, override_height)?;
+            return Ok(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS));
         }
 
         if tx.is_submit_vote() {
@@ -780,6 +856,11 @@ impl State {
                         .to_string(),
                 });
             }
+            crate::validation::VoterValidator::validate_voter_not_registered(
+                self,
+                rotxn,
+                voter_address,
+            )?;
         }
 
         tx.bitcoin_fee()?.ok_or(Error::NotEnoughValueIn)
@@ -971,25 +1052,36 @@ impl State {
         two_way_peg_data::disconnect(self, rwtxn, two_way_peg_data)
     }
 
-    pub fn get_all_slot_quarters(
+    pub fn get_all_slot_periods(
         &self,
         rotxn: &RoTxn,
     ) -> Result<Vec<(u32, u64)>, Error> {
         let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
         let current_height = self.try_get_height(rotxn)?;
-        self.slots
-            .get_active_periods(rotxn, current_ts, current_height)
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.get_active_periods(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
     }
 
-    pub fn get_slots_for_quarter(
+    pub fn get_slots_for_period(
         &self,
         rotxn: &RoTxn,
-        quarter: u32,
+        period: u32,
     ) -> Result<u64, Error> {
         let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
         let current_height = self.try_get_height(rotxn)?;
-        self.slots
-            .total_for(rotxn, quarter, current_ts, current_height)
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.total_for(
+            rotxn,
+            period,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
     }
 
     pub fn get_available_slots_in_period(
@@ -999,11 +1091,13 @@ impl State {
     ) -> Result<Vec<crate::state::slots::SlotId>, Error> {
         let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
         let current_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
         self.slots.get_available_slots_in_period(
             rotxn,
             period_index,
             current_ts,
             current_height,
+            genesis_ts,
         )
     }
 
@@ -1013,8 +1107,13 @@ impl State {
     ) -> Result<Vec<crate::state::slots::Slot>, Error> {
         let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
         let current_height = self.try_get_height(rotxn)?;
-        self.slots
-            .get_ossified_slots(rotxn, current_ts, current_height)
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.get_ossified_slots(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
     }
 
     pub fn is_slot_in_voting(
@@ -1031,8 +1130,13 @@ impl State {
     ) -> Result<Vec<(u32, u64, u64)>, Error> {
         let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
         let current_height = self.try_get_height(rotxn)?;
-        self.slots
-            .get_voting_periods(rotxn, current_ts, current_height)
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.get_voting_periods(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
     }
 
     pub fn get_period_summary(
@@ -1041,8 +1145,13 @@ impl State {
     ) -> Result<type_aliases::PeriodSummary, Error> {
         let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
         let current_height = self.try_get_height(rotxn)?;
-        self.slots
-            .get_period_summary(rotxn, current_ts, current_height)
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.get_period_summary(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
     }
 
     pub fn get_claimed_slot_count_in_period(

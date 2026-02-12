@@ -26,9 +26,7 @@ use crate::{
         trading,
     },
     state::markets::{
-        DEFAULT_MARKET_BETA, DimensionSpec, MarketId,
-        generate_market_author_fee_address, generate_market_treasury_address,
-        parse_dimensions,
+        DEFAULT_MARKET_BETA, DimensionSpec, MarketId, parse_dimensions,
     },
     types::{
         Address, AmountOverflowError, AmountUnderflowError, AssetId,
@@ -49,6 +47,8 @@ pub struct SlotClaimInput {
     pub question: String,
     pub min: Option<i64>,
     pub max: Option<i64>,
+    pub option_0_label: Option<String>,
+    pub option_1_label: Option<String>,
 }
 
 /// Input struct for claiming multiple slots as a category.
@@ -795,6 +795,8 @@ impl Wallet {
             question,
             min,
             max,
+            option_0_label,
+            option_1_label,
         } = input;
 
         let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
@@ -819,6 +821,8 @@ impl Wallet {
             question,
             min,
             max,
+            option_0_label,
+            option_1_label,
         });
 
         Ok(tx)
@@ -1056,94 +1060,29 @@ impl Wallet {
         Ok((tx, market_id))
     }
 
-    /// # Arguments
-    /// * `market_id` - The market to trade in
-    /// * `outcome_index` - The outcome to trade shares for
-    /// * `shares` - Number of shares to trade (positive = buy, negative = sell)
-    /// * `trader` - The trader address (required for sell ownership validation)
-    /// * `limit_sats` - Slippage limit: max_cost for buy, min_proceeds for sell
-    /// * `base_sats` - LMSR base cost/proceeds (absolute)
-    /// * `fee_sats` - Trading fee (absolute)
-    /// * `tx_fee` - Transaction fee for the miner
-    #[allow(clippy::too_many_arguments)]
     pub fn trade(
         &self,
         market_id: crate::state::markets::MarketId,
         outcome_index: usize,
-        shares: f64,
+        shares: i64,
         trader: Address,
         limit_sats: u64,
-        base_sats: u64,
-        fee_sats: u64,
-        tx_fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
-        let market_id_bytes = *market_id.as_bytes();
-        let is_buy = shares > 0.0;
+        let is_buy = shares > 0;
 
-        let (inputs, outputs, change_address) = if is_buy {
-            // Buy: need to pay base_sats + fee_sats to market + tx_fee
-            let total_market_cost =
-                bitcoin::Amount::from_sat(base_sats + fee_sats);
-            let total_cost = tx_fee
-                .checked_add(total_market_cost)
-                .ok_or(AmountOverflowError)?;
+        let inputs = if is_buy {
+            let (_total_bitcoin, bitcoin_utxos) =
+                self.select_bitcoins(bitcoin::Amount::from_sat(limit_sats))?;
 
-            let (total_bitcoin, bitcoin_utxos) =
-                self.select_bitcoins(total_cost)?;
-            let change = total_bitcoin - total_cost;
-
-            // Sort UTXOs for deterministic ordering
             let mut utxo_vec: Vec<_> = bitcoin_utxos.into_iter().collect();
             utxo_vec.sort_by_key(|(outpoint, _)| *outpoint);
-
-            let inputs: Vec<_> =
-                utxo_vec.into_iter().map(|(outpoint, _)| outpoint).collect();
-            let mut outputs = Vec::new();
-
-            // Treasury output (MarketFunds with is_fee=false)
-            let treasury_address = generate_market_treasury_address(&market_id);
-            outputs.push(Output::new(
-                treasury_address,
-                OutputContent::MarketFunds {
-                    market_id: market_id_bytes,
-                    amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
-                        base_sats,
-                    )),
-                    is_fee: false,
-                },
-            ));
-
-            // Author fee output (MarketFunds with is_fee=true)
-            let fee_address = generate_market_author_fee_address(&market_id);
-            outputs.push(Output::new(
-                fee_address,
-                OutputContent::MarketFunds {
-                    market_id: market_id_bytes,
-                    amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
-                        fee_sats,
-                    )),
-                    is_fee: true,
-                },
-            ));
-
-            // Change output goes to trader address (same as where shares are credited)
-            // This ensures the address has Bitcoin for future sells
-            if change > bitcoin::Amount::ZERO {
-                outputs.push(Output::new(
-                    trader,
-                    OutputContent::Bitcoin(BitcoinOutputContent(change)),
-                ));
-            }
-
-            (inputs, outputs, trader)
+            utxo_vec.into_iter().map(|(outpoint, _)| outpoint).collect()
         } else {
-            // Sell: only need tx_fee, payout comes from treasury during block connection.
-            let (total_bitcoin, bitcoin_utxos) =
-                self.select_bitcoins_for_sell(tx_fee, trader)?;
-            let change = total_bitcoin - tx_fee;
+            let min_fee =
+                bitcoin::Amount::from_sat(trading::TRADE_MINER_FEE_SATS);
+            let (_total_bitcoin, bitcoin_utxos) =
+                self.select_bitcoins_for_sell(min_fee, trader)?;
 
-            // Sort UTXOs for deterministic ordering, but keep trader's UTXOs first
-            // to ensure validation sees ownership proof
             let mut trader_utxos: Vec<_> = bitcoin_utxos
                 .iter()
                 .filter(|(_, o)| o.address == trader)
@@ -1157,37 +1096,20 @@ impl Wallet {
             trader_utxos.sort_by_key(|(outpoint, _)| *outpoint);
             other_utxos.sort_by_key(|(outpoint, _)| *outpoint);
 
-            // Combine with trader UTXOs first
             let mut utxo_vec = trader_utxos;
             utxo_vec.extend(other_utxos);
-
-            // Change goes back to trader address
-            let inputs: Vec<_> =
-                utxo_vec.into_iter().map(|(op, _)| op).collect();
-            let mut outputs = Vec::new();
-
-            // Only output is change (if any) - send to trader
-            if change > bitcoin::Amount::ZERO {
-                outputs.push(Output::new(
-                    trader,
-                    OutputContent::Bitcoin(BitcoinOutputContent(change)),
-                ));
-            }
-
-            (inputs, outputs, trader)
+            utxo_vec.into_iter().map(|(op, _)| op).collect()
         };
 
-        let _ = change_address; // Used for logging if needed
+        let outputs = Vec::new();
 
         let mut tx = Transaction::new(inputs, outputs);
         tx.data = Some(TxData::Trade {
-            market_id: MarketId::new(market_id_bytes),
+            market_id: MarketId::new(*market_id.as_bytes()),
             outcome_index: outcome_index as u32,
             shares,
             trader,
             limit_sats,
-            base_sats,
-            fee_sats,
         });
 
         Ok(tx)

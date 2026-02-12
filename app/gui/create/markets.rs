@@ -77,7 +77,7 @@ impl CreateMarket {
         self.claimed_slots.clear();
         self.category_slots.clear();
 
-        let periods = match app.node.get_all_slot_quarters() {
+        let periods = match app.node.get_all_slot_periods() {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -151,7 +151,6 @@ impl CreateMarket {
                 }
 
                 if dim.is_categorical && non_empty.len() >= 2 {
-                    // Categorical: [slot1,slot2,slot3]
                     Some(format!(
                         "[{}]",
                         non_empty
@@ -161,7 +160,6 @@ impl CreateMarket {
                             .join(",")
                     ))
                 } else if !non_empty.is_empty() {
-                    // Single: just the slot id
                     Some(non_empty[0].clone())
                 } else {
                     None
@@ -293,7 +291,7 @@ impl CreateMarket {
             title: self.title.clone(),
             description: self.description.clone(),
             dimensions: dimensions_str,
-            beta: None, // Derived from initial_liquidity in wallet
+            beta: None,
             trading_fee,
             tags,
             initial_liquidity,
@@ -330,20 +328,17 @@ impl CreateMarket {
             return;
         };
 
-        // Always load fresh slots from node to catch new blocks
         self.load_claimed_slots(app);
 
         ui.heading("Create Prediction Market");
         ui.separator();
 
-        // Success message
         if let Some(msg) = &self.success_message {
             ui.colored_label(egui::Color32::GREEN, msg);
             ui.add_space(10.0);
         }
 
         ScrollArea::vertical().show(ui, |ui| {
-            // Basic info
             egui::Grid::new("create_market_basic")
                 .num_columns(2)
                 .spacing([10.0, 8.0])
