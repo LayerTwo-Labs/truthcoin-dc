@@ -485,6 +485,7 @@ pub mod mainchain {
         pub prev_block_hash: BlockHash,
         pub height: u32,
         pub work: Work,
+        pub timestamp: u64,
     }
 
     #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -839,6 +840,7 @@ pub mod mainchain {
                 prev_block_hash,
                 height,
                 work,
+                timestamp,
             } = header_info;
             let block_hash = block_hash
                 .as_ref()
@@ -870,6 +872,7 @@ pub mod mainchain {
                 prev_block_hash,
                 height: *height,
                 work,
+                timestamp: *timestamp,
             })
         }
     }

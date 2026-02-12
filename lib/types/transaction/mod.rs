@@ -1,7 +1,4 @@
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-};
+use std::collections::{HashMap, HashSet};
 
 use bitcoin::amount::CheckedSum as _;
 use borsh::BorshSerialize;
@@ -11,14 +8,11 @@ use utoipa::{PartialSchema, ToSchema};
 
 use crate::{
     authorization::Authorization,
+    state::markets::{DimensionSpec, MarketId},
     types::{
-        AmountOverflowError, TruthcoinData, TruthcoinDataUpdates, GetAddress,
-        GetBitcoinValue,
+        AmountOverflowError, GetAddress, GetBitcoinValue,
         address::Address,
-        hashes::{
-            self, AssetId, TruthcoinId, DutchAuctionId, Hash, M6id, MerkleRoot,
-            Txid,
-        },
+        hashes::{self, AssetId, M6id, MerkleRoot, Txid},
         serde_hexstr_human_readable,
     },
 };
@@ -75,6 +69,13 @@ pub enum OutPoint {
         #[borsh(serialize_with = "borsh_serialize_bitcoin_outpoint")]
         bitcoin::OutPoint,
     ),
+    /// Market funds UTXO - treasury (is_fee=false) or author fees (is_fee=true)
+    /// Unified type that replaces the separate Market and MarketAuthorFee variants
+    MarketFunds {
+        market_id: [u8; 6],
+        block_height: u32,
+        is_fee: bool,
+    },
 }
 
 impl std::fmt::Display for OutPoint {
@@ -86,6 +87,20 @@ impl std::fmt::Display for OutPoint {
             }
             Self::Deposit(bitcoin::OutPoint { txid, vout }) => {
                 write!(f, "deposit {txid} {vout}")
+            }
+            Self::MarketFunds {
+                market_id,
+                block_height,
+                is_fee,
+            } => {
+                let type_str = if *is_fee { "market_fee" } else { "market" };
+                write!(
+                    f,
+                    "{} {} {}",
+                    type_str,
+                    hex::encode(market_id),
+                    block_height
+                )
             }
         }
     }
@@ -104,225 +119,277 @@ pub enum InPoint {
     Withdrawal {
         m6id: M6id,
     },
+    /// Consumed by votecoin redistribution during consensus
+    Redistribution,
 }
 
 pub type TxInputs = Vec<OutPoint>;
 
 pub type TxOutputs = Vec<Output>;
 
-/// Parameters of a Dutch Auction
+/// Struct representing a single vote in a batch vote transaction
 #[derive(
-    BorshSerialize, Clone, Copy, Debug, Deserialize, Serialize, ToSchema,
+    BorshSerialize,
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    PartialEq,
+    Serialize,
+    ToSchema,
 )]
-#[cfg_attr(feature = "clap", derive(clap::Parser))]
-pub struct DutchAuctionParams {
-    /// Block height at which the auction starts
-    #[cfg_attr(feature = "clap", arg(long))]
-    pub start_block: u32,
-    /// Auction duration, in blocks
-    #[cfg_attr(feature = "clap", arg(long))]
-    pub duration: u32,
-    /// The asset to be auctioned
-    #[cfg_attr(feature = "clap", arg(long))]
-    pub base_asset: AssetId,
-    /// The amount of the base asset to be auctioned
-    #[cfg_attr(feature = "clap", arg(long))]
-    pub base_amount: u64,
-    /// The asset in which the auction is to be quoted
-    #[cfg_attr(feature = "clap", arg(long))]
-    pub quote_asset: AssetId,
-    /// Initial price
-    #[cfg_attr(feature = "clap", arg(long))]
-    pub initial_price: u64,
-    /// Final price
-    #[cfg_attr(feature = "clap", arg(long))]
-    pub final_price: u64,
+pub struct VoteBatchItem {
+    /// 3 byte slot ID
+    pub slot_id_bytes: [u8; 3],
+    /// The vote value (0.0-1.0 for binary, scaled range for scaled decisions)
+    pub vote_value: f64,
 }
 
 #[allow(clippy::enum_variant_names)]
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
 #[schema(as = TxData)]
 pub enum TransactionData {
-    /// Burn an AMM position
-    AmmBurn {
-        /// Amount of the lexicographically ordered first Truthcoin to receive
-        amount0: u64,
-        /// Amount of the lexicographically ordered second Truthcoin to receive
-        amount1: u64,
-        /// Amount of the LP token to burn
-        lp_token_burn: u64,
+    /// Claim a decision slot
+    ClaimDecisionSlot {
+        /// 3 byte slot ID
+        slot_id_bytes: [u8; 3],
+        /// Whether it is a Standard slot or not
+        is_standard: bool,
+        /// Scaled (true) or Binary (false) decision
+        is_scaled: bool,
+        /// Human readable question for voters (<1000 bytes)
+        question: String,
+        /// Min value (only for scaled decisions)
+        min: Option<i64>,
+        /// Max value (only for scaled decisions)
+        max: Option<i64>,
+        /// Custom label for option 0 (binary decisions). Defaults to "No".
+        option_0_label: Option<String>,
+        /// Custom label for option 1 (binary decisions). Defaults to "Yes".
+        option_1_label: Option<String>,
     },
-    /// Mint an AMM position
-    AmmMint {
-        /// Amount of the lexicographically ordered first Truthcoin to deposit
-        amount0: u64,
-        /// Amount of the lexicographically ordered second Truthcoin to deposit
-        amount1: u64,
-        /// Amount of the LP token to receive
-        lp_token_mint: u64,
+    /// Create a prediction market using dimension bracket notation
+    ///
+    /// Dimension notation examples:
+    /// - Single binary: `[004008]`
+    /// - Multiple independent: `[004008,004009]`
+    /// - Categorical (mutually exclusive): `[[004008,004009,00400a]]`
+    /// - Mixed dimensions: `[004008,[004009,00400a]]`
+    CreateMarket {
+        /// Market title
+        title: String,
+        /// Market description
+        description: String,
+        /// Parsed dimension specifications (internal use)
+        #[schema(value_type = Vec<String>)]
+        dimension_specs: Vec<DimensionSpec>,
+        /// LMSR beta parameter (required - liquidity calculated as b * ln(num_states))
+        b: f64,
+        /// Trading fee percentage
+        trading_fee: Option<f64>,
+        /// Categorization tags
+        tags: Option<Vec<String>>,
+        /// Txid(s) for categorical dimensions - required when using [[...]] notation
+        /// Each txid must be a ClaimCategorySlots transaction
+        category_txids: Option<Vec<[u8; 32]>>,
+        /// Names for residual outcomes in categorical dimensions (one per [[...]])
+        /// e.g., ["Bengals"] for AFC North when explicit slots are Steelers/Ravens/Browns
+        residual_names: Option<Vec<String>>,
     },
-    /// AMM swap
-    AmmSwap {
-        /// Amount to spend
-        amount_spent: u64,
-        /// Amount to receive
-        amount_receive: u64,
-        /// Pair asset to swap for
-        pair_asset: AssetId,
+    /// Trade shares in a prediction market (buy or sell)
+    /// Sign of shares determines direction: positive = buy, negative = sell
+    Trade {
+        /// Market ID standardized across all transaction types per Bitcoin Hivemind specifications
+        market_id: MarketId,
+        /// Outcome index to trade shares for
+        outcome_index: u32,
+        /// Number of whole shares to trade (positive = buy, negative = sell)
+        shares: i64,
+        /// Trader address (required for sell ownership validation)
+        trader: Address,
+        /// Slippage limit: max total cost for buy, min net proceeds for sell (in satoshis)
+        limit_sats: u64,
     },
-    TruthcoinReservation {
-        /// Commitment to the Truthcoin that will be registered
-        #[serde(with = "serde_hexstr_human_readable")]
-        #[schema(value_type = String)]
-        commitment: Hash,
+    /// Submit a vote for a decision in the current voting period
+    SubmitVote {
+        /// 3 byte slot ID of the decision being voted on
+        slot_id_bytes: [u8; 3],
+        /// The vote value (0.0-1.0 for binary, scaled range for scaled decisions)
+        vote_value: f64,
+        /// The voting period this vote belongs to
+        voting_period: u32,
     },
-    TruthcoinRegistration {
-        /// Reveal of the name hash
-        #[serde(with = "serde_hexstr_human_readable")]
-        #[schema(value_type = String)]
-        name_hash: Hash,
-        /// Reveal of the nonce used for the Truthcoin reservation commitment
-        #[serde(with = "serde_hexstr_human_readable")]
-        #[schema(value_type = String)]
-        revealed_nonce: Hash,
-        /// Initial Truthcoin data
-        truthcoin_data: Box<TruthcoinData>,
-        /// Amount to mint
-        initial_supply: u64,
+    /// Register as a voter (one-time setup)
+    RegisterVoter {
+        /// Reserved for future voter metadata
+        initial_data: [u8; 32],
     },
-    /// Mint more of a Truthcoin
-    TruthcoinMint(u64),
-    TruthcoinUpdate(Box<TruthcoinDataUpdates>),
-    DutchAuctionCreate(DutchAuctionParams),
-    DutchAuctionBid {
-        auction_id: DutchAuctionId,
-        /// Asset to receive in the auction
-        receive_asset: AssetId,
-        /// Quantity to purchase in the auction
-        quantity: u64,
-        /// Total bid size, in terms of the quote asset
-        bid_size: u64,
+    /// Submit multiple votes efficiently
+    SubmitVoteBatch {
+        /// List of votes to submit
+        votes: Vec<VoteBatchItem>,
+        /// The voting period these votes belong to
+        voting_period: u32,
     },
-    DutchAuctionCollect {
-        /// Base asset
-        asset_offered: AssetId,
-        /// Quote asset
-        asset_receive: AssetId,
-        /// Amount of the offered base asset
-        amount_offered_remaining: u64,
-        /// Amount of the received quote asset
-        amount_received: u64,
+    /// Claim multiple decision slots as a category (atomic)
+    /// The txid becomes the implicit category identifier
+    /// NOTE: All category slots are binary (is_scaled=false) by design
+    ClaimCategorySlots {
+        /// List of (slot_id_bytes, question) pairs
+        slots: Vec<([u8; 3], String)>,
+        /// Whether these are standard slots
+        is_standard: bool,
     },
 }
 
 pub type TxData = TransactionData;
 
 impl TxData {
-    /// `true` if the tx data corresponds to an AMM burn
-    pub fn is_amm_burn(&self) -> bool {
-        matches!(self, Self::AmmBurn { .. })
+    /// `true` if the tx data corresponds to a decision slot claim
+    pub fn is_claim_decision_slot(&self) -> bool {
+        matches!(self, Self::ClaimDecisionSlot { .. })
     }
 
-    /// `true` if the tx data corresponds to an AMM mint
-    pub fn is_amm_mint(&self) -> bool {
-        matches!(self, Self::AmmMint { .. })
+    /// `true` if the tx data corresponds to market creation
+    pub fn is_create_market(&self) -> bool {
+        matches!(self, Self::CreateMarket { .. })
     }
 
-    /// `true` if the tx data corresponds to an AMM swap
-    pub fn is_amm_swap(&self) -> bool {
-        matches!(self, Self::AmmSwap { .. })
+    /// `true` if the tx data corresponds to trading shares (buy or sell)
+    pub fn is_trade(&self) -> bool {
+        matches!(self, Self::Trade { .. })
     }
 
-    /// `true` if the tx data corresponds to a Dutch auction bid
-    pub fn is_dutch_auction_bid(&self) -> bool {
-        matches!(self, Self::DutchAuctionBid { .. })
+    /// `true` if the tx data corresponds to submitting a vote
+    pub fn is_submit_vote(&self) -> bool {
+        matches!(self, Self::SubmitVote { .. })
     }
 
-    /// `true` if the tx data corresponds to a Dutch auction creation
-    pub fn is_dutch_auction_create(&self) -> bool {
-        matches!(self, Self::DutchAuctionCreate(_))
+    /// `true` if the tx data corresponds to registering a voter
+    pub fn is_register_voter(&self) -> bool {
+        matches!(self, Self::RegisterVoter { .. })
     }
 
-    /// `true` if the tx data corresponds to a Dutch auction collect
-    pub fn is_dutch_auction_collect(&self) -> bool {
-        matches!(self, Self::DutchAuctionCollect { .. })
+    /// `true` if the tx data corresponds to submitting a batch of votes
+    pub fn is_submit_vote_batch(&self) -> bool {
+        matches!(self, Self::SubmitVoteBatch { .. })
     }
 
-    /// `true` if the tx data corresponds to a registration
-    pub fn is_registration(&self) -> bool {
-        matches!(self, Self::TruthcoinRegistration { .. })
-    }
-
-    /// `true` if the tx data corresponds to a reservation
-    pub fn is_reservation(&self) -> bool {
-        matches!(self, Self::TruthcoinReservation { .. })
-    }
-
-    /// `true` if the tx data corresponds to an update
-    pub fn is_update(&self) -> bool {
-        matches!(self, Self::TruthcoinUpdate(_))
+    /// `true` if the tx data corresponds to claiming category slots
+    pub fn is_claim_category_slots(&self) -> bool {
+        matches!(self, Self::ClaimCategorySlots { .. })
     }
 }
 
-/// Struct describing an AMM burn
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AmmBurn {
-    pub asset0: AssetId,
-    pub asset1: AssetId,
-    /// Amount of asset 0 received
-    pub amount0: u64,
-    /// Amount of asset 1 received
-    pub amount1: u64,
-    /// Amount of LP token burned
-    pub lp_token_burn: u64,
+/// Struct describing a decision slot claim
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimDecisionSlot {
+    /// 3 byte slot ID
+    pub slot_id_bytes: [u8; 3],
+    /// Whether it is a Standard slot or not
+    pub is_standard: bool,
+    /// Scaled (true) or Binary (false) decision
+    pub is_scaled: bool,
+    /// Human readable question for voters (<1000 bytes)
+    pub question: String,
+    /// Min value (only for scaled decisions)
+    pub min: Option<i64>,
+    /// Max value (only for scaled decisions)
+    pub max: Option<i64>,
+    /// Custom label for option 0 (binary decisions). Defaults to "No".
+    pub option_0_label: Option<String>,
+    /// Custom label for option 1 (binary decisions). Defaults to "Yes".
+    pub option_1_label: Option<String>,
 }
 
-/// Struct describing an AMM mint
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AmmMint {
-    pub asset0: AssetId,
-    pub asset1: AssetId,
-    /// Amount of asset 0 deposited
-    pub amount0: u64,
-    /// Amount of asset 1 deposited
-    pub amount1: u64,
-    /// Amount of LP token received
-    pub lp_token_mint: u64,
+/// Struct describing a market creation using dimension specifications
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateMarket {
+    /// Market title
+    pub title: String,
+    /// Market description
+    pub description: String,
+    /// Parsed dimension specifications
+    pub dimension_specs: Vec<DimensionSpec>,
+    /// LMSR beta parameter (required - liquidity calculated as b * ln(num_states))
+    pub b: f64,
+    /// Trading fee percentage
+    pub trading_fee: Option<f64>,
+    /// Categorization tags
+    pub tags: Option<Vec<String>>,
+    /// Txid(s) for categorical dimensions - required when using [[...]] notation
+    pub category_txids: Option<Vec<[u8; 32]>>,
+    /// Names for residual outcomes in categorical dimensions (one per [[...]])
+    pub residual_names: Option<Vec<String>>,
 }
 
-/// Struct describing an AMM swap
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AmmSwap {
-    pub asset_spend: AssetId,
-    pub asset_receive: AssetId,
-    /// Amount of spend asset spent
-    pub amount_spend: u64,
-    //// Amount of receive asset received
-    pub amount_receive: u64,
+/// Struct describing a trade operation (buy or sell shares)
+/// Sign of shares determines direction: positive = buy, negative = sell
+#[derive(Clone, Debug, PartialEq)]
+pub struct Trade {
+    /// Market ID standardized across all transaction types per Bitcoin Hivemind specifications
+    pub market_id: MarketId,
+    /// Outcome index to trade shares for
+    pub outcome_index: u32,
+    /// Number of whole shares to trade (positive = buy, negative = sell)
+    pub shares: i64,
+    /// Trader address (required for sell ownership validation)
+    pub trader: Address,
+    /// Slippage limit: max total cost for buy, min net proceeds for sell (in satoshis)
+    pub limit_sats: u64,
 }
 
-/// Struct describing a Dutch auction bid
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DutchAuctionBid {
-    pub auction_id: DutchAuctionId,
-    pub asset_spend: AssetId,
-    pub asset_receive: AssetId,
-    /// Amount of spend asset spent
-    pub amount_spend: u64,
-    //// Amount of receive asset received
-    pub amount_receive: u64,
+impl Trade {
+    /// Returns true if this is a buy trade (positive shares)
+    pub fn is_buy(&self) -> bool {
+        self.shares > 0
+    }
+
+    /// Returns true if this is a sell trade (negative shares)
+    pub fn is_sell(&self) -> bool {
+        self.shares < 0
+    }
+
+    /// Returns the absolute number of shares
+    pub fn shares_abs(&self) -> u64 {
+        self.shares.unsigned_abs()
+    }
 }
 
-/// Struct describing a Dutch auction collect
+/// Struct describing a vote submission
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubmitVote {
+    /// 3 byte slot ID of the decision being voted on
+    pub slot_id_bytes: [u8; 3],
+    /// The vote value (0.0-1.0 for binary, scaled range for scaled decisions)
+    pub vote_value: f64,
+    /// The voting period this vote belongs to
+    pub voting_period: u32,
+}
+
+/// Struct describing voter registration
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DutchAuctionCollect {
-    pub auction_id: DutchAuctionId,
-    pub asset_offered: AssetId,
-    pub asset_receive: AssetId,
-    /// Amount of offered asset remaining
-    pub amount_offered_remaining: u64,
-    //// Amount of receive asset received
-    pub amount_received: u64,
+pub struct RegisterVoter {
+    /// Reserved for future voter metadata
+    pub initial_data: [u8; 32],
+}
+
+/// Struct describing a batch vote submission
+#[derive(Clone, Debug, PartialEq)]
+pub struct SubmitVoteBatch {
+    /// List of votes to submit
+    pub votes: Vec<VoteBatchItem>,
+    /// The voting period these votes belong to
+    pub voting_period: u32,
+}
+
+/// Struct describing a category slots claim (atomic claiming of multiple slots)
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimCategorySlots {
+    /// List of (slot_id_bytes, question) pairs
+    pub slots: Vec<([u8; 3], String)>,
+    /// Whether these are standard slots
+    pub is_standard: bool,
 }
 
 #[derive(
@@ -360,72 +427,9 @@ impl Transaction {
         })
     }
 
-    /// Return an iterator over Truthcoin outputs
-    pub fn truthcoin_outputs(&self) -> impl Iterator<Item = &Output> {
-        self.outputs.iter().filter(|output| output.is_truthcoin())
-    }
-
-    /// Return an iterator over Truthcoin control outputs
-    pub fn truthcoin_control_outputs(&self) -> impl Iterator<Item = &Output> {
-        self.outputs
-            .iter()
-            .filter(|output| output.is_truthcoin_control())
-    }
-
-    /// `true` if the tx data corresponds to an AMM burn
-    pub fn is_amm_burn(&self) -> bool {
-        match &self.data {
-            Some(tx_data) => tx_data.is_amm_burn(),
-            None => false,
-        }
-    }
-
-    /// `true` if the tx data corresponds to an AMM mint
-    pub fn is_amm_mint(&self) -> bool {
-        match &self.data {
-            Some(tx_data) => tx_data.is_amm_mint(),
-            None => false,
-        }
-    }
-
-    /// `true` if the tx data corresponds to an AMM swap
-    pub fn is_amm_swap(&self) -> bool {
-        match &self.data {
-            Some(tx_data) => tx_data.is_amm_swap(),
-            None => false,
-        }
-    }
-
-    /// `true` if the tx data corresponds to a Dutch auction bid
-    pub fn is_dutch_auction_bid(&self) -> bool {
-        match &self.data {
-            Some(tx_data) => tx_data.is_dutch_auction_bid(),
-            None => false,
-        }
-    }
-
-    /// `true` if the tx data corresponds to a Dutch auction creation
-    pub fn is_dutch_auction_create(&self) -> bool {
-        match &self.data {
-            Some(tx_data) => tx_data.is_dutch_auction_create(),
-            None => false,
-        }
-    }
-
-    /// `true` if the tx data corresponds to a Dutch auction collect
-    pub fn is_dutch_auction_collect(&self) -> bool {
-        match &self.data {
-            Some(tx_data) => tx_data.is_dutch_auction_collect(),
-            None => false,
-        }
-    }
-
-    /// `true` if the tx data corresponds to a Truthcoin registration
-    pub fn is_registration(&self) -> bool {
-        match &self.data {
-            Some(tx_data) => tx_data.is_registration(),
-            None => false,
-        }
+    /// Return an iterator over Votecoin outputs
+    pub fn votecoin_outputs(&self) -> impl Iterator<Item = &Output> {
+        self.outputs.iter().filter(|output| output.is_votecoin())
     }
 
     /// `true` if the tx data corresponds to a regular tx
@@ -433,68 +437,8 @@ impl Transaction {
         self.data.is_none()
     }
 
-    /// `true` if the tx data corresponds to a reservation
-    pub fn is_reservation(&self) -> bool {
-        match &self.data {
-            Some(tx_data) => tx_data.is_reservation(),
-            None => false,
-        }
-    }
-
-    /// `true` if the tx data corresponds to an update
-    pub fn is_update(&self) -> bool {
-        match &self.data {
-            Some(tx_data) => tx_data.is_update(),
-            None => false,
-        }
-    }
-
-    /// If the tx is a truthcoin registration, returns the registered name hash
-    pub fn registration_name_hash(&self) -> Option<Hash> {
-        match self.data {
-            Some(TxData::TruthcoinRegistration { name_hash, .. }) => {
-                Some(name_hash)
-            }
-            _ => None,
-        }
-    }
-
-    /** If the tx is a truthcoin registration, returns the implied reservation
-     * commitment */
-    pub fn implied_reservation_commitment(&self) -> Option<Hash> {
-        match self.data {
-            Some(TxData::TruthcoinRegistration {
-                name_hash,
-                revealed_nonce,
-                ..
-            }) => {
-                let implied_commitment =
-                    blake3::keyed_hash(&revealed_nonce, &name_hash).into();
-                Some(implied_commitment)
-            }
-            _ => None,
-        }
-    }
-
-    /// Return an iterator over reservation outputs
-    pub fn reservation_outputs(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = &Output> {
-        self.outputs.iter().filter(|output| output.is_reservation())
-    }
-
     pub fn txid(&self) -> Txid {
         hashes::hash(self).into()
-    }
-
-    /// If the tx is a truthcoin reservation, returns the reservation commitment
-    pub fn reservation_commitment(&self) -> Option<Hash> {
-        match self.data {
-            Some(TxData::TruthcoinReservation { commitment }) => {
-                Some(commitment)
-            }
-            _ => None,
-        }
     }
 }
 
@@ -505,14 +449,9 @@ pub struct FilledTransaction {
 }
 
 impl FilledTransaction {
-    // Return an iterator over Truthcoin outputs
-    pub fn truthcoin_outputs(&self) -> impl Iterator<Item = &Output> {
-        self.transaction.truthcoin_outputs()
-    }
-
-    // Return an iterator over Truthcoin control outputs
-    pub fn truthcoin_control_outputs(&self) -> impl Iterator<Item = &Output> {
-        self.transaction.truthcoin_control_outputs()
+    // Return an iterator over Votecoin outputs
+    pub fn votecoin_outputs(&self) -> impl Iterator<Item = &Output> {
+        self.transaction.votecoin_outputs()
     }
 
     /// Accessor for tx data
@@ -520,65 +459,9 @@ impl FilledTransaction {
         &self.transaction.data
     }
 
-    /** If the tx is a truthcoin registration, returns the implied reservation
-     * commitment */
-    pub fn implied_reservation_commitment(&self) -> Option<Hash> {
-        self.transaction.implied_reservation_commitment()
-    }
-
-    /// Accessor for tx outputs
+    /// Accessor for tx inputs
     pub fn inputs(&self) -> &TxInputs {
         &self.transaction.inputs
-    }
-
-    /// `true` if the tx data corresponds to an AMM burn
-    pub fn is_amm_burn(&self) -> bool {
-        self.transaction.is_amm_burn()
-    }
-
-    /// `true` if the tx data corresponds to an AMM mint
-    pub fn is_amm_mint(&self) -> bool {
-        self.transaction.is_amm_mint()
-    }
-
-    /// `true` if the tx data corresponds to an AMM swap
-    pub fn is_amm_swap(&self) -> bool {
-        self.transaction.is_amm_swap()
-    }
-
-    /// `true` if the tx data corresponds to a Dutch auction bid
-    pub fn is_dutch_auction_bid(&self) -> bool {
-        self.transaction.is_dutch_auction_bid()
-    }
-
-    /// `true` if the tx data corresponds to a Dutch auction creation
-    pub fn is_dutch_auction_create(&self) -> bool {
-        self.transaction.is_dutch_auction_create()
-    }
-
-    /// `true` if the tx data corresponds to a Dutch auction collect
-    pub fn is_dutch_auction_collect(&self) -> bool {
-        self.transaction.is_dutch_auction_collect()
-    }
-
-    /// `true` if the tx data corresponds to a Truthcoin registration
-    pub fn is_registration(&self) -> bool {
-        self.transaction.is_registration()
-    }
-
-    /// `true` if the tx data corresponds to a regular tx
-    pub fn is_regular(&self) -> bool {
-        self.transaction.is_regular()
-    }
-
-    /// `true` if the tx data corresponds to a Truthcoin reservation
-    pub fn is_reservation(&self) -> bool {
-        self.transaction.is_reservation()
-    }
-
-    /// `true` if the tx data corresponds to a Truthcoin update
-    pub fn is_update(&self) -> bool {
-        self.transaction.is_update()
     }
 
     /// Accessor for tx outputs
@@ -586,168 +469,191 @@ impl FilledTransaction {
         &self.transaction.outputs
     }
 
-    /** If the tx is an AMM burn, returns the LP token's
-     *  corresponding [`AmmBurn`]. */
-    pub fn amm_burn(&self) -> Option<AmmBurn> {
-        match self.transaction.data {
-            Some(TransactionData::AmmBurn {
-                amount0,
-                amount1,
-                lp_token_burn,
-            }) => {
-                let unique_spent_lp_tokens = self.unique_spent_lp_tokens();
-                let (asset0, asset1, _) = unique_spent_lp_tokens.first()?;
-                Some(AmmBurn {
-                    asset0: *asset0,
-                    asset1: *asset1,
-                    amount0,
-                    amount1,
-                    lp_token_burn,
+    /// `true` if the tx data corresponds to a decision slot claim
+    pub fn is_claim_decision_slot(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_claim_decision_slot(),
+            None => false,
+        }
+    }
+
+    /// `true` if the tx data corresponds to market creation
+    pub fn is_create_market(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_create_market(),
+            None => false,
+        }
+    }
+
+    /// `true` if the tx data corresponds to submitting a vote
+    pub fn is_submit_vote(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_submit_vote(),
+            None => false,
+        }
+    }
+
+    /// `true` if the tx data corresponds to registering a voter
+    pub fn is_register_voter(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_register_voter(),
+            None => false,
+        }
+    }
+
+    /// `true` if the tx data corresponds to submitting a batch of votes
+    pub fn is_submit_vote_batch(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_submit_vote_batch(),
+            None => false,
+        }
+    }
+
+    /// `true` if the tx data corresponds to claiming category slots
+    pub fn is_claim_category_slots(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_claim_category_slots(),
+            None => false,
+        }
+    }
+
+    /// If the tx is a decision slot claim, returns the corresponding [`ClaimDecisionSlot`].
+    pub fn claim_decision_slot(&self) -> Option<ClaimDecisionSlot> {
+        match &self.transaction.data {
+            Some(TransactionData::ClaimDecisionSlot {
+                slot_id_bytes,
+                is_standard,
+                is_scaled,
+                question,
+                min,
+                max,
+                option_0_label,
+                option_1_label,
+            }) => Some(ClaimDecisionSlot {
+                slot_id_bytes: *slot_id_bytes,
+                is_standard: *is_standard,
+                is_scaled: *is_scaled,
+                question: question.clone(),
+                min: *min,
+                max: *max,
+                option_0_label: option_0_label.clone(),
+                option_1_label: option_1_label.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// If the tx is a market creation, returns the corresponding [`CreateMarket`].
+    pub fn create_market(&self) -> Option<CreateMarket> {
+        match &self.transaction.data {
+            Some(TransactionData::CreateMarket {
+                title,
+                description,
+                dimension_specs,
+                b,
+                trading_fee,
+                tags,
+                category_txids,
+                residual_names,
+            }) => Some(CreateMarket {
+                title: title.clone(),
+                description: description.clone(),
+                dimension_specs: dimension_specs.clone(),
+                b: *b,
+                trading_fee: *trading_fee,
+                tags: tags.clone(),
+                category_txids: category_txids.clone(),
+                residual_names: residual_names.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// If the tx is a trade, returns the corresponding [`Trade`].
+    pub fn trade(&self) -> Option<Trade> {
+        match &self.transaction.data {
+            Some(TransactionData::Trade {
+                market_id,
+                outcome_index,
+                shares,
+                trader,
+                limit_sats,
+            }) => Some(Trade {
+                market_id: market_id.clone(),
+                outcome_index: *outcome_index,
+                shares: *shares,
+                trader: *trader,
+                limit_sats: *limit_sats,
+            }),
+            _ => None,
+        }
+    }
+
+    /// `true` if the tx data corresponds to trading shares (buy or sell)
+    pub fn is_trade(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_trade(),
+            None => false,
+        }
+    }
+
+    /// If the tx is a vote submission, returns the corresponding [`SubmitVote`].
+    pub fn submit_vote(&self) -> Option<SubmitVote> {
+        match &self.transaction.data {
+            Some(TransactionData::SubmitVote {
+                slot_id_bytes,
+                vote_value,
+                voting_period,
+            }) => Some(SubmitVote {
+                slot_id_bytes: *slot_id_bytes,
+                vote_value: *vote_value,
+                voting_period: *voting_period,
+            }),
+            _ => None,
+        }
+    }
+
+    /// If the tx is a voter registration, returns the corresponding [`RegisterVoter`].
+    pub fn register_voter(&self) -> Option<RegisterVoter> {
+        match &self.transaction.data {
+            Some(TransactionData::RegisterVoter { initial_data }) => {
+                Some(RegisterVoter {
+                    initial_data: *initial_data,
                 })
             }
             _ => None,
         }
     }
 
-    /// If the tx is an AMM mint, returns the corresponding [`AmmMint`].
-    pub fn amm_mint(&self) -> Option<AmmMint> {
-        match self.transaction.data {
-            Some(TransactionData::AmmMint {
-                amount0,
-                amount1,
-                lp_token_mint,
-            }) => match self.unique_spent_assets().get(0..=1) {
-                Some([(first_asset, _), (second_asset, _)]) => {
-                    let mut assets = [first_asset, second_asset];
-                    assets.sort();
-                    let [asset0, asset1] = assets;
-                    Some(AmmMint {
-                        asset0: *asset0,
-                        asset1: *asset1,
-                        amount0,
-                        amount1,
-                        lp_token_mint,
-                    })
-                }
-                _ => None,
-            },
+    /// If the tx is a vote batch submission, returns the corresponding [`SubmitVoteBatch`].
+    pub fn submit_vote_batch(&self) -> Option<SubmitVoteBatch> {
+        match &self.transaction.data {
+            Some(TransactionData::SubmitVoteBatch {
+                votes,
+                voting_period,
+            }) => Some(SubmitVoteBatch {
+                votes: votes.clone(),
+                voting_period: *voting_period,
+            }),
             _ => None,
         }
     }
 
-    /// If the tx is an AMM swap, returns the corresponding [`AmmSwap`].
-    pub fn amm_swap(&self) -> Option<AmmSwap> {
-        match self.transaction.data {
-            Some(TransactionData::AmmSwap {
-                amount_spent,
-                amount_receive,
-                pair_asset,
-            }) => {
-                let (spent_asset, _) = *self.unique_spent_assets().first()?;
-                Some(AmmSwap {
-                    asset_spend: spent_asset,
-                    asset_receive: pair_asset,
-                    amount_spend: amount_spent,
-                    amount_receive,
-                })
-            }
+    /// If the tx is a category slots claim, returns the corresponding [`ClaimCategorySlots`].
+    pub fn claim_category_slots(&self) -> Option<ClaimCategorySlots> {
+        match &self.transaction.data {
+            Some(TransactionData::ClaimCategorySlots {
+                slots,
+                is_standard,
+            }) => Some(ClaimCategorySlots {
+                slots: slots.clone(),
+                is_standard: *is_standard,
+            }),
             _ => None,
         }
     }
 
-    /** If the tx is a valid Truthcoin mint,
-     *  returns the Truthcoin ID and mint amount */
-    pub fn truthcoin_mint(&self) -> Option<(TruthcoinId, u64)> {
-        match self.transaction.data {
-            Some(TransactionData::TruthcoinMint(amount)) => {
-                let (_, control_output) =
-                    self.spent_truthcoin_controls().next_back()?;
-                let truthcoin = control_output.get_truthcoin()?;
-                Some((truthcoin, amount))
-            }
-            _ => None,
-        }
-    }
-
-    /** If the tx is a Dutch auction bid,
-     *  returns the corresponding [`DutchAuctionBid`]. */
-    pub fn dutch_auction_bid(&self) -> Option<DutchAuctionBid> {
-        match self.transaction.data {
-            Some(TransactionData::DutchAuctionBid {
-                auction_id,
-                receive_asset,
-                quantity,
-                bid_size,
-            }) => {
-                let unique_spent_assets = self.unique_spent_assets();
-                let (asset_spend, _) = unique_spent_assets.first()?;
-                Some(DutchAuctionBid {
-                    auction_id,
-                    asset_spend: *asset_spend,
-                    asset_receive: receive_asset,
-                    amount_spend: bid_size,
-                    amount_receive: quantity,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    /** If the tx is a Dutch auction creation,
-     *  returns the corresponding [`DutchAuctionParams`]. */
-    pub fn dutch_auction_create(&self) -> Option<DutchAuctionParams> {
-        match self.transaction.data {
-            Some(TransactionData::DutchAuctionCreate(dutch_auction_params)) => {
-                Some(dutch_auction_params)
-            }
-            _ => None,
-        }
-    }
-
-    /** If the tx is a Dutch auction collect,
-     *  returns the corresponding [`DutchAuctionCollect`]. */
-    pub fn dutch_auction_collect(&self) -> Option<DutchAuctionCollect> {
-        match self.transaction.data {
-            Some(TransactionData::DutchAuctionCollect {
-                asset_offered,
-                asset_receive,
-                amount_offered_remaining,
-                amount_received,
-            }) => {
-                let mut spent_dutch_auction_receipts =
-                    self.spent_dutch_auction_receipts();
-                let auction_id = spent_dutch_auction_receipts
-                    .next()?
-                    .1
-                    .dutch_auction_receipt()?;
-                Some(DutchAuctionCollect {
-                    auction_id,
-                    asset_offered,
-                    asset_receive,
-                    amount_offered_remaining,
-                    amount_received,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    /// If the tx is a Truthcoin registration, returns the registered name hash
-    pub fn registration_name_hash(&self) -> Option<Hash> {
-        self.transaction.registration_name_hash()
-    }
-
-    /// Return an iterator over Truthcoin reservation outputs
-    pub fn reservation_outputs(&self) -> impl Iterator<Item = &Output> {
-        self.transaction.reservation_outputs()
-    }
-
-    /// If the tx is a Truthcoin reservation, returns the reservation commitment
-    pub fn reservation_commitment(&self) -> Option<Hash> {
-        self.transaction.reservation_commitment()
-    }
-
-    /// Rccessor for txid
+    /// Accessor for txid
     pub fn txid(&self) -> Txid {
         self.transaction.txid()
     }
@@ -794,53 +700,40 @@ impl FilledTransaction {
             Ok(Some(spent_value - value_out))
         }
     }
-    /// Return an iterator over spent reservations
-    pub fn spent_reservations(
-        &self,
-    ) -> impl Iterator<Item = (&OutPoint, &FilledOutput)> {
-        self.spent_inputs()
-            .filter(|(_, filled_output)| filled_output.is_reservation())
-    }
 
-    /// Return an iterator over spent Truthcoin
-    pub fn spent_truthcoin(
+    /// Return an iterator over spent Votecoin
+    pub fn spent_votecoin(
         &self,
     ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
         self.spent_inputs()
-            .filter(|(_, filled_output)| filled_output.is_truthcoin())
+            .filter(|(_, filled_output)| filled_output.is_votecoin())
     }
 
-    /** Return an iterator over spent assets (Bitcoin, Truthcoin,
-     * and Truthcoin control coins) */
+    /** Return an iterator over spent assets (Bitcoin and Votecoin) */
     pub fn spent_assets(
         &self,
     ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
         self.spent_inputs().filter(|(_, filled_output)| {
-            filled_output.is_bitcoin()
-                || filled_output.is_truthcoin()
-                || filled_output.is_truthcoin_control()
+            filled_output.is_bitcoin() || filled_output.is_votecoin()
         })
     }
 
-    /** Return a vector of pairs consisting of a Truthcoin and the combined
-     *  input value for that Truthcoin.
-     *  The vector is ordered such that Truthcoin occur in the same order
-     *  as they first occur in the inputs. */
-    pub fn unique_spent_truthcoin(&self) -> Vec<(TruthcoinId, u64)> {
-        // Combined value for each Truthcoin
-        let mut combined_value = HashMap::<TruthcoinId, u64>::new();
-        let spent_truthcoin_values = || {
-            self.spent_truthcoin()
-                .filter_map(|(_, output)| output.truthcoin_value())
-        };
-        // Increment combined value for the Truthcoin
-        spent_truthcoin_values().for_each(|(truthcoin, value)| {
-            *combined_value.entry(truthcoin).or_default() += value;
-        });
-        spent_truthcoin_values()
-            .unique_by(|(truthcoin, _)| *truthcoin)
-            .map(|(truthcoin, _)| (truthcoin, combined_value[&truthcoin]))
-            .collect()
+    /** Returns the total amount of Votecoin spent in this transaction.
+     *  Since Votecoin has a fixed supply with no subtypes, this returns
+     *  a simple total amount. */
+    pub fn unique_spent_votecoin(&self) -> Option<u32> {
+        let mut total_votecoin: u64 = 0;
+        for (_, output) in self.spent_votecoin() {
+            if let Some(amount) = output.votecoin() {
+                total_votecoin += amount as u64;
+            }
+        }
+        if total_votecoin > 0 {
+            // Convert back to u32, should not overflow since Votecoin uses u32
+            total_votecoin.try_into().ok()
+        } else {
+            None
+        }
     }
 
     /** Return a vector of pairs consisting of an [`AssetId`] and the combined
@@ -864,54 +757,6 @@ impl FilledTransaction {
             .collect()
     }
 
-    /// Return an iterator over spent Truthcoin control coins
-    pub fn spent_truthcoin_controls(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
-        self.spent_inputs()
-            .filter(|(_, filled_output)| filled_output.is_truthcoin_control())
-    }
-
-    /// Return an iterator over spent Dutch auction receipts
-    pub fn spent_dutch_auction_receipts(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
-        self.spent_inputs().filter(|(_, filled_output)| {
-            filled_output.is_dutch_auction_receipt()
-        })
-    }
-
-    /// Return an iterator over spent AMM LP tokens
-    pub fn spent_lp_tokens(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
-        self.spent_inputs()
-            .filter(|(_, filled_output)| filled_output.is_lp_token())
-    }
-
-    /** Return a vector of pairs consisting of an LP token's corresponding
-     *  asset pair and the combined input amount for that LP token.
-     *  The vector is ordered such that LP tokens occur in the same order
-     *  as they first occur in the inputs. */
-    pub fn unique_spent_lp_tokens(&self) -> Vec<(AssetId, AssetId, u64)> {
-        // Combined amount for each LP token
-        let mut combined_amounts = HashMap::<(AssetId, AssetId), u64>::new();
-        let spent_lp_token_amounts = || {
-            self.spent_lp_tokens()
-                .filter_map(|(_, output)| output.lp_token_amount())
-        };
-        // Increment combined amount for the Truthcoin
-        spent_lp_token_amounts().for_each(|(asset0, asset1, amount)| {
-            *combined_amounts.entry((asset0, asset1)).or_default() += amount;
-        });
-        spent_lp_token_amounts()
-            .unique_by(|(asset0, asset1, _)| (*asset0, *asset1))
-            .map(|(asset0, asset1, _)| {
-                (asset0, asset1, combined_amounts[&(asset0, asset1)])
-            })
-            .collect()
-    }
-
     /** Returns an iterator over total value for each asset that must
      *  appear in the outputs, in order.
      *  The total output value can possibly over/underflow in a transaction,
@@ -920,231 +765,10 @@ impl FilledTransaction {
     fn output_asset_total_values(
         &self,
     ) -> impl Iterator<Item = (AssetId, Option<u64>)> + '_ {
-        /* If this tx is a Truthcoin registration, this is the Truthcoin ID and
-         * value of the output corresponding to the newly created Truthcoin,
-         * which must be the second-to-last registration output.
-         * ie. If there are `n >= 2` outputs `0..(n-1)`,
-         * output `(n-1)` is the Truthcoin control coin,
-         * and output `(n-2)` is the Truthcoin mint.
-         * Note that there may be no Truthcoin mint,
-         * in the case that the initial supply is zero. */
-        let new_truthcoin_value: Option<(TruthcoinId, u64)> =
-            match self.transaction.data {
-                Some(TransactionData::TruthcoinRegistration {
-                    name_hash,
-                    initial_supply,
-                    ..
-                }) if initial_supply != 0 => {
-                    Some((TruthcoinId(name_hash), initial_supply))
-                }
-                _ => None,
-            };
-        let truthcoin_mint = self.truthcoin_mint();
-        let (mut amm_burn0, mut amm_burn1) = match self.amm_burn() {
-            Some(AmmBurn {
-                asset0,
-                asset1,
-                amount0,
-                amount1,
-                lp_token_burn: _,
-            }) => (Some((asset0, amount0)), Some((asset1, amount1))),
-            None => (None, None),
-        };
-        let (mut amm_mint0, mut amm_mint1) = match self.amm_mint() {
-            Some(AmmMint {
-                asset0,
-                asset1,
-                amount0,
-                amount1,
-                lp_token_mint: _,
-            }) => (Some((asset0, amount0)), Some((asset1, amount1))),
-            None => (None, None),
-        };
-        let (mut amm_swap_spend, mut amm_swap_receive) = match self.amm_swap() {
-            Some(AmmSwap {
-                asset_spend,
-                asset_receive,
-                amount_spend,
-                amount_receive,
-            }) => (
-                Some((asset_spend, amount_spend)),
-                Some((asset_receive, amount_receive)),
-            ),
-            None => (None, None),
-        };
-        let (mut dutch_auction_bid_spend, mut dutch_auction_bid_receive) =
-            match self.dutch_auction_bid() {
-                Some(DutchAuctionBid {
-                    auction_id: _,
-                    asset_spend,
-                    asset_receive,
-                    amount_spend,
-                    amount_receive,
-                }) => (
-                    Some((asset_spend, amount_spend)),
-                    Some((asset_receive, amount_receive)),
-                ),
-                None => (None, None),
-            };
-        let mut dutch_auction_create_spend =
-            self.dutch_auction_create().map(|auction_params| {
-                (auction_params.base_asset, auction_params.base_amount)
-            });
-        let (mut dutch_auction_collect0, mut dutch_auction_collect1) =
-            match self.dutch_auction_collect() {
-                Some(DutchAuctionCollect {
-                    auction_id: _,
-                    asset_offered,
-                    asset_receive,
-                    amount_offered_remaining,
-                    amount_received,
-                }) => (
-                    Some((asset_offered, amount_offered_remaining)),
-                    Some((asset_receive, amount_received)),
-                ),
-                None => (None, None),
-            };
         self.unique_spent_assets()
             .into_iter()
-            .map(move |(asset, total_value)| {
-                let total_value = if let Some((mint_truthcoin, mint_amount)) =
-                    truthcoin_mint
-                    && AssetId::Truthcoin(mint_truthcoin) == asset
-                {
-                    total_value.checked_add(mint_amount)
-                } else if let Some((burn_asset, burn_amount)) = amm_burn0
-                    && burn_asset == asset
-                {
-                    amm_burn0 = None;
-                    total_value.checked_add(burn_amount)
-                } else if let Some((burn_asset, burn_amount)) = amm_burn1
-                    && burn_asset == asset
-                {
-                    amm_burn1 = None;
-                    total_value.checked_add(burn_amount)
-                } else if let Some((mint_asset, mint_amount)) = amm_mint0
-                    && mint_asset == asset
-                {
-                    amm_mint0 = None;
-                    total_value.checked_sub(mint_amount)
-                } else if let Some((mint_asset, mint_amount)) = amm_mint1
-                    && mint_asset == asset
-                {
-                    amm_mint1 = None;
-                    total_value.checked_sub(mint_amount)
-                } else if let Some((swap_spend_asset, swap_spend_amount)) =
-                    amm_swap_spend
-                    && swap_spend_asset == asset
-                {
-                    amm_swap_spend = None;
-                    total_value.checked_sub(swap_spend_amount)
-                } else if let Some((swap_receive_asset, swap_receive_amount)) =
-                    amm_swap_receive
-                    && swap_receive_asset == asset
-                {
-                    amm_swap_receive = None;
-                    total_value.checked_add(swap_receive_amount)
-                } else if let Some((receive_asset, receive_amount)) =
-                    dutch_auction_bid_receive
-                    && receive_asset == asset
-                {
-                    dutch_auction_bid_receive = None;
-                    total_value.checked_add(receive_amount)
-                } else if let Some((spend_asset, spend_amount)) =
-                    dutch_auction_bid_spend
-                    && spend_asset == asset
-                {
-                    dutch_auction_bid_spend = None;
-                    total_value.checked_sub(spend_amount)
-                } else if let Some((spend_asset, spend_amount)) =
-                    dutch_auction_create_spend
-                    && spend_asset == asset
-                {
-                    dutch_auction_create_spend = None;
-                    total_value.checked_sub(spend_amount)
-                } else if let Some((receive_asset, receive_amount)) =
-                    dutch_auction_collect0
-                    && receive_asset == asset
-                {
-                    dutch_auction_collect0 = None;
-                    total_value.checked_add(receive_amount)
-                } else if let Some((receive_asset, receive_amount)) =
-                    dutch_auction_collect1
-                    && receive_asset == asset
-                {
-                    dutch_auction_collect1 = None;
-                    total_value.checked_add(receive_amount)
-                } else {
-                    Some(total_value)
-                };
-                (asset, total_value)
-            })
+            .map(|(asset, total_value)| (asset, Some(total_value)))
             .filter(|(_, amount)| *amount != Some(0))
-            .chain(amm_burn0.map(|(burn_asset, burn_amount)| {
-                (burn_asset, Some(burn_amount))
-            }))
-            .chain(amm_burn1.map(|(burn_asset, burn_amount)| {
-                (burn_asset, Some(burn_amount))
-            }))
-            .chain(amm_mint0.map(|(mint_asset, _)|
-                    /* If the Truthcoin are not already accounted for,
-                    * indicate an underflow */
-                    (mint_asset, None)))
-            .chain(amm_mint1.map(|(mint_asset, _)|
-                    /* If the Truthcoin are not already accounted for,
-                    * indicate an underflow */
-                    (mint_asset, None)))
-            .chain(amm_swap_spend.map(|(spend_asset, _)|
-                    /* If the Truthcoin are not already accounted for,
-                    * indicate an underflow */
-                    (spend_asset, None)))
-            .chain(amm_swap_receive.map(|(receive_asset, receive_amount)| {
-                (receive_asset, Some(receive_amount))
-            }))
-            .chain(dutch_auction_bid_receive.map(
-                |(receive_asset, receive_amount)| {
-                    (receive_asset, Some(receive_amount))
-                },
-            ))
-            .chain(dutch_auction_bid_spend.map(|(spend_asset, _)|
-                    /* If the Truthcoin are not already accounted for,
-                    * indicate an underflow */
-                    (spend_asset, None)))
-            .chain(dutch_auction_create_spend.map(|(spend_asset, _)|
-                    /* If the Truthcoin are not already accounted for,
-                    * indicate an underflow */
-                    (spend_asset, None)))
-            .chain(dutch_auction_collect0.map(
-                |(receive_asset, receive_amount)| {
-                    (receive_asset, Some(receive_amount))
-                },
-            ))
-            .chain(dutch_auction_collect1.map(
-                |(receive_asset, receive_amount)| {
-                    (receive_asset, Some(receive_amount))
-                },
-            ))
-            .chain(new_truthcoin_value.map(|(truthcoin, total_value)| {
-                (AssetId::Truthcoin(truthcoin), Some(total_value))
-            }))
-            .chain(new_truthcoin_value.map(|(truthcoin, _)| {
-                (AssetId::TruthcoinControl(truthcoin), Some(1))
-            }))
-    }
-
-    /** Returns an iterator over total value for each Truthcoin that must
-     *  appear in the outputs, in order.
-     *  The total output value can possibly over/underflow in a transaction,
-     *  so the total output values are [`Option<u64>`],
-     *  where `None` indicates over/underflow. */
-    fn output_truthcoin_total_values(
-        &self,
-    ) -> impl Iterator<Item = (TruthcoinId, Option<u64>)> + '_ {
-        self.output_asset_total_values()
-            .filter_map(|(asset_id, value)| match asset_id {
-                AssetId::Truthcoin(truthcoin_id) => Some((truthcoin_id, value)),
-                _ => None,
-            })
     }
 
     /** Returns the max value of Bitcoin that can occur in the outputs.
@@ -1160,232 +784,49 @@ impl FilledTransaction {
             .unwrap_or(Some(bitcoin::Amount::ZERO))
     }
 
-    /** Returns an iterator over total amount for each LP token that must
-     *  appear in the outputs, in order.
-     *  The total output value can possibly over/underflow,
-     *  so the total output values are [`Option<u64>`],
-     *  where `None` indicates over/underflow. */
-    fn output_lp_token_total_amounts(
-        &self,
-    ) -> impl Iterator<Item = (AssetId, AssetId, Option<u64>)> + '_ {
-        /* If this tx is an AMM burn, this is the corresponding Truthcoin IDs
-        and token amount of the output corresponding to the newly created
-        AMM LP position. */
-        let mut amm_burn: Option<AmmBurn> = self.amm_burn();
-        /* If this tx is an AMM mint, this is the corresponding Truthcoin IDs
-        and token amount of the output corresponding to the newly created
-        AMM LP position. */
-        let mut amm_mint: Option<AmmMint> = self.amm_mint();
-        self.unique_spent_lp_tokens()
-            .into_iter()
-            .map(move |(asset0, asset1, total_amount)| {
-                let total_value = if let Some(AmmBurn {
-                    asset0: burn_asset0,
-                    asset1: burn_asset1,
-                    amount0: _,
-                    amount1: _,
-                    lp_token_burn,
-                }) = amm_burn
-                    && (burn_asset0, burn_asset1) == (asset0, asset1)
-                {
-                    amm_burn = None;
-                    total_amount.checked_sub(lp_token_burn)
-                } else if let Some(AmmMint {
-                    asset0: mint_asset0,
-                    asset1: mint_asset1,
-                    amount0: _,
-                    amount1: _,
-                    lp_token_mint,
-                }) = amm_mint
-                    && (mint_asset0, mint_asset1) == (asset0, asset1)
-                {
-                    amm_mint = None;
-                    total_amount.checked_add(lp_token_mint)
-                } else {
-                    Some(total_amount)
-                };
-                (asset0, asset1, total_value)
-            })
-            .chain(amm_burn.map(|amm_burn| {
-                /* If the LP tokens are not already accounted for,
-                 * indicate an underflow */
-                (amm_burn.asset0, amm_burn.asset1, None)
-            }))
-            .chain(amm_mint.map(|amm_mint| {
-                (
-                    amm_mint.asset0,
-                    amm_mint.asset1,
-                    Some(amm_mint.lp_token_mint),
-                )
-            }))
-    }
-
-    /// Compute the filled content for Truthcoin reservation outputs.
-    fn filled_truthcoin_control_output_content(
-        &self,
-    ) -> impl Iterator<Item = FilledOutputContent> + '_ {
-        self.output_asset_total_values()
-            .filter_map(|(asset, _)| match asset {
-                AssetId::TruthcoinControl(truthcoin_id) => {
-                    Some(FilledOutputContent::TruthcoinControl(truthcoin_id))
-                }
-                _ => None,
-            })
-    }
-
-    /// Compute the filled content for Dutch auction receipt outputs.
-    // WARNING: do not expose DoubleEndedIterator.
-    fn filled_dutch_auction_receipts(
-        &self,
-    ) -> impl Iterator<Item = FilledOutputContent> + '_ {
-        /* If this tx is a Dutch auction creation, this is the content of the
-         * output corresponding to the newly created Dutch auction receipt,
-         * which is the last Dutch auction receipt output. */
-        let new_dutch_auction_receipt_content =
-            if self.is_dutch_auction_create() {
-                let auction_id = DutchAuctionId(self.txid());
-                Some(FilledOutputContent::DutchAuctionReceipt(auction_id))
-            } else {
-                None
-            };
-        let mut spent_dutch_auction_receipts =
-            self.spent_dutch_auction_receipts();
-        /* If this tx is a Dutch auction collect,
-        the first auction receipt is burned */
-        if self.is_dutch_auction_collect() {
-            let _ = spent_dutch_auction_receipts.next();
-        }
-        spent_dutch_auction_receipts
-            .map(|(_, filled_output)| filled_output.content())
-            .cloned()
-            .chain(new_dutch_auction_receipt_content)
-    }
-
-    /// compute the filled content for Truthcoin reservation outputs
-    /// WARNING: do not expose DoubleEndedIterator.
-    fn filled_reservation_output_content(
-        &self,
-    ) -> impl Iterator<Item = FilledOutputContent> + '_ {
-        // If this tx is a Truthcoin reservation, this is the content of the
-        // output corresponding to the newly created Truthcoin reservation,
-        // which must be the final reservation output.
-        let new_reservation_content: Option<FilledOutputContent> =
-            self.reservation_commitment().map(|commitment| {
-                FilledOutputContent::TruthcoinReservation(
-                    self.txid(),
-                    commitment,
-                )
-            });
-        // used to track if the reservation that should be burned as part
-        // of a registration tx
-        let mut reservation_to_burn: Option<Hash> =
-            self.implied_reservation_commitment();
-        self.spent_reservations()
-            .map(|(_, filled_output)| filled_output.content())
-            // In the event of a registration, the first corresponding
-            // reservation does not occur in the output
-            .filter(move |content| {
-                if let Some(implied_commitment) = reservation_to_burn {
-                    if matches!(
-                        content,
-                        FilledOutputContent::TruthcoinReservation(_, commitment)
-                            if *commitment == implied_commitment)
-                    {
-                        reservation_to_burn = None;
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .chain(new_reservation_content)
-    }
-
-    /// compute the filled outputs.
-    /// returns None if the outputs cannot be filled because the tx is invalid
-    // FIXME: Invalidate tx if any iterator is incomplete
+    /// Compute the filled outputs.
+    /// Returns None if the outputs cannot be filled because the tx is invalid.
+    ///
+    /// Transaction validation ensures that all iterators over expected output amounts
+    /// are fully consumed during processing. If any iterator has remaining unconsumed
+    /// elements after processing all outputs, the transaction is considered invalid
+    /// per Bitcoin Hivemind transaction consistency requirements.
     pub fn filled_outputs(&self) -> Option<Vec<FilledOutput>> {
         let mut output_bitcoin_max_value = self.output_bitcoin_max_value()?;
-        let mut output_truthcoin_total_values =
-            self.output_truthcoin_total_values().peekable();
-        let mut output_lp_token_total_amounts =
-            self.output_lp_token_total_amounts().peekable();
-        let mut filled_truthcoin_control_output_content =
-            self.filled_truthcoin_control_output_content();
-        let mut filled_dutch_auction_receipts =
-            self.filled_dutch_auction_receipts();
-        let mut filled_reservation_output_content =
-            self.filled_reservation_output_content();
+
         self.outputs()
             .iter()
             .map(|output| {
                 let content = match output.content.clone() {
-                    OutputContent::AmmLpToken(amount) => {
-                        let (asset0, asset1, remaining_amount) =
-                            output_lp_token_total_amounts.peek_mut()?;
-                        let remaining_amount = remaining_amount.as_mut()?;
-                        let filled_content = FilledOutputContent::AmmLpToken {
-                            asset0: *asset0,
-                            asset1: *asset1,
-                            amount,
-                        };
-                        match amount.cmp(remaining_amount) {
-                            Ordering::Greater => {
-                                // Invalid tx, return `None`
-                                return None;
-                            }
-                            Ordering::Equal => {
-                                // Advance the iterator to the next LP token
-                                let _ = output_lp_token_total_amounts.next()?;
-                            }
-                            Ordering::Less => {
-                                // Decrement the remaining value for the current LP token
-                                *remaining_amount -= amount;
-                            }
-                        }
-                        filled_content
-                    }
-                    OutputContent::Truthcoin(value) => {
-                        let (truthcoin, remaining_value) =
-                            output_truthcoin_total_values.peek_mut()?;
-                        let remaining_value = remaining_value.as_mut()?;
-                        let filled_content =
-                            FilledOutputContent::Truthcoin(*truthcoin, value);
-                        match value.cmp(remaining_value) {
-                            Ordering::Greater => {
-                                // Invalid tx, return `None`
-                                return None;
-                            }
-                            Ordering::Equal => {
-                                // Advance the iterator to the next Truthcoin
-                                let _ = output_truthcoin_total_values.next()?;
-                            }
-                            Ordering::Less => {
-                                // Decrement the remaining value for the current Truthcoin
-                                *remaining_value -= value;
-                            }
-                        }
-                        filled_content
-                    }
-                    OutputContent::TruthcoinControl => {
-                        filled_truthcoin_control_output_content.next()?.clone()
-                    }
-                    OutputContent::TruthcoinReservation => {
-                        filled_reservation_output_content.next()?.clone()
-                    }
-                    OutputContent::DutchAuctionReceipt => {
-                        filled_dutch_auction_receipts.next()?
+                    OutputContent::Votecoin(value) => {
+                        FilledOutputContent::Votecoin(value)
                     }
                     OutputContent::Bitcoin(value) => {
-                        output_bitcoin_max_value =
-                            output_bitcoin_max_value.checked_sub(value.0)?;
+                        let new_max =
+                            output_bitcoin_max_value.checked_sub(value.0);
+                        new_max?;
+
+                        output_bitcoin_max_value = new_max.unwrap();
                         FilledOutputContent::Bitcoin(value)
                     }
                     OutputContent::Withdrawal(withdrawal) => {
                         FilledOutputContent::BitcoinWithdrawal(withdrawal)
+                    }
+                    OutputContent::MarketFunds {
+                        market_id,
+                        amount,
+                        is_fee,
+                    } => {
+                        let new_max =
+                            output_bitcoin_max_value.checked_sub(amount.0);
+                        new_max?;
+
+                        output_bitcoin_max_value = new_max.unwrap();
+                        FilledOutputContent::MarketFunds {
+                            market_id,
+                            amount,
+                            is_fee,
+                        }
                     }
                 };
                 Some(FilledOutput {

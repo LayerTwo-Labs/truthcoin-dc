@@ -5,6 +5,8 @@ use std::{
 };
 
 use bitcoin::amount::CheckedSum as _;
+use bitcoin::hashes::Hash as _;
+use bitcoin::merkle_tree;
 use borsh::BorshSerialize;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -14,7 +16,6 @@ use utoipa::ToSchema;
 pub use crate::authorization::Authorization;
 
 mod address;
-pub mod truthcoin_data;
 pub mod hashes;
 pub mod keys;
 pub mod proto;
@@ -22,19 +23,14 @@ pub mod schema;
 mod transaction;
 
 pub use address::Address;
-pub use truthcoin_data::{TruthcoinData, TruthcoinDataUpdates, Update};
-pub use hashes::{
-    AssetId, TruthcoinId, BlockHash, DutchAuctionId, Hash, M6id, MerkleRoot,
-    Txid,
-};
+pub use hashes::{AssetId, BlockHash, Hash, M6id, MerkleRoot, Txid};
 pub use keys::{EncryptionPubKey, VerifyingKey};
 pub use transaction::{
-    AmmBurn, AmmMint, AmmSwap, AssetOutput, AssetOutputContent, Authorized,
-    AuthorizedTransaction, BitcoinOutput, BitcoinOutputContent,
-    DutchAuctionBid, DutchAuctionCollect, DutchAuctionParams, FilledOutput,
-    FilledOutputContent, FilledTransaction, InPoint, OutPoint, Output,
-    OutputContent, PointedOutput, SpentOutput, Transaction, TxData, TxInputs,
-    WithdrawalOutputContent,
+    AssetOutput, AssetOutputContent, Authorized, AuthorizedTransaction,
+    BitcoinOutput, BitcoinOutputContent, ClaimDecisionSlot, CreateMarket,
+    FilledOutput, FilledOutputContent, FilledTransaction, InPoint, OutPoint,
+    Output, OutputContent, PointedOutput, SpentOutput, Transaction,
+    TransactionData, TxData, TxInputs, VoteBatchItem, WithdrawalOutputContent,
 };
 
 pub const THIS_SIDECHAIN: u8 = 13;
@@ -80,12 +76,13 @@ mod serde_display_fromstr_human_readable {
     }
 }
 
-/// (de)serialize as hex strings for human-readable forms like json,
+/// Optimized (de)serialize as hex strings for human-readable forms like json,
 /// and default serialization for non human-readable formats like bincode
 mod serde_hexstr_human_readable {
     use hex::{FromHex, ToHex};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+    #[inline]
     pub fn serialize<S, T>(data: T, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -98,6 +95,7 @@ mod serde_hexstr_human_readable {
         }
     }
 
+    #[inline]
     pub fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
     where
         D: Deserializer<'de>,
@@ -348,8 +346,42 @@ impl Body {
     }
 
     pub fn compute_merkle_root(&self) -> MerkleRoot {
-        // FIXME: Compute actual merkle root instead of just a hash.
-        hashes::hash(&(&self.coinbase, &self.transactions)).into()
+        // Use Bitcoin's standard merkle tree implementation
+        // following the Hivemind whitepaper specification
+
+        // If no transactions, return hash of coinbase only
+        if self.transactions.is_empty() {
+            return hashes::hash(&self.coinbase).into();
+        }
+
+        // Collect all transaction hashes (coinbase + transactions)
+        // Convert our Hash type to bitcoin::Txid for compatibility
+        let tx_hashes: Vec<bitcoin::Txid> = std::iter::once(
+            // Convert coinbase hash to Txid
+            bitcoin::Txid::from_raw_hash(
+                bitcoin::hashes::Hash::from_byte_array(hashes::hash(
+                    &self.coinbase,
+                )),
+            ),
+        )
+        .chain(
+            // Convert transaction hashes to Txid
+            self.transactions.iter().map(|tx| {
+                bitcoin::Txid::from_raw_hash(
+                    bitcoin::hashes::Hash::from_byte_array(tx.txid().into()),
+                )
+            }),
+        )
+        .collect();
+
+        // Use bitcoin crate's merkle tree calculation
+        let merkle_root = merkle_tree::calculate_root(tx_hashes.into_iter())
+            .expect(
+                "calculate_root should not fail with valid transaction hashes",
+            );
+
+        // Convert back to our Hash type
+        merkle_root.to_byte_array().into()
     }
 
     pub fn get_inputs(&self) -> Vec<OutPoint> {
@@ -535,3 +567,16 @@ pub(crate) static VERSION: LazyLock<Version> = LazyLock::new(|| {
     const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
     semver::Version::parse(VERSION_STR).unwrap().into()
 });
+
+// Common constants to avoid duplication - optimized with const evaluation
+pub const BITCOIN_GENESIS_TIMESTAMP: u64 = 1231006505;
+pub const SECONDS_PER_QUARTER: u64 = 3600 * 24 * 91; // Pre-computed: 7,862,400 seconds
+
+// Additional temporal constants for performance optimization
+pub const SECONDS_PER_DAY: u64 = 86400;
+pub const SECONDS_PER_HOUR: u64 = 3600;
+pub const DAYS_PER_QUARTER: u64 = 91;
+
+// Network and protocol constants
+pub const MAX_BLOCK_SIZE: usize = 1024 * 1024; // 1MB block size limit
+pub const MAX_TRANSACTION_SIZE: usize = 100 * 1024; // 100KB transaction size limit
