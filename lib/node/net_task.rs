@@ -1,5 +1,3 @@
-//! Task to manage peers and their responses
-
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -7,6 +5,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+use dashmap::DashMap;
 
 use fallible_iterator::{FallibleIterator, IteratorExt};
 use futures::{
@@ -72,7 +72,7 @@ pub enum Error {
     SendNewTipReady(#[source] TrySendError<NewTipReadyMessage>),
     #[error("Send reorg result error (oneshot)")]
     SendReorgResultOneshot,
-    #[error("state error")]
+    #[error("state error: {0}")]
     State(#[from] Box<state::Error>),
 }
 
@@ -138,15 +138,42 @@ fn connect_tip_(
     two_way_peg_data: &mainchain::TwoWayPegData,
 ) -> Result<(), Error> {
     let block_hash = header.hash();
-    let _fees: bitcoin::Amount = state.validate_block(rwtxn, header, body)?;
+    // validate_block now returns merkle_root to avoid duplicate computation in connect_block
+    let (_fees, filled_txs, merkle_root) =
+        state.validate_block(rwtxn, header, body).inspect_err(|e| {
+            tracing::error!(
+                %block_hash,
+                num_txs = body.transactions.len(),
+                "Block validation FAILED: {:?}",
+                e
+            );
+        })?;
+
+    // Get mainchain timestamp for slot minting
+    let mainchain_timestamp = archive
+        .get_main_header_info(rwtxn, &header.prev_main_hash)?
+        .timestamp;
+
+    state
+        .connect_block(
+            rwtxn,
+            header,
+            body,
+            mainchain_timestamp,
+            filled_txs,
+            merkle_root,
+        )
+        .inspect_err(|e| {
+            tracing::error!(
+                %block_hash,
+                "Block connect FAILED: {:?}",
+                e
+            );
+        })?;
     if tracing::enabled!(tracing::Level::DEBUG) {
-        let merkle_root = body.compute_merkle_root();
         let height = state.try_get_height(rwtxn)?;
-        let () = state.connect_block(rwtxn, header, body)?;
         tracing::debug!(?height, %merkle_root, %block_hash,
                             "connected body")
-    } else {
-        let () = state.connect_block(rwtxn, header, body)?;
     }
     let () = state.connect_two_way_peg_data(rwtxn, two_way_peg_data)?;
     let () = archive.put_header(rwtxn, header)?;
@@ -412,10 +439,8 @@ fn reorg_to_tip(
         {
             continue;
         }
-        rwtxn.commit().map_err(RwTxnError::from)?;
-        tracing::info!("synced to tip: {}", new_tip.block_hash);
-        rwtxn = env.write_txn().map_err(EnvError::from)?;
     }
+    // Single atomic commit for entire reorg
     let tip = state.try_get_tip(&rwtxn)?;
     assert_eq!(tip, Some(new_tip.block_hash));
     rwtxn.commit().map_err(RwTxnError::from)?;
@@ -496,7 +521,7 @@ impl NetTask {
         // Attempt to switch to a descendant tip once a body has been
         // stored, if all other ancestor bodies are available.
         // Each descendant tip maps to the peers that sent that tip.
-        descendant_tips: &mut HashMap<
+        descendant_tips: &DashMap<
             crate::types::BlockHash,
             HashMap<Tip, HashSet<SocketAddr>>,
         >,
@@ -546,6 +571,7 @@ impl NetTask {
                         descendant_tips
                             .entry(*earliest_missing_body)
                             .or_default()
+                            .value_mut()
                             .entry(descendant_tip)
                             .or_default()
                             .insert(addr);
@@ -614,7 +640,7 @@ impl NetTask {
                             .unbounded_send((block_tip, Some(addr), None))
                             .map_err(Error::SendNewTipReady)?;
                     }
-                    let Some(block_descendant_tips) =
+                    let Some((_, block_descendant_tips)) =
                         descendant_tips.remove(&block_hash)
                     else {
                         return Ok(());
@@ -642,6 +668,7 @@ impl NetTask {
                                 descendant_tips
                                     .entry(*earliest_missing_body)
                                     .or_default()
+                                    .value_mut()
                                     .entry(descendant_tip)
                                     .or_default()
                                     .extend(sources.iter().cloned());
@@ -922,10 +949,10 @@ impl NetTask {
         // Attempt to switch to a descendant tip once a body has been
         // stored, if all other ancestor bodies are available.
         // Each descendant tip maps to the peers that sent that tip.
-        let mut descendant_tips = HashMap::<
+        let descendant_tips: DashMap<
             crate::types::BlockHash,
             HashMap<Tip, HashSet<SocketAddr>>,
-        >::new();
+        > = DashMap::new();
         // Map associating mainchain task requests with the peer(s) that
         // caused the request, and the request peer state ID
         let mut mainchain_task_request_sources = HashMap::<
@@ -936,8 +963,6 @@ impl NetTask {
             tracing::trace!(?mailbox_item, "received new mailbox item");
             match mailbox_item {
                 MailboxItem::AcceptConnection(res) => match res {
-                    // We received a connection new incoming network connection, but no peer
-                    // was added
                     Ok(None) => {
                         continue;
                     }
@@ -945,7 +970,6 @@ impl NetTask {
                         tracing::trace!(%addr, "accepted new incoming connection");
                     }
                     Err(fatal_err) => {
-                        // explicitly type error
                         let fatal_err: <net::error::AcceptConnection as fatality::Split>::Fatal =
                             fatal_err;
                         let fatal_err = anyhow::Error::from(fatal_err);
@@ -1003,7 +1027,7 @@ impl NetTask {
                     }
                 }
                 MailboxItem::NewTipReady(new_tip, _addr, resp_tx) => {
-                    let reorg_applied = task::block_in_place(|| {
+                    let reorg_result = task::block_in_place(|| {
                         reorg_to_tip(
                             &self.ctxt.env,
                             &self.ctxt.archive,
@@ -1013,18 +1037,27 @@ impl NetTask {
                             &self.ctxt.zmq_pub_handler,
                             new_tip,
                         )
-                    })?;
+                    });
+
                     if let Some(resp_tx) = resp_tx {
+                        let reorg_applied = match &reorg_result {
+                            Ok(applied) => *applied,
+                            Err(e) => {
+                                tracing::error!("Reorg failed: {:?}", e);
+                                false
+                            }
+                        };
                         let () = resp_tx
                             .send(reorg_applied)
                             .map_err(|_| Error::SendReorgResultOneshot)?;
                     }
+
+                    let _ = reorg_result?;
                 }
                 MailboxItem::PeerInfo(None) => {
                     return Err(Error::PeerInfoRxClosed);
                 }
                 MailboxItem::PeerInfo(Some((addr, None))) => {
-                    // peer connection is closed, remove it
                     tracing::warn!(%addr, "Connection to peer closed");
                     let () = self.ctxt.net.remove_active_peer(addr);
                     continue;
@@ -1039,8 +1072,6 @@ impl NetTask {
                         ) => {
                             const RECONNECT_DELAY: Duration =
                                 Duration::from_secs(10);
-                            // Attempt to reconnect if a valid message was
-                            // received successfully
                             let Some(received_msg_successfully) =
                                 self.ctxt.net.try_with_active_peer_connection(
                                     addr,
@@ -1091,18 +1122,54 @@ impl NetTask {
                                 .map_err(Error::SendNewTipReady)?;
                         }
                         PeerConnectionInfo::NewTransaction(new_tx) => {
-                            let mut rwtxn = self
-                                .ctxt
-                                .env
-                                .write_txn()
-                                .map_err(EnvError::from)?;
-                            self.ctxt.mempool.put(&mut rwtxn, &new_tx)?;
-                            rwtxn.commit().map_err(RwTxnError::from)?;
-                            // broadcast
-                            let () = self
-                                .ctxt
-                                .net
-                                .push_tx(HashSet::from_iter([addr]), new_tx);
+                            let txid = new_tx.transaction.txid();
+                            let result: Result<(), crate::mempool::Error> =
+                                (|| {
+                                    let mut rwtxn =
+                                        self.ctxt.env.write_txn().map_err(
+                                            crate::mempool::Error::from,
+                                        )?;
+                                    self.ctxt
+                                        .mempool
+                                        .put(&mut rwtxn, &new_tx)?;
+                                    rwtxn
+                                        .commit()
+                                        .map_err(crate::mempool::Error::from)?;
+                                    Ok(())
+                                })();
+
+                            match result {
+                                Ok(()) => {
+                                    // Successfully added to mempool, propagate to other peers
+                                    let () = self
+                                        .ctxt
+                                        .net
+                                        .push_tx(HashSet::from_iter([addr]), new_tx);
+                                }
+                                Err(crate::mempool::Error::UtxoDoubleSpent) => {
+                                    tracing::debug!(
+                                        %txid,
+                                        %addr,
+                                        "P2P transaction rejected: UTXO already spent in mempool"
+                                    );
+                                }
+                                Err(crate::mempool::Error::SlotAlreadyClaimedInMempool(slot)) => {
+                                    tracing::debug!(
+                                        %txid,
+                                        %addr,
+                                        %slot,
+                                        "P2P transaction rejected: slot already claimed in mempool"
+                                    );
+                                }
+                                Err(ref err) => {
+                                    tracing::warn!(
+                                        %txid,
+                                        %addr,
+                                        ?err,
+                                        "Failed to add P2P transaction to mempool"
+                                    );
+                                }
+                            }
                         }
                         PeerConnectionInfo::Response(boxed) => {
                             let (resp, req) = *boxed;
@@ -1113,7 +1180,7 @@ impl NetTask {
                             );
                             let () = Self::handle_response(
                                 &self.ctxt,
-                                &mut descendant_tips,
+                                &descendant_tips,
                                 &self.new_tip_ready_tx,
                                 addr,
                                 resp,
@@ -1145,17 +1212,9 @@ impl NetTask {
     }
 }
 
-/// Handle to the net task.
-/// Task is aborted on drop.
 #[derive(Clone)]
 pub(super) struct NetTaskHandle {
     task: Arc<JoinHandle<()>>,
-    /// Push a tip that is ready to reorg to, with the address of the peer
-    /// connection that caused the request, if it originated from a peer.
-    /// If the request originates from this node, then the socket address is
-    /// None.
-    /// An optional oneshot sender can be used receive the result of attempting
-    /// to reorg to the new tip, on the corresponding oneshot receiver.
     new_tip_ready_tx: UnboundedSender<NewTipReadyMessage>,
 }
 
@@ -1209,16 +1268,20 @@ impl NetTaskHandle {
         }
     }
 
-    /// Push a tip that is ready to reorg to, and await successful application.
-    /// A result of Ok(true) indicates that the tip was applied and reorged
-    /// to successfully.
-    /// A result of Ok(false) indicates that the tip was not reorged to.
     pub async fn new_tip_ready_confirm(
         &self,
         new_tip: Tip,
     ) -> Result<bool, Error> {
         tracing::debug!(?new_tip, "sending new tip ready confirm");
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
+
+        if self.new_tip_ready_tx.is_closed() {
+            tracing::error!(
+                "Network task receiver is closed, cannot send new tip ready"
+            );
+            return Ok(false);
+        }
+
         let () = self
             .new_tip_ready_tx
             .unbounded_send((new_tip, None, Some(oneshot_tx)))
@@ -1228,10 +1291,7 @@ impl NetTaskHandle {
 }
 
 impl Drop for NetTaskHandle {
-    // If only one reference exists (ie. within self), abort the net task.
     fn drop(&mut self) {
-        // use `Arc::get_mut` since `Arc::into_inner` requires ownership of the
-        // Arc, and cloning would increase the reference count
         if let Some(task) = Arc::get_mut(&mut self.task) {
             tracing::debug!("dropping net task handle, aborting task");
             task.abort()

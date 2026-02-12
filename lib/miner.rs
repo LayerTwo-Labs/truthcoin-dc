@@ -9,6 +9,8 @@ use crate::types::{
 pub enum Error {
     #[error("CUSF mainchain proto error")]
     CusfMainchain(#[from] proto::Error),
+    #[error("merkle root mismatch: header and body are inconsistent")]
+    MerkleRootMismatch,
 }
 
 #[derive(Clone)]
@@ -58,7 +60,9 @@ where
             )
             .await?;
         tracing::info!(%txid, "created BMM tx");
-        assert_eq!(header.merkle_root, body.compute_merkle_root());
+        if header.merkle_root != body.compute_merkle_root() {
+            return Err(Error::MerkleRootMismatch);
+        }
         self.block = Some((header, body));
         Ok(txid)
     }

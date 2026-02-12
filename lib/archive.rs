@@ -421,7 +421,7 @@ impl Archive {
         Ok(header_info)
     }
 
-    fn get_main_header_info(
+    pub fn get_main_header_info(
         &self,
         rotxn: &RoTxn,
         block_hash: &bitcoin::BlockHash,

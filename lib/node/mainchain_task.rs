@@ -1,5 +1,3 @@
-//! Task to communicate with mainchain node
-
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -25,14 +23,11 @@ use crate::{
     types::proto::{self, mainchain},
 };
 
-/// Request data from the mainchain node
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum Request {
-    /// Request missing mainchain ancestor header/infos
     AncestorInfos(bitcoin::BlockHash),
 }
 
-/// Error included in a response
 #[derive(Debug, Error)]
 pub enum ResponseError {
     #[error("Archive error")]
@@ -45,10 +40,8 @@ pub enum ResponseError {
     Mainchain(#[from] proto::Error),
 }
 
-/// Response indicating that a request has been fulfilled
 #[derive(Debug)]
 pub(super) enum Response {
-    /// Response bool indicates if the requested header was available
     AncestorInfos(bitcoin::BlockHash, Result<bool, ResponseError>),
 }
 
@@ -74,8 +67,6 @@ struct MainchainTask<Transport = tonic::transport::Channel> {
     env: sneed::Env,
     archive: Archive,
     mainchain: proto::mainchain::ValidatorClient<Transport>,
-    // receive a request, and optional oneshot sender to send the result to
-    // instead of sending on `response_tx`
     request_rx: UnboundedReceiver<(Request, Option<oneshot::Sender<Response>>)>,
     response_tx: UnboundedSender<Response>,
 }
@@ -84,9 +75,6 @@ impl<Transport> MainchainTask<Transport>
 where
     Transport: proto::Transport,
 {
-    /// Request ancestor header info and block info from the mainchain node,
-    /// including the specified header.
-    /// Returns `false` if the specified block was not available.
     async fn request_ancestor_infos(
         env: &sneed::Env,
         archive: &Archive,
@@ -149,7 +137,6 @@ where
             }
         }
         block_infos.reverse();
-        // Writing all headers during IBD can starve archive readers.
         tracing::trace!(%block_hash, "storing ancestor headers/info");
         task::block_in_place(|| {
             let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
@@ -197,13 +184,9 @@ where
     }
 }
 
-/// Handle to the task to communicate with mainchain node.
-/// Task is aborted on drop.
 #[derive(Clone)]
 pub(super) struct MainchainTaskHandle {
     task: Arc<JoinHandle<()>>,
-    // send a request, and optional oneshot sender to receive the result on the
-    // corresponding oneshot receiver
     request_tx:
         mpsc::UnboundedSender<(Request, Option<oneshot::Sender<Response>>)>,
 }
@@ -241,7 +224,6 @@ impl MainchainTaskHandle {
         (task_handle, response_rx)
     }
 
-    /// Send a request
     pub fn request(&self, request: Request) -> Result<(), Request> {
         self.request_tx
             .unbounded_send((request, None))
@@ -251,8 +233,6 @@ impl MainchainTaskHandle {
             })
     }
 
-    /// Send a request, and receive the response on a oneshot receiver instead
-    /// of the response stream
     pub fn request_oneshot(
         &self,
         request: Request,
@@ -270,10 +250,7 @@ impl MainchainTaskHandle {
 }
 
 impl Drop for MainchainTaskHandle {
-    // If only one reference exists (ie. within self), abort the net task.
     fn drop(&mut self) {
-        // use `Arc::get_mut` since `Arc::into_inner` requires ownership of the
-        // Arc, and cloning would increase the reference count
         if let Some(task) = Arc::get_mut(&mut self.task) {
             task.abort()
         }

@@ -3,48 +3,81 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use fallible_iterator::FallibleIterator;
 use futures::Stream;
 use heed::types::SerdeBincode;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
 
 use crate::{
     authorization::Authorization,
     types::{
-        Address, AmountOverflowError, Authorized, AuthorizedTransaction,
-        TruthcoinId, BlockHash, Body, FilledOutput, FilledTransaction,
-        GetAddress as _, GetBitcoinValue as _, Header, InPoint, M6id, OutPoint,
-        SpentOutput, Transaction, TxData, VERSION, Verify as _, Version,
-        WithdrawalBundle, WithdrawalBundleStatus,
+        Address, AmountOverflowError, AmountUnderflowError, Authorized,
+        AuthorizedTransaction, BlockHash, Body, FilledOutput,
+        FilledTransaction, GetAddress as _, GetBitcoinValue as _, Header,
+        InPoint, M6id, MerkleRoot, OutPoint, SpentOutput, Transaction, VERSION,
+        Verify as _, Version, WithdrawalBundle, WithdrawalBundleStatus,
         proto::mainchain::TwoWayPegData,
     },
     util::Watchable,
+    validation::{MarketValidator, SlotValidationInterface, SlotValidator},
 };
 
-mod amm;
-pub mod truthcoin;
-mod block;
-mod dutch_auction;
-pub mod error;
-mod rollback;
-mod two_way_peg_data;
+pub trait UtxoManager {
+    fn insert_utxo_with_address_index(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+        filled_output: &FilledOutput,
+    ) -> Result<(), Error>;
+    fn delete_utxo_with_address_index(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+    ) -> Result<bool, Error>;
+    fn clear_utxos_and_address_index(
+        &self,
+        rwtxn: &mut RwTxn,
+    ) -> Result<(), Error>;
 
-pub use amm::{AmmPair, PoolState as AmmPoolState};
-pub use truthcoin::SeqId as TruthcoinSeqId;
-pub use dutch_auction::DutchAuctionState;
+    fn insert_utxo_supply_neutral(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+        filled_output: &FilledOutput,
+    ) -> Result<(), Error>;
+
+    fn delete_utxo_supply_neutral(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+    ) -> Result<bool, Error>;
+}
+
+pub mod block;
+pub mod error;
+pub mod markets;
+mod rollback;
+pub mod slots;
+pub mod type_aliases;
+pub mod undo;
+use slots::{Decision, SlotId};
+mod two_way_peg_data;
+pub mod votecoin;
+pub mod voting;
+
 pub use error::Error;
+pub use markets::{
+    BatchedMarketTrade, Market, MarketBuilder, MarketId, MarketState,
+    MarketsDatabase, ShareAccount,
+};
 use rollback::{HeightStamped, RollBack};
+pub use slots::period_to_name;
+pub use voting::VotingSystem;
 
 pub const WITHDRAWAL_BUNDLE_FAILURE_GAP: u32 = 4;
 
-/// Information we have regarding a withdrawal bundle
 #[derive(Debug, Deserialize, Serialize)]
 enum WithdrawalBundleInfo {
-    /// Withdrawal bundle is known
     Known(WithdrawalBundle),
-    /// Withdrawal bundle is unknown but unconfirmed / failed
     Unknown,
-    /// If an unknown withdrawal bundle is confirmed, ALL UTXOs are
-    /// considered spent.
     UnknownConfirmed {
         spend_utxos: BTreeMap<OutPoint, FilledOutput>,
     },
@@ -69,52 +102,120 @@ type WithdrawalBundlesDb = DatabaseUnique<
 
 #[derive(Clone)]
 pub struct State {
-    /// Current tip
     tip: DatabaseUnique<UnitKey, SerdeBincode<BlockHash>>,
-    /// Current height
     height: DatabaseUnique<UnitKey, SerdeBincode<u32>>,
-    /// Associates ordered pairs of Truthcoin to their AMM pool states
-    amm_pools: amm::PoolsDb,
-    truthcoin: truthcoin::Dbs,
-    /// Associates Dutch auction sequence numbers with auction state
-    dutch_auctions: dutch_auction::Db,
+    mainchain_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
+    genesis_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
+    votecoin: votecoin::Dbs,
+    slots: slots::Dbs,
+    markets: MarketsDatabase,
+    voting: VotingSystem,
     utxos: DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<FilledOutput>>,
+    utxos_by_address:
+        DatabaseUnique<SerdeBincode<(Address, OutPoint)>, SerdeBincode<()>>,
     stxos: DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<SpentOutput>>,
-    /// Pending withdrawal bundle and block height
     pending_withdrawal_bundle:
         DatabaseUnique<UnitKey, SerdeBincode<(WithdrawalBundle, u32)>>,
-    /// Latest failed (known) withdrawal bundle
     latest_failed_withdrawal_bundle:
         DatabaseUnique<UnitKey, SerdeBincode<RollBack<HeightStamped<M6id>>>>,
-    /// Withdrawal bundles and their status.
-    /// Some withdrawal bundles may be unknown.
-    /// in which case they are `None`.
     withdrawal_bundles: WithdrawalBundlesDb,
-    /// Deposit blocks and the height at which they were applied, keyed sequentially
     deposit_blocks: DatabaseUnique<
         SerdeBincode<u32>,
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     >,
-    /// Withdrawal bundle event blocks and the height at which they were applied, keyed sequentially
     withdrawal_bundle_event_blocks: DatabaseUnique<
         SerdeBincode<u32>,
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     >,
+    votecoin_balances: DatabaseUnique<SerdeBincode<Address>, SerdeBincode<u32>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
+    // Undo databases for disconnect_tip chain reorganization support
+    ossification_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::OssificationUndoData>,
+    >,
+    consensus_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::ConsensusUndoData>,
+    >,
+    consolidation_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::ConsolidationUndoData>,
+    >,
+}
+
+impl SlotValidationInterface for State {
+    fn validate_slot_claim(
+        &self,
+        rotxn: &RoTxn,
+        slot_id: SlotId,
+        decision: &Decision,
+        current_ts: u64,
+        current_height: Option<u32>,
+        genesis_ts: u64,
+    ) -> Result<(), Error> {
+        self.slots().validate_slot_claim(
+            rotxn,
+            slot_id,
+            decision,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    fn try_get_height(&self, rotxn: &RoTxn) -> Result<Option<u32>, Error> {
+        self.try_get_height(rotxn)
+    }
+
+    fn try_get_genesis_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        self.try_get_genesis_timestamp(rotxn)
+    }
+
+    fn try_get_mainchain_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        self.try_get_mainchain_timestamp(rotxn)
+    }
 }
 
 impl State {
-    pub const NUM_DBS: u32 = truthcoin::Dbs::NUM_DBS + 12;
+    pub const NUM_DBS: u32 = votecoin::Dbs::NUM_DBS
+        + slots::Dbs::NUM_DBS
+        + MarketsDatabase::NUM_DBS
+        + VotingSystem::NUM_DBS
+        + 19; // 16 base + 3 undo databases
 
-    pub fn new(env: &sneed::Env) -> Result<Self, Error> {
+    pub fn new(
+        env: &sneed::Env,
+        slot_config_testing: Option<u32>,
+    ) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
         let tip = DatabaseUnique::create(env, &mut rwtxn, "tip")?;
         let height = DatabaseUnique::create(env, &mut rwtxn, "height")?;
-        let amm_pools = DatabaseUnique::create(env, &mut rwtxn, "amm_pools")?;
-        let truthcoin = truthcoin::Dbs::new(env, &mut rwtxn)?;
-        let dutch_auctions =
-            DatabaseUnique::create(env, &mut rwtxn, "dutch_auctions")?;
+        let mainchain_timestamp =
+            DatabaseUnique::create(env, &mut rwtxn, "mainchain_timestamp")?;
+        let genesis_timestamp =
+            DatabaseUnique::create(env, &mut rwtxn, "genesis_timestamp")?;
+        let votecoin = votecoin::Dbs::new(env, &mut rwtxn)?;
+        let slots = if let Some(blocks_per_period) = slot_config_testing {
+            slots::Dbs::new_with_config(
+                env,
+                &mut rwtxn,
+                slots::SlotConfig::testing(blocks_per_period),
+            )?
+        } else {
+            slots::Dbs::new(env, &mut rwtxn)?
+        };
+        let markets = MarketsDatabase::new(env, &mut rwtxn)?;
+        let voting = VotingSystem::new(env, &mut rwtxn)?;
         let utxos = DatabaseUnique::create(env, &mut rwtxn, "utxos")?;
+        let utxos_by_address =
+            DatabaseUnique::create(env, &mut rwtxn, "utxos_by_address")?;
         let stxos = DatabaseUnique::create(env, &mut rwtxn, "stxos")?;
         let pending_withdrawal_bundle = DatabaseUnique::create(
             env,
@@ -135,34 +236,62 @@ impl State {
             &mut rwtxn,
             "withdrawal_bundle_event_blocks",
         )?;
+        let votecoin_balances =
+            DatabaseUnique::create(env, &mut rwtxn, "votecoin_balances")?;
         let version = DatabaseUnique::create(env, &mut rwtxn, "state_version")?;
         if version.try_get(&rwtxn, &())?.is_none() {
             version.put(&mut rwtxn, &(), &*VERSION)?;
         }
+        let ossification_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "ossification_undo")?;
+        let consensus_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "consensus_undo")?;
+        let consolidation_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "consolidation_undo")?;
         rwtxn.commit()?;
         Ok(Self {
             tip,
             height,
-            amm_pools,
-            truthcoin,
-            dutch_auctions,
+            mainchain_timestamp,
+            genesis_timestamp,
+            votecoin,
+            slots,
+            markets,
+            voting,
             utxos,
+            utxos_by_address,
             stxos,
             pending_withdrawal_bundle,
             latest_failed_withdrawal_bundle,
             withdrawal_bundles,
             withdrawal_bundle_event_blocks,
             deposit_blocks,
+            votecoin_balances,
             _version: version,
+            ossification_undo,
+            consensus_undo,
+            consolidation_undo,
         })
     }
 
-    pub fn amm_pools(&self) -> &amm::RoPoolsDb {
-        &self.amm_pools
+    pub fn votecoin(&self) -> &votecoin::Dbs {
+        &self.votecoin
     }
 
-    pub fn truthcoin(&self) -> &truthcoin::Dbs {
-        &self.truthcoin
+    pub fn slots(&self) -> &slots::Dbs {
+        &self.slots
+    }
+
+    pub fn markets(&self) -> &MarketsDatabase {
+        &self.markets
+    }
+
+    pub fn voting(&self) -> &VotingSystem {
+        &self.voting
+    }
+
+    pub fn voting_mut(&mut self) -> &mut VotingSystem {
+        &mut self.voting
     }
 
     pub fn deposit_blocks(
@@ -172,10 +301,6 @@ impl State {
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     > {
         &self.deposit_blocks
-    }
-
-    pub fn dutch_auctions(&self) -> &dutch_auction::RoDb {
-        &self.dutch_auctions
     }
 
     pub fn stxos(
@@ -207,6 +332,22 @@ impl State {
         Ok(height)
     }
 
+    pub fn try_get_mainchain_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        let timestamp = self.mainchain_timestamp.try_get(rotxn, &())?;
+        Ok(timestamp)
+    }
+
+    pub fn try_get_genesis_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        let timestamp = self.genesis_timestamp.try_get(rotxn, &())?;
+        Ok(timestamp)
+    }
+
     pub fn get_utxos(
         &self,
         rotxn: &RoTxn,
@@ -220,15 +361,259 @@ impl State {
         rotxn: &RoTxn,
         addresses: &HashSet<Address>,
     ) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
-        let utxos = self
-            .utxos
-            .iter(rotxn)?
-            .filter(|(_, output)| Ok(addresses.contains(&output.address)))
-            .collect()?;
-        Ok(utxos)
+        // NOTE: This implementation scans all UTXOs and filters by address.
+        // For optimal performance, sneed would need to expose heed's range() method
+        // to allow per-address range queries on the (Address, OutPoint) composite key.
+        // This is O(total_utxos) instead of O(matching_utxos).
+        let mut result = HashMap::with_capacity(addresses.len() * 4);
+
+        let mut iter = self.utxos_by_address.iter(rotxn)?;
+        while let Some(((addr, outpoint), _)) = iter.next()? {
+            if addresses.contains(&addr)
+                && let Some(filled_output) =
+                    self.utxos.try_get(rotxn, &outpoint)?
+            {
+                result.insert(outpoint, filled_output);
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+impl UtxoManager for State {
+    fn insert_utxo_with_address_index(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+        filled_output: &FilledOutput,
+    ) -> Result<(), Error> {
+        self.utxos.put(rwtxn, outpoint, filled_output)?;
+
+        self.utxos_by_address.put(
+            rwtxn,
+            &(filled_output.address, *outpoint),
+            &(),
+        )?;
+
+        // Update votecoin balances index (not a cache - this is a denormalized index for O(1) lookups)
+        if let crate::types::FilledOutputContent::Votecoin(amount) =
+            &filled_output.content
+        {
+            let current_balance = self
+                .votecoin_balances
+                .try_get(rwtxn, &filled_output.address)?
+                .unwrap_or(0);
+            let new_balance = current_balance
+                .checked_add(*amount)
+                .ok_or(AmountOverflowError)?;
+            self.votecoin_balances.put(
+                rwtxn,
+                &filled_output.address,
+                &new_balance,
+            )?;
+        }
+
+        Ok(())
     }
 
-    /// Get the latest failed withdrawal bundle, and the height at which it failed
+    fn delete_utxo_with_address_index(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+    ) -> Result<bool, Error> {
+        let filled_output =
+            if let Some(output) = self.utxos.try_get(rwtxn, outpoint)? {
+                output
+            } else {
+                return Ok(false);
+            };
+
+        // Update votecoin balances index (not a cache - this is a denormalized index for O(1) lookups)
+        if let crate::types::FilledOutputContent::Votecoin(amount) =
+            &filled_output.content
+        {
+            let current_balance = self
+                .votecoin_balances
+                .try_get(rwtxn, &filled_output.address)?
+                .unwrap_or(0);
+            let new_balance = current_balance
+                .checked_sub(*amount)
+                .ok_or(AmountUnderflowError)?;
+            self.votecoin_balances.put(
+                rwtxn,
+                &filled_output.address,
+                &new_balance,
+            )?;
+        }
+
+        self.utxos_by_address
+            .delete(rwtxn, &(filled_output.address, *outpoint))?;
+
+        let deleted = self.utxos.delete(rwtxn, outpoint)?;
+
+        if !deleted {
+            // Restore address index
+            self.utxos_by_address.put(
+                rwtxn,
+                &(filled_output.address, *outpoint),
+                &(),
+            )?;
+            // Restore votecoin balance
+            if let crate::types::FilledOutputContent::Votecoin(amount) =
+                &filled_output.content
+            {
+                let current_balance = self
+                    .votecoin_balances
+                    .try_get(rwtxn, &filled_output.address)?
+                    .unwrap_or(0);
+                let restored_balance = current_balance
+                    .checked_add(*amount)
+                    .ok_or(AmountOverflowError)?;
+                self.votecoin_balances.put(
+                    rwtxn,
+                    &filled_output.address,
+                    &restored_balance,
+                )?;
+            }
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn clear_utxos_and_address_index(
+        &self,
+        rwtxn: &mut RwTxn,
+    ) -> Result<(), Error> {
+        self.utxos.clear(rwtxn)?;
+        self.utxos_by_address.clear(rwtxn)?;
+        self.votecoin_balances.clear(rwtxn)?;
+        Ok(())
+    }
+
+    fn insert_utxo_supply_neutral(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+        filled_output: &FilledOutput,
+    ) -> Result<(), Error> {
+        self.utxos.put(rwtxn, outpoint, filled_output)?;
+
+        self.utxos_by_address.put(
+            rwtxn,
+            &(filled_output.address, *outpoint),
+            &(),
+        )?;
+
+        if let crate::types::FilledOutputContent::Votecoin(amount) =
+            &filled_output.content
+        {
+            let current_balance = self
+                .votecoin_balances
+                .try_get(rwtxn, &filled_output.address)?
+                .unwrap_or(0);
+            let new_balance = current_balance
+                .checked_add(*amount)
+                .ok_or(AmountOverflowError)?;
+            self.votecoin_balances.put(
+                rwtxn,
+                &filled_output.address,
+                &new_balance,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn delete_utxo_supply_neutral(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+    ) -> Result<bool, Error> {
+        let filled_output =
+            if let Some(output) = self.utxos.try_get(rwtxn, outpoint)? {
+                output
+            } else {
+                return Ok(false);
+            };
+
+        if let crate::types::FilledOutputContent::Votecoin(amount) =
+            &filled_output.content
+        {
+            let current_balance = self
+                .votecoin_balances
+                .try_get(rwtxn, &filled_output.address)?
+                .unwrap_or(0);
+            let new_balance = current_balance
+                .checked_sub(*amount)
+                .ok_or(AmountUnderflowError)?;
+            self.votecoin_balances.put(
+                rwtxn,
+                &filled_output.address,
+                &new_balance,
+            )?;
+        }
+
+        self.utxos_by_address
+            .delete(rwtxn, &(filled_output.address, *outpoint))?;
+
+        let deleted = self.utxos.delete(rwtxn, outpoint)?;
+
+        if !deleted {
+            self.utxos_by_address.put(
+                rwtxn,
+                &(filled_output.address, *outpoint),
+                &(),
+            )?;
+            if let crate::types::FilledOutputContent::Votecoin(amount) =
+                &filled_output.content
+            {
+                let current_balance = self
+                    .votecoin_balances
+                    .try_get(rwtxn, &filled_output.address)?
+                    .unwrap_or(0);
+                let restored_balance = current_balance
+                    .checked_add(*amount)
+                    .ok_or(AmountOverflowError)?;
+                self.votecoin_balances.put(
+                    rwtxn,
+                    &filled_output.address,
+                    &restored_balance,
+                )?;
+            }
+        }
+
+        Ok(deleted)
+    }
+}
+
+impl State {
+    pub fn get_mempool_shares(
+        &self,
+        rotxn: &RoTxn,
+        market_id: &crate::state::markets::MarketId,
+    ) -> Result<Option<ndarray::Array1<i64>>, Error> {
+        self.markets.get_mempool_shares(rotxn, market_id)
+    }
+
+    pub fn put_mempool_shares(
+        &self,
+        rwtxn: &mut RwTxn,
+        market_id: &crate::state::markets::MarketId,
+        shares: &ndarray::Array1<i64>,
+    ) -> Result<(), Error> {
+        self.markets.put_mempool_shares(rwtxn, market_id, shares)
+    }
+
+    pub fn clear_mempool_shares(
+        &self,
+        rwtxn: &mut RwTxn,
+        market_id: &crate::state::markets::MarketId,
+    ) -> Result<(), Error> {
+        self.markets.clear_mempool_shares(rwtxn, market_id)
+    }
+
     pub fn get_latest_failed_withdrawal_bundle(
         &self,
         rotxn: &RoTxn,
@@ -265,7 +650,6 @@ impl State {
         })
     }
 
-    /// Fill a transaction that has already been applied
     pub fn fill_transaction_from_stxos(
         &self,
         rotxn: &RoTxn,
@@ -273,7 +657,6 @@ impl State {
     ) -> Result<FilledTransaction, Error> {
         let txid = tx.txid();
         let mut spent_utxos = vec![];
-        // fill inputs last-to-first
         for (vin, input) in tx.inputs.iter().enumerate().rev() {
             let stxo = self
                 .stxos
@@ -309,7 +692,6 @@ impl State {
         })
     }
 
-    /// Get pending withdrawal bundle and block height
     pub fn get_pending_withdrawal_bundle(
         &self,
         txn: &RoTxn,
@@ -317,242 +699,170 @@ impl State {
         Ok(self.pending_withdrawal_bundle.try_get(txn, &())?)
     }
 
-    /// Check that
-    /// * If the tx is a Truthcoin reservation, then the number of truthcoin
-    ///   reservations in the outputs is exactly one more than the number of
-    ///   truthcoin reservations in the inputs.
-    /// * If the tx is a Truthcoin
-    ///   registration, then the number of truthcoin reservations in the outputs
-    ///   is exactly one less than the number of truthcoin reservations in the
-    ///   inputs.
-    /// * Otherwise, the number of truthcoin reservations in the outputs
-    ///   is exactly equal to the number of truthcoin reservations in the inputs.
-    pub fn validate_reservations(
-        &self,
-        tx: &FilledTransaction,
-    ) -> Result<(), Error> {
-        let n_reservation_inputs: usize = tx.spent_reservations().count();
-        let n_reservation_outputs: usize = tx.reservation_outputs().count();
-        if tx.is_reservation() {
-            if n_reservation_outputs == n_reservation_inputs + 1 {
-                return Ok(());
-            }
-        } else if tx.is_registration() {
-            if n_reservation_inputs == n_reservation_outputs + 1 {
-                return Ok(());
-            }
-        } else if n_reservation_inputs == n_reservation_outputs {
-            return Ok(());
-        }
-        Err(Error::UnbalancedReservations {
-            n_reservation_inputs,
-            n_reservation_outputs,
-        })
-    }
-
-    /** Check that
-     *  * If the tx is a Truthcoin registration, then
-     *    * The number of Truthcoin control coins in the outputs is exactly
-     *      one more than the number of Truthcoin control coins in the
-     *      inputs
-     *    * The number of Truthcoin outputs is at least
-     *      * The number of unique Truthcoin inputs,
-     *        if the initial supply is zero
-     *      * One more than the number of unique Truthcoin inputs,
-     *        if the initial supply is nonzero.
-     *    * The newly registered Truthcoin must have been unregistered,
-     *      prior to the registration tx.
-     *    * The last output must be a Truthcoin control coin
-     *    * If the initial supply is nonzero,
-     *      the second-to-last output must be a Truthcoin output
-     *    * Otherwise,
-     *      * The number of Truthcoin control coin outputs is exactly the number
-     *        of Truthcoin control coin inputs
-     *      * The number of Truthcoin outputs is at least
-     *        the number of unique Truthcoin in the inputs.
-     *  * If the tx is a Truthcoin update, then there must be at least one
-     *    Truthcoin control coin input and output.
-     *  * If the tx is an AMM Burn, then
-     *    * There must be at least two unique Truthcoin outputs
-     *    * The number of unique Truthcoin outputs must be at most two more than
-     *      the number of unique Truthcoin inputs
-     *    * The number of unique Truthcoin inputs must be at most equal to the
-     *      number of unique Truthcoin outputs
-     *  * If the tx is an AMM Mint, then
-     *    * There must be at least two Truthcoin inputs
-     *    * The number of unique Truthcoin outputs must be at most equal to the
-     *      number of unique Truthcoin inputs
-     *    * The number of unique Truthcoin inputs must be at most two more than
-     *      the number of unique Truthcoin outputs.
-     *  * If the tx is an AMM Swap, then
-     *    * There must be at least one Truthcoin input
-     *    * The number of unique Truthcoin outputs must be one less than,
-     *      one greater than, or equal to, the number of unique Truthcoin inputs.
-     *  * If the tx is a Dutch auction create, then
-     *    * There must be at least one unique Truthcoin input
-     *    * The number of unique Truthcoin outputs must be at most equal to the
-     *      number of unique Truthcoin inputs
-     *    * The number of unique Truthcoin inputs must be at most one more than
-     *      the number of unique Truthcoin outputs.
-     *  * If the tx is a Dutch auction bid, then
-     *    * There must be at least one Truthcoin input
-     *    * The number of unique Truthcoin outputs must be one less than,
-     *      one greater than, or equal to, the number of unique Truthcoin inputs.
-     *  * If the tx is a Dutch auction collect, then
-     *    * There must be at least one unique Truthcoin output
-     *    * The number of unique Truthcoin outputs must be at most two more than
-     *      the number of unique Truthcoin inputs
-     *    * The number of unique Truthcoin inputs must be at most equal to the
-     *      number of unique Truthcoin outputs
-     * */
-    pub fn validate_truthcoin(
+    pub fn validate_votecoin(
         &self,
         rotxn: &RoTxn,
         tx: &FilledTransaction,
+        override_height: Option<u32>,
     ) -> Result<(), Error> {
-        // number of unique truthcoin in the inputs
-        let n_unique_truthcoin_inputs: usize = tx
-            .spent_truthcoin()
-            .filter_map(|(_, output)| output.truthcoin())
-            .unique()
-            .count();
-        let n_truthcoin_control_inputs: usize =
-            tx.spent_truthcoin_controls().count();
-        let n_truthcoin_outputs: usize = tx.truthcoin_outputs().count();
-        let n_unique_truthcoin_outputs: usize =
-            tx.unique_spent_truthcoin().len();
-        let n_truthcoin_control_outputs: usize =
-            tx.truthcoin_control_outputs().count();
-        if tx.is_update()
-            && (n_truthcoin_control_inputs < 1 || n_truthcoin_control_outputs < 1)
-        {
-            return Err(error::Truthcoin::NoTruthcoinToUpdate.into());
-        };
-        if tx.is_amm_burn()
-            && (n_unique_truthcoin_outputs < 2
-                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs
-                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs + 2)
-        {
-            return Err(error::Amm::InvalidBurn.into());
-        };
-        if tx.is_amm_mint()
-            && (n_unique_truthcoin_inputs < 2
-                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs
-                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs + 2)
-        {
-            return Err(error::Amm::TooFewTruthcoinToMint.into());
-        };
-        if (tx.is_amm_swap() || tx.is_dutch_auction_bid())
-            && (n_unique_truthcoin_inputs < 1
-                || !{
-                    let min_unique_truthcoin_outputs =
-                        n_unique_truthcoin_inputs.saturating_sub(1);
-                    let max_unique_truthcoin_outputs =
-                        n_unique_truthcoin_inputs + 1;
-                    (min_unique_truthcoin_outputs..=max_unique_truthcoin_outputs)
-                        .contains(&n_unique_truthcoin_outputs)
-                })
-        {
-            let err = error::dutch_auction::Bid::Invalid;
-            return Err(Error::DutchAuction(err.into()));
-        };
-        if tx.is_dutch_auction_create()
-            && (n_unique_truthcoin_inputs < 1
-                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs
-                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs + 1)
-        {
-            return Err(error::DutchAuction::TooFewTruthcoinToCreate.into());
-        };
-        if tx.is_dutch_auction_collect()
-            && (n_unique_truthcoin_outputs < 1
-                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs
-                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs + 2)
-        {
-            let err = error::dutch_auction::Collect::Invalid;
-            return Err(Error::DutchAuction(err.into()));
-        };
-        if let Some(TxData::TruthcoinRegistration {
-            name_hash,
-            initial_supply,
-            ..
-        }) = tx.data()
-        {
-            if n_truthcoin_control_outputs != n_truthcoin_control_inputs + 1 {
-                return Err(Error::UnbalancedTruthcoinControls {
-                    n_truthcoin_control_inputs,
-                    n_truthcoin_control_outputs,
-                });
-            };
-            if !tx
-                .outputs()
-                .last()
-                .is_some_and(|last_output| last_output.is_truthcoin_control())
-            {
-                return Err(Error::LastOutputNotControlCoin);
-            }
-            if *initial_supply == 0 {
-                if n_truthcoin_outputs < n_unique_truthcoin_inputs {
-                    return Err(Error::UnbalancedTruthcoin {
-                        n_unique_truthcoin_inputs,
-                        n_truthcoin_outputs,
-                    });
-                }
-            } else {
-                if n_truthcoin_outputs < n_unique_truthcoin_inputs + 1 {
-                    return Err(Error::UnbalancedTruthcoin {
-                        n_unique_truthcoin_inputs,
-                        n_truthcoin_outputs,
-                    });
-                }
-                let outputs = tx.outputs();
-                let second_to_last_output = outputs.get(outputs.len() - 2);
-                if !second_to_last_output
-                    .is_some_and(|s2l_output| s2l_output.is_truthcoin())
+        let votecoin_inputs: u32 = tx
+            .spent_votecoin()
+            .filter_map(|(_, output)| output.votecoin())
+            .sum();
+        let votecoin_outputs: u32 = tx
+            .votecoin_outputs()
+            .filter_map(|output| {
+                if let crate::types::OutputContent::Votecoin(amount) =
+                    &output.content
                 {
-                    return Err(Error::SecondLastOutputNotTruthcoin);
+                    Some(*amount)
+                } else {
+                    None
                 }
-            }
-            if self
-                .truthcoin
-                .try_get_truthcoin(rotxn, &TruthcoinId(*name_hash))?
-                .is_some()
-            {
-                return Err(Error::TruthcoinAlreadyRegistered {
-                    name_hash: *name_hash,
-                });
-            };
+            })
+            .sum();
+
+        let block_height = match override_height {
+            Some(height) => height,
+            None => self.try_get_height(rotxn)?.unwrap_or(0),
+        };
+        let is_genesis = block_height == 0;
+
+        if is_genesis {
             Ok(())
         } else {
-            if n_truthcoin_control_outputs != n_truthcoin_control_inputs {
-                return Err(Error::UnbalancedTruthcoinControls {
-                    n_truthcoin_control_inputs,
-                    n_truthcoin_control_outputs,
-                });
-            };
-            if n_truthcoin_outputs < n_unique_truthcoin_inputs {
-                return Err(Error::UnbalancedTruthcoin {
-                    n_unique_truthcoin_inputs,
-                    n_truthcoin_outputs,
-                });
-            }
-            if n_unique_truthcoin_inputs == 0 && n_truthcoin_outputs != 0 {
-                return Err(Error::UnbalancedTruthcoin {
-                    n_unique_truthcoin_inputs,
-                    n_truthcoin_outputs,
+            if votecoin_inputs != votecoin_outputs {
+                return Err(Error::UnbalancedVotecoin {
+                    inputs: votecoin_inputs,
+                    outputs: votecoin_outputs,
                 });
             }
             Ok(())
         }
     }
 
-    /// Validates a filled transaction, and returns the fee
+    pub fn validate_decision_slot_claim(
+        &self,
+        rotxn: &RoTxn,
+        tx: &FilledTransaction,
+        override_height: Option<u32>,
+    ) -> Result<(), Error> {
+        SlotValidator::validate_complete_decision_slot_claim(
+            self,
+            rotxn,
+            tx,
+            override_height,
+        )
+    }
+
+    pub fn validate_category_slots_claim(
+        &self,
+        rotxn: &RoTxn,
+        tx: &FilledTransaction,
+        override_height: Option<u32>,
+    ) -> Result<(), Error> {
+        SlotValidator::validate_complete_category_slots_claim(
+            self,
+            rotxn,
+            tx,
+            override_height,
+        )
+    }
+
+    pub fn validate_market_creation(
+        &self,
+        rotxn: &RoTxn,
+        tx: &FilledTransaction,
+        override_height: Option<u32>,
+    ) -> Result<(), Error> {
+        MarketValidator::validate_market_creation(
+            self,
+            rotxn,
+            tx,
+            override_height,
+        )
+    }
+
+    pub fn validate_trade(
+        &self,
+        rotxn: &RoTxn,
+        tx: &FilledTransaction,
+        override_height: Option<u32>,
+    ) -> Result<(), Error> {
+        MarketValidator::validate_trade(self, rotxn, tx, override_height)
+    }
+
     pub fn validate_filled_transaction(
         &self,
         rotxn: &RoTxn,
         tx: &FilledTransaction,
+        override_height: Option<u32>,
     ) -> Result<bitcoin::Amount, Error> {
-        let () = self.validate_reservations(tx)?;
-        let () = self.validate_truthcoin(rotxn, tx)?;
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+        use crate::validation::VoteValidator;
+
+        let () = self.validate_votecoin(rotxn, tx, override_height)?;
+
+        if tx.is_claim_decision_slot() {
+            self.validate_decision_slot_claim(rotxn, tx, override_height)?;
+        }
+
+        if tx.is_claim_category_slots() {
+            self.validate_category_slots_claim(rotxn, tx, override_height)?;
+        }
+
+        if tx.is_create_market() {
+            self.validate_market_creation(rotxn, tx, override_height)?;
+        }
+
+        if tx.is_trade() {
+            self.validate_trade(rotxn, tx, override_height)?;
+            return Ok(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS));
+        }
+
+        if tx.is_submit_vote() {
+            VoteValidator::validate_vote_submission(
+                self,
+                rotxn,
+                tx,
+                override_height,
+            )?;
+        }
+
+        if tx.is_submit_vote_batch() {
+            VoteValidator::validate_vote_batch(
+                self,
+                rotxn,
+                tx,
+                override_height,
+            )?;
+        }
+
+        if tx.is_register_voter() {
+            let voter_address = tx
+                .spent_utxos
+                .first()
+                .ok_or_else(|| Error::InvalidTransaction {
+                    reason: "Voter registration transaction must have inputs"
+                        .to_string(),
+                })?
+                .address;
+
+            let votecoin_balance =
+                self.get_votecoin_balance(rotxn, &voter_address)?;
+            if votecoin_balance == 0 {
+                return Err(Error::InvalidTransaction {
+                    reason: "Voter registration requires Votecoin balance"
+                        .to_string(),
+                });
+            }
+            crate::validation::VoterValidator::validate_voter_not_registered(
+                self,
+                rotxn,
+                voter_address,
+            )?;
+        }
+
         tx.bitcoin_fee()?.ok_or(Error::NotEnoughValueIn)
     }
 
@@ -576,7 +886,7 @@ impl State {
             return Err(Error::AuthorizationError);
         }
         let fee =
-            self.validate_filled_transaction(rotxn, &filled_transaction)?;
+            self.validate_filled_transaction(rotxn, &filled_transaction, None)?;
         Ok(fee)
     }
 
@@ -602,44 +912,88 @@ impl State {
         Ok(block_hash)
     }
 
-    /// Get total sidechain wealth in Bitcoin
+    /// Compute the total value of all deposit UTXOs (on-demand, no cache).
+    pub fn compute_deposit_utxo_value(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<u64, Error> {
+        let mut total = 0u64;
+        let mut iter = self.utxos.iter(rotxn)?;
+        while let Some((outpoint, filled_output)) = iter.next()? {
+            if matches!(outpoint, OutPoint::Deposit(_)) {
+                total = total
+                    .saturating_add(filled_output.get_bitcoin_value().to_sat());
+            }
+        }
+        Ok(total)
+    }
+
+    /// Compute the total value of all spent deposit outputs (on-demand, no cache).
+    pub fn compute_deposit_stxo_value(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<u64, Error> {
+        let mut total = 0u64;
+        let mut iter = self.stxos.iter(rotxn)?;
+        while let Some((outpoint, spent_output)) = iter.next()? {
+            if matches!(outpoint, OutPoint::Deposit(_)) {
+                total = total.saturating_add(
+                    spent_output.output.get_bitcoin_value().to_sat(),
+                );
+            }
+        }
+        Ok(total)
+    }
+
+    /// Compute the total value of all withdrawal spent outputs (on-demand, no cache).
+    pub fn compute_withdrawal_stxo_value(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<u64, Error> {
+        let mut total = 0u64;
+        let mut iter = self.stxos.iter(rotxn)?;
+        while let Some((_outpoint, spent_output)) = iter.next()? {
+            if matches!(spent_output.inpoint, InPoint::Withdrawal { .. }) {
+                total = total.saturating_add(
+                    spent_output.output.get_bitcoin_value().to_sat(),
+                );
+            }
+        }
+        Ok(total)
+    }
+
+    /// Compute the total votecoin supply (on-demand, no cache).
+    pub fn compute_votecoin_supply(&self, rotxn: &RoTxn) -> Result<u32, Error> {
+        let mut total = 0u32;
+        let mut iter = self.votecoin_balances.iter(rotxn)?;
+        while let Some((_address, balance)) = iter.next()? {
+            total = total.saturating_add(balance);
+        }
+        Ok(total)
+    }
+
     pub fn sidechain_wealth(
         &self,
         rotxn: &RoTxn,
     ) -> Result<bitcoin::Amount, Error> {
-        let mut total_deposit_utxo_value = bitcoin::Amount::ZERO;
-        self.utxos.iter(rotxn)?.map_err(Error::from).for_each(
-            |(outpoint, output)| {
-                if let OutPoint::Deposit(_) = outpoint {
-                    total_deposit_utxo_value = total_deposit_utxo_value
-                        .checked_add(output.get_bitcoin_value())
-                        .ok_or(AmountOverflowError)?;
-                }
-                Ok::<_, Error>(())
-            },
-        )?;
-        let mut total_deposit_stxo_value = bitcoin::Amount::ZERO;
-        let mut total_withdrawal_stxo_value = bitcoin::Amount::ZERO;
-        self.stxos.iter(rotxn)?.map_err(Error::from).for_each(
-            |(outpoint, spent_output)| {
-                if let OutPoint::Deposit(_) = outpoint {
-                    total_deposit_stxo_value = total_deposit_stxo_value
-                        .checked_add(spent_output.output.get_bitcoin_value())
-                        .ok_or(AmountOverflowError)?;
-                }
-                if let InPoint::Withdrawal { .. } = spent_output.inpoint {
-                    total_withdrawal_stxo_value = total_deposit_stxo_value
-                        .checked_add(spent_output.output.get_bitcoin_value())
-                        .ok_or(AmountOverflowError)?;
-                }
-                Ok::<_, Error>(())
-            },
-        )?;
-        let total_wealth: bitcoin::Amount = total_deposit_utxo_value
+        // Compute values on-demand from source data (no caches)
+        let deposit_utxo_value = self.compute_deposit_utxo_value(rotxn)?;
+        let deposit_stxo_value = self.compute_deposit_stxo_value(rotxn)?;
+        let withdrawal_stxo_value =
+            self.compute_withdrawal_stxo_value(rotxn)?;
+
+        let total_deposit_utxo_value =
+            bitcoin::Amount::from_sat(deposit_utxo_value);
+        let total_deposit_stxo_value =
+            bitcoin::Amount::from_sat(deposit_stxo_value);
+        let total_withdrawal_stxo_value =
+            bitcoin::Amount::from_sat(withdrawal_stxo_value);
+
+        let total_wealth = total_deposit_utxo_value
             .checked_add(total_deposit_stxo_value)
-            .ok_or(AmountOverflowError)?
-            .checked_sub(total_withdrawal_stxo_value)
+            .and_then(|sum| sum.checked_sub(total_withdrawal_stxo_value))
             .ok_or(AmountOverflowError)?;
+
         Ok(total_wealth)
     }
 
@@ -648,7 +1002,8 @@ impl State {
         rotxn: &RoTxn,
         header: &Header,
         body: &Body,
-    ) -> Result<bitcoin::Amount, Error> {
+    ) -> Result<(bitcoin::Amount, Vec<FilledTransaction>, MerkleRoot), Error>
+    {
         block::validate(self, rotxn, header, body)
     }
 
@@ -657,8 +1012,19 @@ impl State {
         rwtxn: &mut RwTxn,
         header: &Header,
         body: &Body,
+        mainchain_timestamp: u64,
+        filled_txs: Vec<FilledTransaction>,
+        merkle_root: MerkleRoot,
     ) -> Result<(), Error> {
-        block::connect(self, rwtxn, header, body)
+        block::connect(
+            self,
+            rwtxn,
+            header,
+            body,
+            mainchain_timestamp,
+            filled_txs,
+            merkle_root,
+        )
     }
 
     pub fn disconnect_tip(
@@ -685,12 +1051,186 @@ impl State {
     ) -> Result<(), Error> {
         two_way_peg_data::disconnect(self, rwtxn, two_way_peg_data)
     }
+
+    pub fn get_all_slot_periods(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<(u32, u64)>, Error> {
+        let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
+        let current_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.get_active_periods(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn get_slots_for_period(
+        &self,
+        rotxn: &RoTxn,
+        period: u32,
+    ) -> Result<u64, Error> {
+        let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
+        let current_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.total_for(
+            rotxn,
+            period,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn get_available_slots_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<Vec<crate::state::slots::SlotId>, Error> {
+        let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
+        let current_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.get_available_slots_in_period(
+            rotxn,
+            period_index,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn get_ossified_slots(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<crate::state::slots::Slot>, Error> {
+        let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
+        let current_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.get_ossified_slots(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn is_slot_in_voting(
+        &self,
+        rotxn: &RoTxn,
+        slot_id: crate::state::slots::SlotId,
+    ) -> Result<bool, Error> {
+        self.slots.is_slot_in_voting(rotxn, slot_id)
+    }
+
+    pub fn get_voting_periods(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<(u32, u64, u64)>, Error> {
+        let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
+        let current_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.get_voting_periods(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn get_period_summary(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<type_aliases::PeriodSummary, Error> {
+        let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
+        let current_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        self.slots.get_period_summary(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn get_claimed_slot_count_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<u64, Error> {
+        self.slots
+            .get_claimed_slot_count_in_period(rotxn, period_index)
+    }
+
+    pub fn get_votecoin_balance(
+        &self,
+        rotxn: &RoTxn,
+        address: &Address,
+    ) -> Result<u32, Error> {
+        Ok(self.votecoin_balances.try_get(rotxn, address)?.unwrap_or(0))
+    }
+
+    pub fn get_votecoin_balances_batch(
+        &self,
+        rotxn: &RoTxn,
+        addresses: &HashSet<Address>,
+    ) -> Result<HashMap<Address, u32>, Error> {
+        let mut balances = HashMap::with_capacity(addresses.len());
+        for &address in addresses {
+            let balance = self
+                .votecoin_balances
+                .try_get(rotxn, &address)?
+                .unwrap_or(0);
+            balances.insert(address, balance);
+        }
+        Ok(balances)
+    }
+
+    pub fn get_total_votecoin_supply(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<u32, Error> {
+        self.compute_votecoin_supply(rotxn)
+    }
+
+    pub fn get_votecoin_proportion(
+        &self,
+        rotxn: &RoTxn,
+        address: &Address,
+    ) -> Result<f64, Error> {
+        let balance = self.get_votecoin_balance(rotxn, address)?;
+        let total_supply = self.get_total_votecoin_supply(rotxn)?;
+        if total_supply == 0 {
+            return Ok(0.0);
+        }
+        Ok(balance as f64 / total_supply as f64)
+    }
+
+    pub fn get_votecoin_proportions_batch(
+        &self,
+        rotxn: &RoTxn,
+        addresses: &HashSet<Address>,
+    ) -> Result<HashMap<Address, f64>, Error> {
+        let balances = self.get_votecoin_balances_batch(rotxn, addresses)?;
+        let total_supply = self.get_total_votecoin_supply(rotxn)?;
+        let mut proportions = HashMap::new();
+        if total_supply == 0 {
+            for &address in addresses {
+                proportions.insert(address, 0.0);
+            }
+            return Ok(proportions);
+        }
+        for (&address, &balance) in &balances {
+            let proportion = balance as f64 / total_supply as f64;
+            proportions.insert(address, proportion);
+        }
+        Ok(proportions)
+    }
 }
 
 impl Watchable<()> for State {
     type WatchStream = impl Stream<Item = ()>;
-
-    /// Get a signal that notifies whenever the tip changes
     fn watch(&self) -> Self::WatchStream {
         tokio_stream::wrappers::WatchStream::new(self.tip.watch().clone())
     }

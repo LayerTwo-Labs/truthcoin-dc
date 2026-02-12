@@ -8,29 +8,30 @@ use std::{
 
 use bitcoin::amount::CheckedSum as _;
 use fallible_iterator::FallibleIterator;
-use fraction::Fraction;
-use futures::{Stream, future::BoxFuture};
+use futures::future::BoxFuture;
 use sneed::{DbError, Env, EnvError, RwTxnError, env};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
+use ndarray::Array1;
+
 use crate::{
     archive::{self, Archive},
+    math::trading,
     mempool::{self, MemPool},
     net::{self, Net, Peer},
-    state::{
-        self, AmmPair, AmmPoolState, TruthcoinSeqId, DutchAuctionState, State,
-    },
+    state::{self, State, markets::MarketId},
     types::{
-        Address, AmountOverflowError, AmountUnderflowError, AssetId,
-        Authorized, AuthorizedTransaction, TruthcoinData, TruthcoinId, Block,
-        BlockHash, BmmResult, Body, DutchAuctionId, FilledOutput,
+        Address, AmountOverflowError, AmountUnderflowError, Authorized,
+        AuthorizedTransaction, Block, BlockHash, BmmResult, Body, FilledOutput,
         FilledTransaction, GetBitcoinValue, Header, InPoint, Network, OutPoint,
-        Output, SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
+        Output, SpentOutput, Tip, Transaction, TxData, TxIn, Txid,
+        WithdrawalBundle,
         proto::{self, mainchain},
     },
     util::Watchable,
 };
+use sneed::RwTxn;
 
 mod mainchain_task;
 mod net_task;
@@ -80,7 +81,7 @@ pub enum Error {
     ReceiveMainchainTaskResponse,
     #[error("Send mainchain task request failed")]
     SendMainchainTaskRequest,
-    #[error("state error")]
+    #[error("state error: {0}")]
     State(#[source] Box<state::Error>),
     #[error("Utreexo error: {0}")]
     Utreexo(String),
@@ -142,6 +143,7 @@ where
             mainchain::WalletClient<MainchainTransport>,
         >,
         runtime: &tokio::runtime::Runtime,
+        slot_config_testing: Option<u32>,
         #[cfg(feature = "zmq")] zmq_addr: SocketAddr,
     ) -> Result<Self, Error>
     where
@@ -152,21 +154,18 @@ where
         >>::Future: Send,
     {
         let env_path = datadir.join("data.mdb");
-        // let _ = std::fs::remove_dir_all(&env_path);
         std::fs::create_dir_all(&env_path)?;
         let env = {
             let mut env_open_opts = heed::EnvOpenOptions::new();
-            env_open_opts
-                .map_size(1024 * 1024 * 1024) // 1GB
-                .max_dbs(
-                    State::NUM_DBS
-                        + Archive::NUM_DBS
-                        + MemPool::NUM_DBS
-                        + Net::NUM_DBS,
-                );
+            env_open_opts.map_size(1024 * 1024 * 1024).max_dbs(
+                State::NUM_DBS
+                    + Archive::NUM_DBS
+                    + MemPool::NUM_DBS
+                    + Net::NUM_DBS,
+            );
             unsafe { Env::open(&env_open_opts, &env_path) }?
         };
-        let state = State::new(&env)?;
+        let state = State::new(&env, slot_config_testing)?;
         #[cfg(feature = "zmq")]
         let zmq_pub_handler = Arc::new(ZmqPubHandler::new(zmq_addr).await?);
         let archive = Archive::new(&env)?;
@@ -209,8 +208,6 @@ where
         })
     }
 
-    /// Borrow the CUSF mainchain client, and execute the provided future.
-    /// The CUSF mainchain client will be locked while the future is running.
     pub async fn with_cusf_mainchain<F, Output>(&self, f: F) -> Output
     where
         F: for<'cusf_mainchain> FnOnce(
@@ -234,138 +231,28 @@ where
         Ok(self.state.try_get_tip(&rotxn)?)
     }
 
-    pub fn try_get_amm_price(
+    pub fn votecoin_network_data(
         &self,
-        base: AssetId,
-        quote: AssetId,
-    ) -> Result<Option<Fraction>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let amm_pair = AmmPair::new(base, quote);
-        let Some(AmmPoolState {
-            reserve0,
-            reserve1,
-            outstanding_lp_tokens: _,
-            ..
-        }) = self
-            .state
-            .amm_pools()
-            .try_get(&rotxn, &amm_pair)
-            .map_err(state::Error::from)?
-        else {
-            return Ok(None);
-        };
-        if reserve0 == 0 || reserve1 == 0 {
-            return Ok(None);
-        }
-        if base < quote {
-            Ok(Some(Fraction::new(reserve1, reserve0)))
-        } else {
-            Ok(Some(Fraction::new(reserve0, reserve1)))
-        }
-    }
-
-    pub fn try_get_amm_pool_state(
-        &self,
-        pair: AmmPair,
-    ) -> Result<Option<AmmPoolState>, Error> {
+    ) -> Result<
+        Vec<(
+            crate::state::votecoin::VotecoinId,
+            crate::state::votecoin::VotecoinNetworkData,
+        )>,
+        Error,
+    > {
         let rotxn = self.env.read_txn()?;
         let res = self
             .state
-            .amm_pools()
-            .try_get(&rotxn, &pair)
-            .map_err(state::Error::from)?;
-        Ok(res)
-    }
-
-    pub fn get_amm_pool_state(
-        &self,
-        pair: AmmPair,
-    ) -> Result<AmmPoolState, Error> {
-        let res = self.try_get_amm_pool_state(pair)?.ok_or_else(|| {
-            let err = state::error::Amm::MissingPoolState {
-                asset0: pair.asset0(),
-                asset1: pair.asset1(),
-            };
-            state::Error::from(err)
-        })?;
-        Ok(res)
-    }
-
-    /// List all Truthcoin and their current data
-    pub fn truthcoin(
-        &self,
-    ) -> Result<Vec<(TruthcoinSeqId, TruthcoinId, TruthcoinData)>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let truthcoin_ids_to_data: HashMap<_, _> = self
-            .state
-            .truthcoin()
-            .truthcoin()
+            .votecoin()
+            .votecoin()
             .iter(&rotxn)
             .map_err(state::Error::from)?
             .map_err(state::Error::from)
-            .map(|(truthcoin_id, truthcoin_data)| {
-                Ok((truthcoin_id, truthcoin_data.current()))
-            })
-            .collect()?;
-        let res = self
-            .state
-            .truthcoin()
-            .seq_to_truthcoin()
-            .iter(&rotxn)
-            .map_err(state::Error::from)?
-            .map_err(state::Error::from)
-            .map(|(truthcoin_seq_id, truthcoin_id)| {
-                let truthcoin_data = truthcoin_ids_to_data
-                    .get(&truthcoin_id)
-                    .ok_or_else(|| state::error::Truthcoin::Missing {
-                        truthcoin: truthcoin_id,
-                    })?;
-                Ok((truthcoin_seq_id, truthcoin_id, truthcoin_data.clone()))
+            .map(|(votecoin_id, votecoin_data)| {
+                Ok((votecoin_id, votecoin_data.current()))
             })
             .collect()?;
         Ok(res)
-    }
-
-    /// List all dutch auctions and their current state
-    pub fn dutch_auctions(
-        &self,
-    ) -> Result<Vec<(DutchAuctionId, DutchAuctionState)>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let res = self
-            .state
-            .dutch_auctions()
-            .iter(&rotxn)
-            .map_err(state::Error::from)?
-            .map_err(state::Error::from)
-            .collect()?;
-        Ok(res)
-    }
-
-    pub fn try_get_dutch_auction_state(
-        &self,
-        auction_id: DutchAuctionId,
-    ) -> Result<Option<DutchAuctionState>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let res = self
-            .state
-            .dutch_auctions()
-            .try_get(&rotxn, &auction_id)
-            .map_err(state::Error::from)?;
-        Ok(res)
-    }
-
-    pub fn get_dutch_auction_state(
-        &self,
-        auction_id: DutchAuctionId,
-    ) -> Result<DutchAuctionState, Error> {
-        self.try_get_dutch_auction_state(auction_id).and_then(
-            |dutch_auction_state| {
-                dutch_auction_state.ok_or_else(|| {
-                    let err = state::error::dutch_auction::Bid::MissingAuction;
-                    state::Error::DutchAuction(err.into()).into()
-                })
-            },
-        )
     }
 
     pub fn try_get_height(
@@ -381,7 +268,6 @@ where
         Ok(self.archive.get_height(&rotxn, block_hash)?)
     }
 
-    /// Get blocks in which a tx was included, and tx index within those blocks
     pub fn get_tx_inclusions(
         &self,
         txid: Txid,
@@ -390,10 +276,6 @@ where
         Ok(self.archive.get_tx_inclusions(&rotxn, txid)?)
     }
 
-    /// Returns true if the second specified block is a descendant of the first
-    /// specified block
-    /// Returns an error if either of the specified block headers do not exist
-    /// in the archive.
     pub fn is_descendant(
         &self,
         ancestor: BlockHash,
@@ -403,45 +285,50 @@ where
         Ok(self.archive.is_descendant(&rotxn, ancestor, descendant)?)
     }
 
-    /** Resolve truthcoin data at the specified block height.
-     * Returns an error if it does not exist.rror if it does not exist. */
-    pub fn get_truthcoin_data_at_block_height(
+    pub fn get_votecoin_data_at_block_height(
         &self,
-        truthcoin: &TruthcoinId,
+        votecoin_id: &crate::state::votecoin::VotecoinId,
         height: u32,
-    ) -> Result<TruthcoinData, Error> {
+    ) -> Result<crate::state::votecoin::VotecoinNetworkData, Error> {
         let rotxn = self.env.read_txn()?;
-        Ok(self
-            .state
-            .truthcoin()
-            .get_truthcoin_data_at_block_height(&rotxn, truthcoin, height)
-            .map_err(state::Error::Truthcoin)?)
+        self.state
+            .votecoin()
+            .try_get_votecoin_data_at_block_height(&rotxn, votecoin_id, height)
+            .map_err(state::Error::from)?
+            .ok_or_else(|| {
+                Error::State(Box::new(state::Error::UnbalancedVotecoin {
+                    inputs: 0,
+                    outputs: 0,
+                }))
+            })
     }
 
-    /// resolve current truthcoin data, if it exists
-    pub fn try_get_current_truthcoin_data(
+    pub fn try_get_current_votecoin_data(
         &self,
-        truthcoin: &TruthcoinId,
-    ) -> Result<Option<TruthcoinData>, Error> {
+        votecoin_id: &crate::state::votecoin::VotecoinId,
+    ) -> Result<Option<crate::state::votecoin::VotecoinNetworkData>, Error>
+    {
         let rotxn = self.env.read_txn()?;
         Ok(self
             .state
-            .truthcoin()
-            .try_get_current_truthcoin_data(&rotxn, truthcoin)
-            .map_err(state::Error::Truthcoin)?)
+            .votecoin()
+            .try_get_current_votecoin_data(&rotxn, votecoin_id)?)
     }
 
-    /// Resolve current truthcoin data. Returns an error if it does not exist.
-    pub fn get_current_truthcoin_data(
+    pub fn get_current_votecoin_data(
         &self,
-        truthcoin: &TruthcoinId,
-    ) -> Result<TruthcoinData, Error> {
+        votecoin_id: &crate::state::votecoin::VotecoinId,
+    ) -> Result<crate::state::votecoin::VotecoinNetworkData, Error> {
         let rotxn = self.env.read_txn()?;
-        Ok(self
-            .state
-            .truthcoin()
-            .get_current_truthcoin_data(&rotxn, truthcoin)
-            .map_err(state::Error::Truthcoin)?)
+        self.state
+            .votecoin()
+            .try_get_current_votecoin_data(&rotxn, votecoin_id)?
+            .ok_or_else(|| {
+                Error::State(Box::new(state::Error::UnbalancedVotecoin {
+                    inputs: 0,
+                    outputs: 0,
+                }))
+            })
     }
 
     pub fn submit_transaction(
@@ -449,12 +336,201 @@ where
         transaction: AuthorizedTransaction,
     ) -> Result<(), Error> {
         {
-            let mut rotxn = self.env.write_txn()?;
-            self.state.validate_transaction(&rotxn, &transaction)?;
-            self.mempool.put(&mut rotxn, &transaction)?;
-            rotxn.commit().map_err(RwTxnError::from)?;
+            let mut rwtxn = self.env.write_txn()?;
+            self.state.validate_transaction(&rwtxn, &transaction)?;
+            self.mempool.put(&mut rwtxn, &transaction)?;
+
+            if let Some(data) = transaction.transaction.data.as_ref()
+                && let crate::types::TxData::Trade {
+                    market_id,
+                    outcome_index,
+                    shares,
+                    ..
+                } = data
+            {
+                if *shares > 0 {
+                    self.update_mempool_buy(
+                        &mut rwtxn,
+                        market_id.clone(),
+                        *outcome_index,
+                        *shares,
+                    )?;
+                } else {
+                    self.update_mempool_sell(
+                        &mut rwtxn,
+                        market_id.clone(),
+                        *outcome_index,
+                        shares.unsigned_abs() as i64,
+                    )?;
+                }
+            }
+
+            rwtxn.commit().map_err(RwTxnError::from)?;
         }
         self.net.push_tx(Default::default(), transaction);
+        Ok(())
+    }
+
+    pub fn get_mempool_shares(
+        &self,
+        market_id: &crate::state::markets::MarketId,
+    ) -> Result<Option<ndarray::Array1<i64>>, Error> {
+        let rotxn = self.env.read_txn()?;
+        self.state
+            .get_mempool_shares(&rotxn, market_id)
+            .map_err(|e| Error::State(Box::new(e)))
+    }
+
+    /// Single unified watch stream - fires when state or mempool changes.
+    /// State changes cover: new blocks, market updates, slot changes.
+    /// Mempool changes cover: new tx submissions, tx confirmations.
+    pub fn watch(
+        &self,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = ()> + Send>> {
+        Box::pin(futures::stream::select(
+            self.state.watch(),
+            self.mempool.watch(),
+        ))
+    }
+
+    /// Watch for state changes only (new blocks)
+    pub fn watch_state(&self) -> <State as Watchable<()>>::WatchStream {
+        self.state.watch()
+    }
+
+    fn update_mempool_buy(
+        &self,
+        rwtxn: &mut RwTxn,
+        market_id: MarketId,
+        outcome_index: u32,
+        shares_to_buy: i64,
+    ) -> Result<(), Error> {
+        use crate::state;
+
+        let market = self
+            .state
+            .markets()
+            .get_market(rwtxn, &market_id)?
+            .ok_or_else(|| {
+                Error::State(Box::new(state::Error::InvalidSlotId {
+                    reason: format!("Market {market_id:?} does not exist"),
+                }))
+            })?;
+
+        if market.state() != crate::state::markets::MarketState::Trading {
+            return Ok(());
+        }
+
+        if outcome_index as usize >= market.shares().len() {
+            return Err(Error::State(Box::new(state::Error::InvalidSlotId {
+                reason: format!(
+                    "Outcome index {} exceeds market outcomes {}",
+                    outcome_index,
+                    market.shares().len()
+                ),
+            })));
+        }
+
+        let current_shares = if let Some(existing_mempool_shares) =
+            self.state.get_mempool_shares(rwtxn, &market_id)?
+        {
+            existing_mempool_shares
+        } else {
+            market.shares().clone()
+        };
+
+        let mut new_shares = current_shares.clone();
+        new_shares[outcome_index as usize] += shares_to_buy;
+
+        trading::validate_lmsr_parameters(market.b(), &new_shares).map_err(
+            |e| {
+                Error::State(Box::new(state::Error::InvalidSlotId {
+                    reason: format!(
+                        "Invalid LMSR state after mempool update: {e:?}"
+                    ),
+                }))
+            },
+        )?;
+
+        self.state
+            .put_mempool_shares(rwtxn, &market_id, &new_shares)
+            .map_err(|e| Error::State(Box::new(e)))?;
+
+        tracing::debug!(
+            "Updated mempool shares for market {}: outcome {} increased by {} shares",
+            hex::encode(market_id),
+            outcome_index,
+            shares_to_buy
+        );
+
+        Ok(())
+    }
+
+    fn update_mempool_sell(
+        &self,
+        rwtxn: &mut RwTxn,
+        market_id: MarketId,
+        outcome_index: u32,
+        shares_to_sell: i64,
+    ) -> Result<(), Error> {
+        use crate::state;
+
+        let market = self
+            .state
+            .markets()
+            .get_market(rwtxn, &market_id)?
+            .ok_or_else(|| {
+                Error::State(Box::new(state::Error::InvalidSlotId {
+                    reason: format!("Market {market_id:?} does not exist"),
+                }))
+            })?;
+
+        if market.state() != crate::state::markets::MarketState::Trading {
+            return Ok(());
+        }
+
+        if outcome_index as usize >= market.shares().len() {
+            return Err(Error::State(Box::new(state::Error::InvalidSlotId {
+                reason: format!(
+                    "Outcome index {} exceeds market outcomes {}",
+                    outcome_index,
+                    market.shares().len()
+                ),
+            })));
+        }
+
+        let current_shares = if let Some(existing_mempool_shares) =
+            self.state.get_mempool_shares(rwtxn, &market_id)?
+        {
+            existing_mempool_shares
+        } else {
+            market.shares().clone()
+        };
+
+        let mut new_shares = current_shares.clone();
+        new_shares[outcome_index as usize] -= shares_to_sell;
+
+        trading::validate_lmsr_parameters(market.b(), &new_shares).map_err(
+            |e| {
+                Error::State(Box::new(state::Error::InvalidSlotId {
+                    reason: format!(
+                        "Invalid LMSR state after mempool sell update: {e:?}"
+                    ),
+                }))
+            },
+        )?;
+
+        self.state
+            .put_mempool_shares(rwtxn, &market_id, &new_shares)
+            .map_err(|e| Error::State(Box::new(e)))?;
+
+        tracing::debug!(
+            "Updated mempool shares for market {}: outcome {} decreased by {} shares (sell)",
+            hex::encode(market_id),
+            outcome_index,
+            shares_to_sell
+        );
+
         Ok(())
     }
 
@@ -465,7 +541,7 @@ where
         self.state.get_utxos(&rotxn).map_err(Error::from)
     }
 
-    pub fn get_latest_failed_withdrawal_bundle_height(
+    pub fn get_latest_failed_bundle_height(
         &self,
     ) -> Result<Option<u32>, Error> {
         let rotxn = self.env.read_txn()?;
@@ -540,6 +616,37 @@ where
         Ok(utxos)
     }
 
+    /// Get UTXOs for addresses along with their mempool spent status.
+    /// This is atomic - both queries use the same read transaction.
+    #[allow(clippy::type_complexity)]
+    pub fn get_utxos_with_mempool_status(
+        &self,
+        addresses: &HashSet<Address>,
+    ) -> Result<
+        (HashMap<OutPoint, FilledOutput>, Vec<(OutPoint, InPoint)>),
+        Error,
+    > {
+        let rotxn = self.env.read_txn()?;
+
+        // Get confirmed UTXOs from state
+        let utxos = self.state.get_utxos_by_addresses(&rotxn, addresses)?;
+
+        // Check which are spent in mempool (same transaction - atomic)
+        let mut spent_in_mempool = vec![];
+        for outpoint in utxos.keys() {
+            if let Some(inpoint) = self
+                .mempool
+                .spent_utxos
+                .try_get(&rotxn, outpoint)
+                .map_err(mempool::Error::from)?
+            {
+                spent_in_mempool.push((*outpoint, inpoint));
+            }
+        }
+
+        Ok((utxos, spent_in_mempool))
+    }
+
     pub fn try_get_header(
         &self,
         block_hash: BlockHash,
@@ -553,8 +660,6 @@ where
         Ok(self.archive.get_header(&rotxn, block_hash)?)
     }
 
-    /// Get the block hash at the specified height in the current chain,
-    /// if it exists
     pub fn try_get_block_hash(
         &self,
         height: u32,
@@ -628,7 +733,6 @@ where
         Ok(transactions)
     }
 
-    /// Get total sidechain wealth in Bitcoin
     pub fn get_sidechain_wealth(&self) -> Result<bitcoin::Amount, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self.state.sidechain_wealth(&rotxn)?)
@@ -639,54 +743,108 @@ where
         number: usize,
     ) -> Result<(Vec<Authorized<FilledTransaction>>, bitcoin::Amount), Error>
     {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
         let mut rwtxn = self.env.write_txn()?;
-        let transactions = self.mempool.take(&rwtxn, number)?;
+
+        // Take non-trade TXs first, then trade TXs in chronological order
+        let all_txs = self.mempool.take(&rwtxn, number)?;
+        let trade_txs = self.mempool.take_trades_ordered(&rwtxn)?;
+
+        // Separate non-trade TXs (those not in the trade list)
+        let trade_txids: HashSet<_> =
+            trade_txs.iter().map(|tx| tx.transaction.txid()).collect();
+        let non_trade_txs: Vec<_> = all_txs
+            .into_iter()
+            .filter(|tx| !trade_txids.contains(&tx.transaction.txid()))
+            .collect();
+
+        // Process non-trade TXs first, then trade TXs in insertion order
+        let combined_txs =
+            non_trade_txs.into_iter().chain(trade_txs).take(number);
+
         let mut fee = bitcoin::Amount::ZERO;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
-        for transaction in transactions {
+        let mut cumulative_market_states: HashMap<MarketId, Array1<i64>> =
+            HashMap::new();
+
+        for transaction in combined_txs {
+            let txid = transaction.transaction.txid();
+            let is_trade = transaction
+                .transaction
+                .data
+                .as_ref()
+                .is_some_and(|d| d.is_trade());
+
             let inputs: HashSet<_> =
                 transaction.transaction.inputs.iter().copied().collect();
             if !spent_utxos.is_disjoint(&inputs) {
-                // UTXO double spent
-                self.mempool
-                    .delete(&mut rwtxn, transaction.transaction.txid())?;
+                self.mempool.delete(&mut rwtxn, txid)?;
                 continue;
             }
-            if self
+            let filled_transaction = match self
                 .state
-                .validate_transaction(&rwtxn, &transaction)
-                .is_err()
+                .fill_authorized_transaction(&rwtxn, transaction.clone())
             {
-                self.mempool
-                    .delete(&mut rwtxn, transaction.transaction.txid())?;
-                continue;
+                Ok(filled_tx) => filled_tx,
+                Err(err) => {
+                    tracing::warn!(
+                        "Cannot fill transaction {} during block construction: {:?}. Removing from mempool.",
+                        txid,
+                        err
+                    );
+                    self.mempool.delete(&mut rwtxn, txid)?;
+                    continue;
+                }
+            };
+
+            match self.check_trade_slippage(
+                &rwtxn,
+                &filled_transaction,
+                &mut cumulative_market_states,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(
+                        "Skipping tx {} due to slippage - will retry next block",
+                        txid
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Slippage check error for {}: {:?} - skipping",
+                        txid,
+                        e
+                    );
+                    continue;
+                }
             }
-            let filled_transaction = self
-                .state
-                .fill_authorized_transaction(&rwtxn, transaction)?;
-            let value_in: bitcoin::Amount = filled_transaction
-                .transaction
-                .spent_utxos
-                .iter()
-                .map(GetBitcoinValue::get_bitcoin_value)
-                .checked_sum()
-                .ok_or(AmountOverflowError)?;
-            let value_out: bitcoin::Amount = filled_transaction
-                .transaction
-                .transaction
-                .outputs
-                .iter()
-                .map(GetBitcoinValue::get_bitcoin_value)
-                .checked_sum()
-                .ok_or(AmountOverflowError)?;
-            fee = fee
-                .checked_add(
-                    value_in
-                        .checked_sub(value_out)
-                        .ok_or(AmountOverflowError)?,
-                )
-                .ok_or(AmountUnderflowError)?;
+
+            // Compute fee: constant for trade TXs, input-output for others
+            let tx_fee = if is_trade {
+                bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
+            } else {
+                let value_in: bitcoin::Amount = filled_transaction
+                    .transaction
+                    .spent_utxos
+                    .iter()
+                    .map(GetBitcoinValue::get_bitcoin_value)
+                    .checked_sum()
+                    .ok_or(AmountOverflowError)?;
+                let value_out: bitcoin::Amount = filled_transaction
+                    .transaction
+                    .transaction
+                    .outputs
+                    .iter()
+                    .map(GetBitcoinValue::get_bitcoin_value)
+                    .checked_sum()
+                    .ok_or(AmountOverflowError)?;
+                value_in.checked_sub(value_out).ok_or(AmountOverflowError)?
+            };
+
+            fee = fee.checked_add(tx_fee).ok_or(AmountUnderflowError)?;
             spent_utxos.extend(filled_transaction.transaction.inputs());
             returned_transactions.push(filled_transaction);
         }
@@ -694,7 +852,228 @@ where
         Ok((returned_transactions, fee))
     }
 
-    /// get a transaction from the archive or mempool, if it exists
+    /// Check if a trade transaction passes slippage validation against cumulative market state.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the tx passes slippage check (or is not a market trade)
+    /// - `Ok(false)` if slippage exceeded (tx should be skipped, not deleted)
+    /// - `Err(...)` if there's an error checking (tx should be skipped)
+    ///
+    /// For Trade transactions, this checks the cost/proceeds against
+    /// the cumulative market state (accounting for prior txs in this block) and updates
+    /// the cumulative state if the check passes.
+    fn check_trade_slippage(
+        &self,
+        rotxn: &sneed::RoTxn,
+        filled_tx: &Authorized<FilledTransaction>,
+        cumulative_states: &mut HashMap<MarketId, Array1<i64>>,
+    ) -> Result<bool, Error> {
+        let tx_data = match &filled_tx.transaction.transaction.data {
+            Some(data) => data,
+            None => return Ok(true), // Non-data txs always pass
+        };
+
+        match tx_data {
+            TxData::Trade {
+                market_id,
+                outcome_index,
+                shares,
+                trader,
+                limit_sats,
+            } => {
+                let is_buy = *shares > 0;
+                let shares_abs = shares.unsigned_abs();
+
+                tracing::debug!(
+                    "check_trade_slippage: Trade ({}) market={}, outcome={}, shares={}, limit={}",
+                    if is_buy { "buy" } else { "sell" },
+                    market_id,
+                    outcome_index,
+                    shares,
+                    limit_sats
+                );
+
+                let market =
+                    match self.state.markets().get_market(rotxn, market_id)? {
+                        Some(m) => m,
+                        None => {
+                            tracing::warn!(
+                                "Market {} not found for slippage check",
+                                market_id
+                            );
+                            return Ok(false);
+                        }
+                    };
+
+                tracing::debug!(
+                    "check_trade_slippage: found market with {} outcomes, beta={}",
+                    market.shares().len(),
+                    market.b()
+                );
+
+                // For sells, verify trader owns sufficient shares
+                if !is_buy {
+                    let seller_account = self
+                        .state
+                        .markets()
+                        .get_user_share_account(rotxn, trader)?;
+
+                    let owned_shares = seller_account
+                        .as_ref()
+                        .and_then(|account| {
+                            account
+                                .positions
+                                .get(&(market_id.clone(), *outcome_index))
+                                .copied()
+                        })
+                        .unwrap_or(0);
+
+                    tracing::debug!(
+                        "check_trade_slippage: seller {} owns {} shares, trying to sell {}",
+                        trader,
+                        owned_shares,
+                        shares_abs
+                    );
+
+                    if owned_shares < 0 || (owned_shares as u64) < shares_abs {
+                        tracing::info!(
+                            "Insufficient shares for sell: {} owns {} but trying to sell {} - skipping",
+                            trader,
+                            owned_shares,
+                            shares_abs
+                        );
+                        return Ok(false);
+                    }
+                }
+
+                // Get cumulative state (or confirmed state if first tx for this market)
+                let current_shares = cumulative_states
+                    .get(market_id)
+                    .cloned()
+                    .unwrap_or_else(|| market.shares().clone());
+                tracing::debug!(
+                    "check_trade_slippage: current_shares={:?}",
+                    current_shares
+                );
+
+                // Calculate new shares after trade (sign of shares handles direction)
+                let mut new_shares = current_shares.clone();
+                new_shares[*outcome_index as usize] += *shares;
+                tracing::debug!(
+                    "check_trade_slippage: new_shares={:?}",
+                    new_shares
+                );
+
+                if is_buy {
+                    // Buy: cost = LMSR(current -> new)
+                    let base_cost = trading::calculate_update_cost(
+                        &current_shares,
+                        &new_shares,
+                        market.b(),
+                    )
+                    .map_err(|e| {
+                        Error::State(Box::new(
+                            state::Error::InvalidTransaction {
+                                reason: format!(
+                                    "LMSR calculation failed: {e:?}"
+                                ),
+                            },
+                        ))
+                    })?;
+                    tracing::debug!(
+                        "check_trade_slippage: base_cost={}",
+                        base_cost
+                    );
+
+                    let buy_cost = trading::calculate_buy_cost(
+                        base_cost,
+                        market.trading_fee(),
+                    )
+                    .map_err(|e| {
+                        Error::State(Box::new(
+                            state::Error::InvalidTransaction {
+                                reason: format!(
+                                    "Buy cost calculation failed: {e}"
+                                ),
+                            },
+                        ))
+                    })?;
+                    tracing::debug!(
+                        "check_trade_slippage: total_cost={}, limit={}",
+                        buy_cost.total_cost_sats,
+                        limit_sats
+                    );
+
+                    if buy_cost.total_cost_sats > *limit_sats {
+                        tracing::info!(
+                            "Slippage exceeded for buy tx: cost {} sats > max {} sats",
+                            buy_cost.total_cost_sats,
+                            limit_sats
+                        );
+                        return Ok(false);
+                    }
+                    // Note: We intentionally do NOT check if embedded costs match recalculated costs.
+                    // Multiple transactions targeting the same market in a block will have different
+                    // cumulative costs. The slippage check (above) is sufficient - if the cost is
+                    // within the user's limit_sats, the transaction is valid.
+                } else {
+                    // Sell: proceeds = LMSR(new -> current)
+                    let gross_proceeds = trading::calculate_update_cost(
+                        &new_shares,
+                        &current_shares,
+                        market.b(),
+                    )
+                    .map_err(|e| {
+                        Error::State(Box::new(
+                            state::Error::InvalidTransaction {
+                                reason: format!(
+                                    "LMSR calculation failed: {e:?}"
+                                ),
+                            },
+                        ))
+                    })?;
+
+                    let sell_proceeds = trading::calculate_sell_proceeds(
+                        gross_proceeds,
+                        market.trading_fee(),
+                    )
+                    .map_err(|e| {
+                        Error::State(Box::new(
+                            state::Error::InvalidTransaction {
+                                reason: format!(
+                                    "Sell proceeds calculation failed: {e}"
+                                ),
+                            },
+                        ))
+                    })?;
+
+                    // Only check slippage limit if limit_sats > 0
+                    // (limit_sats = 0 means "no minimum proceeds requirement")
+                    if *limit_sats > 0
+                        && sell_proceeds.net_proceeds_sats < *limit_sats
+                    {
+                        tracing::info!(
+                            "Slippage exceeded for sell tx: proceeds {} sats < min {} sats",
+                            sell_proceeds.net_proceeds_sats,
+                            limit_sats
+                        );
+                        return Ok(false);
+                    }
+                    // Note: We intentionally do NOT check if embedded costs match recalculated costs.
+                    // Multiple transactions targeting the same market in a block will have different
+                    // cumulative proceeds. The slippage check (above) is sufficient - if proceeds
+                    // meet the user's limit_sats minimum, the transaction is valid.
+                }
+
+                // Update cumulative state for subsequent txs
+                cumulative_states.insert(market_id.clone(), new_shares);
+                tracing::debug!("check_trade_slippage: Trade passed");
+                Ok(true)
+            }
+            _ => Ok(true), // Non-market txs always pass
+        }
+    }
+
     pub fn try_get_transaction(
         &self,
         txid: Txid,
@@ -720,10 +1099,6 @@ where
         }
     }
 
-    /// get a filled transaction from the archive/state or mempool,
-    /// and the tx index, if the transaction exists
-    /// and can be filled with the current state.
-    /// a tx index of `None` indicates that the tx is in the mempool.
     pub fn try_get_filled_transaction(
         &self,
         txid: Txid,
@@ -801,10 +1176,6 @@ where
         self.net.get_active_peers()
     }
 
-    /// Attempt to submit a block.
-    /// Returns `Ok(true)` if the block was accepted successfully as the new tip.
-    /// Returns `Ok(false)` if the block could not be submitted for some reason,
-    /// or was rejected as the new tip.
     pub async fn submit_block(
         &self,
         main_block_hash: bitcoin::BlockHash,
@@ -816,7 +1187,6 @@ where
             return Err(Error::NoCusfMainchainWalletClient);
         };
         let block_hash = header.hash();
-        // Store the header, if ancestors exist
         if let Some(parent) = header.prev_side_hash
             && self.try_get_header(parent)?.is_none()
         {
@@ -825,7 +1195,6 @@ where
             );
             return Ok(false);
         }
-        // Request mainchain header/infos if they do not exist
         let mainchain_task::Response::AncestorInfos(_, res): mainchain_task::Response = self
             .mainchain_task
             .request_oneshot(mainchain_task::Request::AncestorInfos(
@@ -835,21 +1204,17 @@ where
             .await
             .map_err(|_| Error::ReceiveMainchainTaskResponse)?;
         if !res.map_err(Error::MainchainAncestors)? {
+            tracing::error!(%block_hash, "submit_block: Mainchain ancestor infos check failed");
             return Ok(false);
         };
-        // Write header
         tracing::trace!("Storing header: {block_hash}");
         {
             let mut rwtxn = self.env.write_txn()?;
             let () = self.archive.put_header(&mut rwtxn, header)?;
-            rwtxn.commit().map_err(RwTxnError::from)?;
-        }
-        tracing::trace!("Stored header: {block_hash}");
-        // Check BMM
-        {
-            let rotxn = self.env.read_txn()?;
+            // Check BMM in same transaction before committing
+            // This prevents TOCTOU: other threads won't see the header until BMM is verified
             if self.archive.get_bmm_result(
-                &rotxn,
+                &rwtxn,
                 block_hash,
                 main_block_hash,
             )? == BmmResult::Failed
@@ -857,10 +1222,12 @@ where
                 tracing::error!(%block_hash,
                     "Rejecting block {block_hash} due to failing BMM verification",
                 );
+                // Don't commit - transaction will be dropped and header discarded
                 return Ok(false);
             }
+            rwtxn.commit().map_err(RwTxnError::from)?;
         }
-        // Check that ancestor bodies exist, and store body
+        tracing::trace!("Stored header: {block_hash}");
         {
             let rotxn = self.env.read_txn()?;
             let tip = self.state.try_get_tip(&rotxn)?;
@@ -889,13 +1256,12 @@ where
                 rwtxn.commit().map_err(RwTxnError::from)?;
             }
         }
-        // Submit new tip
         let new_tip = Tip {
             block_hash,
             main_block_hash,
         };
         if !self.net_task.new_tip_ready_confirm(new_tip).await? {
-            tracing::warn!(%block_hash, "Not ready to reorg");
+            tracing::error!(%block_hash, "submit_block: new_tip_ready_confirm returned false - reorg failed!");
             return Ok(false);
         };
         let rotxn = self.env.read_txn()?;
@@ -927,8 +1293,381 @@ where
         Ok(true)
     }
 
-    /// Get a notification whenever the tip changes
-    pub fn watch_state(&self) -> impl Stream<Item = ()> {
-        self.state.watch()
+    pub fn get_all_slot_periods(&self) -> Result<Vec<(u32, u64)>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.get_all_slot_periods(&rotxn)?)
+    }
+
+    pub fn get_slots_for_period(&self, period: u32) -> Result<u64, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.get_slots_for_period(&rotxn, period)?)
+    }
+
+    pub fn get_genesis_timestamp(&self) -> Result<Option<u64>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.try_get_genesis_timestamp(&rotxn)?)
+    }
+
+    pub fn get_mainchain_timestamp(&self) -> Result<u64, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.try_get_mainchain_timestamp(&rotxn)?.unwrap_or(0))
+    }
+
+    pub fn get_slot(
+        &self,
+        slot_id: crate::state::slots::SlotId,
+    ) -> Result<Option<crate::state::slots::Slot>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.slots().get_slot(&rotxn, slot_id)?)
+    }
+
+    pub fn get_available_slots_in_period(
+        &self,
+        period_id: crate::state::voting::types::VotingPeriodId,
+    ) -> Result<Vec<crate::state::slots::SlotId>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .get_available_slots_in_period(&rotxn, period_id.as_u32())?)
+    }
+
+    pub fn get_claimed_slots_in_period(
+        &self,
+        period_id: crate::state::voting::types::VotingPeriodId,
+    ) -> Result<Vec<crate::state::slots::Slot>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .slots()
+            .get_claimed_slots_in_period(&rotxn, period_id.as_u32())?)
+    }
+
+    pub fn is_slot_in_voting(
+        &self,
+        slot_id: crate::state::slots::SlotId,
+    ) -> Result<bool, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.is_slot_in_voting(&rotxn, slot_id)?)
+    }
+
+    pub fn get_ossified_slots(
+        &self,
+    ) -> Result<Vec<crate::state::slots::Slot>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.get_ossified_slots(&rotxn)?)
+    }
+
+    pub fn get_voting_periods(&self) -> Result<Vec<(u32, u64, u64)>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.get_voting_periods(&rotxn)?)
+    }
+
+    pub fn get_period_summary(
+        &self,
+    ) -> Result<crate::state::type_aliases::PeriodSummary, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.get_period_summary(&rotxn)?)
+    }
+
+    pub fn get_claimed_slot_count_in_period(
+        &self,
+        period_id: crate::state::voting::types::VotingPeriodId,
+    ) -> Result<u64, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .get_claimed_slot_count_in_period(&rotxn, period_id.as_u32())?)
+    }
+
+    pub fn is_slots_testing_mode(&self) -> bool {
+        self.state.slots().is_testing_mode()
+    }
+
+    pub fn get_slots_testing_config(&self) -> u32 {
+        self.state.slots().get_testing_blocks_per_period()
+    }
+
+    pub fn get_slot_config(&self) -> &crate::state::slots::SlotConfig {
+        self.state.slots().get_config()
+    }
+
+    pub fn get_current_period(&self, _ts_secs: u64) -> Result<u32, Error> {
+        let rotxn = self.env.read_txn()?;
+        let block_height = self.state.try_get_height(&rotxn)?;
+        let genesis_ts =
+            self.state.try_get_genesis_timestamp(&rotxn)?.unwrap_or(0);
+        let mainchain_ts =
+            self.state.try_get_mainchain_timestamp(&rotxn)?.unwrap_or(0);
+        Ok(self.state.slots().get_current_period(
+            mainchain_ts,
+            block_height,
+            genesis_ts,
+        )?)
+    }
+
+    pub fn get_slots_db(&self) -> &crate::state::slots::Dbs {
+        self.state.slots()
+    }
+
+    pub fn block_height_to_testing_period(&self, block_height: u32) -> u32 {
+        self.state
+            .slots()
+            .block_height_to_testing_period(block_height)
+    }
+
+    pub fn get_all_markets(&self) -> Result<Vec<crate::state::Market>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.markets().get_all_markets(&rotxn)?)
+    }
+
+    pub fn get_all_markets_with_states(
+        &self,
+    ) -> Result<Vec<(crate::state::Market, crate::state::MarketState)>, Error>
+    {
+        let rotxn = self.env.read_txn()?;
+        let markets = self.state.markets().get_all_markets(&rotxn)?;
+        let result = markets
+            .into_iter()
+            .map(|market| {
+                let state = market.state();
+                (market, state)
+            })
+            .collect();
+        Ok(result)
+    }
+
+    pub fn get_markets_by_state(
+        &self,
+        state: crate::state::MarketState,
+    ) -> Result<Vec<crate::state::Market>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.markets().get_markets_by_state(&rotxn, state)?)
+    }
+
+    pub fn get_market_by_id(
+        &self,
+        market_id: &crate::state::MarketId,
+    ) -> Result<Option<crate::state::Market>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.markets().get_market(&rotxn, market_id)?)
+    }
+
+    pub fn get_market_by_id_with_state(
+        &self,
+        market_id: &crate::state::MarketId,
+    ) -> Result<Option<(crate::state::Market, crate::state::MarketState)>, Error>
+    {
+        let rotxn = self.env.read_txn()?;
+        if let Some(market) =
+            self.state.markets().get_market(&rotxn, market_id)?
+        {
+            let state = market.state();
+            Ok(Some((market, state)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_markets_batch(
+        &self,
+        market_ids: &[crate::state::MarketId],
+    ) -> Result<
+        std::collections::HashMap<crate::state::MarketId, crate::state::Market>,
+        Error,
+    > {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.markets().get_markets_batch(&rotxn, market_ids)?)
+    }
+
+    pub fn get_market_decisions(
+        &self,
+        market: &crate::state::Market,
+    ) -> Result<
+        std::collections::HashMap<
+            crate::state::slots::SlotId,
+            crate::state::slots::Decision,
+        >,
+        Error,
+    > {
+        let rotxn = self.env.read_txn()?;
+        let mut decisions = std::collections::HashMap::new();
+
+        for &slot_id in &market.decision_slots {
+            if let Some(slot) = self.state.slots().get_slot(&rotxn, slot_id)?
+                && let Some(decision) = slot.decision
+            {
+                decisions.insert(slot_id, decision);
+            }
+        }
+
+        Ok(decisions)
+    }
+
+    pub fn get_user_share_positions(
+        &self,
+        address: &crate::types::Address,
+    ) -> Result<Vec<(crate::state::MarketId, u32, i64)>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .markets()
+            .get_user_share_positions(&rotxn, address)?)
+    }
+
+    pub fn get_market_user_positions(
+        &self,
+        address: &crate::types::Address,
+        market_id: &crate::state::MarketId,
+    ) -> Result<Vec<(u32, i64)>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .markets()
+            .get_market_user_positions(&rotxn, address, market_id)?)
+    }
+
+    /// Get share positions for multiple addresses for a specific market/outcome.
+    /// Returns a map of address -> shares for addresses that have positions.
+    pub fn get_wallet_positions_for_market_outcome(
+        &self,
+        addresses: &std::collections::HashSet<crate::types::Address>,
+        market_id: &crate::state::MarketId,
+        outcome_index: u32,
+    ) -> Result<std::collections::HashMap<crate::types::Address, i64>, Error>
+    {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .markets()
+            .get_wallet_positions_for_market_outcome(
+                &rotxn,
+                addresses,
+                market_id,
+                outcome_index,
+            )?)
+    }
+
+    pub fn get_all_share_accounts(
+        &self,
+    ) -> Result<crate::state::type_aliases::AllShareAccounts, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.markets().get_all_share_accounts(&rotxn)?)
+    }
+
+    pub fn get_market_treasury_sats(
+        &self,
+        market_id: &crate::state::MarketId,
+    ) -> Result<u64, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.markets().get_market_funds_sats(
+            &rotxn,
+            &self.state,
+            market_id,
+            false,
+        )?)
+    }
+
+    pub fn read_txn(&self) -> Result<sneed::RoTxn<'_>, Error> {
+        self.env.read_txn().map_err(Into::into)
+    }
+
+    pub fn voting_state(&self) -> &crate::state::voting::VotingSystem {
+        self.state.voting()
+    }
+
+    pub fn get_votecoin_balance_for(
+        &self,
+        rotxn: &sneed::RoTxn,
+        address: &crate::types::Address,
+    ) -> Result<u32, Error> {
+        self.state
+            .get_votecoin_balance(rotxn, address)
+            .map_err(Into::into)
+    }
+
+    pub fn get_tip_height(&self) -> Result<u32, Error> {
+        self.try_get_tip_height()?.ok_or_else(|| {
+            Error::State(Box::new(state::Error::InvalidTransaction {
+                reason: "No tip height found".to_string(),
+            }))
+        })
+    }
+
+    pub fn get_last_block_timestamp(&self) -> Result<u64, Error> {
+        self.get_mainchain_timestamp()
+    }
+
+    pub fn resolve_voting_period(
+        &self,
+        period_id: crate::state::voting::types::VotingPeriodId,
+    ) -> Result<Vec<crate::state::voting::types::DecisionOutcome>, Error> {
+        let mut rwtxn = self.env.write_txn()?;
+        let current_timestamp = self.get_last_block_timestamp()?;
+        let current_height = self.get_tip_height()?;
+
+        let config = self.state.slots().get_config();
+        let slots_db = self.state.slots();
+
+        let genesis_ts =
+            self.state.try_get_genesis_timestamp(&rwtxn)?.unwrap_or(0);
+
+        let outcomes = self.state.voting().resolve_period_decisions(
+            &mut rwtxn,
+            period_id,
+            current_timestamp,
+            current_height as u64,
+            &self.state,
+            config,
+            slots_db,
+            genesis_ts,
+        )?;
+
+        rwtxn
+            .commit()
+            .map_err(|e| Error::DbWrite(RwTxnError::Commit(e)))?;
+        Ok(outcomes)
+    }
+
+    pub fn get_consensus_outcomes(
+        &self,
+        period_id: crate::state::voting::types::VotingPeriodId,
+    ) -> Result<
+        std::collections::HashMap<crate::state::slots::SlotId, f64>,
+        Error,
+    > {
+        let rotxn = self.env.read_txn()?;
+        self.state
+            .voting()
+            .databases()
+            .get_consensus_outcomes_for_period(&rotxn, period_id)
+            .map_err(Into::into)
+    }
+
+    /// Trigger a sync/reorg to a specific block hash.
+    /// The block must exist in the archive (received via P2P or locally mined).
+    /// Returns true if reorg was successful, false if not needed or failed.
+    pub async fn sync_to_tip(
+        &self,
+        block_hash: crate::types::BlockHash,
+    ) -> Result<bool, Error> {
+        // Get the new tip info synchronously, then await the reorg
+        let new_tip = {
+            let rotxn = self.env.read_txn()?;
+
+            let main_block_hash = self
+                .archive
+                .get_best_main_verification(&rotxn, block_hash)?;
+
+            Tip {
+                block_hash,
+                main_block_hash,
+            }
+        }; // rotxn is dropped here before the await
+
+        // Trigger the reorg via net_task
+        self.net_task
+            .new_tip_ready_confirm(new_tip)
+            .await
+            .map_err(Error::from)
     }
 }

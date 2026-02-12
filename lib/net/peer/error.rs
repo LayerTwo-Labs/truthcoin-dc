@@ -119,6 +119,7 @@ pub(in crate::net::peer) mod channel_pool {
         Request(#[source] tokio::task::JoinError),
     }
 
+    #[allow(clippy::duplicated_attributes)]
     #[derive(transitive::Transitive, Debug, Error)]
     #[transitive(
         from(super::connection::SendHeartbeat, super::connection::SendMessage),
@@ -167,6 +168,7 @@ pub(in crate::net::peer) mod request_queue {
     #[error("Failed to add request to send queue")]
     pub struct SendRequest;
 
+    #[allow(clippy::duplicated_attributes)]
     #[derive(transitive::Transitive, Debug, Error)]
     #[transitive(
         from(super::channel_pool::SendMessage, super::channel_pool::Error),
@@ -225,7 +227,7 @@ pub enum Error {
     SendRequest(#[from] request_queue::SendRequest),
     #[error(transparent)]
     SendResponse(#[from] connection::SendResponse),
-    #[error("state error")]
+    #[error("state error: {0}")]
     State(#[from] Box<crate::state::Error>),
 }
 

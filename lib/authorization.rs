@@ -105,6 +105,8 @@ pub enum Error {
         address: Address,
         hash_verifying_key: Address,
     },
+    #[error("signature count mismatch: expected {expected}, got {actual}")]
+    SignatureCountMismatch { expected: usize, actual: usize },
 }
 
 #[derive(
@@ -239,10 +241,13 @@ pub fn verify_authorizations(body: &Body) -> Result<(), Error> {
             .verifying_keys
             .push(authorization.verifying_key.0);
     }
-    assert_eq!(
-        packages.iter().map(|p| p.signatures.len()).sum::<usize>(),
-        body.authorizations.len()
-    );
+    let total_sigs: usize = packages.iter().map(|p| p.signatures.len()).sum();
+    if total_sigs != body.authorizations.len() {
+        return Err(Error::SignatureCountMismatch {
+            expected: body.authorizations.len(),
+            actual: total_sigs,
+        });
+    }
     packages
         .par_iter()
         .map(
