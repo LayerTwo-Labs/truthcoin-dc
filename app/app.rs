@@ -2,24 +2,24 @@ use std::{collections::HashMap, sync::Arc};
 
 use futures::{StreamExt as _, TryFutureExt as _};
 use parking_lot::RwLock;
+use tokio::{spawn, sync::RwLock as TokioRwLock, task::JoinHandle};
+use tokio_util::task::LocalPoolHandle;
+use tonic_health::{
+    ServingStatus,
+    pb::{HealthCheckRequest, health_client::HealthClient},
+};
 use truthcoin_dc::{
     miner::{self, Miner},
     node::{self, Node},
     types::{
         self, Address, AmountOverflowError, BitcoinOutputContent, Body,
-        FilledOutput, OutPoint, Output, Transaction,
+        FilledOutput, InPoint, OutPoint, Output, Transaction,
         proto::mainchain::{
             self,
             generated::{validator_service_server, wallet_service_server},
         },
     },
     wallet::{self, Wallet},
-};
-use tokio::{spawn, sync::RwLock as TokioRwLock, task::JoinHandle};
-use tokio_util::task::LocalPoolHandle;
-use tonic_health::{
-    ServingStatus,
-    pb::{HealthCheckRequest, health_client::HealthClient},
 };
 
 use crate::cli::Config;
@@ -28,13 +28,13 @@ use crate::cli::Config;
 pub enum Error {
     #[error(transparent)]
     AmountOverflow(#[from] AmountOverflowError),
-    #[error("CUSF mainchain proto error")]
+    #[error("CUSF mainchain proto error: {0}")]
     CusfMainchain(#[from] truthcoin_dc::types::proto::Error),
-    #[error("io error")]
+    #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("miner error: {0}")]
     Miner(#[from] miner::Error),
-    #[error("node error")]
+    #[error("node error: {0}")]
     Node(#[source] Box<node::Error>),
     #[error("No CUSF mainchain wallet client")]
     NoCusfMainchainWalletClient,
@@ -43,7 +43,7 @@ pub enum Error {
         url: Box<url::Url>,
         source: Box<tonic::Status>,
     },
-    #[error("wallet error")]
+    #[error("wallet error: {0}")]
     Wallet(#[from] wallet::Error),
 }
 
@@ -54,43 +54,68 @@ impl From<node::Error> for Error {
 }
 
 fn update_wallet(node: &Node, wallet: &Wallet) -> Result<(), Error> {
-    tracing::trace!("starting wallet update");
     let addresses = wallet.get_addresses()?;
     let unconfirmed_utxos =
         node.get_unconfirmed_utxos_by_addresses(&addresses)?;
-    let utxos = node.get_utxos_by_addresses(&addresses)?;
-    let confirmed_outpoints: Vec<_> = wallet.get_utxos()?.into_keys().collect();
+    let utxos_from_state = node.get_utxos_by_addresses(&addresses)?;
+
+    // Get current wallet UTXOs to detect which ones no longer exist in state
+    let wallet_utxos = wallet.get_utxos()?;
+
+    // Find UTXOs that are in wallet but NOT in state (these were removed, e.g., by redistribution)
+    let mut utxos_to_remove = Vec::new();
+    for outpoint in wallet_utxos.keys() {
+        if !utxos_from_state.contains_key(outpoint) {
+            utxos_to_remove.push(*outpoint);
+        }
+    }
+
+    // Remove stale UTXOs from wallet (e.g., spent by redistribution)
+    if !utxos_to_remove.is_empty() {
+        tracing::debug!(
+            "Removing {} stale UTXOs from wallet (spent by redistribution or otherwise removed from state)",
+            utxos_to_remove.len()
+        );
+        wallet.spend_utxos(
+            &utxos_to_remove
+                .iter()
+                .map(|outpoint| (*outpoint, InPoint::Redistribution))
+                .collect::<Vec<_>>(),
+        )?;
+    }
+
+    let confirmed_outpoints: Vec<_> = wallet_utxos.into_keys().collect();
     let confirmed_spent = node
         .get_spent_utxos(&confirmed_outpoints)?
         .into_iter()
         .map(|(outpoint, spent_output)| (outpoint, spent_output.inpoint));
     let unconfirmed_outpoints: Vec<_> =
         wallet.get_unconfirmed_utxos()?.into_keys().collect();
+    // Check ALL state UTXOs against mempool.spent_utxos, not just wallet UTXOs.
+    // This prevents "resurrecting" UTXOs that are spent in mempool but were
+    // already moved to wallet.stxos in a previous update cycle.
+    let state_outpoints: Vec<_> = utxos_from_state.keys().copied().collect();
     let unconfirmed_spent = node
         .get_unconfirmed_spent_utxos(
-            confirmed_outpoints.iter().chain(&unconfirmed_outpoints),
+            state_outpoints.iter().chain(&unconfirmed_outpoints),
         )?
         .into_iter();
     let spent: Vec<_> = confirmed_spent.chain(unconfirmed_spent).collect();
-    wallet.put_utxos(&utxos)?;
+    wallet.put_utxos(&utxos_from_state)?;
     wallet.put_unconfirmed_utxos(&unconfirmed_utxos)?;
     wallet.spend_utxos(&spent)?;
-    tracing::debug!("finished wallet update");
     Ok(())
 }
 
-/// Update (unconfirmed) utxos & wallet
 fn update(
     node: &Node,
     utxos: &mut HashMap<OutPoint, FilledOutput>,
     unconfirmed_utxos: &mut HashMap<OutPoint, Output>,
     wallet: &Wallet,
 ) -> Result<(), Error> {
-    tracing::trace!("Updating wallet");
     let () = update_wallet(node, wallet)?;
     *utxos = wallet.get_utxos()?;
     *unconfirmed_utxos = wallet.get_unconfirmed_utxos()?;
-    tracing::trace!("Updated wallet");
     Ok(())
 }
 
@@ -141,7 +166,6 @@ impl App {
         )
     }
 
-    /// Check that a service has `Serving` status via gRPC health
     async fn check_status_serving(
         client: &mut HealthClient<tonic::transport::Channel>,
         service_name: &str,
@@ -169,16 +193,12 @@ impl App {
         }
     }
 
-    /// Returns `true` if validator service AND wallet service are available,
-    /// `false` if only validator service is available, and error if validator
-    /// service is unavailable.
     async fn check_proto_support(
         transport: tonic::transport::channel::Channel,
     ) -> Result<bool, tonic::Status> {
         let mut health_client = HealthClient::new(transport);
         let validator_service_name = validator_service_server::SERVICE_NAME;
         let wallet_service_name = wallet_service_server::SERVICE_NAME;
-        // The validator service MUST exist. We therefore error out here directly.
         if !Self::check_status_serving(
             &mut health_client,
             validator_service_name,
@@ -190,7 +210,6 @@ impl App {
             )));
         }
         tracing::info!("Verified existence of {}", validator_service_name);
-        // The wallet service is optional.
         let has_wallet_service =
             Self::check_status_serving(&mut health_client, wallet_service_name)
                 .await?;
@@ -203,8 +222,6 @@ impl App {
     }
 
     pub fn new(config: &Config) -> Result<Self, Error> {
-        // Node launches some tokio tasks for p2p networking, that is why we need a tokio runtime
-        // here.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -246,7 +263,6 @@ impl App {
             .map(|wallet| Miner::new(cusf_mainchain.clone(), wallet))
             .transpose()?;
         let local_pool = LocalPoolHandle::new(1);
-        tracing::debug!("Initializing node...");
         let node = runtime.block_on(Node::new(
             config.net_addr,
             &config.datadir,
@@ -254,6 +270,7 @@ impl App {
             cusf_mainchain,
             cusf_mainchain_wallet,
             &runtime,
+            config.slot_config_testing,
             #[cfg(feature = "zmq")]
             config.zmq_addr,
         ))?;
@@ -292,8 +309,7 @@ impl App {
         })
     }
 
-    /// Update utxos & wallet
-    fn update(&self) -> Result<(), Error> {
+    pub fn update(&self) -> Result<(), Error> {
         update(
             self.node.as_ref(),
             &mut self.utxos.write(),
@@ -347,13 +363,31 @@ impl App {
         };
         const NUM_TRANSACTIONS: usize = 1000;
         let (txs, tx_fees) = self.node.get_transactions(NUM_TRANSACTIONS)?;
-        let coinbase = match tx_fees {
+
+        let new_block_height =
+            self.node.try_get_tip_height()?.map_or(0, |h| h + 1);
+        let is_genesis = new_block_height == 0;
+
+        let mut coinbase = match tx_fees {
             bitcoin::Amount::ZERO => vec![],
             _ => vec![types::Output::new(
                 self.wallet.get_new_address()?,
                 types::OutputContent::Bitcoin(BitcoinOutputContent(tx_fees)),
             )],
         };
+
+        if is_genesis {
+            const INITIAL_VOTECOIN_SUPPLY: u32 = 1000000;
+            coinbase.push(types::Output::new(
+                self.wallet.get_new_address()?,
+                types::OutputContent::Votecoin(INITIAL_VOTECOIN_SUPPLY),
+            ));
+            tracing::info!(
+                "Genesis block: Creating initial Votecoin supply of {} units",
+                INITIAL_VOTECOIN_SUPPLY
+            );
+        }
+
         let body = {
             let txs = txs.into_iter().map(|tx| tx.into()).collect();
             Body::new(txs, coinbase)
@@ -382,7 +416,6 @@ impl App {
         miner_write
             .attempt_bmm(bribe.to_sat(), 0, header, body)
             .await?;
-        tracing::trace!("confirming bmm...");
         if let Some((main_hash, header, body)) =
             miner_write.confirm_bmm().await.inspect_err(|err| {
                 tracing::error!(
@@ -391,11 +424,28 @@ impl App {
                 )
             })?
         {
-            tracing::trace!(
+            tracing::info!(
                 %main_hash,
                 side_hash = %header.hash(),
-                "mine: confirmed BMM, submitting block",
+                num_txs = body.transactions.len(),
+                "mine: confirmed BMM, submitting block with {} transactions",
+                body.transactions.len()
             );
+            // Log transaction types in the block
+            for (i, tx) in body.transactions.iter().enumerate() {
+                let tx_type = match &tx.data {
+                    None => "transfer",
+                    Some(d) if d.is_trade() => "trade",
+                    Some(d) if d.is_create_market() => "create_market",
+                    Some(_) => "other",
+                };
+                tracing::info!(
+                    "mine:   tx[{}] = {:?} type={}",
+                    i,
+                    tx.txid(),
+                    tx_type
+                );
+            }
             match self
                 .node
                 .submit_block(main_hash, &header, &body)
@@ -407,16 +457,20 @@ impl App {
                     )
                 })? {
                 true => {
-                    tracing::debug!(
+                    tracing::info!(
                          %main_hash, "mine: BMM accepted as new tip",
                     );
                 }
                 false => {
-                    tracing::warn!(
-                        %main_hash, "mine: BMM not accepted as new tip",
+                    tracing::error!(
+                        %main_hash, "mine: BMM NOT ACCEPTED as new tip - block rejected!",
                     );
                 }
             }
+        } else {
+            tracing::info!(
+                "mine: confirm_bmm returned None - no BMM confirmed on mainchain"
+            );
         }
         let () = self.update()?;
         Ok(())

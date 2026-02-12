@@ -1,4 +1,3 @@
-#![feature(let_chains)]
 #![feature(try_find)]
 
 use std::path::Path;
@@ -157,6 +156,7 @@ fn run_egui_app(
                 line_buffer,
                 config.rpc_host.clone(),
                 config.rpc_port,
+                config.network,
             )))
         }),
     )
