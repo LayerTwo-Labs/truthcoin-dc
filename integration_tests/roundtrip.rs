@@ -777,6 +777,8 @@ async fn roundtrip_task(
                 question.to_string(),
                 None,
                 None,
+                None,
+                None,
                 1000,
             )
             .await?;
@@ -1036,9 +1038,8 @@ async fn roundtrip_task(
             .market_buy(MarketBuyRequest {
                 market_id: market_id.clone(),
                 outcome_index: 0,
-                shares_amount: 50000.0,
+                shares_amount: 50000,
                 max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-                fee_sats: Some(1000),
                 dry_run: None,
             })
             .await?;
@@ -1069,9 +1070,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_ids[0].clone(),
             outcome_index: 1,
-            shares_amount: 50000.0,
+            shares_amount: 50000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -1101,9 +1101,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_ids[1].clone(),
             outcome_index: 0,
-            shares_amount: 500000.0,
+            shares_amount: 500000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -1194,9 +1193,8 @@ async fn roundtrip_task(
             .market_buy(MarketBuyRequest {
                 market_id: market_ids[2].clone(),
                 outcome_index: outcome,
-                shares_amount: 20000.0,
+                shares_amount: 20000,
                 max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-                fee_sats: Some(1000),
                 dry_run: None,
             })
             .await?;
@@ -1242,9 +1240,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_ids[1].clone(),
             outcome_index: 0,
-            shares_amount: 200000.0,
+            shares_amount: 200000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -1277,9 +1274,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_ids[1].clone(),
             outcome_index: 1,
-            shares_amount: 150000.0,
+            shares_amount: 150000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -1317,9 +1313,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_ids[3].clone(),
             outcome_index: 0,
-            shares_amount: 100000.0,
+            shares_amount: 100000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -1330,9 +1325,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_ids[3].clone(),
             outcome_index: 1,
-            shares_amount: 100000.0,
+            shares_amount: 100000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -2164,6 +2158,8 @@ async fn roundtrip_task(
             "What will BTC price be EOY 2025? (USD)".to_string(),
             Some(expected_phase2::scaled::BTC_PRICE_MIN),
             Some(expected_phase2::scaled::BTC_PRICE_MAX),
+            None,
+            None,
             1000,
         )
         .await?;
@@ -2245,6 +2241,8 @@ async fn roundtrip_task(
             "Will inflation exceed 3% in 2025?".to_string(),
             None,
             None,
+            None,
+            None,
             1000,
         )
         .await?;
@@ -2258,6 +2256,8 @@ async fn roundtrip_task(
             true,
             false,
             "Will the Fed cut rates in 2025?".to_string(),
+            None,
+            None,
             None,
             None,
             1000,
@@ -2275,6 +2275,8 @@ async fn roundtrip_task(
             "Will unemployment rise above 5%?".to_string(),
             None,
             None,
+            None,
+            None,
             1000,
         )
         .await?;
@@ -2288,6 +2290,8 @@ async fn roundtrip_task(
             true,
             false,
             "Will GDP growth exceed 3% in 2025?".to_string(),
+            None,
+            None,
             None,
             None,
             1000,
@@ -2305,6 +2309,8 @@ async fn roundtrip_task(
             "Will housing prices rise in 2025?".to_string(),
             None,
             None,
+            None,
+            None,
             1000,
         )
         .await?;
@@ -2318,6 +2324,8 @@ async fn roundtrip_task(
             true,
             false,
             "Will consumer confidence increase?".to_string(),
+            None,
+            None,
             None,
             None,
             1000,
@@ -2335,6 +2343,8 @@ async fn roundtrip_task(
             "Will retail sales exceed $7T?".to_string(),
             None,
             None,
+            None,
+            None,
             1000,
         )
         .await?;
@@ -2348,6 +2358,8 @@ async fn roundtrip_task(
             true,
             false,
             "Will manufacturing output increase?".to_string(),
+            None,
+            None,
             None,
             None,
             1000,
@@ -2366,6 +2378,8 @@ async fn roundtrip_task(
             "ETH/BTC ratio at end of 2025".to_string(),
             Some(0),
             Some(100),
+            None,
+            None,
             1000,
         )
         .await?;
@@ -2766,9 +2780,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_a_id.clone(),
             outcome_index: 0, // Yes
-            shares_amount: 30000.0,
+            shares_amount: 30000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -2780,9 +2793,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_b_id.clone(),
             outcome_index: 0, // Candidate A
-            shares_amount: 40000.0,
+            shares_amount: 40000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -2792,9 +2804,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_b_id.clone(),
             outcome_index: 1, // Candidate B
-            shares_amount: 20000.0,
+            shares_amount: 20000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -2834,9 +2845,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_a_id.clone(),
             outcome_index: 0,
-            shares_amount: 25000.0,
+            shares_amount: 25000,
             max_cost: Some(10_000_000),
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -2847,9 +2857,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_a_id.clone(),
             outcome_index: 1,
-            shares_amount: 20000.0,
+            shares_amount: 20000,
             max_cost: Some(10_000_000),
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -2861,9 +2870,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_b_id.clone(),
             outcome_index: 2,
-            shares_amount: 30000.0,
+            shares_amount: 30000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -2901,7 +2909,7 @@ async fn roundtrip_task(
         .rpc_client
         .get_wallet_addresses()
         .await?;
-    let mut voter_3_shares_outcome_0: f64 = 0.0;
+    let mut voter_3_shares_outcome_0: i64 = 0;
     let mut voter_3_seller_address: Option<Address> = None;
     for addr in &voter_3_addresses {
         let positions = truthcoin_nodes
@@ -2910,7 +2918,7 @@ async fn roundtrip_task(
             .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
-            if pos.outcome_index == 0 && pos.shares > 0.0 {
+            if pos.outcome_index == 0 && pos.shares > 0 {
                 voter_3_shares_outcome_0 += pos.shares;
                 if voter_3_seller_address.is_none() {
                     voter_3_seller_address = Some(*addr);
@@ -2921,7 +2929,7 @@ async fn roundtrip_task(
     let voter_3_seller_address =
         voter_3_seller_address.expect("voter_3 should have shares");
     anyhow::ensure!(
-        voter_3_shares_outcome_0 >= 25000.0,
+        voter_3_shares_outcome_0 >= 25000,
         "voter_3 should have at least 25000 shares from Test 1 buy"
     );
 
@@ -2930,7 +2938,7 @@ async fn roundtrip_task(
         .rpc_client
         .get_wallet_addresses()
         .await?;
-    let mut voter_4_shares_outcome_1: f64 = 0.0;
+    let mut voter_4_shares_outcome_1: i64 = 0;
     for addr in &voter_4_addresses {
         let positions = truthcoin_nodes
             .voter_4
@@ -2938,19 +2946,19 @@ async fn roundtrip_task(
             .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
-            if pos.outcome_index == 1 && pos.shares > 0.0 {
+            if pos.outcome_index == 1 && pos.shares > 0 {
                 voter_4_shares_outcome_1 += pos.shares;
             }
         }
     }
     anyhow::ensure!(
-        voter_4_shares_outcome_1 >= 20000.0,
+        voter_4_shares_outcome_1 >= 20000,
         "voter_4 should have at least 20000 shares from Test 1 buy"
     );
 
     // Test 3: Partial sell with balance verification
     let pre_sell_shares = voter_3_shares_outcome_0;
-    let shares_to_sell = 12000.0;
+    let shares_to_sell: i64 = 12000;
 
     let sell_response = truthcoin_nodes
         .voter_3
@@ -2961,7 +2969,6 @@ async fn roundtrip_task(
             shares_amount: shares_to_sell,
             seller_address: voter_3_seller_address,
             min_proceeds: Some(0), // No slippage protection for test
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3007,7 +3014,7 @@ async fn roundtrip_task(
         .rpc_client
         .get_wallet_addresses()
         .await?;
-    let mut post_sell_shares: f64 = 0.0;
+    let mut post_sell_shares: i64 = 0;
     for addr in &voter_3_addresses_post {
         let positions = truthcoin_nodes
             .voter_3
@@ -3023,7 +3030,7 @@ async fn roundtrip_task(
 
     let expected_remaining = pre_sell_shares - shares_to_sell;
     anyhow::ensure!(
-        (post_sell_shares - expected_remaining).abs() < 1.0,
+        (post_sell_shares - expected_remaining).abs() < 1,
         "Post-sell balance {} should be approximately {} (pre: {} - sold: {})",
         post_sell_shares,
         expected_remaining,
@@ -3038,9 +3045,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_a_id.clone(),
             outcome_index: 1,
-            shares_amount: 15000.0,
+            shares_amount: 15000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3051,7 +3057,7 @@ async fn roundtrip_task(
         .rpc_client
         .get_wallet_addresses()
         .await?;
-    let mut voter_1_market_b_shares: f64 = 0.0;
+    let mut voter_1_market_b_shares: i64 = 0;
     let mut voter_1_market_b_seller: Option<Address> = None;
     for addr in &voter_1_addresses {
         let positions = truthcoin_nodes
@@ -3060,7 +3066,7 @@ async fn roundtrip_task(
             .market_positions(*addr, Some(market_b_id.clone()))
             .await?;
         for pos in &positions.positions {
-            if pos.outcome_index == 0 && pos.shares > 0.0 {
+            if pos.outcome_index == 0 && pos.shares > 0 {
                 voter_1_market_b_shares += pos.shares;
                 if voter_1_market_b_seller.is_none() {
                     voter_1_market_b_seller = Some(*addr);
@@ -3071,11 +3077,11 @@ async fn roundtrip_task(
     let voter_1_market_b_seller =
         voter_1_market_b_seller.expect("voter_1 should have Market B shares");
     anyhow::ensure!(
-        voter_1_market_b_shares >= 40000.0,
+        voter_1_market_b_shares >= 40000,
         "voter_1 should own at least 40000 shares of Market B outcome 0"
     );
 
-    let voter_1_sell_amount = 20000.0;
+    let voter_1_sell_amount: i64 = 20000;
     truthcoin_nodes
         .voter_1
         .rpc_client
@@ -3085,7 +3091,6 @@ async fn roundtrip_task(
             shares_amount: voter_1_sell_amount,
             seller_address: voter_1_market_b_seller,
             min_proceeds: Some(0),
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3123,9 +3128,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_a_id.clone(),
             outcome_index: 0,
-            shares_amount: 100000.0,
+            shares_amount: 100000,
             max_cost: Some(100_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3136,9 +3140,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_a_id.clone(),
             outcome_index: 0,
-            shares_amount: 120000.0,
+            shares_amount: 120000,
             max_cost: Some(100_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3149,9 +3152,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_a_id.clone(),
             outcome_index: 0,
-            shares_amount: 80000.0,
+            shares_amount: 80000,
             max_cost: Some(100_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3181,7 +3183,7 @@ async fn roundtrip_task(
         .rpc_client
         .get_wallet_addresses()
         .await?;
-    let mut voter_4_pre_sell: f64 = 0.0;
+    let mut voter_4_pre_sell: i64 = 0;
     let mut voter_4_test5_seller: Option<Address> = None;
     for addr in &voter_4_addrs {
         let positions = truthcoin_nodes
@@ -3190,7 +3192,7 @@ async fn roundtrip_task(
             .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
-            if pos.outcome_index == 0 && pos.shares > 0.0 {
+            if pos.outcome_index == 0 && pos.shares > 0 {
                 voter_4_pre_sell += pos.shares;
                 if voter_4_test5_seller.is_none() {
                     voter_4_test5_seller = Some(*addr);
@@ -3200,7 +3202,7 @@ async fn roundtrip_task(
     }
     let voter_4_test5_seller =
         voter_4_test5_seller.expect("voter_4 should have outcome 0 shares");
-    let voter_4_sell_amt = 50000.0;
+    let voter_4_sell_amt: i64 = 50000;
 
     truthcoin_nodes
         .voter_4
@@ -3211,7 +3213,6 @@ async fn roundtrip_task(
             shares_amount: voter_4_sell_amt,
             seller_address: voter_4_test5_seller,
             min_proceeds: Some(0),
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3239,7 +3240,7 @@ async fn roundtrip_task(
     sleep(std::time::Duration::from_secs(1)).await;
 
     // Verify voter_4 post-sell balance
-    let mut voter_4_post_sell: f64 = 0.0;
+    let mut voter_4_post_sell: i64 = 0;
     for addr in &voter_4_addrs {
         let positions = truthcoin_nodes
             .voter_4
@@ -3254,7 +3255,7 @@ async fn roundtrip_task(
     }
     let voter_4_expected = voter_4_pre_sell - voter_4_sell_amt;
     anyhow::ensure!(
-        (voter_4_post_sell - voter_4_expected).abs() < 1.0,
+        (voter_4_post_sell - voter_4_expected).abs() < 1,
         "voter_4 post-sell balance {} should be ~{}",
         voter_4_post_sell,
         voter_4_expected
@@ -3267,10 +3268,9 @@ async fn roundtrip_task(
         .market_sell(MarketSellRequest {
             market_id: market_a_id.clone(),
             outcome_index: 0,
-            shares_amount: 10000.0,
+            shares_amount: 10000,
             seller_address: voter_3_seller_address,
             min_proceeds: Some(0),
-            fee_sats: Some(1000),
             dry_run: Some(true),
         })
         .await?;
@@ -3306,9 +3306,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_a_id.clone(),
             outcome_index: 1,
-            shares_amount: 100000.0,
+            shares_amount: 100000,
             max_cost: Some(100_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3330,7 +3329,7 @@ async fn roundtrip_task(
         .get_wallet_addresses()
         .await?;
     let mut seller_address: Option<Address> = None;
-    let mut shares_at_address: f64 = 0.0;
+    let mut shares_at_address: i64 = 0;
 
     for addr in &voter_6_addresses {
         let positions = truthcoin_nodes
@@ -3339,7 +3338,7 @@ async fn roundtrip_task(
             .market_positions(*addr, Some(market_a_id.clone()))
             .await?;
         for pos in &positions.positions {
-            if pos.outcome_index == 1 && pos.shares > 0.0 {
+            if pos.outcome_index == 1 && pos.shares > 0 {
                 seller_address = Some(*addr);
                 shares_at_address = pos.shares;
                 break;
@@ -3352,11 +3351,11 @@ async fn roundtrip_task(
 
     let seller_address = seller_address.expect("voter_6 should have shares");
     anyhow::ensure!(
-        shares_at_address >= 15000.0,
+        shares_at_address >= 15000,
         "voter_6 should have at least 15000 shares"
     );
 
-    let sell_amount = 50000.0;
+    let sell_amount: i64 = 50000;
     let sell_response = truthcoin_nodes
         .voter_6
         .rpc_client
@@ -3366,7 +3365,6 @@ async fn roundtrip_task(
             shares_amount: sell_amount,
             seller_address,
             min_proceeds: Some(0),
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3412,11 +3410,11 @@ async fn roundtrip_task(
         .iter()
         .find(|p| p.outcome_index == 1)
         .map(|p| p.shares)
-        .unwrap_or(0.0);
+        .unwrap_or(0);
 
     let expected_remaining = shares_at_address - sell_amount;
     anyhow::ensure!(
-        (voter_6_post_sell - expected_remaining).abs() < 1.0,
+        (voter_6_post_sell - expected_remaining).abs() < 1,
         "voter_6 post-sell balance {} should be ~{} (had {} - sold {})",
         voter_6_post_sell,
         expected_remaining,
@@ -3448,9 +3446,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_d_id.clone(),
             outcome_index: 0,
-            shares_amount: 25000.0,
+            shares_amount: 25000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3460,9 +3457,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_d_id.clone(),
             outcome_index: 3,
-            shares_amount: 20000.0,
+            shares_amount: 20000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3485,9 +3481,8 @@ async fn roundtrip_task(
             .market_buy(MarketBuyRequest {
                 market_id: market_f_id.clone(),
                 outcome_index: outcome_idx,
-                shares_amount: 5000.0,
+                shares_amount: 5000,
                 max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-                fee_sats: Some(1000),
                 dry_run: None,
             })
             .await?;
@@ -3506,9 +3501,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_g_id.clone(),
             outcome_index: 0,
-            shares_amount: 20000.0,
+            shares_amount: 20000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3526,9 +3520,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_h_id.clone(),
             outcome_index: 3,
-            shares_amount: 20000.0,
+            shares_amount: 20000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3546,9 +3539,8 @@ async fn roundtrip_task(
         .market_buy(MarketBuyRequest {
             market_id: market_i_id.clone(),
             outcome_index: 3,
-            shares_amount: 20000.0,
+            shares_amount: 20000,
             max_cost: Some(10_000_000), // Large buffer to avoid slippage failures
-            fee_sats: Some(1000),
             dry_run: None,
         })
         .await?;
@@ -3589,174 +3581,6 @@ async fn roundtrip_task(
     }
 
     tracing::info!("✓ Phase 11: Trading completed");
-
-    // Slippage soft-fail behavior tests
-    for voter in [&truthcoin_nodes.voter_0, &truthcoin_nodes.voter_1] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
-    sleep(std::time::Duration::from_millis(500)).await;
-
-    // Get dry run cost for slippage test
-    let dry_run_buy = truthcoin_nodes
-        .voter_0
-        .rpc_client
-        .market_buy(MarketBuyRequest {
-            market_id: market_c_id.clone(),
-            outcome_index: 0,
-            shares_amount: 100000.0,
-            max_cost: Some(100_000_000), // Very high to ensure dry run succeeds
-            fee_sats: Some(1000),
-            dry_run: Some(true),
-        })
-        .await?;
-
-    let exact_cost_a = dry_run_buy.cost_sats;
-
-    // Submit tx A with exact cost (no buffer)
-    truthcoin_nodes
-        .voter_0
-        .rpc_client
-        .market_buy(MarketBuyRequest {
-            market_id: market_c_id.clone(),
-            outcome_index: 0,
-            shares_amount: 100000.0,
-            max_cost: Some(exact_cost_a),
-            fee_sats: Some(1000),
-            dry_run: None,
-        })
-        .await?;
-
-    // Submit tx B with same tight slippage
-    truthcoin_nodes
-        .voter_1
-        .rpc_client
-        .market_buy(MarketBuyRequest {
-            market_id: market_c_id.clone(),
-            outcome_index: 0,
-            shares_amount: 100000.0,
-            max_cost: Some(exact_cost_a),
-            fee_sats: Some(1000),
-            dry_run: None,
-        })
-        .await?;
-
-    // Mine first block
-    truthcoin_nodes
-        .issuer
-        .bmm_single(&mut enforcer_post_setup)
-        .await?;
-    sleep(std::time::Duration::from_secs(1)).await;
-
-    // Check voter_1's shares after first block
-    truthcoin_nodes.voter_0.rpc_client.refresh_wallet().await?;
-    truthcoin_nodes.voter_1.rpc_client.refresh_wallet().await?;
-
-    let voter_0_addrs = truthcoin_nodes
-        .voter_0
-        .rpc_client
-        .get_wallet_addresses()
-        .await?;
-    let voter_1_addrs = truthcoin_nodes
-        .voter_1
-        .rpc_client
-        .get_wallet_addresses()
-        .await?;
-
-    let mut voter_0_shares_block1 = 0.0;
-    let mut voter_0_seller_address: Option<Address> = None;
-    for addr in &voter_0_addrs {
-        let positions = truthcoin_nodes
-            .voter_0
-            .rpc_client
-            .market_positions(*addr, Some(market_c_id.clone()))
-            .await?;
-        for pos in &positions.positions {
-            if pos.outcome_index == 0 {
-                voter_0_shares_block1 += pos.shares;
-                if voter_0_seller_address.is_none() && pos.shares > 0.0 {
-                    voter_0_seller_address = Some(*addr);
-                }
-            }
-        }
-    }
-    // Note: voter_0_seller_address may be None if voter_1's tx was processed first
-    // (due to non-deterministic transaction ordering with soft-fail slippage)
-
-    let mut voter_1_shares_block1 = 0.0;
-    let mut voter_1_seller_address: Option<Address> = None;
-    for addr in &voter_1_addrs {
-        let positions = truthcoin_nodes
-            .voter_1
-            .rpc_client
-            .market_positions(*addr, Some(market_c_id.clone()))
-            .await?;
-        for pos in &positions.positions {
-            if pos.outcome_index == 0 {
-                voter_1_shares_block1 += pos.shares;
-                if voter_1_seller_address.is_none() && pos.shares > 0.0 {
-                    voter_1_seller_address = Some(*addr);
-                }
-            }
-        }
-    }
-
-    // Check at least one transaction succeeded
-    let voter_0_has_shares = voter_0_shares_block1 >= 9999.0;
-    let voter_1_has_shares = voter_1_shares_block1 >= 9999.0;
-
-    anyhow::ensure!(
-        voter_0_has_shares || voter_1_has_shares,
-        "At least one voter should have shares after block 1"
-    );
-
-    // Mine second block for any remaining txs
-    truthcoin_nodes
-        .issuer
-        .bmm_single(&mut enforcer_post_setup)
-        .await?;
-    sleep(std::time::Duration::from_secs(1)).await;
-
-    // Sell slippage behavior test
-    if voter_0_has_shares {
-        let voter_0_addr = voter_0_seller_address
-            .expect("voter_0 should have address if they have shares");
-
-        let dry_run_sell = truthcoin_nodes
-            .voter_0
-            .rpc_client
-            .market_sell(MarketSellRequest {
-                market_id: market_c_id.clone(),
-                outcome_index: 0,
-                shares_amount: 50000.0,
-                seller_address: voter_0_addr,
-                min_proceeds: Some(0), // No limit for dry run
-                fee_sats: Some(1000),
-                dry_run: Some(true),
-            })
-            .await?;
-
-        let exact_proceeds = dry_run_sell.net_proceeds_sats;
-
-        truthcoin_nodes
-            .voter_0
-            .rpc_client
-            .market_sell(MarketSellRequest {
-                market_id: market_c_id.clone(),
-                outcome_index: 0,
-                shares_amount: 50000.0,
-                seller_address: voter_0_addr,
-                min_proceeds: Some(exact_proceeds), // Tight limit
-                fee_sats: Some(1000),
-                dry_run: None,
-            })
-            .await?;
-
-        truthcoin_nodes
-            .issuer
-            .bmm_single(&mut enforcer_post_setup)
-            .await?;
-        sleep(std::time::Duration::from_secs(1)).await;
-    }
 
     // Advance to voting period and submit votes
 
