@@ -6,10 +6,10 @@ use futures::{FutureExt, future::BoxFuture};
 
 use crate::{
     ibd::ibd_trial,
+    roundtrip::roundtrip_trial,
     setup::{Init, PostSetup},
     unknown_withdrawal::unknown_withdrawal_trial,
     util::BinPaths,
-    vote::vote_trial,
 };
 
 fn deposit_withdraw_roundtrip(
@@ -33,6 +33,6 @@ pub fn tests(
         deposit_withdraw_roundtrip(bin_paths.clone()),
         ibd_trial(bin_paths.clone()),
         unknown_withdrawal_trial(bin_paths.clone()),
-        vote_trial(bin_paths),
+        roundtrip_trial(bin_paths),
     ]
 }

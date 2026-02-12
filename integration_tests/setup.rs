@@ -10,11 +10,11 @@ use bip300301_enforcer_integration_tests::{
 };
 use bip300301_enforcer_lib::types::SidechainNumber;
 use futures::{TryFutureExt as _, channel::mpsc, future};
-use truthcoin_dc::types::{FilledOutputContent, PointedOutput};
-use truthcoin_dc_app_rpc_api::RpcClient as _;
 use reserve_port::ReservedPort;
 use thiserror::Error;
 use tokio::time::sleep;
+use truthcoin_dc::types::{FilledOutputContent, PointedOutput};
+use truthcoin_dc_app_rpc_api::RpcClient as _;
 
 use crate::util::TruthcoinApp;
 
@@ -169,6 +169,7 @@ impl Sidechain for PostSetup {
                 .port(),
             net_port: reserved_ports.net.port(),
             rpc_port: reserved_ports.rpc.port(),
+            slot_config_testing: Some(10),
             zmq_port: reserved_ports.zmq.port(),
         };
         let truthcoin_app_task = truthcoin_app
@@ -178,16 +179,13 @@ impl Sidechain for PostSetup {
                     let _err: Result<(), _> = res_tx.unbounded_send(Err(err));
                 }
             });
-        tracing::debug!("Started Truthcoin");
         sleep(Duration::from_secs(1)).await;
         let rpc_client = jsonrpsee::http_client::HttpClient::builder()
             .build(format!("http://127.0.0.1:{}", reserved_ports.rpc.port()))?;
-        tracing::debug!("Generating mnemonic seed phrase");
         let mnemonic = rpc_client.generate_mnemonic().await?;
-        tracing::debug!("Setting mnemonic seed phrase");
         let () = rpc_client.set_seed_from_mnemonic(mnemonic).await?;
-        tracing::debug!("Generating deposit address");
         let deposit_address = rpc_client.get_new_address().await?;
+        tracing::debug!("Node initialized");
         Ok(Self {
             _truthcoin_app_task: truthcoin_app_task,
             rpc_client,
@@ -219,12 +217,9 @@ impl Sidechain for PostSetup {
                     FilledOutputContent::Bitcoin(utxo_value) => {
                         utxo_value.0 == value
                     }
-                    FilledOutputContent::AmmLpToken { .. }
-                    | FilledOutputContent::BitcoinWithdrawal { .. }
-                    | FilledOutputContent::Truthcoin(..)
-                    | FilledOutputContent::TruthcoinControl(_)
-                    | FilledOutputContent::TruthcoinReservation(_, _)
-                    | FilledOutputContent::DutchAuctionReceipt(_) => false,
+                    FilledOutputContent::BitcoinWithdrawal { .. }
+                    | FilledOutputContent::Votecoin(_)
+                    | FilledOutputContent::MarketFunds { .. } => false,
                 }
                 && match utxo.outpoint {
                     truthcoin_dc::types::OutPoint::Deposit(outpoint) => {
@@ -237,7 +232,6 @@ impl Sidechain for PostSetup {
         if utxos.iter().any(is_expected) {
             return Ok(());
         }
-        tracing::debug!("Deposit not found, BMM 1 block...");
         let () = self.bmm_single(post_setup).await?;
         let utxos = self.rpc_client.list_utxos().await?;
         if utxos.iter().any(is_expected) {

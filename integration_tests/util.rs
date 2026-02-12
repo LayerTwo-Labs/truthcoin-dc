@@ -41,6 +41,8 @@ pub struct TruthcoinApp {
     pub net_port: u16,
     /// Port to use for the RPC server
     pub rpc_port: u16,
+    /// Use block-based slot periods for testing (value = blocks per period)
+    pub slot_config_testing: Option<u32>,
     /// Port to use for ZMQ server
     pub zmq_port: u16,
 }
@@ -63,6 +65,8 @@ impl TruthcoinApp {
             "--datadir".to_owned(),
             self.data_dir.display().to_string(),
             "--headless".to_owned(),
+            "--network".to_owned(),
+            "regtest".to_owned(),
             "--mainchain-grpc-port".to_owned(),
             self.mainchain_grpc_port.to_string(),
             "--net-addr".to_owned(),
@@ -75,6 +79,10 @@ impl TruthcoinApp {
         if let Some(log_level) = self.log_level {
             default_args.push("--log-level".to_owned());
             default_args.push(log_level.as_str().to_owned());
+        }
+        if let Some(blocks_per_period) = self.slot_config_testing {
+            default_args.push("--slot-config-testing".to_owned());
+            default_args.push(blocks_per_period.to_string());
         }
         let args = default_args
             .into_iter()

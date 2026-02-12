@@ -11,9 +11,9 @@ use bip300301_enforcer_integration_tests::{
     util::{AbortOnDrop, AsyncTrial},
 };
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::BoxFuture};
-use truthcoin_dc_app_rpc_api::RpcClient as _;
 use tokio::time::sleep;
 use tracing::Instrument as _;
+use truthcoin_dc_app_rpc_api::RpcClient as _;
 
 use crate::{
     setup::{Init, PostSetup},
