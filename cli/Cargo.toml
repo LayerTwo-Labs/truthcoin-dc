@@ -13,6 +13,9 @@ clap = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
 http = { workspace = true }
 jsonrpsee = { workspace = true, features = ["http-client"] }
+regex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
 truthcoin_dc = { path = "../lib", features = ["clap"] }
 truthcoin_dc_app_rpc_api = { path = "../rpc-api" }
 serde_json = { workspace = true }
