@@ -140,12 +140,12 @@ impl UtxoCreator {
         };
         ui.separator();
         ui.horizontal(|ui| {
-            if !matches!(asset_id, AssetId::TruthcoinControl(_)) {
-                ui.monospace("Value:       ");
-                ui.add(egui::TextEdit::singleline(&mut self.value));
-            }
+            ui.monospace("Value:       ");
+            ui.add(egui::TextEdit::singleline(&mut self.value));
             if asset_id == AssetId::Bitcoin {
                 ui.monospace("BTC");
+            } else if asset_id == AssetId::Votecoin {
+                ui.monospace("VOT");
             }
         });
         ui.horizontal(|ui| {
@@ -270,12 +270,11 @@ impl UtxoCreator {
                                 bitcoin_amount,
                             ))
                         }),
-                        AssetId::Truthcoin(_) => {
-                            self.value.parse().ok().map(OutputContent::Truthcoin)
-                        }
-                        AssetId::TruthcoinControl(_) => {
-                            Some(OutputContent::TruthcoinControl)
-                        }
+                        AssetId::Votecoin => self
+                            .value
+                            .parse::<u32>()
+                            .ok()
+                            .map(OutputContent::Votecoin),
                     };
                     if ui
                         .add_enabled(
