@@ -470,7 +470,7 @@ mod tests {
         // Block 9 → period 1; current_period(1) > period_index(1) is false
         let period_at_9 = get_current_period(0, Some(9), 0, &config).unwrap();
         assert_eq!(period_at_9, 1);
-        assert!(!(period_at_9 > 1)); // No transition
+        assert!(period_at_9 <= 1); // No transition
 
         // Block 10 → period 2; current_period(2) > period_index(1) is true
         let period_at_10 = get_current_period(0, Some(10), 0, &config).unwrap();
@@ -487,7 +487,7 @@ mod tests {
         // Block 19 → period 2; current_period(2) > voting_period(2) is false
         let period_at_19 = get_current_period(0, Some(19), 0, &config).unwrap();
         assert_eq!(period_at_19, 2);
-        assert!(!(period_at_19 > 2)); // No resolution
+        assert!(period_at_19 <= 2); // No resolution
 
         // Block 20 → period 3; current_period(3) > voting_period(2) is true
         let period_at_20 = get_current_period(0, Some(20), 0, &config).unwrap();
@@ -511,7 +511,7 @@ mod tests {
         // Slot period_index=3, voting_period=4: 5 > 4 → resolve
         assert!(period_at_40 > 4);
         // Slot period_index=4, voting_period=5: 5 > 5 → false, not yet
-        assert!(!(period_at_40 > 5));
+        assert!(period_at_40 <= 5);
     }
 
     #[test]
@@ -524,7 +524,7 @@ mod tests {
         for h in 5..=9 {
             let cp = get_current_period(0, Some(h), 0, &config).unwrap();
             assert_eq!(cp, 1, "at block {h}");
-            assert!(!(cp > 1), "should NOT transition at block {h}");
+            assert!(cp <= 1, "should NOT transition at block {h}");
         }
 
         // Transition to Voting at block 10 (current_period=2, 2 > 1 is true)
@@ -536,7 +536,7 @@ mod tests {
         for h in 10..=19 {
             let cp = get_current_period(0, Some(h), 0, &config).unwrap();
             assert_eq!(cp, 2, "at block {h}");
-            assert!(!(cp > 2), "should NOT resolve at block {h}");
+            assert!(cp <= 2, "should NOT resolve at block {h}");
         }
 
         // Resolve at block 20 (current_period=3, 3 > 2 is true)
