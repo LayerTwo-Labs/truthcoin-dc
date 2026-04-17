@@ -106,6 +106,7 @@ pub struct PeerResponseItem {
 }
 
 /// Info to send to the net task / node
+#[allow(clippy::large_enum_variant)]
 #[must_use]
 #[derive(Debug)]
 pub enum Info {

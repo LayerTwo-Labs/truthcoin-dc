@@ -29,6 +29,7 @@ use crate::{
 };
 
 /// Message received from the connection task / net task / node
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum InternalMessage {
     /// Indicates if a BMM verification request completed.

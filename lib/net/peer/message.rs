@@ -110,6 +110,7 @@ impl PushTransactionRequest {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(BorshSerialize, Clone, Debug)]
 pub enum Request {
     GetBlock(GetBlockRequest),
@@ -206,7 +207,7 @@ impl<'a> Serialize for RequestMessageRef<'a> {
     }
 }
 
-#[allow(clippy::duplicated_attributes)]
+#[allow(clippy::duplicated_attributes, clippy::large_enum_variant)]
 #[derive(transitive::Transitive, Debug)]
 #[transitive(
     from(GetBlockRequest, Request),
@@ -252,6 +253,7 @@ impl<'de> Deserialize<'de> for RequestMessage {
     where
         D: serde::Deserializer<'de>,
     {
+        #[allow(clippy::large_enum_variant)]
         #[derive(Deserialize)]
         enum Repr {
             Heartbeat(Heartbeat),

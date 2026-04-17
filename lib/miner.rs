@@ -9,6 +9,8 @@ use crate::types::{
 pub enum Error {
     #[error("CUSF mainchain proto error")]
     CusfMainchain(#[from] proto::Error),
+    #[error("merkle root mismatch: header and body are inconsistent")]
+    MerkleRootMismatch,
 }
 
 #[derive(Clone)]

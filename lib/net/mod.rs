@@ -111,7 +111,8 @@ fn configure_server() -> Result<(ServerConfig, Vec<u8>), Error> {
     let cert_chain = vec![cert_key.cert.into()];
     let mut server_config =
         ServerConfig::with_single_cert(cert_chain, priv_key)?;
-    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+    let transport_config = Arc::get_mut(&mut server_config.transport)
+        .ok_or(Error::TransportConfigNotExclusive)?;
     transport_config.max_concurrent_uni_streams(1_u8.into());
     Ok((server_config, cert_der))
 }

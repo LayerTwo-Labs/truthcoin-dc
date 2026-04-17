@@ -51,8 +51,6 @@ pub enum AcceptConnection {
 pub enum Error {
     #[error(transparent)]
     AcceptConnection(#[from] <AcceptConnection as fatality::Split>::Fatal),
-    #[error("accept error")]
-    AcceptError,
     #[error(transparent)]
     AlreadyConnected(#[from] AlreadyConnected),
     #[error("bincode error")]
@@ -85,6 +83,11 @@ pub enum Error {
     ReadToEnd(#[from] quinn::ReadToEndError),
     #[error("send datagram error")]
     SendDatagram(#[from] quinn::SendDatagramError),
+    #[error(
+        "failed to configure server transport: \
+         Arc has multiple owners"
+    )]
+    TransportConfigNotExclusive,
     #[error("write error")]
     Write(#[from] quinn::WriteError),
 }
