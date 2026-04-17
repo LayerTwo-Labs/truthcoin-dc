@@ -230,53 +230,6 @@ impl utoipa::ToSchema for Txid {
     }
 }
 
-/// Identifier for a Truthcoin
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Copy,
-    Debug,
-    Deserialize,
-    Eq,
-    Hash,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-)]
-#[repr(transparent)]
-pub struct TruthcoinId(#[serde(with = "serde_hexstr_human_readable")] pub Hash);
-
-impl FromHex for TruthcoinId {
-    type Error = <Hash as FromHex>::Error;
-
-    fn from_hex<T: AsRef<[u8]>>(hex: T) -> Result<Self, Self::Error> {
-        Hash::from_hex(hex).map(Self)
-    }
-}
-
-impl std::str::FromStr for TruthcoinId {
-    type Err = <Self as FromHex>::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_hex(s)
-    }
-}
-
-impl utoipa::PartialSchema for TruthcoinId {
-    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
-        let obj =
-            utoipa::openapi::Object::with_type(utoipa::openapi::Type::String);
-        utoipa::openapi::RefOr::T(utoipa::openapi::Schema::Object(obj))
-    }
-}
-
-impl utoipa::ToSchema for TruthcoinId {
-    fn name() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("TruthcoinId")
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum ParseAssetIdError {
     #[error(transparent)]
@@ -285,7 +238,7 @@ pub enum ParseAssetIdError {
     FromHex(#[from] hex::FromHexError),
 }
 
-/// Identifier for an arbitrary asset (Bitcoin, Truthcoin, or Truthcoin control)
+/// Identifier for an asset type
 #[derive(
     Clone,
     Copy,
@@ -300,8 +253,6 @@ pub enum ParseAssetIdError {
 )]
 pub enum AssetId {
     Bitcoin,
-    Truthcoin(TruthcoinId),
-    TruthcoinControl(TruthcoinId),
 }
 
 impl<'de> Deserialize<'de> for AssetId {
@@ -327,7 +278,8 @@ impl Serialize for AssetId {
 
 impl std::fmt::Display for AssetId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let bytes = borsh::to_vec(self).unwrap();
+        let bytes = borsh::to_vec(self)
+            .expect("AssetId borsh serialization is infallible");
         hex::encode(bytes).fmt(f)
     }
 }
@@ -354,59 +306,6 @@ impl utoipa::ToSchema for AssetId {
     }
 }
 
-/// Unique identifier for each Dutch auction
-#[derive(
-    BorshDeserialize,
-    BorshSerialize,
-    Clone,
-    Copy,
-    Debug,
-    Deserialize,
-    Eq,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-)]
-#[repr(transparent)]
-#[serde(transparent)]
-pub struct DutchAuctionId(pub Txid);
-
-impl std::fmt::Display for DutchAuctionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl FromHex for DutchAuctionId {
-    type Error = <Hash as FromHex>::Error;
-
-    fn from_hex<T: AsRef<[u8]>>(hex: T) -> Result<Self, Self::Error> {
-        Txid::from_hex(hex).map(Self)
-    }
-}
-
-impl FromStr for DutchAuctionId {
-    type Err = <Self as FromHex>::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::from_hex(s)
-    }
-}
-
-impl utoipa::PartialSchema for DutchAuctionId {
-    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
-        let obj =
-            utoipa::openapi::Object::with_type(utoipa::openapi::Type::String);
-        utoipa::openapi::RefOr::T(utoipa::openapi::Schema::Object(obj))
-    }
-}
-
-impl utoipa::ToSchema for DutchAuctionId {
-    fn name() -> std::borrow::Cow<'static, str> {
-        std::borrow::Cow::Borrowed("DutchAuctionId")
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[repr(transparent)]
 #[serde(transparent)]
@@ -421,7 +320,7 @@ impl std::fmt::Display for M6id {
 
 pub fn hash<T>(data: &T) -> Hash
 where
-    T: BorshSerialize,
+    T: BorshSerialize + ?Sized,
 {
     let data_serialized = borsh::to_vec(data)
         .expect("failed to serialize with borsh to compute a hash");
