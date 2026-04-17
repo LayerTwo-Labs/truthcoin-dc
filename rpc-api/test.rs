@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 
 use utoipa::openapi::{self, Ref, RefOr, Schema};
 
-/// Get all component refs
 trait ComponentRefs {
     fn component_refs(&self) -> impl Iterator<Item = &Ref> + '_;
 }
@@ -275,8 +274,6 @@ impl ComponentRefs for openapi::OpenApi {
     }
 }
 
-// Check for errors within a schema.
-// This is a WIP and may not cover all possible errors.
 #[test]
 fn check_schema() -> anyhow::Result<()> {
     let schema: openapi::OpenApi =
@@ -290,7 +287,6 @@ fn check_schema() -> anyhow::Result<()> {
         BTreeSet::<&str>::from_iter(schema.components.iter().flat_map(
             |components| components.schemas.keys().map(|s| s.as_str()),
         ));
-    // TODO: check that there are no ref cycles here
     for ref_loc in &component_ref_locations {
         let Some(loc) = ref_loc.strip_prefix("#/components/schemas/") else {
             anyhow::bail!("Unexpected prefix in ref location: `{ref_loc}`");
@@ -299,7 +295,6 @@ fn check_schema() -> anyhow::Result<()> {
             anyhow::bail!("Missing schema referenced as `{ref_loc}`")
         }
     }
-    // Check for redundant components
     for component in component_schemas {
         let component_ref = format!("#/components/schemas/{component}");
         if !component_ref_locations.contains(component_ref.as_str()) {
