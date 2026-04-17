@@ -485,6 +485,7 @@ pub mod mainchain {
         pub prev_block_hash: BlockHash,
         pub height: u32,
         pub work: Work,
+        pub timestamp: u64,
     }
 
     #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -839,6 +840,7 @@ pub mod mainchain {
                 prev_block_hash,
                 height,
                 work,
+                timestamp,
             } = header_info;
             let block_hash = block_hash
                 .as_ref()
@@ -870,6 +872,7 @@ pub mod mainchain {
                 prev_block_hash,
                 height: *height,
                 work,
+                timestamp: *timestamp,
             })
         }
     }
@@ -1031,7 +1034,8 @@ pub mod mainchain {
                         generated::GetBlockHeaderInfoResponse,
                     >(
                         "header_infos",
-                        &serde_json::to_string(&header_info).unwrap(),
+                        &serde_json::to_string(&header_info)
+                            .expect("BlockHeaderInfo serializes to JSON"),
                     ));
                 }
             }
@@ -1067,7 +1071,7 @@ pub mod mainchain {
                     >(
                         "infos",
                         &serde_json::to_string(&(header_info, block_info))
-                            .unwrap(),
+                            .expect("(BlockHeaderInfo, BlockInfo) serializes to JSON"),
                     ));
                 }
             }
