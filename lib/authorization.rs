@@ -105,6 +105,8 @@ pub enum Error {
         address: Address,
         hash_verifying_key: Address,
     },
+    #[error("signature count mismatch: expected {expected}, got {actual}")]
+    SignatureCountMismatch { expected: usize, actual: usize },
 }
 
 #[derive(
@@ -129,17 +131,42 @@ impl GetAddress for Authorization {
     }
 }
 
+pub fn verify_actor_proof(
+    transaction: &AuthorizedTransaction,
+) -> Result<(), Error> {
+    let actor_proof = match &transaction.actor_proof {
+        Some(proof) => proof,
+        None => return Ok(()),
+    };
+    let tx_msg_canonical = tx_msg_canonical(&transaction.transaction)?;
+    actor_proof
+        .verifying_key
+        .0
+        .verify_strict(&tx_msg_canonical, &actor_proof.signature.0)?;
+    Ok(())
+}
+
 impl Verify for Authorization {
     type Error = Error;
     fn verify_transaction(
         transaction: &AuthorizedTransaction,
     ) -> Result<(), Self::Error> {
         verify_authorized_transaction(transaction)?;
+        verify_actor_proof(transaction)?;
         Ok(())
     }
 
     fn verify_body(body: &Body) -> Result<(), Self::Error> {
         verify_authorizations(body)?;
+        let authorized_txs = body.authorized_transactions().map_err(|_| {
+            Error::SignatureCountMismatch {
+                expected: 0,
+                actual: 0,
+            }
+        })?;
+        for tx in &authorized_txs {
+            verify_actor_proof(tx)?;
+        }
         Ok(())
     }
 }
@@ -168,6 +195,13 @@ fn tx_msg_canonical(tx: &Transaction) -> borsh::io::Result<Vec<u8>> {
 pub fn verify_authorized_transaction(
     transaction: &AuthorizedTransaction,
 ) -> Result<(), Error> {
+    if transaction.authorizations.len() != transaction.transaction.inputs.len()
+    {
+        return Err(Error::SignatureCountMismatch {
+            expected: transaction.transaction.inputs.len(),
+            actual: transaction.authorizations.len(),
+        });
+    }
     let tx_msg_canonical = tx_msg_canonical(&transaction.transaction)?;
     let messages: Vec<_> = std::iter::repeat_n(
         tx_msg_canonical.as_slice(),
@@ -192,10 +226,18 @@ pub fn verify_authorized_transaction(
 }
 
 pub fn verify_authorizations(body: &Body) -> Result<(), Error> {
-    let input_numbers = body
+    let input_numbers: Vec<usize> = body
         .transactions
         .iter()
-        .map(|transaction| transaction.inputs.len());
+        .map(|transaction| transaction.inputs.len())
+        .collect();
+    let total_inputs: usize = input_numbers.iter().sum();
+    if body.authorizations.len() != total_inputs {
+        return Err(Error::SignatureCountMismatch {
+            expected: total_inputs,
+            actual: body.authorizations.len(),
+        });
+    }
     let serialized_transactions: Vec<Vec<u8>> = body
         .transactions
         .par_iter()
@@ -203,11 +245,13 @@ pub fn verify_authorizations(body: &Body) -> Result<(), Error> {
         .collect::<Result<_, _>>()?;
     let serialized_transactions =
         serialized_transactions.iter().map(Vec::as_slice);
-    let messages = input_numbers.zip(serialized_transactions).flat_map(
-        |(input_number, serialized_transaction)| {
+    let messages = input_numbers
+        .iter()
+        .copied()
+        .zip(serialized_transactions)
+        .flat_map(|(input_number, serialized_transaction)| {
             std::iter::repeat_n(serialized_transaction, input_number)
-        },
-    );
+        });
 
     let pairs = body.authorizations.iter().zip(messages).collect::<Vec<_>>();
 
@@ -239,10 +283,13 @@ pub fn verify_authorizations(body: &Body) -> Result<(), Error> {
             .verifying_keys
             .push(authorization.verifying_key.0);
     }
-    assert_eq!(
-        packages.iter().map(|p| p.signatures.len()).sum::<usize>(),
-        body.authorizations.len()
-    );
+    let total_sigs: usize = packages.iter().map(|p| p.signatures.len()).sum();
+    if total_sigs != body.authorizations.len() {
+        return Err(Error::SignatureCountMismatch {
+            expected: body.authorizations.len(),
+            actual: total_sigs,
+        });
+    }
     packages
         .par_iter()
         .map(
@@ -315,5 +362,6 @@ pub fn authorize(
     Ok(AuthorizedTransaction {
         authorizations,
         transaction,
+        actor_proof: None,
     })
 }
