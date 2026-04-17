@@ -14,27 +14,23 @@ use utoipa::ToSchema;
 pub use crate::authorization::Authorization;
 
 mod address;
-pub mod truthcoin_data;
 pub mod hashes;
 pub mod keys;
 pub mod proto;
 pub mod schema;
 mod transaction;
+pub mod tx_pow;
 
 pub use address::Address;
-pub use truthcoin_data::{TruthcoinData, TruthcoinDataUpdates, Update};
-pub use hashes::{
-    AssetId, TruthcoinId, BlockHash, DutchAuctionId, Hash, M6id, MerkleRoot,
-    Txid,
-};
+pub use hashes::{AssetId, BlockHash, Hash, M6id, MerkleRoot, Txid};
 pub use keys::{EncryptionPubKey, VerifyingKey};
 pub use transaction::{
-    AmmBurn, AmmMint, AmmSwap, AssetOutput, AssetOutputContent, Authorized,
-    AuthorizedTransaction, BitcoinOutput, BitcoinOutputContent,
-    DutchAuctionBid, DutchAuctionCollect, DutchAuctionParams, FilledOutput,
-    FilledOutputContent, FilledTransaction, InPoint, OutPoint, OutPointKey,
-    Output, OutputContent, PointedOutput, SpentOutput, Transaction, TxData,
-    TxInputs, WithdrawalOutputContent,
+    AssetOutput, AssetOutputContent, Authorized, AuthorizedTransaction,
+    BallotItem, BitcoinOutput, BitcoinOutputContent, ClaimDecision,
+    CreateMarket, DecisionClaimEntry, FilledOutput, FilledOutputContent,
+    FilledTransaction, InPoint, OutPoint, OutPointKey, Output, OutputContent,
+    PointedOutput, SpentOutput, Transaction, TransactionData, TxData, TxInputs,
+    WithdrawalOutputContent,
 };
 
 pub const THIS_SIDECHAIN: u8 = 13;
@@ -46,6 +42,10 @@ pub struct AmountOverflowError;
 #[derive(Debug, Error)]
 #[error("Bitcoin amount underflow")]
 pub struct AmountUnderflowError;
+
+#[derive(Debug, Error)]
+#[error("body has fewer authorizations than transaction inputs")]
+pub struct MalformedBodyError;
 
 /// (de)serialize as Display/FromStr for human-readable forms like json,
 /// and default serialization for non human-readable forms like bincode
@@ -80,12 +80,13 @@ mod serde_display_fromstr_human_readable {
     }
 }
 
-/// (de)serialize as hex strings for human-readable forms like json,
+/// Optimized (de)serialize as hex strings for human-readable forms like json,
 /// and default serialization for non human-readable formats like bincode
 mod serde_hexstr_human_readable {
     use hex::{FromHex, ToHex};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+    #[inline]
     pub fn serialize<S, T>(data: T, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -98,6 +99,7 @@ mod serde_hexstr_human_readable {
         }
     }
 
+    #[inline]
     pub fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
     where
         D: Deserializer<'de>,
@@ -303,6 +305,8 @@ pub struct Body {
     pub coinbase: Vec<Output>,
     pub transactions: Vec<Transaction>,
     pub authorizations: Vec<Authorization>,
+    #[serde(default)]
+    pub actor_proofs: Vec<Option<Authorization>>,
 }
 
 impl Body {
@@ -318,31 +322,41 @@ impl Body {
         );
         let mut transactions =
             Vec::with_capacity(authorized_transactions.len());
+        let mut actor_proofs =
+            Vec::with_capacity(authorized_transactions.len());
         for at in authorized_transactions.into_iter() {
             authorizations.extend(at.authorizations);
+            actor_proofs.push(at.actor_proof);
             transactions.push(at.transaction);
         }
         Self {
             coinbase,
             transactions,
             authorizations,
+            actor_proofs,
         }
     }
 
-    pub fn authorized_transactions(&self) -> Vec<AuthorizedTransaction> {
+    pub fn authorized_transactions(
+        &self,
+    ) -> Result<Vec<AuthorizedTransaction>, MalformedBodyError> {
         let mut authorizations_iter = self.authorizations.iter();
+        let mut actor_proofs_iter = self.actor_proofs.iter();
         self.transactions
             .iter()
             .map(|tx| {
                 let mut authorizations = Vec::with_capacity(tx.inputs.len());
                 for _ in 0..tx.inputs.len() {
-                    let auth = authorizations_iter.next().unwrap();
+                    let auth =
+                        authorizations_iter.next().ok_or(MalformedBodyError)?;
                     authorizations.push(auth.clone());
                 }
-                AuthorizedTransaction {
+                let actor_proof = actor_proofs_iter.next().cloned().flatten();
+                Ok(AuthorizedTransaction {
                     transaction: tx.clone(),
                     authorizations,
-                }
+                    actor_proof,
+                })
             })
             .collect()
     }
@@ -351,8 +365,27 @@ impl Body {
         coinbase: &[Output],
         txs: &[Transaction],
     ) -> MerkleRoot {
-        // FIXME: Compute actual merkle root instead of just a hash.
-        hashes::hash_with_scratch_buffer(&(coinbase, txs)).into()
+        let coinbase_hash: Hash = hashes::hash_with_scratch_buffer(coinbase);
+        let mut leaves: Vec<Hash> = std::iter::once(coinbase_hash)
+            .chain(txs.iter().map(|tx| tx.txid().into()))
+            .collect();
+        while leaves.len() > 1 {
+            let mut next_level = Vec::with_capacity(leaves.len().div_ceil(2));
+            for pair in leaves.chunks(2) {
+                let left = pair[0].as_ref();
+                let right = if pair.len() == 2 {
+                    pair[1].as_ref()
+                } else {
+                    pair[0].as_ref()
+                };
+                let mut combined = [0u8; 64];
+                combined[..32].copy_from_slice(left);
+                combined[32..].copy_from_slice(right);
+                next_level.push(*blake3::hash(&combined).as_bytes());
+            }
+            leaves = next_level;
+        }
+        leaves[0].into()
     }
 
     pub fn get_inputs(&self) -> Vec<OutPoint> {
@@ -410,18 +443,6 @@ pub struct Block {
     pub body: Body,
     pub height: u32,
 }
-
-/*
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DisconnectData {
-    pub spent_utxos: HashMap<types::OutPoint, Output>,
-    pub deposits: Vec<types::OutPoint>,
-    pub pending_bundles: Vec<bitcoin::Txid>,
-    pub spent_bundles: HashMap<bitcoin::Txid, Vec<types::OutPoint>>,
-    pub spent_withdrawals: HashMap<types::OutPoint, Output>,
-    pub failed_withdrawals: Vec<bitcoin::Txid>,
-}
-*/
 
 #[derive(Eq, PartialEq, Clone, Debug)]
 pub struct AggregatedWithdrawal {
@@ -540,3 +561,5 @@ pub(crate) static VERSION: LazyLock<Version> = LazyLock::new(|| {
     const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
     semver::Version::parse(VERSION_STR).unwrap().into()
 });
+
+pub const SECONDS_PER_QUARTER: u64 = 3600 * 24 * 91;
