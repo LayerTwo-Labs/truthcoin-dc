@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     path::Path,
 };
@@ -12,7 +11,7 @@ use fallible_iterator::FallibleIterator as _;
 use futures::{Stream, StreamExt};
 use heed::{
     byteorder::BigEndian,
-    types::{Bytes, SerdeBincode, Str, U8, U32},
+    types::{Bytes, SerdeBincode, U8, U32},
 };
 use libes::EciesError;
 use serde::{Deserialize, Serialize};
@@ -22,16 +21,63 @@ use tokio_stream::{StreamMap, wrappers::WatchStream};
 
 use crate::{
     authorization::{self, Authorization, Signature, get_address},
+    math::{
+        markets,
+        safe_math::{Rounding, to_sats},
+        trading,
+    },
+    state::markets::{
+        DEFAULT_MARKET_BETA, DimensionSpec, MarketId, parse_dimensions,
+    },
     types::{
-        Address, AmountOverflowError, AmountUnderflowError, AssetId,
-        AuthorizedTransaction, TruthcoinData, TruthcoinId, BitcoinOutputContent,
-        DutchAuctionId, DutchAuctionParams, EncryptionPubKey, FilledOutput,
-        GetBitcoinValue, Hash, InPoint, OutPoint, Output, OutputContent,
-        SpentOutput, Transaction, TxData, VERSION, VerifyingKey, Version,
-        WithdrawalOutputContent, keys::Ecies,
+        Address, AmountOverflowError, AmountUnderflowError,
+        AuthorizedTransaction, BitcoinOutputContent, EncryptionPubKey,
+        FilledOutput, GetBitcoinValue, InPoint, OutPoint, Output,
+        OutputContent, SpentOutput, Transaction, TxData, VERSION, VerifyingKey,
+        Version, WithdrawalOutputContent, keys::Ecies,
     },
     util::Watchable,
 };
+
+fn sorted_outpoints(utxos: HashMap<OutPoint, Output>) -> Vec<OutPoint> {
+    let mut pairs: Vec<_> = utxos.into_iter().collect();
+    pairs.sort_by_key(|(outpoint, _)| *outpoint);
+    pairs.into_iter().map(|(outpoint, _)| outpoint).collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct DecisionClaimInput {
+    pub decision_type: crate::state::decisions::DecisionType,
+    pub decisions: Vec<crate::types::DecisionClaimEntry>,
+}
+
+/// Input struct for creating a market.
+///
+/// Markets are defined using dimension bracket notation:
+/// - Single binary decision: `[decision_id]`
+/// - Multiple independent decisions: `[dec1,dec2,dec3]`
+/// - Categorical (mutually exclusive): `[[dec1,dec2,dec3]]`
+/// - Mixed dimensions: `[dec1,[dec2,dec3],dec4]`
+#[derive(Clone, Debug)]
+pub struct CreateMarketInput {
+    pub title: String,
+    pub description: String,
+    /// Dimension specification in bracket notation
+    pub dimensions: String,
+    /// Advanced: LMSR liquidity parameter controlling price sensitivity.
+    /// Higher beta = more liquid = smaller price moves per trade.
+    /// Mutually exclusive with initial_liquidity - specify one or the other.
+    pub beta: Option<f64>,
+    pub trading_fee: Option<f64>,
+    /// Initial liquidity in satoshis to fund the market (recommended).
+    /// Beta is derived: β = liquidity / ln(num_outcomes)
+    /// Mutually exclusive with beta - specify one or the other.
+    pub initial_liquidity: Option<u64>,
+    pub category_option_counts: Option<Vec<usize>>,
+    pub tx_pow_hash_selector: Option<u8>,
+    pub tx_pow_ordering: Option<u8>,
+    pub tx_pow_difficulty: Option<u8>,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct Balance {
@@ -95,8 +141,6 @@ pub enum Error {
         "wallet does not have a seed (set with RPC `set-seed-from-mnemonic`)"
     )]
     NoSeed,
-    #[error("could not find truthcoin reservation for `{plain_name}`")]
-    NoTruthcoinReservation { plain_name: String },
     #[error("not enough funds")]
     NotEnoughFunds,
     #[error("utxo does not exist")]
@@ -107,6 +151,8 @@ pub enum Error {
     SeedAlreadyExists,
     #[error(transparent)]
     VkDoesNotExist(#[from] Box<VkDoesNotExistError>),
+    #[error("Invalid decision ID: {reason}")]
+    InvalidDecisionId { reason: String },
 }
 
 /// Marker type for Wallet Env
@@ -142,17 +188,13 @@ pub struct Wallet {
         SerdeBincode<OutPoint>,
         SerdeBincode<SpentOutput<OutputContent>>,
     >,
-    /// Associates reservation commitments with plaintext Truthcoin names
-    truthcoin_reservations: DatabaseUnique<SerdeBincode<[u8; 32]>, Str>,
-    /// Associates Truthcoin with plaintext names
-    known_truthcoin: DatabaseUnique<SerdeBincode<TruthcoinId>, Str>,
     /// Map each verifying key to it's index
     vk_to_index: DatabaseUnique<SerdeBincode<VerifyingKey>, U32<BigEndian>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
 }
 
 impl Wallet {
-    pub const NUM_DBS: u32 = 14;
+    pub const NUM_DBS: u32 = 12;
 
     pub fn new(path: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(path)?;
@@ -162,25 +204,12 @@ impl Wallet {
             env_open_options
                 .map_size(10 * 1024 * 1024) // 10MB
                 .max_dbs(Self::NUM_DBS);
-            // Apply LMDB "fast" flags consistent with our benchmark setup:
-            // - WRITE_MAP lets us write directly into the memory map instead of
-            //   copying into LMDB's page buffer, reducing syscall overhead for
-            //   write-heavy workloads.
-            // - MAP_ASYNC hands dirty-page flushing to the kernel so commits do
-            //   not block waiting for msync, keeping latencies tight.
-            // - NO_SYNC and NO_META_SYNC skip fsync calls for data and
-            //   metadata; this trades durability for throughput, which is
-            //   acceptable here because the state can be reconstructed from the
-            //   canonical chain if a crash occurs.
-            // - NO_READ_AHEAD disables kernel readahead that would otherwise
-            //   touch cold pages we immediately overwrite, improving random
-            //   access behaviour on SSDs used in testing.
-            // - NO_TLS stops LMDB from relying on thread-local storage for
-            //   reader slots so transactions can be moved across Tokio tasks.
+            // Wallet DB keeps fsync enabled (no NO_SYNC/NO_META_SYNC)
+            // because the seed and key material cannot be
+            // reconstructed from the chain. The DB is small (~10MB)
+            // and low write volume, so fsync cost is negligible.
             let fast_flags = EnvFlags::WRITE_MAP
                 | EnvFlags::MAP_ASYNC
-                | EnvFlags::NO_SYNC
-                | EnvFlags::NO_META_SYNC
                 | EnvFlags::NO_READ_AHEAD
                 | EnvFlags::NO_TLS;
             unsafe { env_open_options.flags(fast_flags) };
@@ -208,10 +237,6 @@ impl Wallet {
             &mut rwtxn,
             "spent_unconfirmed_utxos",
         )?;
-        let truthcoin_reservations =
-            DatabaseUnique::create(&env, &mut rwtxn, "truthcoin_reservations")?;
-        let known_truthcoin =
-            DatabaseUnique::create(&env, &mut rwtxn, "known_truthcoin")?;
         let vk_to_index =
             DatabaseUnique::create(&env, &mut rwtxn, "vk_to_index")?;
         let version = DatabaseUnique::create(&env, &mut rwtxn, "version")?;
@@ -231,8 +256,6 @@ impl Wallet {
             utxos,
             stxos,
             spent_unconfirmed_utxos,
-            truthcoin_reservations,
-            known_truthcoin,
             vk_to_index,
             _version: version,
         })
@@ -338,6 +361,24 @@ impl Wallet {
         Ok(signing_key)
     }
 
+    pub fn voter_address(&self) -> Result<Address, Error> {
+        let mut txn = self.env.write_txn()?;
+        if let Some(addr) = self
+            .index_to_address
+            .try_get(&txn, &0)
+            .map_err(DbError::from)?
+        {
+            txn.abort();
+            return Ok(addr);
+        }
+        let tx_signing_key = self.get_tx_signing_key(&txn, 0)?;
+        let address = get_address(&tx_signing_key.verifying_key().into());
+        self.index_to_address.put(&mut txn, &0, &address)?;
+        self.address_to_index.put(&mut txn, &address, &0)?;
+        txn.commit()?;
+        Ok(address)
+    }
+
     pub fn get_new_address(&self) -> Result<Address, Error> {
         let mut txn = self.env.write_txn()?;
         let next_index = self
@@ -402,9 +443,6 @@ impl Wallet {
         self.spent_unconfirmed_utxos
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
-        self.truthcoin_reservations
-            .clear(&mut rwtxn)
-            .map_err(DbError::from)?;
         rwtxn.commit()?;
         Ok(())
     }
@@ -443,7 +481,8 @@ impl Wallet {
             bip39::Mnemonic::from_phrase(mnemonic, bip39::Language::English)
                 .map_err(Error::ParseMnemonic)?;
         let seed = bip39::Seed::new(&mnemonic, "");
-        let seed_bytes: [u8; 64] = seed.as_bytes().try_into().unwrap();
+        let seed_bytes: [u8; 64] =
+            seed.as_bytes().try_into().map_err(|_| Error::NoSeed)?;
         self.set_seed(&seed_bytes)
     }
 
@@ -461,20 +500,6 @@ impl Wallet {
     }
 
     /// Create a transaction with a fee only.
-    pub fn create_regular_transaction(
-        &self,
-        fee: bitcoin::Amount,
-    ) -> Result<Transaction, Error> {
-        let (total, coins) = self.select_bitcoins(fee)?;
-        let change = total - fee;
-        let inputs = coins.into_keys().collect();
-        let outputs = vec![Output::new(
-            self.get_new_address()?,
-            OutputContent::Bitcoin(BitcoinOutputContent(change)),
-        )];
-        Ok(Transaction::new(inputs, outputs))
-    }
-
     pub fn create_withdrawal(
         &self,
         main_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
@@ -498,20 +523,15 @@ impl Wallet {
         )?;
         let change = total - value - fee;
         let inputs = coins.into_keys().collect();
-        let outputs = vec![
-            Output::new(
-                self.get_new_address()?,
-                OutputContent::Withdrawal(WithdrawalOutputContent {
-                    value,
-                    main_fee,
-                    main_address,
-                }),
-            ),
-            Output::new(
-                self.get_new_address()?,
-                OutputContent::Bitcoin(BitcoinOutputContent(change)),
-            ),
-        ];
+        let mut outputs = vec![Output::new(
+            self.get_new_address()?,
+            OutputContent::Withdrawal(WithdrawalOutputContent {
+                value,
+                main_fee,
+                main_address,
+            }),
+        )];
+        self.push_bitcoin_change(&mut outputs, change)?;
         Ok(Transaction::new(inputs, outputs))
     }
 
@@ -532,799 +552,348 @@ impl Wallet {
             content: OutputContent::Bitcoin(BitcoinOutputContent(value)),
             memo: memo.unwrap_or_default(),
         }];
-        if change != Amount::ZERO {
-            outputs.push(Output::new(
-                self.get_new_address()?,
-                OutputContent::Bitcoin(BitcoinOutputContent(change)),
-            ))
-        }
+        self.push_bitcoin_change(&mut outputs, change)?;
         Ok(Transaction::new(inputs, outputs))
     }
 
-    pub fn create_truthcoin_transfer(
-        &self,
-        address: Address,
-        asset_id: TruthcoinId,
-        amount: u64,
-        fee: bitcoin::Amount,
-        memo: Option<Vec<u8>>,
-    ) -> Result<Transaction, Error> {
-        let (total_sats, bitcoins) = self.select_bitcoins(fee)?;
-        let change_sats = total_sats - fee;
-        let mut inputs: Vec<_> = bitcoins.into_keys().collect();
-        let (total_truthcoin, truthcoin_utxos) =
-            self.select_truthcoin_utxos(asset_id, amount)?;
-        let truthcoin_change = total_truthcoin - amount;
-        inputs.extend(truthcoin_utxos.into_keys());
-        let mut outputs = vec![Output {
-            address,
-            content: OutputContent::Truthcoin(amount),
-            memo: memo.unwrap_or_default(),
-        }];
-        if change_sats != Amount::ZERO {
-            outputs.push(Output::new(
-                self.get_new_address()?,
-                OutputContent::Bitcoin(BitcoinOutputContent(change_sats)),
-            ))
-        }
-        if truthcoin_change != 0 {
-            outputs.push(Output::new(
-                self.get_new_address()?,
-                OutputContent::Truthcoin(truthcoin_change),
-            ))
-        }
-        Ok(Transaction::new(inputs, outputs))
-    }
-
-    /// given a regular transaction, add a truthcoin reservation.
-    /// given a truthcoin reservation tx, change the reserved name.
-    /// panics if the tx is not regular or a truthcoin reservation tx.
-    pub fn reserve_truthcoin(
-        &self,
-        tx: &mut Transaction,
-        plain_name: &str,
-    ) -> Result<(), Error> {
-        assert!(
-            tx.is_regular() || tx.is_reservation(),
-            "this function only accepts a regular or truthcoin reservation tx"
-        );
-        // address for the reservation output
-        let reservation_addr =
-            // if the tx is already truthcoin reservation,
-            // re-use the reservation address
-            if tx.is_reservation() {
-                tx.reservation_outputs().next_back()
-                    .expect("A truthcoin reservation tx must have at least one reservation output")
-                    .address
-            }
-            // if the last output is owned by this wallet, then use
-            // the address associated with the last output
-            else if let Some(last_output) = tx.outputs.last() {
-                let last_output_addr = last_output.address;
-                let rotxn = self.env.read_txn()?;
-                if self.address_to_index.try_get(&rotxn, &last_output_addr)?.is_some() {
-                    last_output_addr
-                } else {
-                    self.get_new_address()?
-                }
-            } else {
-                self.get_new_address()?
-            };
-        let rotxn = self.env.read_txn()?;
-        let reservation_signing_key =
-            self.get_tx_signing_key_for_addr(&rotxn, &reservation_addr)?;
-        let name_hash: Hash = blake3::hash(plain_name.as_bytes()).into();
-        let truthcoin_id = TruthcoinId(name_hash);
-        // hmac(secret, name_hash)
-        let nonce =
-            blake3::keyed_hash(reservation_signing_key.as_bytes(), &name_hash)
-                .into();
-        // hmac(nonce, name_hash)
-        let commitment = blake3::keyed_hash(&nonce, &name_hash).into();
-        // store reservation data
-        let mut rwtxn = self.env.write_txn()?;
-        self.truthcoin_reservations
-            .put(&mut rwtxn, &commitment, plain_name)?;
-        self.known_truthcoin
-            .put(&mut rwtxn, &truthcoin_id, plain_name)?;
-        rwtxn.commit()?;
-        // if the tx is regular, add a reservation output
-        if tx.is_regular() {
-            let reservation_output = Output::new(
-                reservation_addr,
-                OutputContent::TruthcoinReservation,
-            );
-            tx.outputs.push(reservation_output);
-        };
-        tx.data = Some(TxData::TruthcoinReservation { commitment });
-        Ok(())
-    }
-
-    /// given a regular transaction, add a truthcoin registration.
-    /// panics if the tx is not regular.
-    /// returns an error if there is no corresponding reservation utxo
-    /// does not modify the tx if there is no corresponding reservation utxo.
-    pub fn register_truthcoin(
-        &self,
-        tx: &mut Transaction,
-        plain_name: &str,
-        truthcoin_data: Cow<TruthcoinData>,
-        initial_supply: u64,
-    ) -> Result<(), Error> {
-        assert!(tx.is_regular(), "this function only accepts a regular tx");
-        // address for the registration output
-        let registration_addr =
-            // if the last output is owned by this wallet, then use
-            // the address associated with the last output
-            if let Some(last_output) = tx.outputs.last() {
-                let last_output_addr = last_output.address;
-                let rotxn = self.env.read_txn()?;
-                if self.address_to_index.try_get(&rotxn, &last_output_addr)?.is_some() {
-                    last_output_addr
-                } else {
-                    self.get_new_address()?
-                }
-            } else {
-                self.get_new_address()?
-            };
-        let name_hash: Hash = blake3::hash(plain_name.as_bytes()).into();
-        let truthcoin_id = TruthcoinId(name_hash);
-        /* Search for reservation utxo by the following procedure:
-        For each reservation:
-        * Get the corresponding signing key
-        * Compute a reservation commitment for the truthcoin to be registered
-        * If the computed commitment is the same as the reservation commitment,
-          then use this utxo. Otherwise, continue */
-        // outpoint and nonce, if found
-        let mut reservation_outpoint_nonce: Option<(OutPoint, Hash)> = None;
-        for (outpoint, filled_output) in self.get_utxos()?.into_iter() {
-            if let Some(reservation_commitment) =
-                filled_output.reservation_commitment()
-            {
-                // for each reservation, get the signing key, and
-                let reservation_addr = filled_output.address;
-                let rotxn = self.env.read_txn()?;
-                let reservation_signing_key = self
-                    .get_tx_signing_key_for_addr(&rotxn, &reservation_addr)?;
-                // hmac(secret, name_hash)
-                let nonce = blake3::keyed_hash(
-                    reservation_signing_key.as_bytes(),
-                    &name_hash,
-                )
-                .into();
-                // hmac(nonce, name_hash)
-                let commitment = blake3::keyed_hash(&nonce, &name_hash);
-                // WARNING: This comparison MUST be done in constant time.
-                // `blake3::Hash` handles this; DO NOT compare as byte arrays
-                if commitment == *reservation_commitment {
-                    reservation_outpoint_nonce = Some((outpoint, nonce));
-                    break;
-                }
-            }
-        }
-        // store truthcoin data
-        let mut rwtxn = self.env.write_txn()?;
-        self.known_truthcoin
-            .put(&mut rwtxn, &truthcoin_id, plain_name)?;
-        rwtxn.commit()?;
-        let (reservation_outpoint, nonce) = reservation_outpoint_nonce
-            .ok_or_else(|| Error::NoTruthcoinReservation {
-                plain_name: plain_name.to_owned(),
-            })?;
-        tx.inputs.push(reservation_outpoint);
-        if initial_supply != 0 {
-            let mint_output = Output::new(
-                registration_addr,
-                OutputContent::Truthcoin(initial_supply),
-            );
-            tx.outputs.push(mint_output);
-        };
-        let control_coin_output =
-            Output::new(registration_addr, OutputContent::TruthcoinControl);
-        tx.outputs.push(control_coin_output);
-        tx.data = Some(TxData::TruthcoinRegistration {
-            name_hash,
-            revealed_nonce: nonce,
-            truthcoin_data: Box::new(truthcoin_data.into_owned()),
-            initial_supply,
-        });
-        Ok(())
-    }
-
+    /// Select confirmed Bitcoin UTXOs only, following Bitcoin Hivemind's requirement
+    /// that only confirmed UTXOs can be spent in block construction.
+    /// This prevents the "utxo doesn't exist" error when trying to spend mempool UTXOs.
     pub fn select_bitcoins(
         &self,
         value: bitcoin::Amount,
     ) -> Result<(bitcoin::Amount, HashMap<OutPoint, Output>), Error> {
         let rotxn = self.env.read_txn()?;
-        let mut bitcoin_utxos: Vec<(_, Output)> = self
-            .utxos
-            .iter(&rotxn)
-            .map_err(DbError::from)?
-            .filter_map(|(outpoint, output)| {
-                if output.is_bitcoin() {
-                    Ok(Some((outpoint, output.into())))
-                } else {
-                    Ok(None)
-                }
-            })
-            .collect()
-            .map_err(DbError::from)?;
-        bitcoin_utxos
-            .sort_unstable_by_key(|(_, output)| output.get_bitcoin_value());
-        let mut unconfirmed_bitcoin_utxos: Vec<_> = self
-            .unconfirmed_utxos
-            .iter(&rotxn)
-            .map_err(DbError::from)?
-            .filter(|(_outpoint, output)| Ok(output.is_bitcoin()))
-            .collect()
-            .map_err(DbError::from)?;
-        unconfirmed_bitcoin_utxos
-            .sort_unstable_by_key(|(_, output)| output.get_bitcoin_value());
 
-        let mut selected = HashMap::new();
-        let mut total = bitcoin::Amount::ZERO;
-        for (outpoint, output) in
-            bitcoin_utxos.into_iter().chain(unconfirmed_bitcoin_utxos)
+        let mut bitcoin_utxos = Vec::with_capacity(64);
+
+        let mut iter = self.utxos.iter(&rotxn).map_err(DbError::from)?;
+        while let Some((outpoint, filled_output)) =
+            iter.next().map_err(DbError::from)?
         {
-            if output.content.is_withdrawal()
-                || output.is_truthcoin()
-                || output.is_reservation()
-                || output.get_bitcoin_value() == bitcoin::Amount::ZERO
+            if filled_output.is_bitcoin()
+                && !filled_output.content.is_withdrawal()
+                && filled_output.get_bitcoin_value() > bitcoin::Amount::ZERO
             {
-                continue;
+                let output: Output = filled_output.into();
+                bitcoin_utxos.push((outpoint, output));
             }
-            if total >= value {
-                break;
-            }
+        }
+
+        bitcoin_utxos.sort_unstable_by_key(
+            |(_, output): &(OutPoint, Output)| {
+                std::cmp::Reverse(output.get_bitcoin_value())
+            },
+        );
+
+        let mut selected = HashMap::with_capacity(bitcoin_utxos.len().min(10));
+        let mut total = bitcoin::Amount::ZERO;
+
+        for (outpoint, output) in &bitcoin_utxos {
             total = total
                 .checked_add(output.get_bitcoin_value())
                 .ok_or(AmountOverflowError)?;
-            selected.insert(outpoint, output.clone());
-        }
-        if total >= value {
-            Ok((total, selected))
-        } else {
-            Err(Error::NotEnoughFunds)
-        }
-    }
-
-    // Select UTXOs for the specified Truthcoin
-    pub fn select_truthcoin_utxos(
-        &self,
-        truthcoin: TruthcoinId,
-        value: u64,
-    ) -> Result<(u64, HashMap<OutPoint, Output>), Error> {
-        let rotxn = self.env.read_txn()?;
-        let mut truthcoin_utxos: Vec<_> = self
-            .utxos
-            .iter(&rotxn)?
-            .filter(|(_outpoint, output)| {
-                Ok(output.truthcoin().is_some_and(|output_truthcoin| {
-                    truthcoin == *output_truthcoin
-                }))
-            })
-            .collect()?;
-        truthcoin_utxos.sort_unstable_by_key(|(_, output)| {
-            output
-                .truthcoin_value()
-                .map(|(_, truthcoin_value)| truthcoin_value)
-        });
-
-        let mut selected = HashMap::new();
-        let mut total_value: u64 = 0;
-        for (outpoint, output) in &truthcoin_utxos {
-            if output.content.is_withdrawal() {
-                continue;
-            }
-            if total_value > value {
-                break;
-            }
-            let (_, truthcoin_value) = output.truthcoin_value().unwrap();
-            total_value += truthcoin_value;
-            selected.insert(*outpoint, output.clone().into());
-        }
-        if total_value < value {
-            return Err(Error::NotEnoughFunds);
-        }
-        Ok((total_value, selected))
-    }
-
-    // Select control coin for the specified Truthcoin
-    pub fn select_truthcoin_control(
-        &self,
-        truthcoin: TruthcoinId,
-    ) -> Result<(OutPoint, Output), Error> {
-        let rotxn = self.env.read_txn()?;
-        let truthcoin_utxo =
-            self.utxos.iter(&rotxn)?.find_map(|(outpoint, output)| {
-                if let Some(output_truthcoin) = output.truthcoin()
-                    && truthcoin == *output_truthcoin
-                {
-                    Ok(Some((outpoint, output.into())))
-                } else {
-                    Ok(None)
-                }
-            })?;
-        truthcoin_utxo.ok_or(Error::NotEnoughFunds)
-    }
-
-    pub fn select_asset_utxos(
-        &self,
-        asset: AssetId,
-        amount: u64,
-    ) -> Result<(u64, HashMap<OutPoint, Output>), Error> {
-        match asset {
-            AssetId::Bitcoin => self
-                .select_bitcoins(bitcoin::Amount::from_sat(amount))
-                .map(|(amount, utxos)| (amount.to_sat(), utxos)),
-            AssetId::Truthcoin(truthcoin) => {
-                self.select_truthcoin_utxos(truthcoin, amount)
-            }
-            AssetId::TruthcoinControl(truthcoin) => {
-                if amount == 1 {
-                    let utxo = self.select_truthcoin_control(truthcoin)?;
-                    Ok((1, HashMap::from_iter([utxo])))
-                } else {
-                    do yeet Error::NotEnoughFunds
-                }
-            }
-        }
-    }
-
-    // Select control coin for the specified LP token
-    pub fn select_amm_lp_tokens(
-        &self,
-        asset0: AssetId,
-        asset1: AssetId,
-        amount: u64,
-    ) -> Result<(u64, HashMap<OutPoint, FilledOutput>), Error> {
-        let rotxn = self.env.read_txn()?;
-        let mut amm_lp_token_utxos: Vec<_> = self
-            .utxos
-            .iter(&rotxn)?
-            .filter(|(_outpoint, output)| {
-                Ok(output.lp_token_amount().is_some_and(
-                    |(pool_asset0, pool_asset1, _)| {
-                        pool_asset0 == asset0 && pool_asset1 == asset1
-                    },
-                ))
-            })
-            .collect()?;
-        amm_lp_token_utxos.sort_unstable_by_key(|(_, output)| {
-            output.lp_token_amount().map(|(_, _, amount)| amount)
-        });
-        let mut selected = HashMap::new();
-        let mut total_amount: u64 = 0;
-        for (outpoint, output) in &amm_lp_token_utxos {
-            if total_amount > amount {
-                break;
-            }
-            let (_, _, lp_token_amount) = output.lp_token_amount().unwrap();
-            total_amount += lp_token_amount;
             selected.insert(*outpoint, output.clone());
+
+            if total >= value {
+                return Ok((total, selected));
+            }
         }
-        if total_amount < amount {
+
+        Err(Error::NotEnoughFunds)
+    }
+
+    fn push_bitcoin_change(
+        &self,
+        outputs: &mut Vec<Output>,
+        change: bitcoin::Amount,
+    ) -> Result<(), Error> {
+        if change > bitcoin::Amount::ZERO {
+            outputs.push(Output::new(
+                self.get_new_address()?,
+                OutputContent::Bitcoin(BitcoinOutputContent(change)),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create a transaction to claim a decision.
+    /// Returns a new transaction ready to be signed and sent.
+    pub fn claim_decision(
+        &self,
+        input: DecisionClaimInput,
+        fee: bitcoin::Amount,
+    ) -> Result<Transaction, Error> {
+        let DecisionClaimInput {
+            decision_type,
+            decisions,
+        } = input;
+
+        let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
+        let change = total_bitcoin - fee;
+        let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
+
+        let mut outputs = Vec::new();
+        self.push_bitcoin_change(&mut outputs, change)?;
+
+        let mut tx = Transaction::new(inputs, outputs);
+        tx.data = Some(TxData::ClaimDecision {
+            decision_type,
+            decisions,
+        });
+
+        Ok(tx)
+    }
+
+    /// Create a prediction market using dimension bracket notation
+    ///
+    /// Implements Bitcoin Hivemind Section 3.1 - Market Creation
+    ///
+    /// Dimension notation examples:
+    /// - Single binary: `[004008]`
+    /// - Multiple independent: `[004008,004009]`
+    /// - Categorical: `[[004008,004009,00400a]]`
+    /// - Mixed: `[004008,[004009,00400a]]`
+    pub fn create_market(
+        &self,
+        input: CreateMarketInput,
+        fee: bitcoin::Amount,
+    ) -> Result<(Transaction, crate::state::markets::MarketId), Error> {
+        use crate::state::markets::{
+            compute_market_id, generate_market_treasury_address,
+        };
+
+        let CreateMarketInput {
+            title,
+            description,
+            dimensions,
+            beta: input_beta,
+            trading_fee,
+            initial_liquidity,
+            category_option_counts,
+            tx_pow_hash_selector,
+            tx_pow_ordering,
+            tx_pow_difficulty,
+        } = input;
+
+        let dimension_specs = parse_dimensions(&dimensions).map_err(|_| {
+            Error::InvalidDecisionId {
+                reason: "Failed to parse dimension specification".to_string(),
+            }
+        })?;
+
+        let num_outcomes: usize = {
+            let mut cat_idx = 0usize;
+            dimension_specs.iter().fold(1, |acc, spec| match spec {
+                DimensionSpec::Single(_) => acc * 2,
+                DimensionSpec::Categorical(_) => {
+                    let n = category_option_counts
+                        .as_ref()
+                        .and_then(|c| c.get(cat_idx).copied())
+                        .unwrap_or(2);
+                    cat_idx += 1;
+                    acc * n
+                }
+            })
+        };
+
+        let storage_fee = bitcoin::Amount::from_sat(
+            markets::market_storage_fee(num_outcomes),
+        );
+
+        // Determine treasury from inputs (mutually exclusive).
+        // Beta is derived from treasury: `beta = treasury / ln(num_outcomes)`.
+        let treasury_sats = match (input_beta, initial_liquidity) {
+            (Some(_), Some(_)) => {
+                return Err(Error::InvalidDecisionId {
+                    reason:
+                        "Specify either beta or initial_liquidity, not both"
+                            .to_string(),
+                });
+            }
+            (Some(b), None) => {
+                let liq_f64 =
+                    trading::calculate_lmsr_liquidity(b, num_outcomes);
+                to_sats(liq_f64, Rounding::Up)
+                    .map_err(|_| AmountOverflowError)?
+            }
+            (None, Some(liq)) => liq,
+            (None, None) => {
+                let liq_f64 = trading::calculate_lmsr_liquidity(
+                    DEFAULT_MARKET_BETA,
+                    num_outcomes,
+                );
+                to_sats(liq_f64, Rounding::Up)
+                    .map_err(|_| AmountOverflowError)?
+            }
+        };
+
+        // Calculate total cost: fee + storage + treasury
+        let mut total_cost =
+            fee.checked_add(storage_fee).ok_or(AmountOverflowError)?;
+        if treasury_sats > 0 {
+            total_cost = total_cost
+                .checked_add(bitcoin::Amount::from_sat(treasury_sats))
+                .ok_or(AmountOverflowError)?;
+        }
+
+        // Select UTXOs - need to get creator_address from first UTXO
+        let (total_bitcoin, bitcoin_utxos) =
+            self.select_bitcoins(total_cost)?;
+        let change = total_bitcoin - total_cost;
+
+        // Collect inputs first so creator_address matches the first
+        // transaction input, consistent with extract_creator_address
+        // in block validation (which uses spent_utxos.first())
+        let inputs: Vec<_> = bitcoin_utxos.keys().copied().collect();
+        let creator_address = bitcoin_utxos
+            .get(inputs.first().ok_or(Error::NotEnoughFunds)?)
+            .ok_or(Error::NotEnoughFunds)?
+            .address;
+
+        // Compute market_id deterministically from content
+        let market_id = compute_market_id(
+            &title,
+            &description,
+            &creator_address,
+            &dimension_specs,
+        );
+        let market_id_bytes = *market_id.as_bytes();
+
+        let tx_data = TxData::CreateMarket {
+            title,
+            description,
+            dimension_specs,
+            trading_fee,
+            category_txids: None,
+            residual_names: None,
+            tx_pow_hash_selector,
+            tx_pow_ordering,
+            tx_pow_difficulty,
+        };
+        let mut outputs = Vec::new();
+
+        // Create explicit MarketFunds (treasury) output with treasury funding
+        if treasury_sats > 0 {
+            let treasury_address = generate_market_treasury_address(&market_id);
+            outputs.push(Output::new(
+                treasury_address,
+                OutputContent::MarketFunds {
+                    market_id: market_id_bytes,
+                    amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
+                        treasury_sats,
+                    )),
+                    is_fee: false,
+                },
+            ));
+        }
+
+        self.push_bitcoin_change(&mut outputs, change)?;
+
+        let mut tx = Transaction::new(inputs, outputs);
+        tx.data = Some(tx_data);
+
+        Ok((tx, market_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn trade(
+        &self,
+        market_id: crate::state::markets::MarketId,
+        outcome_index: usize,
+        shares: i64,
+        trader: Address,
+        limit_sats: u64,
+        tx_pow_config: Option<crate::types::tx_pow::TxPowConfig>,
+        prev_block_hash: crate::types::BlockHash,
+    ) -> Result<Transaction, Error> {
+        let is_buy = shares > 0;
+
+        let inputs = if is_buy {
+            let (_total_bitcoin, bitcoin_utxos) =
+                self.select_bitcoins(bitcoin::Amount::from_sat(limit_sats))?;
+            sorted_outpoints(bitcoin_utxos)
+        } else {
+            let min_fee =
+                bitcoin::Amount::from_sat(trading::TRADE_MINER_FEE_SATS);
+            let (_total_bitcoin, bitcoin_utxos) =
+                self.select_bitcoins(min_fee)?;
+            sorted_outpoints(bitcoin_utxos)
+        };
+
+        let outputs = Vec::new();
+
+        let tx_pow_nonce = match tx_pow_config {
+            Some(config) if config.is_enabled() => {
+                let pow_data = crate::types::tx_pow::serialize_trade_for_pow(
+                    market_id.as_bytes(),
+                    outcome_index as u32,
+                    shares,
+                    &trader,
+                    limit_sats,
+                    &prev_block_hash,
+                );
+                Some(config.mine(&pow_data))
+            }
+            _ => None,
+        };
+
+        let mut tx = Transaction::new(inputs, outputs);
+        tx.data = Some(TxData::Trade {
+            market_id: MarketId::new(*market_id.as_bytes()),
+            outcome_index: outcome_index as u32,
+            shares,
+            trader,
+            limit_sats,
+            tx_pow_nonce,
+            prev_block_hash,
+        });
+
+        Ok(tx)
+    }
+
+    /// Build an `AmplifyBeta` transaction that adds `amount` sats to the
+    /// market's treasury, increasing its LMSR beta (liquidity depth).
+    /// The wallet must own a UTXO belonging to `market_author` so the
+    /// authorization can prove author identity.
+    pub fn amplify_beta(
+        &self,
+        market_id: crate::state::markets::MarketId,
+        amount: u64,
+        market_author: Address,
+    ) -> Result<Transaction, Error> {
+        if amount == 0 {
+            return Err(Error::InvalidDecisionId {
+                reason: "AmplifyBeta amount must be positive".to_string(),
+            });
+        }
+
+        let total_needed = bitcoin::Amount::from_sat(
+            amount
+                .checked_add(trading::TRADE_MINER_FEE_SATS)
+                .ok_or(AmountOverflowError)?,
+        );
+
+        let (_total_bitcoin, bitcoin_utxos) =
+            self.select_bitcoins(total_needed)?;
+
+        let has_author_input = bitcoin_utxos
+            .values()
+            .any(|output| output.address == market_author);
+        if !has_author_input {
             return Err(Error::NotEnoughFunds);
         }
-        Ok((total_amount, selected))
-    }
 
-    // Select dutch auction receipt utxo for the specified auction
-    pub fn select_dutch_auction_receipt(
-        &self,
-        auction_id: DutchAuctionId,
-    ) -> Result<(OutPoint, FilledOutput), Error> {
-        let rotxn = self.env.read_txn()?;
-        /*
-        let mut receipt_utxo = None;
-        for item in self.utxos.iter(&txn)? {
-            let (outpoint, output) = item?;
-            if let Some(output_auction_id) = output.dutch_auction_receipt()
-                && auction_id == output_auction_id
-            {
-                receipt_utxo = Some((outpoint, output));
-                break;
-            }
-        }
-        */
-        let receipt_utxo =
-            self.utxos.iter(&rotxn)?.find(|(_outpoint, output)| {
-                Ok(output.dutch_auction_receipt().is_some_and(
-                    |output_auction_id| auction_id == output_auction_id,
-                ))
-            })?;
-        receipt_utxo.ok_or(Error::NotEnoughFunds)
-    }
+        let inputs = sorted_outpoints(bitcoin_utxos);
 
-    /// Given a regular transaction, add an AMM mint.
-    pub fn amm_mint(
-        &self,
-        tx: &mut Transaction,
-        asset0: AssetId,
-        asset1: AssetId,
-        amount0: u64,
-        amount1: u64,
-        lp_token_mint: u64,
-    ) -> Result<(), Error> {
-        assert!(tx.is_regular(), "this function only accepts a regular tx");
-        // address for the LP token output
-        let lp_token_addr = self.get_new_address()?;
-
-        let (input_amount0, asset0_utxos) =
-            self.select_asset_utxos(asset0, amount0)?;
-        let (input_amount1, asset1_utxos) =
-            self.select_asset_utxos(asset1, amount1)?;
-
-        let change_amount0 = input_amount0 - amount0;
-        let change_amount1 = input_amount1 - amount1;
-        let change_output0 = if change_amount0 != 0 {
-            let address = self.get_new_address()?;
-            let content = match asset0 {
-                AssetId::Bitcoin => {
-                    OutputContent::Bitcoin(BitcoinOutputContent(
-                        bitcoin::Amount::from_sat(change_amount0),
-                    ))
-                }
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount0),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            };
-            Some(Output {
-                address,
-                memo: Vec::new(),
-                content,
-            })
-        } else {
-            None
-        };
-        let change_output1 = if change_amount1 != 0 {
-            let address = self.get_new_address()?;
-            let content = match asset1 {
-                AssetId::Bitcoin => {
-                    OutputContent::Bitcoin(BitcoinOutputContent(
-                        bitcoin::Amount::from_sat(change_amount1),
-                    ))
-                }
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount1),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            };
-            Some(Output {
-                address,
-                memo: Vec::new(),
-                content,
-            })
-        } else {
-            None
-        };
-        let lp_token_output = Output {
-            address: lp_token_addr,
-            content: OutputContent::AmmLpToken(lp_token_mint),
-            memo: Vec::new(),
-        };
-
-        /* The first two unique assets in the inputs must be
-         * `asset0` and `asset1` */
-        tx.inputs.extend(asset0_utxos.keys());
-        tx.inputs.extend(asset1_utxos.keys());
-        tx.inputs
-            .rotate_right(asset0_utxos.len() + asset1_utxos.len());
-
-        tx.outputs.extend(change_output0);
-        tx.outputs.extend(change_output1);
-        tx.outputs.push(lp_token_output);
-
-        tx.data = Some(TxData::AmmMint {
-            amount0,
-            amount1,
-            lp_token_mint,
+        let mut tx = Transaction::new(inputs, Vec::new());
+        tx.data = Some(TxData::AmplifyBeta {
+            market_id: MarketId::new(*market_id.as_bytes()),
+            amount,
+            market_author,
         });
-        Ok(())
-    }
 
-    // Given a regular transaction, add an AMM burn.
-    pub fn amm_burn(
-        &self,
-        tx: &mut Transaction,
-        asset0: AssetId,
-        asset1: AssetId,
-        amount0: u64,
-        amount1: u64,
-        lp_token_burn: u64,
-    ) -> Result<(), Error> {
-        assert!(tx.is_regular(), "this function only accepts a regular tx");
-        // address for receiving asset0
-        let asset0_addr = self.get_new_address()?;
-        // address for receiving asset1
-        let asset1_addr = self.get_new_address()?;
-
-        let (input_lp_token_amount, lp_token_utxos) =
-            self.select_amm_lp_tokens(asset0, asset1, lp_token_burn)?;
-
-        let lp_token_change_amount = input_lp_token_amount - lp_token_burn;
-        let lp_token_change_output = if lp_token_change_amount != 0 {
-            let address = self.get_new_address()?;
-            Some(Output {
-                address,
-                content: OutputContent::AmmLpToken(lp_token_change_amount),
-                memo: Vec::new(),
-            })
-        } else {
-            None
-        };
-        let asset0_output = Output {
-            address: asset0_addr,
-            memo: Vec::new(),
-            content: match asset0 {
-                AssetId::Bitcoin => OutputContent::Bitcoin(
-                    BitcoinOutputContent(bitcoin::Amount::from_sat(amount0)),
-                ),
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount0),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            },
-        };
-        let asset1_output = Output {
-            address: asset1_addr,
-            memo: Vec::new(),
-            content: match asset1 {
-                AssetId::Bitcoin => OutputContent::Bitcoin(
-                    BitcoinOutputContent(bitcoin::Amount::from_sat(amount1)),
-                ),
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount1),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            },
-        };
-
-        /* The AMM lp token input must occur before any other AMM lp token
-         * inputs. */
-        tx.inputs.extend(lp_token_utxos.keys());
-        tx.inputs.rotate_right(lp_token_utxos.len());
-
-        tx.outputs.extend(lp_token_change_output);
-        tx.outputs.push(asset0_output);
-        tx.outputs.push(asset1_output);
-
-        tx.data = Some(TxData::AmmBurn {
-            amount0,
-            amount1,
-            lp_token_burn,
-        });
-        Ok(())
-    }
-
-    // Given a regular transaction, add an AMM swap.
-    pub fn amm_swap(
-        &self,
-        tx: &mut Transaction,
-        asset_spend: AssetId,
-        asset_receive: AssetId,
-        amount_spend: u64,
-        amount_receive: u64,
-    ) -> Result<(), Error> {
-        assert!(tx.is_regular(), "this function only accepts a regular tx");
-        // Address for receiving `asset_receive`
-        let receive_addr = self.get_new_address()?;
-        let (input_amount_spend, spend_utxos) =
-            self.select_asset_utxos(asset_spend, amount_spend)?;
-        let amount_change = input_amount_spend - amount_spend;
-        let change_output = if amount_change != 0 {
-            let address = self.get_new_address()?;
-            let content = match asset_spend {
-                AssetId::Bitcoin => {
-                    OutputContent::Bitcoin(BitcoinOutputContent(
-                        bitcoin::Amount::from_sat(amount_change),
-                    ))
-                }
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount_change),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            };
-            Some(Output {
-                address,
-                memo: Vec::new(),
-                content,
-            })
-        } else {
-            None
-        };
-        let receive_output = Output {
-            address: receive_addr,
-            memo: Vec::new(),
-            content: match asset_receive {
-                AssetId::Bitcoin => {
-                    OutputContent::Bitcoin(BitcoinOutputContent(
-                        bitcoin::Amount::from_sat(amount_receive),
-                    ))
-                }
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount_receive),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            },
-        };
-        // The first unique asset in the inputs must be `asset_spend`.
-        tx.inputs.extend(spend_utxos.keys());
-        tx.inputs.rotate_right(spend_utxos.len());
-        tx.outputs.extend(change_output);
-        tx.outputs.push(receive_output);
-        tx.data = Some(TxData::AmmSwap {
-            amount_spent: amount_spend,
-            amount_receive,
-            pair_asset: asset_receive,
-        });
-        Ok(())
-    }
-
-    /// Given a regular transaction, create a dutch auction tx
-    pub fn dutch_auction_create(
-        &self,
-        tx: &mut Transaction,
-        dutch_auction_params: DutchAuctionParams,
-    ) -> Result<(), Error> {
-        assert!(tx.is_regular(), "this function only accepts a regular tx");
-        let (input_base_amount, base_utxos) = self.select_asset_utxos(
-            dutch_auction_params.base_asset,
-            dutch_auction_params.base_amount,
-        )?;
-        let change_amount =
-            input_base_amount - dutch_auction_params.base_amount;
-        let change_output = if change_amount != 0 {
-            let address = self.get_new_address()?;
-            let content = match dutch_auction_params.base_asset {
-                AssetId::Bitcoin => {
-                    OutputContent::Bitcoin(BitcoinOutputContent(
-                        bitcoin::Amount::from_sat(change_amount),
-                    ))
-                }
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            };
-            Some(Output {
-                address,
-                memo: Vec::new(),
-                content,
-            })
-        } else {
-            None
-        };
-        let dutch_auction_receipt = Output {
-            address: self.get_new_address()?,
-            memo: Vec::new(),
-            content: OutputContent::DutchAuctionReceipt,
-        };
-        tx.inputs.extend(base_utxos.keys());
-        tx.outputs.extend(change_output);
-        tx.outputs.push(dutch_auction_receipt);
-        tx.data = Some(TxData::DutchAuctionCreate(dutch_auction_params));
-        Ok(())
-    }
-
-    /// Given a regular transaction, create a dutch auction bid
-    pub fn dutch_auction_bid(
-        &self,
-        tx: &mut Transaction,
-        auction_id: DutchAuctionId,
-        base_asset: AssetId,
-        quote_asset: AssetId,
-        bid_size: u64,
-        receive_quantity: u64,
-    ) -> Result<(), Error> {
-        assert!(tx.is_regular(), "this function only accepts a regular tx");
-        let (input_quote_amount, quote_utxos) =
-            self.select_asset_utxos(quote_asset, bid_size)?;
-        let change_amount = input_quote_amount - bid_size;
-        let change_output = if change_amount != 0 {
-            let address = self.get_new_address()?;
-            let content = match quote_asset {
-                AssetId::Bitcoin => {
-                    OutputContent::Bitcoin(BitcoinOutputContent(
-                        bitcoin::Amount::from_sat(change_amount),
-                    ))
-                }
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            };
-            Some(Output {
-                address,
-                memo: Vec::new(),
-                content,
-            })
-        } else {
-            None
-        };
-        let base_output = {
-            let content = match base_asset {
-                AssetId::Bitcoin => {
-                    OutputContent::Bitcoin(BitcoinOutputContent(
-                        bitcoin::Amount::from_sat(receive_quantity),
-                    ))
-                }
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(change_amount),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            };
-            Output {
-                address: self.get_new_address()?,
-                memo: Vec::new(),
-                content,
-            }
-        };
-
-        // The first unique asset in the inputs must be `quote_asset`.
-        tx.inputs.extend(quote_utxos.keys());
-        tx.inputs.rotate_right(quote_utxos.len());
-
-        tx.outputs.push(base_output);
-        tx.outputs.extend(change_output);
-        tx.data = Some(TxData::DutchAuctionBid {
-            auction_id,
-            receive_asset: base_asset,
-            quantity: receive_quantity,
-            bid_size,
-        });
-        Ok(())
-    }
-
-    /// Given a regular transaction, create a dutch auction collect tx
-    pub fn dutch_auction_collect(
-        &self,
-        tx: &mut Transaction,
-        auction_id: DutchAuctionId,
-        base_asset: AssetId,
-        quote_asset: AssetId,
-        amount_base: u64,
-        amount_quote: u64,
-    ) -> Result<(), Error> {
-        assert!(tx.is_regular(), "this function only accepts a regular tx");
-        let (dutch_auction_receipt_input, _) =
-            self.select_dutch_auction_receipt(auction_id)?;
-        let base_output = if amount_base != 0 {
-            let address = self.get_new_address()?;
-            let content = match base_asset {
-                AssetId::Bitcoin => {
-                    OutputContent::Bitcoin(BitcoinOutputContent(
-                        bitcoin::Amount::from_sat(amount_base),
-                    ))
-                }
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount_base),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            };
-            Some(Output {
-                address,
-                memo: Vec::new(),
-                content,
-            })
-        } else {
-            None
-        };
-        let quote_output = if amount_quote != 0 {
-            let address = self.get_new_address()?;
-            let content = match quote_asset {
-                AssetId::Bitcoin => {
-                    OutputContent::Bitcoin(BitcoinOutputContent(
-                        bitcoin::Amount::from_sat(amount_quote),
-                    ))
-                }
-                AssetId::Truthcoin(_) => OutputContent::Truthcoin(amount_quote),
-                AssetId::TruthcoinControl(_) => OutputContent::TruthcoinControl,
-            };
-            Some(Output {
-                address,
-                memo: Vec::new(),
-                content,
-            })
-        } else {
-            None
-        };
-
-        /* The Dutch auction receipt must occur before any other Dutch auction
-        receipts in the inputs. */
-        tx.inputs.push(dutch_auction_receipt_input);
-        tx.inputs.rotate_right(1);
-
-        tx.outputs.extend(base_output);
-        tx.outputs.extend(quote_output);
-        tx.data = Some(TxData::DutchAuctionCollect {
-            asset_offered: base_asset,
-            asset_receive: quote_asset,
-            amount_offered_remaining: amount_base,
-            amount_received: amount_quote,
-        });
-        Ok(())
+        Ok(tx)
     }
 
     pub fn spend_utxos(
@@ -1420,28 +989,6 @@ impl Wallet {
         Ok(balance)
     }
 
-    /// gets the plaintext name associated with a truthcoin reservation
-    /// commitment, if it is known by the wallet.
-    pub fn get_truthcoin_reservation_plaintext(
-        &self,
-        commitment: &Hash,
-    ) -> Result<Option<String>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let res = self.truthcoin_reservations.try_get(&rotxn, commitment)?;
-        Ok(res.map(String::from))
-    }
-
-    /// gets the plaintext name associated with a truthcoin,
-    /// if it is known by the wallet.
-    pub fn get_truthcoin_plaintext(
-        &self,
-        truthcoin: &TruthcoinId,
-    ) -> Result<Option<String>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let res = self.known_truthcoin.try_get(&rotxn, truthcoin)?;
-        Ok(res.map(String::from))
-    }
-
     pub fn get_utxos(&self) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
         let rotxn = self.env.read_txn()?;
         let utxos: HashMap<_, _> = self
@@ -1468,32 +1015,6 @@ impl Wallet {
         Ok(stxos)
     }
 
-    pub fn get_spent_unconfirmed_utxos(
-        &self,
-    ) -> Result<HashMap<OutPoint, SpentOutput<OutputContent>>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let stxos = self.spent_unconfirmed_utxos.iter(&rotxn)?.collect()?;
-        Ok(stxos)
-    }
-
-    /// get all owned truthcoin utxos
-    pub fn get_truthcoin(
-        &self,
-    ) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
-        let mut utxos = self.get_utxos()?;
-        utxos.retain(|_, output| output.is_truthcoin());
-        Ok(utxos)
-    }
-
-    /// get all spent truthcoin utxos
-    pub fn get_spent_truthcoin(
-        &self,
-    ) -> Result<HashMap<OutPoint, SpentOutput>, Error> {
-        let mut stxos = self.get_stxos()?;
-        stxos.retain(|_, output| output.output.is_truthcoin());
-        Ok(stxos)
-    }
-
     pub fn get_addresses(&self) -> Result<HashSet<Address>, Error> {
         let rotxn = self.env.read_txn()?;
         let addresses: HashSet<_> = self
@@ -1506,26 +1027,37 @@ impl Wallet {
         Ok(addresses)
     }
 
+    /// Authorize a transaction with strict validation against mempool UTXO spending.
+    /// Following Bitcoin Hivemind's requirement that only confirmed UTXOs can be spent.
     pub fn authorize(
         &self,
         transaction: Transaction,
     ) -> Result<AuthorizedTransaction, Error> {
         let rotxn = self.env.read_txn()?;
         let mut authorizations = vec![];
+        let mut input_addresses = std::collections::HashSet::new();
+
         for input in &transaction.inputs {
-            let spent_utxo = if let Some(utxo) =
+            let spent_utxo: Output = if let Some(filled_utxo) =
                 self.utxos.try_get(&rotxn, input).map_err(DbError::from)?
             {
-                utxo.into()
-            } else if let Some(utxo) = self
-                .unconfirmed_utxos
-                .try_get(&rotxn, input)
-                .map_err(DbError::from)?
-            {
-                utxo
+                filled_utxo.into()
             } else {
+                if let Some(_unconfirmed_utxo) = self
+                    .unconfirmed_utxos
+                    .try_get(&rotxn, input)
+                    .map_err(DbError::from)?
+                {
+                    tracing::error!(
+                        "Attempted to spend unconfirmed UTXO {:?}",
+                        input
+                    );
+                    return Err(Error::NoUtxo);
+                }
                 return Err(Error::NoUtxo);
             };
+
+            input_addresses.insert(spent_utxo.address);
             let index = self
                 .address_to_index
                 .try_get(&rotxn, &spent_utxo.address)
@@ -1541,10 +1073,66 @@ impl Wallet {
                 signature,
             });
         }
+
+        let actor_proof =
+            self.build_actor_proof(&rotxn, &transaction, &input_addresses)?;
+
         Ok(AuthorizedTransaction {
             authorizations,
             transaction,
+            actor_proof,
         })
+    }
+
+    fn build_actor_proof(
+        &self,
+        rotxn: &RoTxn,
+        transaction: &Transaction,
+        input_addresses: &std::collections::HashSet<Address>,
+    ) -> Result<Option<Authorization>, Error> {
+        use crate::types::TransactionData;
+
+        let actor_addr = match &transaction.data {
+            Some(TransactionData::Trade { trader, shares, .. })
+                if *shares < 0 =>
+            {
+                if !input_addresses.contains(trader) {
+                    Some(*trader)
+                } else {
+                    None
+                }
+            }
+            Some(TransactionData::TransferReputation { sender, .. }) => {
+                if !input_addresses.contains(sender) {
+                    Some(*sender)
+                } else {
+                    None
+                }
+            }
+            Some(TransactionData::SubmitVote { voter, .. })
+            | Some(TransactionData::SubmitBallot { voter, .. }) => {
+                if !input_addresses.contains(voter) {
+                    Some(*voter)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        match actor_addr {
+            Some(addr) => {
+                let signing_key =
+                    self.get_tx_signing_key_for_addr(rotxn, &addr)?;
+                let signature =
+                    crate::authorization::sign_tx(&signing_key, transaction)?;
+                Ok(Some(Authorization {
+                    verifying_key: signing_key.verifying_key().into(),
+                    signature,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn get_num_addresses(&self) -> Result<u32, Error> {
@@ -1581,6 +1169,109 @@ impl Wallet {
             signature,
         })
     }
+
+    pub fn submit_ballot(
+        &self,
+        votes: Vec<crate::types::BallotItem>,
+        voting_period: u32,
+        fee: bitcoin::Amount,
+    ) -> Result<Transaction, Error> {
+        let voter = self.voter_address()?;
+        let tx_data = crate::types::TransactionData::SubmitBallot {
+            voter,
+            votes,
+            voting_period,
+        };
+
+        let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
+        let change_bitcoin = total_bitcoin - fee;
+
+        let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
+        let mut outputs = Vec::new();
+        self.push_bitcoin_change(&mut outputs, change_bitcoin)?;
+
+        let mut tx = Transaction::new(inputs, outputs);
+        tx.data = Some(tx_data);
+
+        Ok(tx)
+    }
+
+    pub fn transfer_reputation(
+        &self,
+        dest: Address,
+        amount: f64,
+        fee: bitcoin::Amount,
+        memo: Option<Vec<u8>>,
+    ) -> Result<Transaction, Error> {
+        let voter_addr = self.voter_address()?;
+        let tx_data = crate::types::TransactionData::TransferReputation {
+            sender: voter_addr,
+            dest,
+            amount,
+        };
+
+        let (total_bitcoin, bitcoin_utxos) =
+            self.select_bitcoins_from_address(fee, voter_addr)?;
+        let change_bitcoin = total_bitcoin - fee;
+
+        let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
+        let mut outputs = Vec::new();
+        if change_bitcoin > bitcoin::Amount::ZERO {
+            outputs.push(Output::new(
+                voter_addr,
+                OutputContent::Bitcoin(BitcoinOutputContent(change_bitcoin)),
+            ));
+        }
+
+        let mut tx = Transaction::new(inputs, outputs);
+        tx.data = Some(tx_data);
+        tx.memo = memo.unwrap_or_default();
+
+        Ok(tx)
+    }
+
+    fn select_bitcoins_from_address(
+        &self,
+        value: bitcoin::Amount,
+        address: Address,
+    ) -> Result<(bitcoin::Amount, HashMap<OutPoint, Output>), Error> {
+        let rotxn = self.env.read_txn()?;
+
+        let mut bitcoin_utxos = Vec::with_capacity(16);
+        let mut iter = self.utxos.iter(&rotxn).map_err(DbError::from)?;
+        while let Some((outpoint, filled_output)) =
+            iter.next().map_err(DbError::from)?
+        {
+            if filled_output.address == address
+                && filled_output.is_bitcoin()
+                && !filled_output.content.is_withdrawal()
+                && filled_output.get_bitcoin_value() > bitcoin::Amount::ZERO
+            {
+                let output: Output = filled_output.into();
+                bitcoin_utxos.push((outpoint, output));
+            }
+        }
+
+        bitcoin_utxos.sort_unstable_by_key(
+            |(_, output): &(OutPoint, Output)| {
+                std::cmp::Reverse(output.get_bitcoin_value())
+            },
+        );
+
+        let mut selected = HashMap::with_capacity(bitcoin_utxos.len().min(10));
+        let mut total = bitcoin::Amount::ZERO;
+        for (outpoint, output) in &bitcoin_utxos {
+            total = total
+                .checked_add(output.get_bitcoin_value())
+                .ok_or(AmountOverflowError)?;
+            selected.insert(*outpoint, output.clone());
+            if total >= value {
+                return Ok((total, selected));
+            }
+        }
+
+        Err(Error::NotEnoughFunds)
+    }
 }
 
 impl Watchable<()> for Wallet {
@@ -1600,8 +1291,6 @@ impl Watchable<()> for Wallet {
             stxos,
             unconfirmed_utxos,
             spent_unconfirmed_utxos,
-            truthcoin_reservations,
-            known_truthcoin,
             vk_to_index,
             _version: _,
         } = self;
@@ -1616,8 +1305,6 @@ impl Watchable<()> for Wallet {
             stxos.watch().clone(),
             unconfirmed_utxos.watch().clone(),
             spent_unconfirmed_utxos.watch().clone(),
-            truthcoin_reservations.watch().clone(),
-            known_truthcoin.watch().clone(),
             vk_to_index.watch().clone(),
         ];
         let streams = StreamMap::from_iter(
