@@ -81,7 +81,6 @@ impl UtxoCreator {
         memo_encoding: MemoEncoding,
         memo_user_input: &str,
     ) -> Result<MemoEncoded, hex::FromHexError> {
-        // try to decode as hex
         let decoded_hex = hex::decode(memo_user_input);
         if memo_user_input.is_empty() {
             return Ok((Vec::new(), None));
@@ -140,10 +139,8 @@ impl UtxoCreator {
         };
         ui.separator();
         ui.horizontal(|ui| {
-            if !matches!(asset_id, AssetId::TruthcoinControl(_)) {
-                ui.monospace("Value:       ");
-                ui.add(egui::TextEdit::singleline(&mut self.value));
-            }
+            ui.monospace("Value:       ");
+            ui.add(egui::TextEdit::singleline(&mut self.value));
             if asset_id == AssetId::Bitcoin {
                 ui.monospace("BTC");
             }
@@ -191,7 +188,6 @@ impl UtxoCreator {
             })
             .join()
             .changed();
-        // (un)initialize memo
         if memo_encoding_changed {
             match self.memo_encoding {
                 None => self.memo_user_input = None,
@@ -270,12 +266,6 @@ impl UtxoCreator {
                                 bitcoin_amount,
                             ))
                         }),
-                        AssetId::Truthcoin(_) => {
-                            self.value.parse().ok().map(OutputContent::Truthcoin)
-                        }
-                        AssetId::TruthcoinControl(_) => {
-                            Some(OutputContent::TruthcoinControl)
-                        }
                     };
                     if ui
                         .add_enabled(
