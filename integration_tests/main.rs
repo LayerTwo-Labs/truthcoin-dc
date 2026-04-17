@@ -6,10 +6,10 @@ use tracing_subscriber::{filter as tracing_filter, layer::SubscriberExt};
 
 mod ibd;
 mod integration_test;
+mod roundtrip;
 mod setup;
 mod unknown_withdrawal;
 mod util;
-mod vote;
 
 #[derive(Parser)]
 struct Cli {
@@ -79,8 +79,26 @@ fn set_tracing_subscriber(log_level: tracing::Level) -> anyhow::Result<()> {
     })
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<std::process::ExitCode> {
+const STACK_SIZE: usize = 32 * 1024 * 1024;
+
+fn main() -> anyhow::Result<std::process::ExitCode> {
+    // Set minimum stack size for all spawned threads (including
+    // those created by the enforcer's run_blocking via std::thread::spawn)
+    // SAFETY: called at the very start of main before any threads are
+    // spawned, so no concurrent access to the environment.
+    unsafe {
+        std::env::set_var("RUST_MIN_STACK", STACK_SIZE.to_string());
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(STACK_SIZE)
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<std::process::ExitCode> {
     // Parse command line arguments
     let args = Cli::parse();
     let () = set_tracing_subscriber(tracing::Level::DEBUG)?;
