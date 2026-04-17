@@ -1,15 +1,20 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use fallible_iterator::FallibleIterator as _;
+use futures::{Stream, StreamExt};
 use heed::types::SerdeBincode;
 use sneed::{
     DatabaseUnique, DbError, EnvError, RoTxn, RwTxn, RwTxnError, UnitKey, db,
     env, rwtxn,
 };
+use tokio_stream::{StreamMap, wrappers::WatchStream};
 
-use crate::types::{
-    Address, AuthorizedTransaction, InPoint, OutPoint, Output, Txid, VERSION,
-    Version,
+use crate::{
+    types::{
+        Address, AuthorizedTransaction, InPoint, OutPoint, Output, Txid,
+        VERSION, Version,
+    },
+    util::Watchable,
 };
 
 #[allow(clippy::duplicated_attributes)]
@@ -31,6 +36,10 @@ pub enum Error {
     MissingTransaction(Txid),
     #[error("can't add transaction, utxo double spent")]
     UtxoDoubleSpent,
+    #[error("can't add transaction, decision {0} already claimed in mempool")]
+    DecisionAlreadyClaimedInMempool(String),
+    #[error("mempool full: {current} transactions (max {max})")]
+    MempoolFull { current: usize, max: usize },
 }
 
 #[derive(Clone)]
@@ -42,11 +51,19 @@ pub struct MemPool {
     /// Associates relevant txs to each address
     address_to_txs:
         DatabaseUnique<SerdeBincode<Address>, SerdeBincode<HashSet<Txid>>>,
+    /// Tracks pending decision claims: decision_id_bytes -> claiming txid
+    pending_decision_claims:
+        DatabaseUnique<SerdeBincode<[u8; 3]>, SerdeBincode<Txid>>,
+    trade_insertion_order:
+        DatabaseUnique<SerdeBincode<u64>, SerdeBincode<Txid>>,
+    trade_order_counter: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
 }
 
+const MAX_MEMPOOL_TRANSACTIONS: usize = 5000;
+
 impl MemPool {
-    pub const NUM_DBS: u32 = 4;
+    pub const NUM_DBS: u32 = 7;
 
     pub fn new(env: &sneed::Env) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
@@ -56,6 +73,12 @@ impl MemPool {
             DatabaseUnique::create(env, &mut rwtxn, "spent_utxos")?;
         let address_to_txs =
             DatabaseUnique::create(env, &mut rwtxn, "address_to_txs")?;
+        let pending_decision_claims =
+            DatabaseUnique::create(env, &mut rwtxn, "pending_decision_claims")?;
+        let trade_insertion_order =
+            DatabaseUnique::create(env, &mut rwtxn, "trade_insertion_order")?;
+        let trade_order_counter =
+            DatabaseUnique::create(env, &mut rwtxn, "trade_order_counter")?;
         let version =
             DatabaseUnique::create(env, &mut rwtxn, "mempool_version")?;
         if version.try_get(&rwtxn, &())?.is_none() {
@@ -66,6 +89,9 @@ impl MemPool {
             transactions,
             spent_utxos,
             address_to_txs,
+            pending_decision_claims,
+            trade_insertion_order,
+            trade_order_counter,
             _version: version,
         })
     }
@@ -99,7 +125,7 @@ impl MemPool {
         Iter: IntoIterator<Item = &'a OutPoint>,
     {
         stxos.into_iter().try_for_each(|stxo| {
-            let _ = self.spent_utxos.delete(rwtxn, stxo)?;
+            self.spent_utxos.delete(rwtxn, stxo)?;
             Ok(())
         })
     }
@@ -123,7 +149,7 @@ impl MemPool {
 
     /// Associates the [`Transaction`]'s [`Txid`] with all relevant
     /// [`Address`]es, by inserting into `address_to_txs`.
-    fn assoc_tx_with_relevant_addresses(
+    fn index_tx_addresses(
         &self,
         rwtxn: &mut RwTxn,
         tx: &AuthorizedTransaction,
@@ -151,14 +177,14 @@ impl MemPool {
         if !associated_txs.is_empty() {
             self.address_to_txs.put(rwtxn, address, &associated_txs)?;
         } else {
-            let _ = self.address_to_txs.delete(rwtxn, address)?;
+            self.address_to_txs.delete(rwtxn, address)?;
         }
         Ok(())
     }
 
     /// Unassociates the [`Transaction`]'s [`Txid`] with all relevant
     /// [`Address`]es, by deleting from `address_to_txs`.
-    fn unassoc_tx_with_relevant_addresses(
+    fn unindex_tx_addresses(
         &self,
         rwtxn: &mut RwTxn,
         tx: &AuthorizedTransaction,
@@ -169,6 +195,85 @@ impl MemPool {
         })
     }
 
+    fn is_trade_tx(transaction: &AuthorizedTransaction) -> bool {
+        matches!(
+            &transaction.transaction.data,
+            Some(crate::types::TransactionData::Trade { .. })
+        )
+    }
+
+    /// Extract decision IDs being claimed by this transaction
+    fn get_claimed_decision_ids(
+        transaction: &AuthorizedTransaction,
+    ) -> Vec<[u8; 3]> {
+        use crate::types::TransactionData;
+
+        let mut decision_ids = Vec::new();
+        if let Some(ref data) = transaction.transaction.data
+            && let TransactionData::ClaimDecision { decisions, .. } = data
+        {
+            for entry in decisions {
+                decision_ids.push(entry.decision_id_bytes);
+            }
+        }
+        decision_ids
+    }
+
+    /// Check if any decisions are already claimed in mempool, and add them.
+    ///
+    /// # Atomicity
+    /// This method uses a check-then-act pattern that relies on LMDB write
+    /// transaction exclusivity - only one write transaction can be active at
+    /// a time across all threads, preventing TOCTOU races between the check
+    /// and add phases.
+    fn put_decision_claims(
+        &self,
+        rwtxn: &mut RwTxn,
+        txid: Txid,
+        decision_ids: &[[u8; 3]],
+    ) -> Result<(), Error> {
+        // First check for conflicts
+        for decision_id in decision_ids {
+            if let Some(existing_txid) =
+                self.pending_decision_claims.try_get(rwtxn, decision_id)?
+                && existing_txid != txid
+            {
+                return Err(Error::DecisionAlreadyClaimedInMempool(
+                    hex::encode(decision_id),
+                ));
+            }
+        }
+        // No conflicts, add all claims
+        for decision_id in decision_ids {
+            self.pending_decision_claims
+                .put(rwtxn, decision_id, &txid)?;
+        }
+        Ok(())
+    }
+
+    /// Remove decision claims for a transaction
+    fn delete_decision_claims(
+        &self,
+        rwtxn: &mut RwTxn,
+        transaction: &AuthorizedTransaction,
+    ) -> Result<(), Error> {
+        let decision_ids = Self::get_claimed_decision_ids(transaction);
+        for decision_id in decision_ids {
+            self.pending_decision_claims.delete(rwtxn, &decision_id)?;
+        }
+        Ok(())
+    }
+
+    fn tx_count(&self, rotxn: &RoTxn) -> Result<usize, Error> {
+        let count = self
+            .transactions
+            .iter(rotxn)
+            .map_err(DbError::from)?
+            .count()
+            .map_err(DbError::from)?;
+        Ok(count)
+    }
+
     pub fn put(
         &self,
         rwtxn: &mut RwTxn,
@@ -176,6 +281,21 @@ impl MemPool {
     ) -> Result<(), Error> {
         let txid = transaction.transaction.txid();
         tracing::debug!("adding transaction {txid} to mempool");
+
+        let current_count = self.tx_count(rwtxn)?;
+        if current_count >= MAX_MEMPOOL_TRANSACTIONS {
+            return Err(Error::MempoolFull {
+                current: current_count,
+                max: MAX_MEMPOOL_TRANSACTIONS,
+            });
+        }
+
+        // Check for duplicate decision claims first
+        let claimed_decisions = Self::get_claimed_decision_ids(transaction);
+        if !claimed_decisions.is_empty() {
+            self.put_decision_claims(rwtxn, txid, &claimed_decisions)?;
+        }
+
         let stxos = {
             let txid = transaction.transaction.txid();
             transaction.transaction.inputs.iter().enumerate().map(
@@ -192,7 +312,16 @@ impl MemPool {
         };
         let () = self.put_stxos(rwtxn, stxos)?;
         self.transactions.put(rwtxn, &txid, transaction)?;
-        let () = self.assoc_tx_with_relevant_addresses(rwtxn, transaction)?;
+        let () = self.index_tx_addresses(rwtxn, transaction)?;
+
+        if Self::is_trade_tx(transaction) {
+            let counter =
+                self.trade_order_counter.try_get(rwtxn, &())?.unwrap_or(0);
+            let next = counter + 1;
+            self.trade_insertion_order.put(rwtxn, &next, &txid)?;
+            self.trade_order_counter.put(rwtxn, &(), &next)?;
+        }
+
         Ok(())
     }
 
@@ -201,7 +330,13 @@ impl MemPool {
         while let Some(txid) = pending_deletes.pop_front() {
             if let Some(tx) = self.transactions.try_get(rwtxn, &txid)? {
                 let () = self.delete_stxos(rwtxn, &tx.transaction.inputs)?;
-                let () = self.unassoc_tx_with_relevant_addresses(rwtxn, &tx)?;
+                let () = self.unindex_tx_addresses(rwtxn, &tx)?;
+                let () = self.delete_decision_claims(rwtxn, &tx)?;
+
+                if Self::is_trade_tx(&tx) {
+                    self.delete_trade_order(rwtxn, &txid)?;
+                }
+
                 self.transactions.delete(rwtxn, &txid)?;
                 for vout in 0..tx.transaction.outputs.len() {
                     let outpoint = OutPoint::Regular {
@@ -216,6 +351,31 @@ impl MemPool {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn delete_trade_order(
+        &self,
+        rwtxn: &mut RwTxn,
+        txid: &Txid,
+    ) -> Result<(), Error> {
+        let mut iter = self
+            .trade_insertion_order
+            .iter(rwtxn)
+            .map_err(DbError::from)?;
+        let mut key_to_delete = None;
+        while let Some((counter, stored_txid)) =
+            iter.next().map_err(DbError::from)?
+        {
+            if stored_txid == *txid {
+                key_to_delete = Some(counter);
+                break;
+            }
+        }
+        drop(iter);
+        if let Some(key) = key_to_delete {
+            self.trade_insertion_order.delete(rwtxn, &key)?;
         }
         Ok(())
     }
@@ -244,6 +404,23 @@ impl MemPool {
             .map(|(_, transaction)| Ok(transaction))
             .collect()
             .map_err(|err| DbError::from(err).into())
+    }
+
+    pub fn take_trades_ordered(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<AuthorizedTransaction>, Error> {
+        let mut trades = Vec::new();
+        let mut iter = self
+            .trade_insertion_order
+            .iter(rotxn)
+            .map_err(DbError::from)?;
+        while let Some((_counter, txid)) = iter.next().map_err(DbError::from)? {
+            if let Some(tx) = self.transactions.try_get(rotxn, &txid)? {
+                trades.push(tx);
+            }
+        }
+        Ok(trades)
     }
 
     /// Get [`Txid`]s relevant to a particular address
@@ -304,5 +481,27 @@ impl MemPool {
             })
             .collect();
         Ok(res)
+    }
+}
+
+impl Watchable<()> for MemPool {
+    type WatchStream = impl Stream<Item = ()>;
+
+    /// Get a signal that notifies whenever the mempool changes
+    fn watch(&self) -> Self::WatchStream {
+        let watchables = [
+            self.transactions.watch().clone(),
+            self.spent_utxos.watch().clone(),
+            self.pending_decision_claims.watch().clone(),
+        ];
+        let streams = StreamMap::from_iter(
+            watchables.into_iter().map(WatchStream::new).enumerate(),
+        );
+        let streams_len = streams.len();
+        streams.ready_chunks(streams_len).map(|signals| {
+            assert_ne!(signals.len(), 0);
+            #[allow(clippy::unused_unit)]
+            ()
+        })
     }
 }
