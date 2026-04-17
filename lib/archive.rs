@@ -421,7 +421,7 @@ impl Archive {
         Ok(header_info)
     }
 
-    fn get_main_header_info(
+    pub fn get_main_header_info(
         &self,
         rotxn: &RoTxn,
         block_hash: &bitcoin::BlockHash,
@@ -679,7 +679,7 @@ impl Archive {
         block_hash: BlockHash,
         body: &Body,
     ) -> Result<(), Error> {
-        let _header = self.get_header(rwtxn, block_hash)?;
+        self.get_header(rwtxn, block_hash)?;
         self.bodies.put(rwtxn, &block_hash, body)?;
         body.transactions
             .iter()
@@ -742,15 +742,22 @@ impl Archive {
         if height >= 2 {
             let grandparent = self.get_nth_ancestor(
                 rwtxn,
-                header.prev_side_hash.unwrap(),
+                header
+                    .prev_side_hash
+                    .expect("header at height >= 2 must have prev_side_hash"),
                 1,
             )?;
             exponential_ancestors.push(grandparent);
             let mut next_exponential_ancestor_depth = 4u64;
             while height as u64 >= next_exponential_ancestor_depth {
+                let last =
+                    *exponential_ancestors.last().ok_or(Error::NoAncestor {
+                        block_hash,
+                        depth: next_exponential_ancestor_depth as u32,
+                    })?;
                 let next_exponential_ancestor = self.get_nth_ancestor(
                     rwtxn,
-                    *exponential_ancestors.last().unwrap(),
+                    last,
                     next_exponential_ancestor_depth as u32 / 2,
                 )?;
                 exponential_ancestors.push(next_exponential_ancestor);
@@ -840,10 +847,7 @@ impl Archive {
     ) -> Result<(), Error> {
         let main_header_info = self.get_main_header_info(rwtxn, &main_hash)?;
         if main_header_info.prev_block_hash != bitcoin::BlockHash::all_zeros() {
-            let _parent_info = self.get_main_block_info(
-                rwtxn,
-                &main_header_info.prev_block_hash,
-            )?;
+            self.get_main_block_info(rwtxn, &main_header_info.prev_block_hash)?;
         }
         self.main_block_infos.put(rwtxn, &main_hash, block_info)?;
         let Some(commitment) = block_info.bmm_commitment else {
@@ -948,9 +952,15 @@ impl Archive {
             exponential_ancestors.push(grandparent);
             let mut next_exponential_ancestor_depth = 4u64;
             while height as u64 >= next_exponential_ancestor_depth {
+                let last = *exponential_ancestors.last().ok_or(
+                    Error::NoMainAncestor {
+                        block_hash: header_info.block_hash,
+                        depth: next_exponential_ancestor_depth as u32,
+                    },
+                )?;
                 let next_exponential_ancestor = self.get_nth_main_ancestor(
                     rwtxn,
-                    *exponential_ancestors.last().unwrap(),
+                    last,
                     next_exponential_ancestor_depth as u32 / 2,
                 )?;
                 exponential_ancestors.push(next_exponential_ancestor);
