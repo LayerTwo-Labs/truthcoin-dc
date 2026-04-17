@@ -8,10 +8,12 @@ version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = "0.22"
 bincode = { workspace = true }
 bitcoin = { workspace = true, features = ["serde"] }
 blake3 = { workspace = true }
 borsh = { workspace = true }
+chrono = "0.4"
 clap = { workspace = true, features = ["derive"] }
 dirs = "6.0.0"
 eframe = "0.31.0"

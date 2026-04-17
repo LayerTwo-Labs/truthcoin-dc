@@ -78,7 +78,12 @@ ignore = [
     # paste (via aws-lc-rs) is unmaintained
     # https://github.com/aws/aws-lc-rs/issues/722
     { id = "RUSTSEC-2024-0436", reason = "Temporary ignore until aws-lc-rs and rustls-webpki get updated"},
-    { id = "RUSTSEC-2025-0141", reason = "Temporary ignore until heed migrates to wincode"},
+    # number_prefix is unmaintained (transitive via indicatif)
+    { id = "RUSTSEC-2025-0119", reason = "Transitive dependency from indicatif, awaiting upstream update"},
+    # rustls-pemfile is unmaintained (transitive via reqwest)
+    { id = "RUSTSEC-2025-0134", reason = "Transitive dependency from reqwest/esplora-client, awaiting upstream update"},
+    # bincode is unmaintained (transitive via heed)
+    { id = "RUSTSEC-2025-0141", reason = "Transitive dependency from heed, awaiting upstream update to use alternative"},
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
@@ -239,11 +244,11 @@ skip-tree = [
     { crate = "hashlink@0.9.1" },
     { crate = "heck@0.4.1" },
     { crate = "itertools@0.11.0" },
+    { crate = "itertools@0.12.1" },
     { crate = "litrs@0.2.3" },
     { crate = "quick-xml@0.30.0" },
     { crate = "redox_syscall@0.4.1" },
     { crate = "rustc-hash@1.1.0" },
-    { crate = "rustls-platform-verifier@0.5.3" },
     { crate = "thiserror@1" },
     { crate = "unicode-width@0.1.14" },
     { crate = "windows-core@0.58.0" },

@@ -15,6 +15,7 @@ blake3 = { workspace = true }
 clap = { workspace = true }
 dotenvy = "0.15.7"
 futures = { workspace = true }
+hex = { workspace = true }
 jsonrpsee = { workspace = true }
 libtest-mimic = "0.8.1"
 truthcoin_dc = { path = "../lib" }
