@@ -5,9 +5,11 @@ use crate::app::App;
 
 mod block_explorer;
 mod mempool_explorer;
+mod periods;
 
 use block_explorer::BlockExplorer;
 use mempool_explorer::MempoolExplorer;
+use periods::Periods;
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Default, EnumIter, Eq, PartialEq, strum::Display)]
@@ -17,11 +19,14 @@ enum Tab {
     BlockExplorer,
     #[strum(to_string = "Mempool Explorer")]
     MemPoolExplorer,
+    #[strum(to_string = "Periods")]
+    Periods,
 }
 
 pub struct Activity {
     block_explorer: BlockExplorer,
     mempool_explorer: MempoolExplorer,
+    periods: Periods,
     tab: Tab,
 }
 
@@ -34,6 +39,7 @@ impl Activity {
         Self {
             block_explorer: BlockExplorer::new(height),
             mempool_explorer: Default::default(),
+            periods: Default::default(),
             tab: Default::default(),
         }
     }
@@ -53,6 +59,9 @@ impl Activity {
             }
             Tab::MemPoolExplorer => {
                 self.mempool_explorer.show(app, ui);
+            }
+            Tab::Periods => {
+                self.periods.show(app, ui);
             }
         });
     }

@@ -118,6 +118,22 @@ impl MempoolExplorer {
                                     format!("{merkle_root}"),
                                     *vout,
                                 ),
+                                OutPoint::MarketFunds {
+                                    market_id,
+                                    block_height,
+                                    is_fee,
+                                } => (
+                                    if *is_fee {
+                                        "author_fee"
+                                    } else {
+                                        "market"
+                                    },
+                                    hex::encode(market_id),
+                                    *block_height,
+                                ),
+                                OutPoint::Payout { hash, vout } => {
+                                    ("payout", format!("{hash}"), *vout)
+                                }
                             };
                             let output = &utxos[input];
                             let hash = &hash[0..8];
