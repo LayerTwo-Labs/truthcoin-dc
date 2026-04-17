@@ -153,8 +153,10 @@ fn connect_tip_(
             );
         })?;
 
+    let bmm_main_hash =
+        archive.get_best_main_verification(rwtxn, block_hash)?;
     let mainchain_timestamp = archive
-        .get_main_header_info(rwtxn, &header.prev_main_hash)?
+        .get_main_header_info(rwtxn, &bmm_main_hash)?
         .timestamp;
 
     state

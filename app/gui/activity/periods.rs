@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, ScrollArea};
-use truthcoin_dc::state::{
-    decisions::{DecisionConfig, DecisionEntry},
-    voting::period_calculator,
-};
+use truthcoin_dc::state::decisions::{DecisionConfig, DecisionEntry};
 
 use crate::app::App;
+
+struct PeriodAnchor {
+    period: u32,
+    mainchain_ts: u64,
+    observed_at: Instant,
+}
 
 #[allow(clippy::type_complexity)]
 pub struct Periods {
@@ -16,8 +19,7 @@ pub struct Periods {
     voting_decisions: HashMap<u32, Vec<DecisionEntry>>, // claim_period -> claimed decisions in voting
     last_refresh: Instant,
     genesis_timestamp: Option<u64>,
-    mainchain_timestamp: u64,
-    timestamp_fetched_at: Instant,
+    period_anchor: Option<PeriodAnchor>,
     decision_config: Option<DecisionConfig>,
     error: Option<String>,
 }
@@ -30,8 +32,7 @@ impl Default for Periods {
             voting_decisions: HashMap::new(),
             last_refresh: Instant::now(),
             genesis_timestamp: None,
-            mainchain_timestamp: 0,
-            timestamp_fetched_at: Instant::now(),
+            period_anchor: None,
             decision_config: None,
             error: None,
         }
@@ -39,9 +40,22 @@ impl Default for Periods {
 }
 
 impl Periods {
-    fn estimated_timestamp(&self) -> u64 {
-        let wall_elapsed = self.timestamp_fetched_at.elapsed().as_secs();
-        self.mainchain_timestamp.saturating_add(wall_elapsed)
+    fn estimated_mainchain_ts(&self) -> Option<u64> {
+        let anchor = self.period_anchor.as_ref()?;
+        Some(
+            anchor
+                .mainchain_ts
+                .saturating_add(anchor.observed_at.elapsed().as_secs()),
+        )
+    }
+
+    fn period_start_ts(&self, seconds_per_period: u64) -> Option<u64> {
+        let genesis_ts = self.genesis_timestamp?;
+        let period = self.current_period.checked_sub(1)? as u64;
+        Some(
+            genesis_ts
+                .saturating_add(period.saturating_mul(seconds_per_period)),
+        )
     }
 
     fn refresh_data(&mut self, app: &App) {
@@ -50,14 +64,22 @@ impl Periods {
         }
         self.last_refresh = Instant::now();
 
-        let new_timestamp = app.node.get_mainchain_timestamp().unwrap_or(0);
-        if new_timestamp != self.mainchain_timestamp {
-            self.timestamp_fetched_at = Instant::now();
-        }
-        self.mainchain_timestamp = new_timestamp;
+        let mainchain_ts = app.node.get_mainchain_timestamp().unwrap_or(0);
 
         match app.node.get_current_period() {
             Ok(period) => {
+                let anchor_stale = self
+                    .period_anchor
+                    .as_ref()
+                    .map(|a| a.period != period)
+                    .unwrap_or(true);
+                if anchor_stale {
+                    self.period_anchor = Some(PeriodAnchor {
+                        period,
+                        mainchain_ts,
+                        observed_at: Instant::now(),
+                    });
+                }
                 self.current_period = period;
                 self.error = None;
             }
@@ -155,24 +177,8 @@ impl Periods {
                     .show(ui, |ui| {
                         ui.label(RichText::new("Current Period:").strong());
 
-                        let display_period = match (
-                            &self.decision_config,
-                            self.genesis_timestamp,
-                        ) {
-                            (Some(cfg), Some(genesis_ts)) => {
-                                period_calculator::get_current_period(
-                                    self.estimated_timestamp(),
-                                    None,
-                                    genesis_ts,
-                                    cfg,
-                                )
-                                .unwrap_or(self.current_period)
-                            }
-                            _ => self.current_period,
-                        };
-
                         ui.label(
-                            RichText::new(format!("{display_period}"))
+                            RichText::new(format!("{}", self.current_period))
                                 .size(18.0)
                                 .color(Color32::from_rgb(100, 200, 100)),
                         );
@@ -197,6 +203,16 @@ impl Periods {
                                 ui.label(format_duration(secs));
                             }
                             ui.end_row();
+
+                            if let Some(secs) = config.seconds_per_period()
+                                && let Some(start) = self.period_start_ts(secs)
+                            {
+                                ui.label(
+                                    RichText::new("Period Started:").strong(),
+                                );
+                                ui.label(format_timestamp(start));
+                                ui.end_row();
+                            }
                         }
 
                         if let Some(genesis_ts) = self.genesis_timestamp {
@@ -228,7 +244,7 @@ impl Periods {
             return;
         }
 
-        let Some(genesis_ts) = self.genesis_timestamp else {
+        if self.genesis_timestamp.is_none() {
             ui.heading("Timer Until Next Period");
             ui.add_space(5.0);
             ui.label(
@@ -239,23 +255,24 @@ impl Periods {
                 .italics(),
             );
             return;
-        };
+        }
 
         let Some(seconds_per_period) = config.seconds_per_period() else {
             return;
         };
 
-        let estimated_now = self.estimated_timestamp();
-        let elapsed_since_genesis = estimated_now.saturating_sub(genesis_ts);
-        let estimated_period = period_calculator::get_current_period(
-            estimated_now,
-            None,
-            genesis_ts,
-            config,
-        )
-        .unwrap_or(self.current_period);
-        let time_in_period = elapsed_since_genesis % seconds_per_period;
+        let Some(period_start_ts) = self.period_start_ts(seconds_per_period)
+        else {
+            return;
+        };
+        let Some(estimated_now) = self.estimated_mainchain_ts() else {
+            return;
+        };
+        let time_in_period = estimated_now
+            .saturating_sub(period_start_ts)
+            .min(seconds_per_period);
         let time_remaining = seconds_per_period.saturating_sub(time_in_period);
+        let estimated_period = self.current_period;
 
         ui.heading("Time Until Next Period");
         ui.add_space(10.0);
