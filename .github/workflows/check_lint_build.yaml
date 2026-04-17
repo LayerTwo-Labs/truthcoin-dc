@@ -69,26 +69,20 @@ jobs:
           rm -r bip300301-enforcer-latest-x86_64-unknown-linux-gnu
           chmod +x bip300301-enforcer
           popd
-      - name: Checkout electrs
+      - name: Download latest electrs
         run: |
           pushd ..
-          git clone https://github.com/mempool/electrs.git
+          wget https://releases.drivechain.info/electrs-latest-x86_64-unknown-linux-gnu.zip
+          unzip electrs-latest-x86_64-unknown-linux-gnu.zip
+          rm electrs-latest-x86_64-unknown-linux-gnu.zip
+          mv electrs-latest-x86_64-unknown-linux-gnu electrs
+          chmod +x electrs
           popd
       - name: Install latest nightly toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
           target: x86_64-pc-windows-gnu
-      - name: Rust Cache (electrs)
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v0-rust-electrs"
-          workspaces: ../electrs -> target
-      - name: Install electrs
-        run: |
-          pushd ../electrs
-          cargo build --locked --release
-          popd
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
@@ -104,7 +98,7 @@ jobs:
           export BIP300301_ENFORCER='../bip300301-enforcer'
           export BITCOIND='../bitcoin-patched-bins/bitcoind'
           export BITCOIN_CLI='../bitcoin-patched-bins/bitcoin-cli'
-          export ELECTRS='../electrs/target/release/electrs'
+          export ELECTRS='../electrs'
           export TRUTHCOIN_APP='target/debug/truthcoin_dc_app'
           cargo run --example integration_tests
 
@@ -194,38 +188,41 @@ jobs:
     name: Upload releases to releases.drivechain.info
     runs-on: ubuntu-latest
     needs: [build-release, integration-test]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.ref == 'refs/heads/master'
     steps:
-      - name: Download release assets
-        uses: robinraju/release-downloader@v1.9
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
         with:
-          tag: ${{ github.ref_name }}
+          path: artifacts
 
       - name: Create zip files for releases.drivechain.info
         run: |
           shopt -s extglob
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-latest-x86_64-apple-darwin
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-cli-latest-x86_64-apple-darwin
-          zip L2-S4-Truthcoin-latest-x86_64-apple-darwin.zip \
+          # Find and rename artifacts for each platform
+          # Darwin
+          find artifacts -name 'truthcoin-*-x86_64-apple-darwin' -type f | head -1 | xargs -I {} mv {} truthcoin-latest-x86_64-apple-darwin
+          find artifacts -name 'truthcoin-cli-*-x86_64-apple-darwin' -type f | head -1 | xargs -I {} mv {} truthcoin-cli-latest-x86_64-apple-darwin
+          zip L2-S13-Truthcoin-latest-x86_64-apple-darwin.zip \
             truthcoin-latest-x86_64-apple-darwin \
             truthcoin-cli-latest-x86_64-apple-darwin
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-latest-x86_64-pc-windows-gnu.exe
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
-          zip L2-S4-Truthcoin-latest-x86_64-pc-windows-gnu.zip \
+          # Windows
+          find artifacts -name 'truthcoin-*-x86_64-pc-windows-gnu.exe' -type f | head -1 | xargs -I {} mv {} truthcoin-latest-x86_64-pc-windows-gnu.exe
+          find artifacts -name 'truthcoin-cli-*-x86_64-pc-windows-gnu.exe' -type f | head -1 | xargs -I {} mv {} truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
+          zip L2-S13-Truthcoin-latest-x86_64-pc-windows-gnu.zip \
             truthcoin-latest-x86_64-pc-windows-gnu.exe \
             truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-latest-x86_64-unknown-linux-gnu
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-cli-latest-x86_64-unknown-linux-gnu
-          zip L2-S4-Truthcoin-latest-x86_64-unknown-linux-gnu.zip \
+          # Linux
+          find artifacts -name 'truthcoin-*-x86_64-unknown-linux-gnu' -type f ! -name '*cli*' | head -1 | xargs -I {} mv {} truthcoin-latest-x86_64-unknown-linux-gnu
+          find artifacts -name 'truthcoin-cli-*-x86_64-unknown-linux-gnu' -type f | head -1 | xargs -I {} mv {} truthcoin-cli-latest-x86_64-unknown-linux-gnu
+          zip L2-S13-Truthcoin-latest-x86_64-unknown-linux-gnu.zip \
             truthcoin-latest-x86_64-unknown-linux-gnu \
             truthcoin-cli-latest-x86_64-unknown-linux-gnu
 
       - name: Upload release assets to releases.drivechain.info
-        uses: appleboy/scp-action@v1
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: 45.33.96.47
           username: root
           password: ${{ secrets.RELEASES_SERVER_PW }}
-          port: 22
-          scp: |
-            'L2-S4-Truthcoin-latest-*.zip' => '/var/www/html/'
+          source: "L2-S13-Truthcoin-latest-*.zip"
+          target: "/var/www/html/"
