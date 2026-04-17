@@ -1,38 +1,58 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroU32;
 
 use fallible_iterator::FallibleIterator;
 use futures::Stream;
 use heed::types::SerdeBincode;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
 
 use crate::{
-    authorization::Authorization,
     types::{
         Address, AmountOverflowError, Authorized, AuthorizedTransaction,
-        TruthcoinId, BlockHash, Body, FilledOutput, FilledTransaction,
-        GetAddress as _, GetBitcoinValue as _, Header, InPoint, M6id, OutPoint,
-        OutPointKey, SpentOutput, Transaction, TxData, VERSION, Verify as _,
-        Version, WithdrawalBundle, WithdrawalBundleStatus,
-        proto::mainchain::TwoWayPegData,
+        BlockHash, Body, FilledOutput, FilledTransaction, GetBitcoinValue as _,
+        Header, InPoint, M6id, MerkleRoot, OutPoint, OutPointKey, SpentOutput,
+        Transaction, VERSION, Version, WithdrawalBundle,
+        WithdrawalBundleStatus, proto::mainchain::TwoWayPegData,
     },
     util::Watchable,
+    validation::DecisionValidationInterface,
 };
 
-mod amm;
-pub mod truthcoin;
-mod block;
-mod dutch_auction;
-pub mod error;
-mod rollback;
-mod two_way_peg_data;
+pub trait UtxoManager {
+    fn insert_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+        filled_output: &FilledOutput,
+    ) -> Result<(), Error>;
+    fn delete_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+    ) -> Result<bool, Error>;
+    fn clear_utxos(&self, rwtxn: &mut RwTxn) -> Result<(), Error>;
+}
 
-pub use amm::{AmmPair, PoolState as AmmPoolState};
-pub use truthcoin::SeqId as TruthcoinSeqId;
-pub use dutch_auction::DutchAuctionState;
+pub mod block;
+pub mod decisions;
+pub mod error;
+pub mod markets;
+mod rollback;
+pub mod type_aliases;
+pub mod undo;
+use decisions::{Decision, DecisionId};
+pub mod reputation;
+mod two_way_peg_data;
+pub mod voting;
+
+pub use decisions::period_to_name;
 pub use error::Error;
+pub use markets::{
+    Market, MarketBuilder, MarketId, MarketState, MarketsDatabase, ShareAccount,
+};
 use rollback::{HeightStamped, RollBack};
+pub use voting::VotingSystem;
 
 pub const WITHDRAWAL_BUNDLE_FAILURE_GAP: u32 = 4;
 
@@ -40,21 +60,15 @@ pub const WITHDRAWAL_BUNDLE_FAILURE_GAP: u32 = 4;
 /// to avoid redundant computation during connection
 pub struct PrevalidatedBlock {
     pub filled_transactions: Vec<FilledTransaction>,
-    pub computed_merkle_root: crate::types::BlockHash,
-    pub total_fees: bitcoin::Amount,
+    pub computed_merkle_root: MerkleRoot,
     pub coinbase_value: bitcoin::Amount,
-    pub next_height: u32, // Precomputed next height to avoid DB read in write txn
+    pub next_height: u32,
 }
 
-/// Information we have regarding a withdrawal bundle
 #[derive(Debug, Deserialize, Serialize)]
 enum WithdrawalBundleInfo {
-    /// Withdrawal bundle is known
     Known(WithdrawalBundle),
-    /// Withdrawal bundle is unknown but unconfirmed / failed
     Unknown,
-    /// If an unknown withdrawal bundle is confirmed, ALL UTXOs are
-    /// considered spent.
     UnknownConfirmed {
         spend_utxos: BTreeMap<OutPoint, FilledOutput>,
     },
@@ -79,52 +93,163 @@ type WithdrawalBundlesDb = DatabaseUnique<
 
 #[derive(Clone)]
 pub struct State {
-    /// Current tip
     tip: DatabaseUnique<UnitKey, SerdeBincode<BlockHash>>,
-    /// Current height
     height: DatabaseUnique<UnitKey, SerdeBincode<u32>>,
-    /// Associates ordered pairs of Truthcoin to their AMM pool states
-    amm_pools: amm::PoolsDb,
-    truthcoin: truthcoin::Dbs,
-    /// Associates Dutch auction sequence numbers with auction state
-    dutch_auctions: dutch_auction::Db,
+    mainchain_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
+    genesis_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
+    reputation: reputation::ReputationDbs,
+    decisions: decisions::Dbs,
+    markets: MarketsDatabase,
+    voting: VotingSystem,
     utxos: DatabaseUnique<OutPointKey, SerdeBincode<FilledOutput>>,
+    utxos_by_address:
+        DatabaseUnique<SerdeBincode<(Address, OutPoint)>, SerdeBincode<()>>,
     stxos: DatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>>,
-    /// Pending withdrawal bundle and block height
     pending_withdrawal_bundle:
         DatabaseUnique<UnitKey, SerdeBincode<(WithdrawalBundle, u32)>>,
-    /// Latest failed (known) withdrawal bundle
     latest_failed_withdrawal_bundle:
         DatabaseUnique<UnitKey, SerdeBincode<RollBack<HeightStamped<M6id>>>>,
-    /// Withdrawal bundles and their status.
-    /// Some withdrawal bundles may be unknown.
-    /// in which case they are `None`.
     withdrawal_bundles: WithdrawalBundlesDb,
-    /// Deposit blocks and the height at which they were applied, keyed sequentially
     deposit_blocks: DatabaseUnique<
         SerdeBincode<u32>,
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     >,
-    /// Withdrawal bundle event blocks and the height at which they were applied, keyed sequentially
     withdrawal_bundle_event_blocks: DatabaseUnique<
         SerdeBincode<u32>,
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     >,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
+    // Undo databases for disconnect_tip chain reorganization support
+    ossification_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::OssificationUndoData>,
+    >,
+    consensus_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::ConsensusUndoData>,
+    >,
+    consolidation_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::ConsolidationUndoData>,
+    >,
+    pub(crate) minting_undo:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<u32>>,
+    reputation_transfer_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::ReputationTransferUndoData>,
+    >,
+}
+
+impl DecisionValidationInterface for State {
+    fn validate_decision_claim(
+        &self,
+        rotxn: &RoTxn,
+        decision_id: DecisionId,
+        decision: &Decision,
+        current_ts: u64,
+        current_height: Option<u32>,
+        genesis_ts: u64,
+    ) -> Result<(), Error> {
+        self.decisions().validate_decision_claim(
+            rotxn,
+            decision_id,
+            decision,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    fn try_get_height(&self, rotxn: &RoTxn) -> Result<Option<u32>, Error> {
+        self.try_get_height(rotxn)
+    }
+
+    fn try_get_genesis_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        self.try_get_genesis_timestamp(rotxn)
+    }
+
+    fn try_get_mainchain_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        self.try_get_mainchain_timestamp(rotxn)
+    }
+
+    fn get_standard_claimed_count_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<u64, Error> {
+        self.decisions()
+            .get_standard_claimed_count_in_period(rotxn, period_index)
+    }
+
+    fn get_available_decisions(
+        &self,
+        rotxn: &RoTxn,
+        period: u32,
+        current_ts: u64,
+        current_height: Option<u32>,
+        genesis_ts: u64,
+    ) -> Result<u64, Error> {
+        self.decisions().get_available_decisions(
+            rotxn,
+            period,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
 }
 
 impl State {
-    pub const NUM_DBS: u32 = truthcoin::Dbs::NUM_DBS + 12;
+    const BASE_DBS: u32 = 13;
+    const UNDO_DBS: u32 = 5;
 
-    pub fn new(env: &sneed::Env) -> Result<Self, Error> {
+    pub const NUM_DBS: u32 = reputation::ReputationDbs::NUM_DBS
+        + decisions::Dbs::NUM_DBS
+        + MarketsDatabase::NUM_DBS
+        + VotingSystem::NUM_DBS
+        + Self::BASE_DBS
+        + Self::UNDO_DBS;
+
+    pub fn new(
+        env: &sneed::Env,
+        decision_config_testing: Option<u32>,
+    ) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
         let tip = DatabaseUnique::create(env, &mut rwtxn, "tip")?;
         let height = DatabaseUnique::create(env, &mut rwtxn, "height")?;
-        let amm_pools = DatabaseUnique::create(env, &mut rwtxn, "amm_pools")?;
-        let truthcoin = truthcoin::Dbs::new(env, &mut rwtxn)?;
-        let dutch_auctions =
-            DatabaseUnique::create(env, &mut rwtxn, "dutch_auctions")?;
+        let mainchain_timestamp =
+            DatabaseUnique::create(env, &mut rwtxn, "mainchain_timestamp")?;
+        let genesis_timestamp =
+            DatabaseUnique::create(env, &mut rwtxn, "genesis_timestamp")?;
+        let reputation = reputation::ReputationDbs::new(env, &mut rwtxn)?;
+        let decisions = if let Some(blocks_per_period) = decision_config_testing
+        {
+            let nz = NonZeroU32::new(blocks_per_period).ok_or_else(|| {
+                Error::InvalidTransaction {
+                    reason: "decision_config_testing blocks_per_period \
+                             must be > 0"
+                        .into(),
+                }
+            })?;
+            decisions::Dbs::new_with_config(
+                env,
+                &mut rwtxn,
+                decisions::DecisionConfig::testing(nz),
+            )?
+        } else {
+            decisions::Dbs::new(env, &mut rwtxn)?
+        };
+        let markets = MarketsDatabase::new(env, &mut rwtxn)?;
+        let voting = VotingSystem::new(env, &mut rwtxn)?;
         let utxos = DatabaseUnique::create(env, &mut rwtxn, "utxos")?;
+        let utxos_by_address =
+            DatabaseUnique::create(env, &mut rwtxn, "utxos_by_address")?;
         let stxos = DatabaseUnique::create(env, &mut rwtxn, "stxos")?;
         let pending_withdrawal_bundle = DatabaseUnique::create(
             env,
@@ -149,14 +274,31 @@ impl State {
         if version.try_get(&rwtxn, &())?.is_none() {
             version.put(&mut rwtxn, &(), &*VERSION)?;
         }
+        let ossification_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "ossification_undo")?;
+        let consensus_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "consensus_undo")?;
+        let consolidation_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "consolidation_undo")?;
+        let minting_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "minting_undo")?;
+        let reputation_transfer_undo = DatabaseUnique::create(
+            env,
+            &mut rwtxn,
+            "reputation_transfer_undo",
+        )?;
         rwtxn.commit()?;
         Ok(Self {
             tip,
             height,
-            amm_pools,
-            truthcoin,
-            dutch_auctions,
+            mainchain_timestamp,
+            genesis_timestamp,
+            reputation,
+            decisions,
+            markets,
+            voting,
             utxos,
+            utxos_by_address,
             stxos,
             pending_withdrawal_bundle,
             latest_failed_withdrawal_bundle,
@@ -164,15 +306,28 @@ impl State {
             withdrawal_bundle_event_blocks,
             deposit_blocks,
             _version: version,
+            ossification_undo,
+            consensus_undo,
+            consolidation_undo,
+            minting_undo,
+            reputation_transfer_undo,
         })
     }
 
-    pub fn amm_pools(&self) -> &amm::RoPoolsDb {
-        &self.amm_pools
+    pub fn reputation(&self) -> &reputation::ReputationDbs {
+        &self.reputation
     }
 
-    pub fn truthcoin(&self) -> &truthcoin::Dbs {
-        &self.truthcoin
+    pub fn decisions(&self) -> &decisions::Dbs {
+        &self.decisions
+    }
+
+    pub fn markets(&self) -> &MarketsDatabase {
+        &self.markets
+    }
+
+    pub fn voting(&self) -> &VotingSystem {
+        &self.voting
     }
 
     pub fn deposit_blocks(
@@ -182,10 +337,6 @@ impl State {
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     > {
         &self.deposit_blocks
-    }
-
-    pub fn dutch_auctions(&self) -> &dutch_auction::RoDb {
-        &self.dutch_auctions
     }
 
     pub fn stxos(
@@ -216,6 +367,22 @@ impl State {
         Ok(height)
     }
 
+    pub fn try_get_mainchain_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        let timestamp = self.mainchain_timestamp.try_get(rotxn, &())?;
+        Ok(timestamp)
+    }
+
+    pub fn try_get_genesis_timestamp(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Option<u64>, Error> {
+        let timestamp = self.genesis_timestamp.try_get(rotxn, &())?;
+        Ok(timestamp)
+    }
+
     pub fn get_utxos(
         &self,
         rotxn: &RoTxn,
@@ -233,16 +400,130 @@ impl State {
         rotxn: &RoTxn,
         addresses: &HashSet<Address>,
     ) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
-        let utxos: HashMap<OutPoint, FilledOutput> = self
-            .utxos
-            .iter(rotxn)?
-            .filter(|(_, output)| Ok(addresses.contains(&output.address)))
-            .map(|(key, output)| Ok((key.to_outpoint(), output)))
-            .collect()?;
-        Ok(utxos)
+        let mut result = HashMap::with_capacity(addresses.len() * 4);
+
+        let mut iter = self.utxos_by_address.iter(rotxn)?;
+        while let Some(((addr, outpoint), _)) = iter.next()? {
+            if addresses.contains(&addr)
+                && let Some(filled_output) = self
+                    .utxos
+                    .try_get(rotxn, &OutPointKey::from_outpoint(&outpoint))?
+            {
+                result.insert(outpoint, filled_output);
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+impl UtxoManager for State {
+    fn insert_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+        filled_output: &FilledOutput,
+    ) -> Result<(), Error> {
+        let key = OutPointKey::from_outpoint(outpoint);
+        self.utxos.put(rwtxn, &key, filled_output)?;
+        self.utxos_by_address.put(
+            rwtxn,
+            &(filled_output.address, *outpoint),
+            &(),
+        )?;
+        Ok(())
     }
 
-    /// Get the latest failed withdrawal bundle, and the height at which it failed
+    fn delete_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        outpoint: &OutPoint,
+    ) -> Result<bool, Error> {
+        let key = OutPointKey::from_outpoint(outpoint);
+        let filled_output =
+            if let Some(output) = self.utxos.try_get(rwtxn, &key)? {
+                output
+            } else {
+                return Ok(false);
+            };
+
+        self.utxos_by_address
+            .delete(rwtxn, &(filled_output.address, *outpoint))?;
+
+        let deleted = self.utxos.delete(rwtxn, &key)?;
+
+        if !deleted {
+            // Restore address index
+            self.utxos_by_address.put(
+                rwtxn,
+                &(filled_output.address, *outpoint),
+                &(),
+            )?;
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn clear_utxos(&self, rwtxn: &mut RwTxn) -> Result<(), Error> {
+        self.utxos.clear(rwtxn)?;
+        self.utxos_by_address.clear(rwtxn)?;
+        Ok(())
+    }
+}
+
+impl State {
+    pub fn get_mempool_shares(
+        &self,
+        rotxn: &RoTxn,
+        market_id: &crate::state::markets::MarketId,
+    ) -> Result<Option<ndarray::Array1<i64>>, Error> {
+        self.markets.get_mempool_shares(rotxn, market_id)
+    }
+
+    pub fn put_mempool_shares(
+        &self,
+        rwtxn: &mut RwTxn,
+        market_id: &crate::state::markets::MarketId,
+        shares: &ndarray::Array1<i64>,
+    ) -> Result<(), Error> {
+        self.markets.put_mempool_shares(rwtxn, market_id, shares)
+    }
+
+    pub fn clear_mempool_shares(
+        &self,
+        rwtxn: &mut RwTxn,
+        market_id: &crate::state::markets::MarketId,
+    ) -> Result<(), Error> {
+        self.markets.clear_mempool_shares(rwtxn, market_id)
+    }
+
+    pub fn get_mempool_treasury_delta(
+        &self,
+        rotxn: &RoTxn,
+        market_id: &crate::state::markets::MarketId,
+    ) -> Result<u64, Error> {
+        self.markets.get_mempool_treasury_delta(rotxn, market_id)
+    }
+
+    pub fn put_mempool_treasury_delta(
+        &self,
+        rwtxn: &mut RwTxn,
+        market_id: &crate::state::markets::MarketId,
+        delta: u64,
+    ) -> Result<(), Error> {
+        self.markets
+            .put_mempool_treasury_delta(rwtxn, market_id, delta)
+    }
+
+    pub fn clear_mempool_treasury_delta(
+        &self,
+        rwtxn: &mut RwTxn,
+        market_id: &crate::state::markets::MarketId,
+    ) -> Result<(), Error> {
+        self.markets.clear_mempool_treasury_delta(rwtxn, market_id)
+    }
+
     pub fn get_latest_failed_withdrawal_bundle(
         &self,
         rotxn: &RoTxn,
@@ -253,10 +534,22 @@ impl State {
             return Ok(None);
         };
         let latest_failed_m6id = latest_failed_m6id.latest().value;
-        let (_bundle, bundle_status) = self.withdrawal_bundles.try_get(rotxn, &latest_failed_m6id)?
-            .expect("Inconsistent DBs: latest failed m6id should exist in withdrawal_bundles");
+        let (_bundle, bundle_status) = self
+            .withdrawal_bundles
+            .try_get(rotxn, &latest_failed_m6id)?
+            .ok_or_else(|| {
+                Error::DatabaseError(format!(
+                    "latest failed m6id {latest_failed_m6id} \
+                     not found in withdrawal_bundles"
+                ))
+            })?;
         let bundle_status = bundle_status.latest();
-        assert_eq!(bundle_status.value, WithdrawalBundleStatus::Failed);
+        if bundle_status.value != WithdrawalBundleStatus::Failed {
+            return Err(Error::DatabaseError(format!(
+                "latest failed bundle has status {:?}, expected Failed",
+                bundle_status.value,
+            )));
+        }
         Ok(Some((bundle_status.height, latest_failed_m6id)))
     }
 
@@ -277,10 +570,10 @@ impl State {
         Ok(FilledTransaction {
             spent_utxos,
             transaction: transaction.clone(),
+            actor_address: None,
         })
     }
 
-    /// Fill a transaction that has already been applied
     pub fn fill_transaction_from_stxos(
         &self,
         rotxn: &RoTxn,
@@ -288,7 +581,6 @@ impl State {
     ) -> Result<FilledTransaction, Error> {
         let txid = tx.txid();
         let mut spent_utxos = Vec::with_capacity(tx.inputs.len());
-        // fill inputs last-to-first
         for (vin, input) in tx.inputs.iter().enumerate().rev() {
             let key = OutPointKey::from_outpoint(input);
             let stxo = self
@@ -308,6 +600,7 @@ impl State {
         Ok(FilledTransaction {
             spent_utxos,
             transaction: tx,
+            actor_address: None,
         })
     }
 
@@ -322,10 +615,10 @@ impl State {
         Ok(Authorized {
             transaction: filled_tx,
             authorizations,
+            actor_proof: transaction.actor_proof,
         })
     }
 
-    /// Get pending withdrawal bundle and block height
     pub fn get_pending_withdrawal_bundle(
         &self,
         txn: &RoTxn,
@@ -333,267 +626,34 @@ impl State {
         Ok(self.pending_withdrawal_bundle.try_get(txn, &())?)
     }
 
-    /// Check that
-    /// * If the tx is a Truthcoin reservation, then the number of truthcoin
-    ///   reservations in the outputs is exactly one more than the number of
-    ///   truthcoin reservations in the inputs.
-    /// * If the tx is a Truthcoin
-    ///   registration, then the number of truthcoin reservations in the outputs
-    ///   is exactly one less than the number of truthcoin reservations in the
-    ///   inputs.
-    /// * Otherwise, the number of truthcoin reservations in the outputs
-    ///   is exactly equal to the number of truthcoin reservations in the inputs.
-    pub fn validate_reservations(
-        &self,
-        tx: &FilledTransaction,
-    ) -> Result<(), Error> {
-        let n_reservation_inputs: usize = tx.spent_reservations().count();
-        let n_reservation_outputs: usize = tx.reservation_outputs().count();
-        if tx.is_reservation() {
-            if n_reservation_outputs == n_reservation_inputs + 1 {
-                return Ok(());
-            }
-        } else if tx.is_registration() {
-            if n_reservation_inputs == n_reservation_outputs + 1 {
-                return Ok(());
-            }
-        } else if n_reservation_inputs == n_reservation_outputs {
-            return Ok(());
-        }
-        Err(Error::UnbalancedReservations {
-            n_reservation_inputs,
-            n_reservation_outputs,
-        })
-    }
-
-    /** Check that
-     *  * If the tx is a Truthcoin registration, then
-     *    * The number of Truthcoin control coins in the outputs is exactly
-     *      one more than the number of Truthcoin control coins in the
-     *      inputs
-     *    * The number of Truthcoin outputs is at least
-     *      * The number of unique Truthcoin inputs,
-     *        if the initial supply is zero
-     *      * One more than the number of unique Truthcoin inputs,
-     *        if the initial supply is nonzero.
-     *    * The newly registered Truthcoin must have been unregistered,
-     *      prior to the registration tx.
-     *    * The last output must be a Truthcoin control coin
-     *    * If the initial supply is nonzero,
-     *      the second-to-last output must be a Truthcoin output
-     *    * Otherwise,
-     *      * The number of Truthcoin control coin outputs is exactly the number
-     *        of Truthcoin control coin inputs
-     *      * The number of Truthcoin outputs is at least
-     *        the number of unique Truthcoin in the inputs.
-     *  * If the tx is a Truthcoin update, then there must be at least one
-     *    Truthcoin control coin input and output.
-     *  * If the tx is an AMM Burn, then
-     *    * There must be at least two unique Truthcoin outputs
-     *    * The number of unique Truthcoin outputs must be at most two more than
-     *      the number of unique Truthcoin inputs
-     *    * The number of unique Truthcoin inputs must be at most equal to the
-     *      number of unique Truthcoin outputs
-     *  * If the tx is an AMM Mint, then
-     *    * There must be at least two Truthcoin inputs
-     *    * The number of unique Truthcoin outputs must be at most equal to the
-     *      number of unique Truthcoin inputs
-     *    * The number of unique Truthcoin inputs must be at most two more than
-     *      the number of unique Truthcoin outputs.
-     *  * If the tx is an AMM Swap, then
-     *    * There must be at least one Truthcoin input
-     *    * The number of unique Truthcoin outputs must be one less than,
-     *      one greater than, or equal to, the number of unique Truthcoin inputs.
-     *  * If the tx is a Dutch auction create, then
-     *    * There must be at least one unique Truthcoin input
-     *    * The number of unique Truthcoin outputs must be at most equal to the
-     *      number of unique Truthcoin inputs
-     *    * The number of unique Truthcoin inputs must be at most one more than
-     *      the number of unique Truthcoin outputs.
-     *  * If the tx is a Dutch auction bid, then
-     *    * There must be at least one Truthcoin input
-     *    * The number of unique Truthcoin outputs must be one less than,
-     *      one greater than, or equal to, the number of unique Truthcoin inputs.
-     *  * If the tx is a Dutch auction collect, then
-     *    * There must be at least one unique Truthcoin output
-     *    * The number of unique Truthcoin outputs must be at most two more than
-     *      the number of unique Truthcoin inputs
-     *    * The number of unique Truthcoin inputs must be at most equal to the
-     *      number of unique Truthcoin outputs
-     * */
-    pub fn validate_truthcoin(
-        &self,
-        rotxn: &RoTxn,
-        tx: &FilledTransaction,
-    ) -> Result<(), Error> {
-        // number of unique truthcoin in the inputs
-        let n_unique_truthcoin_inputs: usize = tx
-            .spent_truthcoin()
-            .filter_map(|(_, output)| output.truthcoin())
-            .unique()
-            .count();
-        let n_truthcoin_control_inputs: usize =
-            tx.spent_truthcoin_controls().count();
-        let n_truthcoin_outputs: usize = tx.truthcoin_outputs().count();
-        let n_unique_truthcoin_outputs: usize =
-            tx.unique_spent_truthcoin().len();
-        let n_truthcoin_control_outputs: usize =
-            tx.truthcoin_control_outputs().count();
-        if tx.is_update()
-            && (n_truthcoin_control_inputs < 1 || n_truthcoin_control_outputs < 1)
-        {
-            return Err(error::Truthcoin::NoTruthcoinToUpdate.into());
-        };
-        if tx.is_amm_burn()
-            && (n_unique_truthcoin_outputs < 2
-                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs
-                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs + 2)
-        {
-            return Err(error::Amm::InvalidBurn.into());
-        };
-        if tx.is_amm_mint()
-            && (n_unique_truthcoin_inputs < 2
-                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs
-                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs + 2)
-        {
-            return Err(error::Amm::TooFewTruthcoinToMint.into());
-        };
-        if (tx.is_amm_swap() || tx.is_dutch_auction_bid())
-            && (n_unique_truthcoin_inputs < 1
-                || !{
-                    let min_unique_truthcoin_outputs =
-                        n_unique_truthcoin_inputs.saturating_sub(1);
-                    let max_unique_truthcoin_outputs =
-                        n_unique_truthcoin_inputs + 1;
-                    (min_unique_truthcoin_outputs..=max_unique_truthcoin_outputs)
-                        .contains(&n_unique_truthcoin_outputs)
-                })
-        {
-            let err = error::dutch_auction::Bid::Invalid;
-            return Err(Error::DutchAuction(err.into()));
-        };
-        if tx.is_dutch_auction_create()
-            && (n_unique_truthcoin_inputs < 1
-                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs
-                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs + 1)
-        {
-            return Err(error::DutchAuction::TooFewTruthcoinToCreate.into());
-        };
-        if tx.is_dutch_auction_collect()
-            && (n_unique_truthcoin_outputs < 1
-                || n_unique_truthcoin_inputs > n_unique_truthcoin_outputs
-                || n_unique_truthcoin_outputs > n_unique_truthcoin_inputs + 2)
-        {
-            let err = error::dutch_auction::Collect::Invalid;
-            return Err(Error::DutchAuction(err.into()));
-        };
-        if let Some(TxData::TruthcoinRegistration {
-            name_hash,
-            initial_supply,
-            ..
-        }) = tx.data()
-        {
-            if n_truthcoin_control_outputs != n_truthcoin_control_inputs + 1 {
-                return Err(Error::UnbalancedTruthcoinControls {
-                    n_truthcoin_control_inputs,
-                    n_truthcoin_control_outputs,
-                });
-            };
-            if !tx
-                .outputs()
-                .last()
-                .is_some_and(|last_output| last_output.is_truthcoin_control())
-            {
-                return Err(Error::LastOutputNotControlCoin);
-            }
-            if *initial_supply == 0 {
-                if n_truthcoin_outputs < n_unique_truthcoin_inputs {
-                    return Err(Error::UnbalancedTruthcoin {
-                        n_unique_truthcoin_inputs,
-                        n_truthcoin_outputs,
-                    });
-                }
-            } else {
-                if n_truthcoin_outputs < n_unique_truthcoin_inputs + 1 {
-                    return Err(Error::UnbalancedTruthcoin {
-                        n_unique_truthcoin_inputs,
-                        n_truthcoin_outputs,
-                    });
-                }
-                let outputs = tx.outputs();
-                let second_to_last_output = outputs.get(outputs.len() - 2);
-                if !second_to_last_output
-                    .is_some_and(|s2l_output| s2l_output.is_truthcoin())
-                {
-                    return Err(Error::SecondLastOutputNotTruthcoin);
-                }
-            }
-            if self
-                .truthcoin
-                .try_get_truthcoin(rotxn, &TruthcoinId(*name_hash))?
-                .is_some()
-            {
-                return Err(Error::TruthcoinAlreadyRegistered {
-                    name_hash: *name_hash,
-                });
-            };
-            Ok(())
-        } else {
-            if n_truthcoin_control_outputs != n_truthcoin_control_inputs {
-                return Err(Error::UnbalancedTruthcoinControls {
-                    n_truthcoin_control_inputs,
-                    n_truthcoin_control_outputs,
-                });
-            };
-            if n_truthcoin_outputs < n_unique_truthcoin_inputs {
-                return Err(Error::UnbalancedTruthcoin {
-                    n_unique_truthcoin_inputs,
-                    n_truthcoin_outputs,
-                });
-            }
-            if n_unique_truthcoin_inputs == 0 && n_truthcoin_outputs != 0 {
-                return Err(Error::UnbalancedTruthcoin {
-                    n_unique_truthcoin_inputs,
-                    n_truthcoin_outputs,
-                });
-            }
-            Ok(())
-        }
-    }
-
-    /// Validates a filled transaction, and returns the fee
     pub fn validate_filled_transaction(
         &self,
+        archive: &crate::archive::Archive,
         rotxn: &RoTxn,
         tx: &FilledTransaction,
+        override_height: Option<u32>,
     ) -> Result<bitcoin::Amount, Error> {
-        let () = self.validate_reservations(tx)?;
-        let () = self.validate_truthcoin(rotxn, tx)?;
-        tx.bitcoin_fee()?.ok_or(Error::NotEnoughValueIn)
+        crate::validation::BlockValidator::validate_filled_transaction(
+            self,
+            archive,
+            rotxn,
+            tx,
+            override_height,
+        )
     }
 
     pub fn validate_transaction(
         &self,
+        archive: &crate::archive::Archive,
         rotxn: &RoTxn,
         transaction: &AuthorizedTransaction,
     ) -> Result<bitcoin::Amount, Error> {
-        let filled_transaction =
-            self.fill_transaction(rotxn, &transaction.transaction)?;
-        for (authorization, spent_utxo) in transaction
-            .authorizations
-            .iter()
-            .zip(filled_transaction.spent_utxos.iter())
-        {
-            if authorization.get_address() != spent_utxo.address {
-                return Err(Error::WrongPubKeyForAddress);
-            }
-        }
-        if Authorization::verify_transaction(transaction).is_err() {
-            return Err(Error::AuthorizationError);
-        }
-        let fee =
-            self.validate_filled_transaction(rotxn, &filled_transaction)?;
-        Ok(fee)
+        crate::validation::BlockValidator::validate_transaction(
+            self,
+            archive,
+            rotxn,
+            transaction,
+        )
     }
 
     pub fn get_last_deposit_block_hash(
@@ -618,65 +678,125 @@ impl State {
         Ok(block_hash)
     }
 
-    /// Get total sidechain wealth in Bitcoin
+    /// Compute the total value of all deposit UTXOs (on-demand, no cache).
+    pub fn compute_deposit_utxo_value(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<u64, Error> {
+        let mut total = 0u64;
+        let mut iter = self.utxos.iter(rotxn)?;
+        while let Some((outpoint_key, filled_output)) = iter.next()? {
+            let outpoint = outpoint_key.to_outpoint();
+            if matches!(outpoint, OutPoint::Deposit(_)) {
+                total = total
+                    .saturating_add(filled_output.get_bitcoin_value().to_sat());
+            }
+        }
+        Ok(total)
+    }
+
+    /// Compute the total value of all spent deposit outputs (on-demand, no cache).
+    pub fn compute_deposit_stxo_value(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<u64, Error> {
+        let mut total = 0u64;
+        let mut iter = self.stxos.iter(rotxn)?;
+        while let Some((outpoint_key, spent_output)) = iter.next()? {
+            let outpoint = outpoint_key.to_outpoint();
+            if matches!(outpoint, OutPoint::Deposit(_)) {
+                total = total.saturating_add(
+                    spent_output.output.get_bitcoin_value().to_sat(),
+                );
+            }
+        }
+        Ok(total)
+    }
+
+    /// Compute the total value of all withdrawal spent outputs (on-demand, no cache).
+    pub fn compute_withdrawal_stxo_value(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<u64, Error> {
+        let mut total = 0u64;
+        let mut iter = self.stxos.iter(rotxn)?;
+        while let Some((_outpoint_key, spent_output)) = iter.next()? {
+            if matches!(spent_output.inpoint, InPoint::Withdrawal { .. }) {
+                total = total.saturating_add(
+                    spent_output.output.get_bitcoin_value().to_sat(),
+                );
+            }
+        }
+        Ok(total)
+    }
+
     pub fn sidechain_wealth(
         &self,
         rotxn: &RoTxn,
     ) -> Result<bitcoin::Amount, Error> {
-        let mut total_deposit_utxo_value = bitcoin::Amount::ZERO;
-        self.utxos.iter(rotxn)?.map_err(Error::from).for_each(
-            |(outpoint_key, output)| {
-                let outpoint = outpoint_key.to_outpoint();
-                if let OutPoint::Deposit(_) = outpoint {
-                    total_deposit_utxo_value = total_deposit_utxo_value
-                        .checked_add(output.get_bitcoin_value())
-                        .ok_or(AmountOverflowError)?;
-                }
-                Ok::<_, Error>(())
-            },
-        )?;
-        let mut total_deposit_stxo_value = bitcoin::Amount::ZERO;
-        let mut total_withdrawal_stxo_value = bitcoin::Amount::ZERO;
-        self.stxos.iter(rotxn)?.map_err(Error::from).for_each(
-            |(outpoint_key, spent_output)| {
-                let outpoint = outpoint_key.to_outpoint();
-                if let OutPoint::Deposit(_) = outpoint {
-                    total_deposit_stxo_value = total_deposit_stxo_value
-                        .checked_add(spent_output.output.get_bitcoin_value())
-                        .ok_or(AmountOverflowError)?;
-                }
-                if let InPoint::Withdrawal { .. } = spent_output.inpoint {
-                    total_withdrawal_stxo_value = total_deposit_stxo_value
-                        .checked_add(spent_output.output.get_bitcoin_value())
-                        .ok_or(AmountOverflowError)?;
-                }
-                Ok::<_, Error>(())
-            },
-        )?;
-        let total_wealth: bitcoin::Amount = total_deposit_utxo_value
+        let total_deposit_utxo_value =
+            bitcoin::Amount::from_sat(self.compute_deposit_utxo_value(rotxn)?);
+        let total_deposit_stxo_value =
+            bitcoin::Amount::from_sat(self.compute_deposit_stxo_value(rotxn)?);
+        let total_withdrawal_stxo_value = bitcoin::Amount::from_sat(
+            self.compute_withdrawal_stxo_value(rotxn)?,
+        );
+
+        let total_wealth = total_deposit_utxo_value
             .checked_add(total_deposit_stxo_value)
-            .ok_or(AmountOverflowError)?
-            .checked_sub(total_withdrawal_stxo_value)
+            .and_then(|sum| sum.checked_sub(total_withdrawal_stxo_value))
             .ok_or(AmountOverflowError)?;
+
         Ok(total_wealth)
     }
 
-    pub fn validate_block(
+    pub fn prevalidate_block(
         &self,
+        archive: &crate::archive::Archive,
         rotxn: &RoTxn,
         header: &Header,
         body: &Body,
-    ) -> Result<bitcoin::Amount, Error> {
-        block::validate(self, rotxn, header, body)
+    ) -> Result<PrevalidatedBlock, Error> {
+        crate::validation::BlockValidator::prevalidate(
+            self, archive, rotxn, header, body,
+        )
     }
 
-    pub fn connect_block(
+    pub fn connect_prevalidated_block(
         &self,
         rwtxn: &mut RwTxn,
         header: &Header,
         body: &Body,
+        mainchain_timestamp: u64,
+        prevalidated: PrevalidatedBlock,
     ) -> Result<(), Error> {
-        block::connect(self, rwtxn, header, body)
+        block::connect_prevalidated(
+            self,
+            rwtxn,
+            header,
+            body,
+            mainchain_timestamp,
+            prevalidated,
+        )
+    }
+
+    pub fn apply_block(
+        &self,
+        archive: &crate::archive::Archive,
+        rwtxn: &mut RwTxn,
+        header: &Header,
+        body: &Body,
+        mainchain_timestamp: u64,
+    ) -> Result<(), Error> {
+        let prevalidated =
+            self.prevalidate_block(archive, rwtxn, header, body)?;
+        self.connect_prevalidated_block(
+            rwtxn,
+            header,
+            body,
+            mainchain_timestamp,
+            prevalidated,
+        )
     }
 
     pub fn disconnect_tip(
@@ -704,41 +824,123 @@ impl State {
         two_way_peg_data::disconnect(self, rwtxn, two_way_peg_data)
     }
 
-    pub fn prevalidate_block(
+    fn period_context(
         &self,
         rotxn: &RoTxn,
-        header: &Header,
-        body: &Body,
-    ) -> Result<PrevalidatedBlock, Error> {
-        block::prevalidate(self, rotxn, header, body)
+    ) -> Result<(u64, Option<u32>, u64), Error> {
+        let current_ts = self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
+        let current_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        Ok((current_ts, current_height, genesis_ts))
     }
 
-    pub fn connect_prevalidated_block(
+    pub fn get_all_decision_periods(
         &self,
-        rwtxn: &mut RwTxn,
-        header: &Header,
-        body: &Body,
-        prevalidated: PrevalidatedBlock,
-    ) -> Result<(), Error> {
-        block::connect_prevalidated(self, rwtxn, header, body, prevalidated)
+        rotxn: &RoTxn,
+    ) -> Result<Vec<(u32, u64)>, Error> {
+        let (current_ts, current_height, genesis_ts) =
+            self.period_context(rotxn)?;
+        self.decisions.get_active_periods(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
     }
 
-    pub fn apply_block(
+    pub fn get_decisions_for_period(
         &self,
-        rwtxn: &mut RwTxn,
-        header: &Header,
-        body: &Body,
-    ) -> Result<(), Error> {
-        let prevalidated = self.prevalidate_block(rwtxn, header, body)?;
-        self.connect_prevalidated_block(rwtxn, header, body, prevalidated)?;
-        Ok(())
+        rotxn: &RoTxn,
+        period: u32,
+    ) -> Result<u64, Error> {
+        let (current_ts, current_height, genesis_ts) =
+            self.period_context(rotxn)?;
+        self.decisions.total_for(
+            rotxn,
+            period,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn get_available_decisions_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<Vec<crate::state::decisions::DecisionId>, Error> {
+        let (current_ts, current_height, genesis_ts) =
+            self.period_context(rotxn)?;
+        self.decisions.get_available_decisions_in_period(
+            rotxn,
+            period_index,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn get_ossified_decisions(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<crate::state::decisions::DecisionEntry>, Error> {
+        let (current_ts, current_height, genesis_ts) =
+            self.period_context(rotxn)?;
+        self.decisions.get_ossified_decisions(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn is_decision_in_voting(
+        &self,
+        rotxn: &RoTxn,
+        decision_id: crate::state::decisions::DecisionId,
+    ) -> Result<bool, Error> {
+        self.decisions.is_decision_in_voting(rotxn, decision_id)
+    }
+
+    pub fn get_voting_periods(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<(u32, u64, u64)>, Error> {
+        let (current_ts, current_height, genesis_ts) =
+            self.period_context(rotxn)?;
+        self.decisions.get_voting_periods(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn get_period_summary(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<type_aliases::PeriodSummary, Error> {
+        let (current_ts, current_height, genesis_ts) =
+            self.period_context(rotxn)?;
+        self.decisions.get_period_summary(
+            rotxn,
+            current_ts,
+            current_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn claimed_count_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<u64, Error> {
+        self.decisions.claimed_count_in_period(rotxn, period_index)
     }
 }
 
 impl Watchable<()> for State {
     type WatchStream = impl Stream<Item = ()>;
-
-    /// Get a signal that notifies whenever the tip changes
     fn watch(&self) -> Self::WatchStream {
         tokio_stream::wrappers::WatchStream::new(self.tip.watch().clone())
     }
