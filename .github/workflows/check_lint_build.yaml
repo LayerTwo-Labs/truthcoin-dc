@@ -188,41 +188,38 @@ jobs:
     name: Upload releases to releases.drivechain.info
     runs-on: ubuntu-latest
     needs: [build-release, integration-test]
-    if: github.ref == 'refs/heads/master'
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+      - name: Download release assets
+        uses: robinraju/release-downloader@v1.9
         with:
-          path: artifacts
+          tag: ${{ github.ref_name }}
 
       - name: Create zip files for releases.drivechain.info
         run: |
           shopt -s extglob
-          # Find and rename artifacts for each platform
-          # Darwin
-          find artifacts -name 'truthcoin-*-x86_64-apple-darwin' -type f | head -1 | xargs -I {} mv {} truthcoin-latest-x86_64-apple-darwin
-          find artifacts -name 'truthcoin-cli-*-x86_64-apple-darwin' -type f | head -1 | xargs -I {} mv {} truthcoin-cli-latest-x86_64-apple-darwin
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-latest-x86_64-apple-darwin
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-cli-latest-x86_64-apple-darwin
           zip L2-S13-Truthcoin-latest-x86_64-apple-darwin.zip \
             truthcoin-latest-x86_64-apple-darwin \
             truthcoin-cli-latest-x86_64-apple-darwin
-          # Windows
-          find artifacts -name 'truthcoin-*-x86_64-pc-windows-gnu.exe' -type f | head -1 | xargs -I {} mv {} truthcoin-latest-x86_64-pc-windows-gnu.exe
-          find artifacts -name 'truthcoin-cli-*-x86_64-pc-windows-gnu.exe' -type f | head -1 | xargs -I {} mv {} truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-latest-x86_64-pc-windows-gnu.exe
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
           zip L2-S13-Truthcoin-latest-x86_64-pc-windows-gnu.zip \
             truthcoin-latest-x86_64-pc-windows-gnu.exe \
             truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
-          # Linux
-          find artifacts -name 'truthcoin-*-x86_64-unknown-linux-gnu' -type f ! -name '*cli*' | head -1 | xargs -I {} mv {} truthcoin-latest-x86_64-unknown-linux-gnu
-          find artifacts -name 'truthcoin-cli-*-x86_64-unknown-linux-gnu' -type f | head -1 | xargs -I {} mv {} truthcoin-cli-latest-x86_64-unknown-linux-gnu
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-latest-x86_64-unknown-linux-gnu
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-cli-latest-x86_64-unknown-linux-gnu
           zip L2-S13-Truthcoin-latest-x86_64-unknown-linux-gnu.zip \
             truthcoin-latest-x86_64-unknown-linux-gnu \
             truthcoin-cli-latest-x86_64-unknown-linux-gnu
 
       - name: Upload release assets to releases.drivechain.info
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@v1
         with:
           host: 45.33.96.47
           username: root
           password: ${{ secrets.RELEASES_SERVER_PW }}
-          source: "L2-S13-Truthcoin-latest-*.zip"
-          target: "/var/www/html/"
+          port: 22
+          source: 'L2-S13-Truthcoin-latest-*.zip'
+          target: '/var/www/html/'
