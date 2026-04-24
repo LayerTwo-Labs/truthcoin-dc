@@ -1,3 +1,5 @@
+//! Task to communicate with mainchain node
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -23,11 +25,14 @@ use crate::{
     types::proto::{self, mainchain},
 };
 
+/// Request data from the mainchain node
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum Request {
+    /// Request missing mainchain ancestor header/infos
     AncestorInfos(bitcoin::BlockHash),
 }
 
+/// Error included in a response
 #[derive(Debug, Error)]
 pub enum ResponseError {
     #[error("Archive error")]
@@ -38,12 +43,12 @@ pub enum ResponseError {
     DbWrite(#[from] sneed::rwtxn::Error),
     #[error("CUSF Mainchain proto error")]
     Mainchain(#[from] proto::Error),
-    #[error("gRPC request to mainchain timed out")]
-    MainchainTimeout,
 }
 
+/// Response indicating that a request has been fulfilled
 #[derive(Debug)]
 pub(super) enum Response {
+    /// Response bool indicates if the requested header was available
     AncestorInfos(bitcoin::BlockHash, Result<bool, ResponseError>),
 }
 
@@ -69,6 +74,8 @@ struct MainchainTask<Transport = tonic::transport::Channel> {
     env: sneed::Env,
     archive: Archive,
     mainchain: proto::mainchain::ValidatorClient<Transport>,
+    // receive a request, and optional oneshot sender to send the result to
+    // instead of sending on `response_tx`
     request_rx: UnboundedReceiver<(Request, Option<oneshot::Sender<Response>>)>,
     response_tx: UnboundedSender<Response>,
 }
@@ -77,6 +84,9 @@ impl<Transport> MainchainTask<Transport>
 where
     Transport: proto::Transport,
 {
+    /// Request ancestor header info and block info from the mainchain node,
+    /// including the specified header.
+    /// Returns `false` if the specified block was not available.
     async fn request_ancestor_infos(
         env: &sneed::Env,
         archive: &Archive,
@@ -101,7 +111,6 @@ where
         tracing::debug!(%block_hash, "requesting ancestor headers/info");
         const LOG_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
         const BATCH_REQUEST_SIZE: u32 = 1000;
-        const FLUSH_THRESHOLD: usize = 10_000;
         let mut progress_logged = Instant::now();
         loop {
             if let Some(current_height) = current_height {
@@ -115,16 +124,9 @@ where
                 }
                 tracing::trace!(%block_hash, "requesting ancestor headers: {current_block_hash}({current_height})")
             }
-            const GRPC_TIMEOUT: Duration = Duration::from_secs(30);
-            let Some(block_infos_resp) = tokio::time::timeout(
-                GRPC_TIMEOUT,
-                cusf_mainchain.get_block_infos(
-                    current_block_hash,
-                    BATCH_REQUEST_SIZE - 1,
-                ),
-            )
-            .await
-            .map_err(|_| ResponseError::MainchainTimeout)??
+            let Some(block_infos_resp) = cusf_mainchain
+                .get_block_infos(current_block_hash, BATCH_REQUEST_SIZE - 1)
+                .await?
             else {
                 return Ok(false);
             };
@@ -134,27 +136,6 @@ where
                 current_height = current_header.height.checked_sub(1);
             }
             block_infos.extend(block_infos_resp);
-            if block_infos.len() >= FLUSH_THRESHOLD {
-                block_infos.reverse();
-                task::block_in_place(|| {
-                    let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
-                    for (header_info, block_info) in block_infos.drain(..) {
-                        archive
-                            .put_main_header_info(&mut rwtxn, &header_info)?;
-                        archive.put_main_block_info(
-                            &mut rwtxn,
-                            header_info.block_hash,
-                            &block_info,
-                        )?;
-                    }
-                    rwtxn.commit().map_err(RwTxnError::from)?;
-                    Ok::<_, ResponseError>(())
-                })?;
-                tracing::trace!(
-                    %block_hash,
-                    "flushed batch of ancestor headers/info"
-                );
-            }
             if current_block_hash == bitcoin::BlockHash::all_zeros() {
                 break;
             } else {
@@ -167,26 +148,24 @@ where
                 }
             }
         }
-        if !block_infos.is_empty() {
-            block_infos.reverse();
-            tracing::trace!(%block_hash, "storing remaining ancestor headers/info");
-            task::block_in_place(|| {
-                let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
-                for (header_info, block_info) in block_infos {
+        block_infos.reverse();
+        // Writing all headers during IBD can starve archive readers.
+        tracing::trace!(%block_hash, "storing ancestor headers/info");
+        task::block_in_place(|| {
+            let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
+            for (header_info, block_info) in block_infos {
+                let () =
                     archive.put_main_header_info(&mut rwtxn, &header_info)?;
-                    archive.put_main_block_info(
-                        &mut rwtxn,
-                        header_info.block_hash,
-                        &block_info,
-                    )?;
-                }
-                rwtxn.commit().map_err(RwTxnError::from)?;
-                tracing::trace!(%block_hash, "stored ancestor headers/info");
-                Ok(true)
-            })
-        } else {
+                let () = archive.put_main_block_info(
+                    &mut rwtxn,
+                    header_info.block_hash,
+                    &block_info,
+                )?;
+            }
+            rwtxn.commit().map_err(RwTxnError::from)?;
+            tracing::trace!(%block_hash, "stored ancestor headers/info");
             Ok(true)
-        }
+        })
     }
 
     async fn run(mut self) -> Result<(), Error> {
@@ -218,9 +197,13 @@ where
     }
 }
 
+/// Handle to the task to communicate with mainchain node.
+/// Task is aborted on drop.
 #[derive(Clone)]
 pub(super) struct MainchainTaskHandle {
     task: Arc<JoinHandle<()>>,
+    // send a request, and optional oneshot sender to receive the result on the
+    // corresponding oneshot receiver
     request_tx:
         mpsc::UnboundedSender<(Request, Option<oneshot::Sender<Response>>)>,
 }
@@ -258,6 +241,7 @@ impl MainchainTaskHandle {
         (task_handle, response_rx)
     }
 
+    /// Send a request
     pub fn request(&self, request: Request) -> Result<(), Request> {
         self.request_tx
             .unbounded_send((request, None))
@@ -267,6 +251,8 @@ impl MainchainTaskHandle {
             })
     }
 
+    /// Send a request, and receive the response on a oneshot receiver instead
+    /// of the response stream
     pub fn request_oneshot(
         &self,
         request: Request,
@@ -284,7 +270,10 @@ impl MainchainTaskHandle {
 }
 
 impl Drop for MainchainTaskHandle {
+    // If only one reference exists (ie. within self), abort the net task.
     fn drop(&mut self) {
+        // use `Arc::get_mut` since `Arc::into_inner` requires ownership of the
+        // Arc, and cloning would increase the reference count
         if let Some(task) = Arc::get_mut(&mut self.task) {
             task.abort()
         }
