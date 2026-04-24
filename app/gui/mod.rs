@@ -16,7 +16,7 @@ mod miner;
 mod parent_chain;
 mod seed;
 mod util;
-mod votecoin;
+mod voter;
 
 use activity::Activity;
 use coins::Coins;
@@ -28,7 +28,7 @@ use miner::Miner;
 use parent_chain::ParentChain;
 use seed::SetSeed;
 use util::{BITCOIN_LOGO_FA, BITCOIN_ORANGE, UiExt, show_btc_amount};
-use votecoin::Votecoin;
+use voter::Voter;
 
 struct BottomPanelInitialized {
     app: App,
@@ -37,12 +37,8 @@ struct BottomPanelInitialized {
 
 impl BottomPanelInitialized {
     fn new(app: App) -> Self {
-        let node_updated = {
-            let rt_guard = app.runtime.enter();
-            let node_updated = PromiseStream::from(app.node.watch());
-            drop(rt_guard);
-            node_updated
-        };
+        let node_updated =
+            PromiseStream::new(app.node.watch(), app.runtime.handle().clone());
         Self { app, node_updated }
     }
 }
@@ -221,7 +217,7 @@ pub struct EguiApp {
     parent_chain: ParentChain,
     set_seed: SetSeed,
     tab: Tab,
-    votecoin: Votecoin,
+    voter: Voter,
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq, strum::Display)]
@@ -235,8 +231,8 @@ enum Tab {
     Markets,
     #[strum(to_string = "Create")]
     Create,
-    #[strum(to_string = "Votecoin")]
-    Votecoin,
+    #[strum(to_string = "Voter")]
+    Voter,
     #[strum(to_string = "Activity")]
     Activity,
     #[strum(to_string = "Console / Logs")]
@@ -247,7 +243,7 @@ impl Tab {
     fn sections() -> &'static [[Tab; 2]] {
         &[
             [Tab::Coins, Tab::Markets],
-            [Tab::Create, Tab::Votecoin],
+            [Tab::Create, Tab::Voter],
             [Tab::Activity, Tab::ConsoleLogs],
         ]
     }
@@ -290,6 +286,7 @@ impl EguiApp {
         let create = Create::default();
         let markets = Markets::new(app.as_ref());
         let parent_chain = ParentChain::new(app.as_ref());
+        let voter = Voter::new(app.as_ref());
         Self {
             activity,
             app,
@@ -303,7 +300,7 @@ impl EguiApp {
             parent_chain,
             set_seed: SetSeed::default(),
             tab: Tab::default(),
-            votecoin: Votecoin::default(),
+            voter,
         }
     }
 }
@@ -355,8 +352,8 @@ impl eframe::App for EguiApp {
                 Tab::Create => {
                     self.create.show(self.app.as_ref(), ui);
                 }
-                Tab::Votecoin => {
-                    self.votecoin.show(self.app.as_ref(), ui);
+                Tab::Voter => {
+                    self.voter.show(self.app.as_ref(), ui);
                 }
                 Tab::Activity => {
                     self.activity.show(self.app.as_ref(), ui);

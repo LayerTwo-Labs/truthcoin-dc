@@ -1729,6 +1729,10 @@ where
         self.env.read_txn().map_err(Into::into)
     }
 
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
     pub fn voting_state(&self) -> &crate::state::voting::VotingSystem {
         self.state.voting()
     }

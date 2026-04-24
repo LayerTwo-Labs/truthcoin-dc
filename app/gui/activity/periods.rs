@@ -1,10 +1,16 @@
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, ScrollArea};
+use futures::Stream;
 use truthcoin_dc::state::decisions::{DecisionConfig, DecisionEntry};
 
 use crate::app::App;
+use crate::util::PromiseStream;
+
+type NodeUpdates = PromiseStream<Pin<Box<dyn Stream<Item = ()> + Send>>>;
 
 struct PeriodAnchor {
     period: u32,
@@ -17,11 +23,12 @@ pub struct Periods {
     current_period: u32,
     period_summary: Option<(Vec<(u32, u64)>, Vec<(u32, u64)>)>, // (active_periods, voting_periods)
     voting_decisions: HashMap<u32, Vec<DecisionEntry>>, // claim_period -> claimed decisions in voting
-    last_refresh: Instant,
     genesis_timestamp: Option<u64>,
     period_anchor: Option<PeriodAnchor>,
     decision_config: Option<DecisionConfig>,
     error: Option<String>,
+    node_updated: Option<NodeUpdates>,
+    needs_initial_load: bool,
 }
 
 impl Default for Periods {
@@ -30,11 +37,12 @@ impl Default for Periods {
             current_period: 0,
             period_summary: None,
             voting_decisions: HashMap::new(),
-            last_refresh: Instant::now(),
             genesis_timestamp: None,
             period_anchor: None,
             decision_config: None,
             error: None,
+            node_updated: None,
+            needs_initial_load: true,
         }
     }
 }
@@ -58,69 +66,102 @@ impl Periods {
         )
     }
 
-    fn refresh_data(&mut self, app: &App) {
-        if self.last_refresh.elapsed() < Duration::from_secs(1) {
-            return;
+    fn ensure_subscribed(&mut self, app: &App) {
+        if self.node_updated.is_none() {
+            let stream: Pin<Box<dyn Stream<Item = ()> + Send>> =
+                Box::pin(app.node.watch_state());
+            self.node_updated =
+                Some(PromiseStream::new(stream, app.runtime.handle().clone()));
         }
-        self.last_refresh = Instant::now();
+    }
 
-        let mainchain_ts = app.node.get_mainchain_timestamp().unwrap_or(0);
+    fn tip_changed(&mut self) -> bool {
+        let Some(stream) = self.node_updated.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        while let Some(Poll::Ready(())) = stream.poll_next() {
+            changed = true;
+        }
+        changed
+    }
 
-        match app.node.get_current_period() {
-            Ok(period) => {
-                let anchor_stale = self
-                    .period_anchor
-                    .as_ref()
-                    .map(|a| a.period != period)
-                    .unwrap_or(true);
-                if anchor_stale {
-                    self.period_anchor = Some(PeriodAnchor {
-                        period,
-                        mainchain_ts,
-                        observed_at: Instant::now(),
-                    });
-                }
-                self.current_period = period;
-                self.error = None;
+    fn refresh_data(&mut self, app: &App) {
+        let rotxn = match app.node.read_txn() {
+            Ok(t) => t,
+            Err(e) => {
+                self.error = Some(format!("Failed to open read txn: {e:#}"));
+                return;
             }
+        };
+        let state = app.node.state();
+
+        let mainchain_ts = state
+            .try_get_mainchain_timestamp(&rotxn)
+            .unwrap_or(None)
+            .unwrap_or(0);
+        let genesis_ts = match state.try_get_genesis_timestamp(&rotxn) {
+            Ok(ts) => ts,
+            Err(e) => {
+                tracing::warn!("Failed to get genesis timestamp: {e:#}");
+                None
+            }
+        };
+        let height = state.try_get_height(&rotxn).unwrap_or(None);
+
+        let current_period = match state.decisions().get_current_period(
+            mainchain_ts,
+            height,
+            genesis_ts.unwrap_or(0),
+        ) {
+            Ok(p) => p,
             Err(e) => {
                 self.error =
                     Some(format!("Failed to get current period: {e:#}"));
                 return;
             }
+        };
+
+        let anchor_stale = self
+            .period_anchor
+            .as_ref()
+            .map(|a| a.period != current_period)
+            .unwrap_or(true);
+        if anchor_stale {
+            self.period_anchor = Some(PeriodAnchor {
+                period: current_period,
+                mainchain_ts,
+                observed_at: Instant::now(),
+            });
         }
+        self.current_period = current_period;
+        self.genesis_timestamp = genesis_ts;
+        self.decision_config = Some(state.decisions().get_config().clone());
 
-        match app.node.get_genesis_timestamp() {
-            Ok(ts) => self.genesis_timestamp = ts,
-            Err(e) => {
-                tracing::warn!("Failed to get genesis timestamp: {e:#}");
-            }
-        }
-
-        self.decision_config = Some(app.node.get_decision_config().clone());
-
-        match app.node.get_period_summary() {
-            Ok(summary) => {
-                self.period_summary = Some(summary);
-            }
+        match state.get_period_summary(&rotxn) {
+            Ok(summary) => self.period_summary = Some(summary),
             Err(e) => {
                 tracing::warn!("Failed to get period summary: {e:#}");
             }
         }
 
-        match app.node.get_voting_periods() {
+        match state.get_voting_periods(&rotxn) {
             Ok(voting_periods) => {
                 self.voting_decisions.clear();
                 for (claim_period, _voting_count, _total) in voting_periods {
-                    if let Ok(entries) = app
-                        .node
-                        .get_claimed_decisions_in_period(
-                        truthcoin_dc::state::voting::types::VotingPeriodId::new(
-                            claim_period,
-                        ),
-                    ) && !entries.is_empty()
+                    match state
+                        .decisions()
+                        .get_claimed_decisions_in_period(&rotxn, claim_period)
                     {
-                        self.voting_decisions.insert(claim_period, entries);
+                        Ok(entries) if !entries.is_empty() => {
+                            self.voting_decisions.insert(claim_period, entries);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to get claimed decisions in period {claim_period}: {e:#}"
+                            );
+                        }
                     }
                 }
             }
@@ -128,6 +169,8 @@ impl Periods {
                 tracing::warn!("Failed to get voting periods: {e:#}");
             }
         }
+
+        self.error = None;
     }
 
     pub fn show(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
@@ -136,7 +179,11 @@ impl Periods {
             return;
         };
 
-        self.refresh_data(app);
+        self.ensure_subscribed(app);
+        if self.needs_initial_load || self.tip_changed() {
+            self.needs_initial_load = false;
+            self.refresh_data(app);
+        }
 
         if let Some(ref config) = self.decision_config
             && !config.is_blocks_mode()

@@ -4,38 +4,47 @@ use std::{marker::Unpin, task::Poll};
 
 use futures::{Stream, StreamExt};
 use poll_promise::Promise;
+use tokio::runtime::Handle;
 
 type PromiseStreamInner<S> = Promise<Option<(S, <S as Stream>::Item)>>;
 
-pub struct PromiseStream<S>(Option<PromiseStreamInner<S>>)
+pub struct PromiseStream<S>
 where
     S: Send + Stream + 'static,
-    S::Item: Send;
+    S::Item: Send,
+{
+    inner: Option<PromiseStreamInner<S>>,
+    handle: Handle,
+}
 
 impl<S> PromiseStream<S>
 where
     S: Send + Stream + Unpin + 'static,
     S::Item: Send,
 {
-    fn promise(mut stream: S) -> Promise<Option<(S, S::Item)>>
-    where
-        S:,
-    {
-        Promise::spawn_async(async {
-            stream.next().await.map(|item| (stream, item))
-        })
+    pub fn new(stream: S, handle: Handle) -> Self {
+        let inner = Some(Self::spawn(stream, &handle));
+        Self { inner, handle }
+    }
+
+    fn spawn(mut stream: S, handle: &Handle) -> PromiseStreamInner<S> {
+        let (sender, promise) = Promise::new();
+        handle.spawn(async move {
+            sender.send(stream.next().await.map(|item| (stream, item)));
+        });
+        promise
     }
 
     /// Get the next item in the stream if available,
     /// or return None if the stream is complete
     pub fn poll_next(&mut self) -> Option<Poll<S::Item>> {
         let res;
-        let inner = std::mem::take(&mut self.0);
-        self.0 = match inner {
+        let inner = std::mem::take(&mut self.inner);
+        self.inner = match inner {
             Some(promise) => match promise.try_take() {
                 Ok(Some((stream, item))) => {
                     res = Some(Poll::Ready(item));
-                    Some(Self::promise(stream))
+                    Some(Self::spawn(stream, &self.handle))
                 }
                 Ok(None) => {
                     res = None;
@@ -52,16 +61,6 @@ where
             }
         };
         res
-    }
-}
-
-impl<S> From<S> for PromiseStream<S>
-where
-    S: Send + Stream + Unpin + 'static,
-    S::Item: Send,
-{
-    fn from(stream: S) -> Self {
-        Self(Some(Self::promise(stream)))
     }
 }
 
