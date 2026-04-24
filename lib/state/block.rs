@@ -961,12 +961,18 @@ pub fn connect_prevalidated(
 
         if !payout_results.is_empty() {
             for (market_id, summary) in &payout_results {
+                let refund_sats = summary
+                    .creator_refund
+                    .as_ref()
+                    .map(|r| r.amount_sats)
+                    .unwrap_or(0);
                 tracing::info!(
-                    "Protocol: Market {} auto-ossified with {} sats treasury + {} sats fees distributed to {} shareholders",
+                    "Protocol: Market {} auto-ossified with {} sats treasury + {} sats fees distributed to {} shareholders ({} sats refunded to creator)",
                     market_id,
                     summary.treasury_distributed,
                     summary.total_fees_distributed,
-                    summary.shareholder_count
+                    summary.shareholder_count,
+                    refund_sats,
                 );
             }
         }

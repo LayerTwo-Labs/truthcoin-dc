@@ -313,6 +313,12 @@ pub struct FeePayoutRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreatorRefund {
+    pub address: Address,
+    pub amount_sats: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MarketPayoutSummary {
     pub market_id: MarketId,
     pub treasury_distributed: u64,
@@ -320,5 +326,6 @@ pub struct MarketPayoutSummary {
     pub shareholder_count: u32,
     pub payouts: Vec<SharePayoutRecord>,
     pub fee_payouts: Vec<FeePayoutRecord>,
+    pub creator_refund: Option<CreatorRefund>,
     pub block_height: u32,
 }

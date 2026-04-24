@@ -986,8 +986,14 @@ impl MarketsDatabase {
             })
             .sum();
 
-        // If no winning positions, nothing to distribute
+        // If no winning positions, refund treasury to the market creator
+        // rather than burning it.
         if total_weighted_shares <= 0.0 {
+            let creator_refund =
+                (treasury_sats > 0).then_some(super::types::CreatorRefund {
+                    address: market.creator_address,
+                    amount_sats: treasury_sats,
+                });
             return Ok(MarketPayoutSummary {
                 market_id: market.id,
                 treasury_distributed: 0,
@@ -995,6 +1001,7 @@ impl MarketsDatabase {
                 shareholder_count: 0,
                 payouts: Vec::new(),
                 fee_payouts: Vec::new(),
+                creator_refund,
                 block_height,
             });
         }
@@ -1064,6 +1071,7 @@ impl MarketsDatabase {
             shareholder_count: payouts.len() as u32,
             payouts,
             fee_payouts,
+            creator_refund: None,
             block_height,
         })
     }
@@ -1131,6 +1139,23 @@ impl MarketsDatabase {
             sequence += 1;
         }
 
+        if let Some(refund) = &payout_summary.creator_refund {
+            let refund_outpoint = generate_share_payout_outpoint(
+                &payout_summary.market_id,
+                &refund.address,
+                block_height,
+                sequence,
+            );
+            let refund_output = FilledOutput {
+                address: refund.address,
+                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                    bitcoin::Amount::from_sat(refund.amount_sats),
+                )),
+                memo: vec![],
+            };
+            state.insert_utxo(txn, &refund_outpoint, &refund_output)?;
+        }
+
         // Consume the Market UTXO (treasury is now distributed to shareholders)
         if let Some(market_utxo) =
             self.get_market_funds_utxo(txn, &payout_summary.market_id, false)?
@@ -1196,6 +1221,16 @@ impl MarketsDatabase {
 
             state.delete_utxo(txn, &fee_outpoint)?;
             sequence += 1;
+        }
+
+        if let Some(refund) = &payout_summary.creator_refund {
+            let refund_outpoint = generate_share_payout_outpoint(
+                &payout_summary.market_id,
+                &refund.address,
+                block_height,
+                sequence,
+            );
+            state.delete_utxo(txn, &refund_outpoint)?;
         }
 
         tracing::info!(
