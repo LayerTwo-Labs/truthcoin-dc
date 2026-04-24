@@ -429,7 +429,10 @@ mod tests {
 
     #[test]
     fn test_get_current_period_time_mode() {
-        let config = DecisionConfig::default(); // 600 seconds per period
+        let config = DecisionConfig {
+            is_blocks: false,
+            quantity: 600,
+        };
         let genesis_ts = 1000;
 
         // Before genesis

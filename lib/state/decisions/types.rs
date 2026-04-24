@@ -567,7 +567,7 @@ impl Default for DecisionConfig {
     fn default() -> Self {
         Self {
             is_blocks: false,
-            quantity: 600,
+            quantity: 86400,
         }
     }
 }
