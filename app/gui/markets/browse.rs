@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{self, Button, Color32, RichText, ScrollArea, Vec2};
 use truthcoin_dc::math::trading;
-use truthcoin_dc::state::decisions::DecisionId;
+use truthcoin_dc::state::decisions::{Decision, DecisionId};
 use truthcoin_dc::state::{Market, MarketId, MarketState};
 use truthcoin_dc::types::Address;
 
@@ -93,8 +93,9 @@ pub struct Browse {
     selected_market: Option<MarketId>,
     selected_outcome: Option<usize>,
     error: Option<String>,
-    decision_questions: Vec<(DecisionId, String)>,
     cached_decision_info: Option<CachedDecisionInfo>,
+    picker_state: Vec<Option<usize>>,
+    popup_combo: Option<Vec<usize>>,
     sort_by: SortBy,
     selected_tag: Option<String>,
     all_tags: Vec<String>,
@@ -403,8 +404,9 @@ impl Browse {
             self.trading_panel = TradingPanelState::default();
             self.user_positions.clear();
             self.cached_balance_sats = None;
-            self.decision_questions.clear();
             self.cached_decision_info = None;
+            self.picker_state.clear();
+            self.popup_combo = None;
             self.view_mode = ViewMode::Detail;
         }
     }
@@ -668,23 +670,25 @@ impl Browse {
             match combo.first() {
                 Some(0) => return "No".to_string(),
                 Some(1) => return "Yes".to_string(),
-                _ => {}
+                _ => return format!("Outcome {outcome_display_idx}"),
             }
         }
 
-        combo
+        let decisions_map: HashMap<DecisionId, Decision> = market
+            .decision_ids
             .iter()
-            .enumerate()
-            .map(|(dim, &val)| {
-                let val_str = match val {
-                    0 => "No",
-                    1 => "Yes",
-                    _ => "?",
-                };
-                format!("D{}: {}", dim + 1, val_str)
+            .filter_map(|id| {
+                app.node
+                    .get_decision_entry(*id)
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.decision)
+                    .map(|d| (*id, d))
             })
-            .collect::<Vec<_>>()
-            .join(", ")
+            .collect();
+        market
+            .describe_outcome(combo, &decisions_map)
+            .unwrap_or_else(|_| format!("Outcome {outcome_display_idx}"))
     }
 
     fn show_detail_view(&mut self, app: &App, ui: &mut egui::Ui) {
@@ -792,6 +796,8 @@ impl Browse {
                     self.trading_panel = TradingPanelState::default();
                     self.user_positions.clear();
                     self.cached_balance_sats = None;
+                    self.picker_state.clear();
+                    self.popup_combo = None;
                 }
             });
             ui.add_space(5.0);
@@ -800,6 +806,11 @@ impl Browse {
                 self.show_market_info(app, &market, &state, ui);
             });
         });
+
+        if self.popup_combo.is_some() {
+            let ctx = ui.ctx().clone();
+            self.show_outcome_popup(app, &market, &ctx);
+        }
     }
 
     fn load_user_positions(&mut self, app: &App, market: &Market) {
@@ -1064,23 +1075,10 @@ impl Browse {
             .map(|info| info.is_scaled)
             .unwrap_or(false);
 
-        if market.decision_ids.len() > 1 && self.decision_questions.is_empty() {
-            for decision_id in &market.decision_ids {
-                if let Ok(Some(entry)) =
-                    app.node.get_decision_entry(*decision_id)
-                {
-                    let header = entry
-                        .decision
-                        .as_ref()
-                        .map(|d| d.header.clone())
-                        .unwrap_or_else(|| format!("Decision {decision_id:?}"));
-                    self.decision_questions.push((*decision_id, header));
-                }
-            }
-        }
-
         if is_scaled {
             self.show_scaled_market_info(&prices, ui);
+        } else if market.decision_ids.len() > 1 {
+            self.show_trade_builder(app, market, &prices, &valid_combos, ui);
         } else {
             self.show_outcomes_with_probability_bars(
                 app,
@@ -1100,7 +1098,14 @@ impl Browse {
         valid_combos: &[(usize, &Vec<usize>)],
         ui: &mut egui::Ui,
     ) {
-        for (i, (_, combo)) in valid_combos.iter().enumerate() {
+        let mut display_order: Vec<usize> = (0..valid_combos.len()).collect();
+        display_order.sort_by(|&a, &b| {
+            let pa = prices.get(a).copied().unwrap_or(0.0);
+            let pb = prices.get(b).copied().unwrap_or(0.0);
+            pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for &i in &display_order {
             let price = prices.get(i).copied().unwrap_or(0.0);
             let outcome_label =
                 self.get_outcome_label(app, market, i, valid_combos);
@@ -1130,34 +1135,6 @@ impl Browse {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&outcome_label).strong());
-                        if combo.len() > 1 {
-                            let combo_str = combo
-                                .iter()
-                                .enumerate()
-                                .map(|(d, &v)| {
-                                    let decision_name = self
-                                        .decision_questions
-                                        .get(d)
-                                        .map(|(_, q)| {
-                                            if q.len() > 15 {
-                                                format!("{}...", &q[..12])
-                                            } else {
-                                                q.clone()
-                                            }
-                                        })
-                                        .unwrap_or_else(|| {
-                                            format!("D{}", d + 1)
-                                        });
-                                    format!(
-                                        "{}: {}",
-                                        decision_name,
-                                        if v == 1 { "Yes" } else { "No" }
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" | ");
-                            ui.label(RichText::new(combo_str).small().weak());
-                        }
                     });
 
                     ui.with_layout(
@@ -1215,6 +1192,314 @@ impl Browse {
             }
 
             ui.add_space(4.0);
+        }
+    }
+
+    fn picker_options(&self, decision: &Decision) -> Vec<(usize, String)> {
+        if decision.is_categorical() {
+            let labels = decision.get_category_labels().unwrap_or(&[]);
+            let mut opts: Vec<(usize, String)> = labels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (i, l.clone()))
+                .collect();
+            opts.push((labels.len(), "Inconclusive".to_string()));
+            opts
+        } else if decision.is_scaled() {
+            vec![
+                (0, format!("Min: {}", decision.scale_min().unwrap_or(0))),
+                (1, format!("Max: {}", decision.scale_max().unwrap_or(100))),
+            ]
+        } else {
+            let (l0, l1) = decision.get_binary_labels();
+            vec![(0, l0), (1, l1)]
+        }
+    }
+
+    fn show_trade_builder(
+        &mut self,
+        app: &App,
+        market: &Market,
+        prices: &[f64],
+        valid_combos: &[(usize, &Vec<usize>)],
+        ui: &mut egui::Ui,
+    ) {
+        if self.picker_state.len() != market.decision_ids.len() {
+            self.picker_state = vec![None; market.decision_ids.len()];
+        }
+
+        ui.label(RichText::new("Build your outcome").strong().size(14.0));
+        ui.add_space(6.0);
+
+        let decisions: Vec<Option<Decision>> = market
+            .decision_ids
+            .iter()
+            .map(|id| {
+                app.node
+                    .get_decision_entry(*id)
+                    .ok()
+                    .flatten()
+                    .and_then(|e| e.decision)
+            })
+            .collect();
+
+        for (i, decision_opt) in decisions.iter().enumerate() {
+            let Some(decision) = decision_opt else {
+                ui.label(
+                    RichText::new(format!("Decision {} unavailable", i + 1))
+                        .weak(),
+                );
+                continue;
+            };
+
+            ui.label(RichText::new(&decision.header).strong());
+
+            let options = self.picker_options(decision);
+            let current_label = self.picker_state[i]
+                .and_then(|state| {
+                    options
+                        .iter()
+                        .find(|(s, _)| *s == state)
+                        .map(|(_, l)| l.clone())
+                })
+                .unwrap_or_else(|| "-- Select --".to_string());
+
+            let mut new_value = self.picker_state[i];
+            egui::ComboBox::from_id_salt(format!("trade_builder_dim_{i}"))
+                .selected_text(current_label)
+                .width(300.0)
+                .show_ui(ui, |ui| {
+                    for (state, label) in &options {
+                        ui.selectable_value(
+                            &mut new_value,
+                            Some(*state),
+                            label,
+                        );
+                    }
+                });
+
+            if new_value != self.picker_state[i] {
+                self.picker_state[i] = new_value;
+                self.trading_panel.preview = None;
+                self.trading_panel.tx_error = None;
+                self.trading_panel.preview_error = None;
+            }
+
+            ui.add_space(6.0);
+        }
+
+        if self.picker_state.iter().all(|s| s.is_some()) {
+            let combo: Vec<usize> =
+                self.picker_state.iter().filter_map(|s| *s).collect();
+            match market.tradeable_index_for_positions(&combo) {
+                Ok(idx) => {
+                    if self.selected_outcome != Some(idx) {
+                        self.selected_outcome = Some(idx);
+                        self.trading_panel.preview = None;
+                    }
+                }
+                Err(_) => {
+                    self.selected_outcome = None;
+                }
+            }
+        } else {
+            self.selected_outcome = None;
+        }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(RichText::new("Top outcomes").strong().size(14.0));
+        ui.add_space(6.0);
+
+        let decisions_map: HashMap<DecisionId, Decision> = market
+            .decision_ids
+            .iter()
+            .zip(decisions.iter())
+            .filter_map(|(id, opt)| opt.as_ref().map(|d| (*id, d.clone())))
+            .collect();
+
+        let mut indexed: Vec<(usize, &Vec<usize>, f64)> = valid_combos
+            .iter()
+            .enumerate()
+            .map(|(i, (_, combo))| {
+                (i, *combo, prices.get(i).copied().unwrap_or(0.0))
+            })
+            .collect();
+        indexed.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for (tradeable_idx, combo, price) in indexed.into_iter().take(10) {
+            let label = market
+                .describe_outcome(combo, &decisions_map)
+                .unwrap_or_else(|_| format!("Outcome {tradeable_idx}"));
+            let truncated = if label.chars().count() > 60 {
+                let t: String = label.chars().take(57).collect();
+                format!("{t}...")
+            } else {
+                label
+            };
+
+            let is_selected = self.selected_outcome == Some(tradeable_idx);
+            let bar_color = GREEN;
+
+            let frame = egui::Frame::new()
+                .fill(if is_selected {
+                    bar_color.gamma_multiply(0.15)
+                } else {
+                    ui.visuals().widgets.noninteractive.bg_fill
+                })
+                .stroke(if is_selected {
+                    egui::Stroke::new(2.0, bar_color)
+                } else {
+                    ui.visuals().widgets.noninteractive.bg_stroke
+                })
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 8));
+
+            let mut info_clicked = false;
+            let response = frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&truncated).size(13.0));
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .small_button("⋯")
+                                .on_hover_text("Show full outcome")
+                                .clicked()
+                            {
+                                info_clicked = true;
+                            }
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(format!("{:.1}%", price * 100.0))
+                                    .strong()
+                                    .size(13.0)
+                                    .color(bar_color),
+                            );
+                        },
+                    );
+                });
+            });
+
+            if info_clicked {
+                self.popup_combo = Some(combo.clone());
+            } else {
+                let row_response =
+                    response.response.interact(egui::Sense::click());
+                if row_response.clicked() {
+                    self.picker_state =
+                        combo.iter().map(|s| Some(*s)).collect();
+                    self.selected_outcome = Some(tradeable_idx);
+                    self.trading_panel.amount_input.clear();
+                    self.trading_panel.preview = None;
+                    self.trading_panel.tx_error = None;
+                    self.trading_panel.preview_error = None;
+                }
+                if row_response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            }
+
+            ui.add_space(4.0);
+        }
+    }
+
+    fn show_outcome_popup(
+        &mut self,
+        app: &App,
+        market: &Market,
+        ctx: &egui::Context,
+    ) {
+        let Some(combo) = self.popup_combo.clone() else {
+            return;
+        };
+
+        let mut keep_open = true;
+        let mut close_clicked = false;
+
+        egui::Window::new("Outcome detail")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut keep_open)
+            .show(ctx, |ui| {
+                for (i, &state) in combo.iter().enumerate() {
+                    let Some(decision_id) = market.decision_ids.get(i) else {
+                        continue;
+                    };
+                    let Some(decision) = app
+                        .node
+                        .get_decision_entry(*decision_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|e| e.decision)
+                    else {
+                        ui.label(format!("Decision {} unavailable", i + 1));
+                        continue;
+                    };
+
+                    let value = if decision.is_categorical() {
+                        let labels =
+                            decision.get_category_labels().unwrap_or(&[]);
+                        labels
+                            .get(state)
+                            .cloned()
+                            .unwrap_or_else(|| "Inconclusive".to_string())
+                    } else if decision.is_scaled() {
+                        match state {
+                            0 => format!(
+                                "{} (Min)",
+                                decision.scale_min().unwrap_or(0)
+                            ),
+                            1 => format!(
+                                "{} (Max)",
+                                decision.scale_max().unwrap_or(100)
+                            ),
+                            _ => "Abstain".to_string(),
+                        }
+                    } else {
+                        let (l0, l1) = decision.get_binary_labels();
+                        match state {
+                            0 => l0,
+                            1 => l1,
+                            _ => "Abstain".to_string(),
+                        }
+                    };
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{}:", decision.header))
+                                .strong(),
+                        );
+                        ui.label(value);
+                    });
+                    ui.add_space(2.0);
+                }
+
+                ui.add_space(8.0);
+                if let Ok(idx) = market.tradeable_index_for_positions(&combo) {
+                    let beta = app
+                        .node
+                        .get_market_beta(&market.id, market)
+                        .unwrap_or(0.0);
+                    let prices = market.current_prices(beta).to_vec();
+                    if let Some(p) = prices.get(idx) {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Probability:").strong());
+                            ui.label(format!("{:.2}%", p * 100.0));
+                        });
+                    }
+                }
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    close_clicked = true;
+                }
+            });
+
+        if !keep_open || close_clicked {
+            self.popup_combo = None;
         }
     }
 
@@ -1540,11 +1825,12 @@ impl Browse {
                     );
                 });
             } else {
-                ui.label(
-                    RichText::new("Select an outcome to trade")
-                        .weak()
-                        .italics(),
-                );
+                let hint = if market.decision_ids.len() > 1 {
+                    "Pick a value for each dimension to enable trading"
+                } else {
+                    "Select an outcome to trade"
+                };
+                ui.label(RichText::new(hint).weak().italics());
                 return;
             }
 

@@ -14,6 +14,8 @@ struct ClaimedDecisionInfo {
     decision_id_hex: String,
     header: String,
     is_scaled: bool,
+    is_categorical: bool,
+    option_count: usize,
     claiming_txid: [u8; 32],
 }
 
@@ -110,6 +112,10 @@ impl CreateMarket {
                                 decision_id_hex: decision_id_hex.clone(),
                                 header: decision.header.clone(),
                                 is_scaled: decision.is_scaled(),
+                                is_categorical: decision.is_categorical(),
+                                option_count: decision
+                                    .option_count()
+                                    .unwrap_or(2),
                                 claiming_txid: claiming_txid_bytes,
                             });
 
@@ -166,10 +172,12 @@ impl CreateMarket {
                             .collect::<Vec<_>>()
                             .join(",")
                     ))
-                } else if !non_empty.is_empty() {
-                    Some(non_empty[0].clone())
+                } else if non_empty.len() == 1
+                    && self.is_categorical_decision(non_empty[0])
+                {
+                    Some(format!("[{}]", non_empty[0]))
                 } else {
-                    None
+                    Some(non_empty[0].clone())
                 }
             })
             .collect();
@@ -181,18 +189,38 @@ impl CreateMarket {
         }
     }
 
+    fn is_categorical_decision(&self, decision_id_hex: &str) -> bool {
+        self.claimed_decisions
+            .iter()
+            .find(|d| d.decision_id_hex == decision_id_hex)
+            .map(|d| d.is_categorical)
+            .unwrap_or(false)
+    }
+
+    fn option_count_for(&self, decision_id_hex: &str) -> Option<usize> {
+        self.claimed_decisions
+            .iter()
+            .find(|d| d.decision_id_hex == decision_id_hex)
+            .filter(|d| d.is_categorical)
+            .map(|d| d.option_count)
+    }
+
     fn calculate_outcome_count(&self) -> usize {
         let mut count = 1usize;
 
         for dim in &self.dimensions {
-            let non_empty_decisions =
-                dim.decision_ids.iter().filter(|s| !s.is_empty()).count();
-            if non_empty_decisions == 0 {
+            let non_empty: Vec<&String> =
+                dim.decision_ids.iter().filter(|s| !s.is_empty()).collect();
+            if non_empty.is_empty() {
                 continue;
             }
 
-            if dim.is_categorical && non_empty_decisions >= 2 {
-                count *= non_empty_decisions;
+            if dim.is_categorical && non_empty.len() >= 2 {
+                count *= non_empty.len();
+            } else if non_empty.len() == 1
+                && let Some(n) = self.option_count_for(non_empty[0])
+            {
+                count *= n;
             } else {
                 count *= 2;
             }
@@ -472,6 +500,13 @@ impl CreateMarket {
                                         {
                                             continue;
                                         }
+                                        let kind_suffix = if claimed.is_scaled {
+                                            " [Scaled]".to_string()
+                                        } else if claimed.is_categorical {
+                                            format!(" [Categorical: {}]", claimed.option_count)
+                                        } else {
+                                            String::new()
+                                        };
                                         let label = format!(
                                             "{} - {}{}",
                                             claimed.decision_id_hex,
@@ -480,7 +515,7 @@ impl CreateMarket {
                                             } else {
                                                 claimed.header.clone()
                                             },
-                                            if claimed.is_scaled { " [Scaled]" } else { "" }
+                                            kind_suffix
                                         );
                                         ui.selectable_value(
                                             &mut new_value,

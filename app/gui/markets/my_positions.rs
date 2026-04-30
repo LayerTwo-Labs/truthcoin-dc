@@ -170,7 +170,7 @@ impl MyPositions {
                                     })
                                 })
                         })
-                        .unwrap_or_else(|| format!("D{}", dim + 1));
+                        .unwrap_or_else(|| format!("Decision {}", dim + 1));
                     format!("{question}: {val_str}")
                 })
                 .collect::<Vec<_>>()
