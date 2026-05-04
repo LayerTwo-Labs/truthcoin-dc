@@ -3,11 +3,13 @@ resolver = "2"
 members = ["app", "cli", "integration_tests", "lib", "rpc-api"]
 
 [workspace.package]
-authors = ["Ash Manning <ash@layertwolabs.com>"]
+authors = ["Ash Manning <ash@layertwolabs.com>",
+           "Marc Platt <plattmarc@proton.me>",
+]
 edition = "2024"
 license-file = "LICENSE.txt"
 publish = false
-version = "0.14.3"
+version = "0.14.4"
 
 [workspace.dependencies]
 anyhow = "1.0.72"
