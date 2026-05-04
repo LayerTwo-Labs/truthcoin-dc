@@ -183,12 +183,22 @@ where
             //   access behaviour on SSDs used in testing.
             // - NO_TLS stops LMDB from relying on thread-local storage for
             //   reader slots so transactions can be moved across Tokio tasks.
+            // WRITE_MAP/MAP_ASYNC/NO_READ_AHEAD are gated off on
+            // Windows: LMDB's writable-mmap path returns
+            // ERROR_INVALID_HANDLE on commit there, and
+            // NO_READ_AHEAD has no effect without posix_madvise.
+            // NO_SYNC/NO_META_SYNC/NO_TLS are kept on every platform
+            // since their tradeoffs are OS-independent.
+            #[cfg(not(windows))]
             let fast_flags = EnvFlags::WRITE_MAP
                 | EnvFlags::MAP_ASYNC
                 | EnvFlags::NO_SYNC
                 | EnvFlags::NO_META_SYNC
                 | EnvFlags::NO_READ_AHEAD
                 | EnvFlags::NO_TLS;
+            #[cfg(windows)]
+            let fast_flags =
+                EnvFlags::NO_SYNC | EnvFlags::NO_META_SYNC | EnvFlags::NO_TLS;
             unsafe { env_open_opts.flags(fast_flags) };
             unsafe { Env::open(&env_open_opts, &env_path) }?
         };

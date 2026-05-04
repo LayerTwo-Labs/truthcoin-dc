@@ -208,10 +208,17 @@ impl Wallet {
             // because the seed and key material cannot be
             // reconstructed from the chain. The DB is small (~10MB)
             // and low write volume, so fsync cost is negligible.
+            // WRITE_MAP/MAP_ASYNC/NO_READ_AHEAD are gated off on
+            // Windows: LMDB's writable-mmap path returns
+            // ERROR_INVALID_HANDLE on commit there, and
+            // NO_READ_AHEAD has no effect without posix_madvise.
+            #[cfg(not(windows))]
             let fast_flags = EnvFlags::WRITE_MAP
                 | EnvFlags::MAP_ASYNC
                 | EnvFlags::NO_READ_AHEAD
                 | EnvFlags::NO_TLS;
+            #[cfg(windows)]
+            let fast_flags = EnvFlags::NO_TLS;
             unsafe { env_open_options.flags(fast_flags) };
             unsafe { Env::open(&env_open_options, path) }
                 .map_err(EnvError::from)?
