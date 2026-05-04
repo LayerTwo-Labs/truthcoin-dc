@@ -1850,7 +1850,7 @@ async fn roundtrip_task_inner(
         anyhow::ensure!(
             !market_data.decision_ids.is_empty(),
             "Market {} has no decisions",
-            &market_summary.market_id
+            market_summary.market_id
         );
         let market_decision_id = &market_data.decision_ids[0];
         let expected_outcome = consensus_results
@@ -1868,7 +1868,7 @@ async fn roundtrip_task_inner(
             anyhow::ensure!(
                 !resolution.winning_outcomes.is_empty(),
                 "Market {} should have winning outcomes for consensus 1.0",
-                &market_summary.market_id
+                market_summary.market_id
             );
             let yes_outcome = resolution
                 .winning_outcomes
@@ -1886,7 +1886,7 @@ async fn roundtrip_task_inner(
             anyhow::ensure!(
                 !resolution.winning_outcomes.is_empty(),
                 "Market {} should have winning outcomes for consensus 0.0",
-                &market_summary.market_id
+                market_summary.market_id
             );
             let no_outcome = resolution
                 .winning_outcomes
@@ -2633,7 +2633,7 @@ async fn roundtrip_task_inner(
             anyhow::ensure!(
                 (price_sum - 1.0).abs() < expected::PRICE_SUM_TOLERANCE,
                 "LMSR invariant violated for market {}: prices sum to {}",
-                &market.market_id,
+                market.market_id,
                 price_sum
             );
         }
