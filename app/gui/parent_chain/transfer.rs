@@ -1,4 +1,4 @@
-use eframe::egui::{self, Button};
+use eframe::egui::{self, Button, Color32};
 
 use crate::app::App;
 
@@ -6,6 +6,7 @@ use crate::app::App;
 pub struct Deposit {
     amount: String,
     fee: String,
+    error: Option<String>,
 }
 
 impl Deposit {
@@ -53,9 +54,15 @@ impl Deposit {
                 fee.expect("should not happen"),
             ) {
                 tracing::error!("{err}");
+                self.error = Some(format!("{err:#}"));
             } else {
                 *self = Self::default();
             }
+        }
+
+        if let Some(err) = &self.error {
+            ui.add_space(5.0);
+            ui.colored_label(Color32::RED, err);
         }
     }
 }
@@ -66,6 +73,7 @@ pub struct Withdrawal {
     amount: String,
     fee: String,
     mainchain_fee: String,
+    error: Option<String>,
 }
 
 fn create_withdrawal(
@@ -104,7 +112,8 @@ impl Withdrawal {
                         }
                         Err(err) => {
                             let err = anyhow::Error::new(err);
-                            tracing::error!("{err:#}")
+                            tracing::error!("{err:#}");
+                            self.error = Some(format!("{err:#}"));
                         }
                     };
                 }
@@ -177,9 +186,15 @@ impl Withdrawal {
                 mainchain_fee.expect("should not happen"),
             ) {
                 tracing::error!("{err:#}");
+                self.error = Some(format!("{err:#}"));
             } else {
                 *self = Self::default();
             }
+        }
+
+        if let Some(err) = &self.error {
+            ui.add_space(5.0);
+            ui.colored_label(Color32::RED, err);
         }
     }
 }
