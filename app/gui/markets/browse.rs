@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{self, Button, Color32, RichText, ScrollArea, Vec2};
 use truthcoin_dc::math::trading;
-use truthcoin_dc::state::decisions::{Decision, DecisionId};
+use truthcoin_dc::state::decisions::{Decision, DecisionId, DecisionType};
 use truthcoin_dc::state::{Market, MarketId, MarketState};
 use truthcoin_dc::types::Address;
 
@@ -50,6 +50,12 @@ pub struct TradingPanelState {
     pub is_processing: bool,
     pub tx_error: Option<String>,
     pub preview_error: Option<String>,
+}
+
+#[derive(Default)]
+pub struct AmplifyPanelState {
+    pub amount_sats_input: String,
+    pub tx_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -103,6 +109,7 @@ pub struct Browse {
     show_resolved: bool,
     view_mode: ViewMode,
     trading_panel: TradingPanelState,
+    amplify_panel: AmplifyPanelState,
     user_positions: Vec<UserPosition>,
     cached_balance_sats: Option<u64>,
     market_voting_status: HashMap<MarketId, MarketVotingStatus>,
@@ -110,9 +117,7 @@ pub struct Browse {
 
 #[derive(Clone)]
 struct CachedDecisionInfo {
-    is_scaled: bool,
-    min: i64,
-    max: i64,
+    decision_type: DecisionType,
     #[allow(dead_code)]
     header: String,
 }
@@ -260,29 +265,28 @@ impl Browse {
                     self.apply_filters_and_sort();
                 }
 
-                ui.add_space(20.0);
-
-                ui.label("Sort:");
-                for sort_option in [
-                    SortBy::Popular,
-                    SortBy::Newest,
-                    SortBy::MostActive,
-                    SortBy::HighestLiquidity,
-                ] {
-                    let is_selected = self.sort_by == sort_option;
-                    if ui
-                        .selectable_label(is_selected, sort_option.label())
-                        .clicked()
-                    {
-                        self.sort_by = sort_option;
-                        self.apply_filters_and_sort();
-                    }
-                }
-
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        ui.checkbox(&mut self.show_resolved, "Show Resolved");
+                        for sort_option in [
+                            SortBy::HighestLiquidity,
+                            SortBy::MostActive,
+                            SortBy::Newest,
+                            SortBy::Popular,
+                        ] {
+                            let is_selected = self.sort_by == sort_option;
+                            if ui
+                                .selectable_label(
+                                    is_selected,
+                                    sort_option.label(),
+                                )
+                                .clicked()
+                            {
+                                self.sort_by = sort_option;
+                                self.apply_filters_and_sort();
+                            }
+                        }
+                        ui.label("Sort:");
                         if ui.button("Refresh").clicked() {
                             self.refresh_markets(app);
                         }
@@ -333,11 +337,44 @@ impl Browse {
         ui.separator();
 
         ui.add_space(5.0);
+        if ui
+            .checkbox(&mut self.show_resolved, "Show Resolved")
+            .changed()
+        {
+            self.apply_filters_and_sort();
+        }
+        ui.add_space(5.0);
+        ui.separator();
+
+        ui.add_space(5.0);
         ui.label(RichText::new("Tags").strong());
         ui.add_space(5.0);
 
+        let show_resolved = self.show_resolved;
+        let search_query = self.search_query.to_lowercase();
+        let matches_visibility = |m: &Market, s: &MarketState| -> bool {
+            if !show_resolved && *s != MarketState::Trading {
+                return false;
+            }
+            if !search_query.is_empty()
+                && !m.title.to_lowercase().contains(&search_query)
+                && !m.description.to_lowercase().contains(&search_query)
+            {
+                return false;
+            }
+            true
+        };
+
+        let all_count = self
+            .markets
+            .iter()
+            .filter(|(m, s)| matches_visibility(m, s))
+            .count();
         if ui
-            .selectable_label(self.selected_tag.is_none(), "All Markets")
+            .selectable_label(
+                self.selected_tag.is_none(),
+                format!("All Markets ({all_count})"),
+            )
             .clicked()
         {
             self.selected_tag = None;
@@ -352,9 +389,16 @@ impl Browse {
                 let count = self
                     .markets
                     .iter()
-                    .filter(|(m, _)| m.tags.contains(&tag))
+                    .filter(|(m, s)| {
+                        m.tags.contains(&tag) && matches_visibility(m, s)
+                    })
                     .count();
-                let label = format!("{tag} ({count})");
+                let label_text = format!("{tag} ({count})");
+                let label = if count == 0 {
+                    RichText::new(label_text).weak()
+                } else {
+                    RichText::new(label_text)
+                };
 
                 if ui.selectable_label(is_selected, label).clicked() {
                     if is_selected {
@@ -402,6 +446,7 @@ impl Browse {
             self.selected_market = Some(market_id);
             self.selected_outcome = None;
             self.trading_panel = TradingPanelState::default();
+            self.amplify_panel = AmplifyPanelState::default();
             self.user_positions.clear();
             self.cached_balance_sats = None;
             self.cached_decision_info = None;
@@ -478,7 +523,7 @@ impl Browse {
                     ("LIVE", egui::Color32::from_rgb(0, 200, 83))
                 }
             }
-            MarketState::Ossified => {
+            MarketState::Settled => {
                 ("RESOLVED", egui::Color32::from_rgb(100, 149, 237))
             }
             MarketState::Cancelled => {
@@ -732,6 +777,11 @@ impl Browse {
 
         let is_trading = matches!(state, MarketState::Trading);
         let trading_enabled = is_trading && !all_decisions_voting;
+        let is_market_creator = app
+            .wallet
+            .get_addresses()
+            .map(|addrs| addrs.contains(&market.creator_address))
+            .unwrap_or(false);
 
         egui::SidePanel::right("trading_panel")
             .default_width(340.0)
@@ -755,6 +805,11 @@ impl Browse {
                         ui.add_space(10.0);
                     }
                     self.show_trading_panel(app, &market, ui);
+                    if is_market_creator {
+                        ui.add_space(10.0);
+                        ui.separator();
+                        self.show_amplify_panel(app, &market, ui);
+                    }
                 } else {
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
@@ -768,7 +823,7 @@ impl Browse {
                             ui.label("Trading disabled - all decisions are in voting.");
                         } else {
                             let (state_text, state_color) = match state {
-                                MarketState::Ossified => {
+                                MarketState::Settled => {
                                     ("RESOLVED", Color32::from_rgb(100, 149, 237))
                                 }
                                 MarketState::Cancelled => ("CANCELLED", RED),
@@ -794,6 +849,7 @@ impl Browse {
                     self.selected_market = None;
                     self.selected_outcome = None;
                     self.trading_panel = TradingPanelState::default();
+                    self.amplify_panel = AmplifyPanelState::default();
                     self.user_positions.clear();
                     self.cached_balance_sats = None;
                     self.picker_state.clear();
@@ -915,7 +971,7 @@ impl Browse {
                         ("LIVE", GREEN)
                     }
                 }
-                MarketState::Ossified => {
+                MarketState::Settled => {
                     ("RESOLVED", Color32::from_rgb(100, 149, 237))
                 }
                 MarketState::Cancelled => ("CANCELLED", RED),
@@ -1062,9 +1118,7 @@ impl Browse {
             && let Some(decision) = &entry.decision
         {
             self.cached_decision_info = Some(CachedDecisionInfo {
-                is_scaled: decision.is_scaled(),
-                min: decision.scale_min().unwrap_or(0),
-                max: decision.scale_max().unwrap_or(100),
+                decision_type: decision.decision_type.clone(),
                 header: decision.header.clone(),
             });
         }
@@ -1072,7 +1126,9 @@ impl Browse {
         let is_scaled = self
             .cached_decision_info
             .as_ref()
-            .map(|info| info.is_scaled)
+            .map(|info| {
+                matches!(info.decision_type, DecisionType::Scaled { .. })
+            })
             .unwrap_or(false);
 
         if is_scaled {
@@ -1207,8 +1263,8 @@ impl Browse {
             opts
         } else if decision.is_scaled() {
             vec![
-                (0, format!("Min: {}", decision.scale_min().unwrap_or(0))),
-                (1, format!("Max: {}", decision.scale_max().unwrap_or(100))),
+                (0, format!("Min: {}", decision.scale_min().unwrap_or(0.0))),
+                (1, format!("Max: {}", decision.scale_max().unwrap_or(100.0))),
             ]
         } else {
             let (l0, l1) = decision.get_binary_labels();
@@ -1451,11 +1507,11 @@ impl Browse {
                         match state {
                             0 => format!(
                                 "{} (Min)",
-                                decision.scale_min().unwrap_or(0)
+                                decision.scale_min().unwrap_or(0.0)
                             ),
                             1 => format!(
                                 "{} (Max)",
-                                decision.scale_max().unwrap_or(100)
+                                decision.scale_max().unwrap_or(100.0)
                             ),
                             _ => "Abstain".to_string(),
                         }
@@ -1508,6 +1564,10 @@ impl Browse {
             ui.label("Unable to load decision info");
             return;
         };
+        let DecisionType::Scaled { min, max, .. } = info.decision_type else {
+            ui.label("Unable to load decision info");
+            return;
+        };
 
         let p_min = prices.first().copied().unwrap_or(0.5);
         let p_max = prices.get(1).copied().unwrap_or(0.5);
@@ -1520,8 +1580,7 @@ impl Browse {
         } else {
             0.5
         };
-        let implied_value =
-            info.min as f64 + normalized_value * (info.max - info.min) as f64;
+        let implied_value = min + normalized_value * (max - min);
 
         ui.label(RichText::new("Scaled Decision Market").italics().weak());
         ui.add_space(10.0);
@@ -1594,13 +1653,9 @@ impl Browse {
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{}", info.min)).color(RED),
-                        );
+                        ui.label(RichText::new(format!("{min}")).color(RED));
                         ui.add_space(slider_width - 60.0);
-                        ui.label(
-                            RichText::new(format!("{}", info.max)).color(GREEN),
-                        );
+                        ui.label(RichText::new(format!("{max}")).color(GREEN));
                     });
                 });
             });
@@ -1613,15 +1668,13 @@ impl Browse {
                 .spacing([20.0, 4.0])
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(format!("Lower ({}):", info.min))
-                            .color(RED),
+                        RichText::new(format!("Lower ({min}):")).color(RED),
                     );
                     ui.label(format!("{:.1}%", p_min * 100.0));
                     ui.end_row();
 
                     ui.label(
-                        RichText::new(format!("Higher ({}):", info.max))
-                            .color(GREEN),
+                        RichText::new(format!("Higher ({max}):")).color(GREEN),
                     );
                     ui.label(format!("{:.1}%", p_max * 100.0));
                     ui.end_row();
@@ -1655,8 +1708,7 @@ impl Browse {
         let lower_response = lower_frame.show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("Lower (toward {})", info.min))
-                        .strong(),
+                    RichText::new(format!("Lower (toward {min})")).strong(),
                 );
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
@@ -1704,8 +1756,7 @@ impl Browse {
         let higher_response = higher_frame.show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("Higher (toward {})", info.max))
-                        .strong(),
+                    RichText::new(format!("Higher (toward {max})")).strong(),
                 );
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
@@ -2344,6 +2395,91 @@ impl Browse {
         } else {
             self.execute_sell(app, market, outcome_idx, &preview);
         }
+    }
+
+    fn show_amplify_panel(
+        &mut self,
+        app: &App,
+        market: &Market,
+        ui: &mut egui::Ui,
+    ) {
+        ui.vertical(|ui| {
+            ui.add_space(5.0);
+            ui.label(RichText::new("Amplify Liquidity").strong());
+            ui.label(
+                RichText::new(
+                    "Deposit sats into this market's treasury to deepen LMSR liquidity.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(5.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Amount (sats):");
+                ui.add(
+                    egui::TextEdit::singleline(
+                        &mut self.amplify_panel.amount_sats_input,
+                    )
+                    .desired_width(140.0),
+                );
+            });
+
+            ui.add_space(5.0);
+            let clicked = ui
+                .add(Button::new(RichText::new("Amplify").strong()))
+                .clicked();
+
+            if clicked {
+                self.amplify_panel.tx_error = None;
+                let amount: u64 = match self
+                    .amplify_panel
+                    .amount_sats_input
+                    .trim()
+                    .parse()
+                {
+                    Ok(v) if v > 0 => v,
+                    Ok(_) => {
+                        self.amplify_panel.tx_error =
+                            Some("Amount must be greater than zero".to_string());
+                        return;
+                    }
+                    Err(_) => {
+                        self.amplify_panel.tx_error =
+                            Some("Invalid amount".to_string());
+                        return;
+                    }
+                };
+                match app.wallet.amplify_beta(
+                    market.id,
+                    amount,
+                    market.creator_address,
+                ) {
+                    Ok(tx) => {
+                        if let Err(e) = app.sign_and_send(tx) {
+                            self.amplify_panel.tx_error =
+                                Some(format!("Failed to send: {e:#}"));
+                        } else {
+                            tracing::info!(
+                                "AmplifyBeta submitted: market {:?} amount {} sats",
+                                market.id,
+                                amount,
+                            );
+                            self.amplify_panel.amount_sats_input.clear();
+                        }
+                    }
+                    Err(e) => {
+                        self.amplify_panel.tx_error =
+                            Some(format!("Failed to build tx: {e:#}"));
+                    }
+                }
+            }
+
+            if let Some(err) = &self.amplify_panel.tx_error {
+                ui.add_space(5.0);
+                ui.colored_label(RED, RichText::new(err).small());
+            }
+        });
     }
 
     fn execute_buy(
