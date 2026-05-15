@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use fallible_iterator::FallibleIterator as _;
 use futures::{Stream, StreamExt};
@@ -11,8 +11,8 @@ use tokio_stream::{StreamMap, wrappers::WatchStream};
 
 use crate::{
     types::{
-        Address, AuthorizedTransaction, InPoint, OutPoint, Output, Txid,
-        VERSION, Version,
+        Address, AuthorizedTransaction, InPoint, OutPoint, Output, Transaction,
+        Txid, VERSION, Version,
     },
     util::Watchable,
 };
@@ -203,13 +203,11 @@ impl MemPool {
     }
 
     /// Extract decision IDs being claimed by this transaction
-    fn get_claimed_decision_ids(
-        transaction: &AuthorizedTransaction,
-    ) -> Vec<[u8; 3]> {
+    fn get_claimed_decision_ids(transaction: &Transaction) -> Vec<[u8; 3]> {
         use crate::types::TransactionData;
 
         let mut decision_ids = Vec::new();
-        if let Some(ref data) = transaction.transaction.data
+        if let Some(ref data) = transaction.data
             && let TransactionData::ClaimDecision { decisions, .. } = data
         {
             for entry in decisions {
@@ -257,7 +255,8 @@ impl MemPool {
         rwtxn: &mut RwTxn,
         transaction: &AuthorizedTransaction,
     ) -> Result<(), Error> {
-        let decision_ids = Self::get_claimed_decision_ids(transaction);
+        let decision_ids =
+            Self::get_claimed_decision_ids(&transaction.transaction);
         for decision_id in decision_ids {
             self.pending_decision_claims.delete(rwtxn, &decision_id)?;
         }
@@ -291,7 +290,8 @@ impl MemPool {
         }
 
         // Check for duplicate decision claims first
-        let claimed_decisions = Self::get_claimed_decision_ids(transaction);
+        let claimed_decisions =
+            Self::get_claimed_decision_ids(&transaction.transaction);
         if !claimed_decisions.is_empty() {
             self.put_decision_claims(rwtxn, txid, &claimed_decisions)?;
         }
@@ -353,6 +353,38 @@ impl MemPool {
             }
         }
         Ok(())
+    }
+
+    /// Evict mempool transactions that conflict with `confirmed_tx` on a
+    /// `decision_id`. Used after a block confirms a decision-claim to drop
+    /// zombie competitors that lost the propagation race or a reorg.
+    ///
+    /// Returns the txids that were evicted (empty if `confirmed_tx` is not a
+    /// `ClaimDecision` or no conflicts exist). Cascades through `delete()`,
+    /// so any descendants of evicted zombies are also removed.
+    pub fn evict_decision_claim_conflicts(
+        &self,
+        rwtxn: &mut RwTxn,
+        confirmed_tx: &Transaction,
+    ) -> Result<Vec<Txid>, Error> {
+        let confirmed_txid = confirmed_tx.txid();
+        let mut evicted = Vec::new();
+        for decision_id in Self::get_claimed_decision_ids(confirmed_tx) {
+            if let Some(zombie_txid) =
+                self.pending_decision_claims.try_get(rwtxn, &decision_id)?
+                && zombie_txid != confirmed_txid
+            {
+                tracing::info!(
+                    decision_id = %hex::encode(decision_id),
+                    %zombie_txid,
+                    %confirmed_txid,
+                    "evicting zombie decision-claim conflict"
+                );
+                self.delete(rwtxn, zombie_txid)?;
+                evicted.push(zombie_txid);
+            }
+        }
+        Ok(evicted)
     }
 
     fn delete_trade_order(
@@ -482,6 +514,19 @@ impl MemPool {
             .collect();
         Ok(res)
     }
+
+    pub fn pending_decision_claim_ids(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<BTreeSet<[u8; 3]>, Error> {
+        self.pending_decision_claims
+            .iter(rotxn)
+            .map_err(DbError::from)?
+            .map(|(decision_id, _txid)| Ok(decision_id))
+            .collect()
+            .map_err(DbError::from)
+            .map_err(Error::from)
+    }
 }
 
 impl Watchable<()> for MemPool {
@@ -504,4 +549,243 @@ impl Watchable<()> for MemPool {
             ()
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::decisions::DecisionType;
+    use crate::types::{
+        Authorized, DecisionClaimEntry, TransactionData, hashes::Hash,
+    };
+    use sneed::Env;
+
+    fn make_env() -> (Env, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("data.mdb");
+        std::fs::create_dir_all(&env_path).unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(MemPool::NUM_DBS);
+        let env = unsafe { Env::open(&opts, &env_path) }.unwrap();
+        (env, dir)
+    }
+
+    fn input_outpoint(seed: u8) -> OutPoint {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        OutPoint::Regular {
+            txid: Txid(Hash::from(bytes)),
+            vout: 0,
+        }
+    }
+
+    fn claim_entry(decision_id: [u8; 3]) -> DecisionClaimEntry {
+        DecisionClaimEntry {
+            decision_id_bytes: decision_id,
+            header: "h".to_string(),
+            description: String::new(),
+            option_0_label: None,
+            option_1_label: None,
+            option_labels: None,
+            tags: None,
+        }
+    }
+
+    fn claim_tx(
+        input_seed: u8,
+        decision_ids: &[[u8; 3]],
+    ) -> AuthorizedTransaction {
+        let entries: Vec<DecisionClaimEntry> =
+            decision_ids.iter().copied().map(claim_entry).collect();
+        let tx = Transaction {
+            inputs: vec![input_outpoint(input_seed)],
+            outputs: vec![],
+            memo: Vec::new(),
+            data: Some(TransactionData::ClaimDecision {
+                decision_type: DecisionType::Binary,
+                decisions: entries,
+            }),
+        };
+        Authorized {
+            transaction: tx,
+            authorizations: vec![],
+            actor_proof: None,
+        }
+    }
+
+    fn regular_tx(input_seed: u8) -> AuthorizedTransaction {
+        let tx = Transaction {
+            inputs: vec![input_outpoint(input_seed)],
+            outputs: vec![],
+            memo: Vec::new(),
+            data: None,
+        };
+        Authorized {
+            transaction: tx,
+            authorizations: vec![],
+            actor_proof: None,
+        }
+    }
+
+    #[test]
+    fn evict_basic_conflict() {
+        let (env, _dir) = make_env();
+        let mempool = MemPool::new(&env).unwrap();
+        let did: [u8; 3] = [0x42, 0, 0];
+
+        let tx_a = claim_tx(1, &[did]);
+        let tx_b = claim_tx(2, &[did]);
+        let txid_a = tx_a.transaction.txid();
+        let txid_b = tx_b.transaction.txid();
+
+        let mut rwtxn = env.write_txn().unwrap();
+        mempool.put(&mut rwtxn, &tx_b).unwrap();
+        assert_eq!(
+            mempool
+                .pending_decision_claims
+                .try_get(&rwtxn, &did)
+                .unwrap(),
+            Some(txid_b),
+        );
+
+        let evicted = mempool
+            .evict_decision_claim_conflicts(&mut rwtxn, &tx_a.transaction)
+            .unwrap();
+
+        assert_eq!(evicted, vec![txid_b]);
+        assert!(
+            mempool
+                .pending_decision_claims
+                .try_get(&rwtxn, &did)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mempool
+                .transactions
+                .try_get(&rwtxn, &txid_b)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mempool
+                .transactions
+                .try_get(&rwtxn, &txid_a)
+                .unwrap()
+                .is_none(),
+            "tx_a was never inserted; helper should not insert it"
+        );
+        rwtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn evict_noop_when_in_block_tx_equals_pending_claim() {
+        let (env, _dir) = make_env();
+        let mempool = MemPool::new(&env).unwrap();
+        let did: [u8; 3] = [1, 2, 3];
+
+        let tx_a = claim_tx(7, &[did]);
+        let txid_a = tx_a.transaction.txid();
+
+        let mut rwtxn = env.write_txn().unwrap();
+        mempool.put(&mut rwtxn, &tx_a).unwrap();
+
+        let evicted = mempool
+            .evict_decision_claim_conflicts(&mut rwtxn, &tx_a.transaction)
+            .unwrap();
+
+        assert!(evicted.is_empty());
+        assert_eq!(
+            mempool
+                .pending_decision_claims
+                .try_get(&rwtxn, &did)
+                .unwrap(),
+            Some(txid_a),
+        );
+        assert!(
+            mempool
+                .transactions
+                .try_get(&rwtxn, &txid_a)
+                .unwrap()
+                .is_some()
+        );
+        rwtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn evict_noop_when_tx_is_not_claim_decision() {
+        let (env, _dir) = make_env();
+        let mempool = MemPool::new(&env).unwrap();
+        let did: [u8; 3] = [9, 9, 9];
+
+        let zombie = claim_tx(3, &[did]);
+        let txid_zombie = zombie.transaction.txid();
+        let confirmed_regular = regular_tx(4);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        mempool.put(&mut rwtxn, &zombie).unwrap();
+
+        let evicted = mempool
+            .evict_decision_claim_conflicts(
+                &mut rwtxn,
+                &confirmed_regular.transaction,
+            )
+            .unwrap();
+
+        assert!(evicted.is_empty());
+        assert_eq!(
+            mempool
+                .pending_decision_claims
+                .try_get(&rwtxn, &did)
+                .unwrap(),
+            Some(txid_zombie),
+            "regular tx should not touch decision-claim state"
+        );
+        rwtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn evict_multi_decision_partial_overlap_clears_all_zombie_rows() {
+        let (env, _dir) = make_env();
+        let mempool = MemPool::new(&env).unwrap();
+        let x: [u8; 3] = [1, 1, 1];
+        let y: [u8; 3] = [2, 2, 2];
+        let z: [u8; 3] = [3, 3, 3];
+
+        let zombie = claim_tx(5, &[x, z]);
+        let txid_zombie = zombie.transaction.txid();
+        let confirmed = claim_tx(6, &[x, y]);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        mempool.put(&mut rwtxn, &zombie).unwrap();
+
+        let evicted = mempool
+            .evict_decision_claim_conflicts(&mut rwtxn, &confirmed.transaction)
+            .unwrap();
+
+        assert_eq!(evicted, vec![txid_zombie]);
+        assert!(
+            mempool
+                .pending_decision_claims
+                .try_get(&rwtxn, &x)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mempool
+                .pending_decision_claims
+                .try_get(&rwtxn, &z)
+                .unwrap()
+                .is_none(),
+            "cascade through delete() must clear all of zombie's claim rows, \
+             not just the directly-conflicting one"
+        );
+        rwtxn.commit().unwrap();
+    }
+
+    // Cascade-to-children behavior is intentionally not tested here: it lives
+    // entirely in `MemPool::delete()` (already in production) and the helper
+    // simply forwards to it. Building the parent/child UTXO graph requires
+    // assembling typed Outputs and is covered indirectly by the existing
+    // `delete` test surface in higher-level integration coverage.
 }

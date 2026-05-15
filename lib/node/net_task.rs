@@ -183,6 +183,8 @@ fn connect_tip_(
     let () = archive.put_header(rwtxn, header)?;
     let () = archive.put_body(rwtxn, block_hash, body)?;
     for transaction in &body.transactions {
+        let _evicted =
+            mempool.evict_decision_claim_conflicts(rwtxn, transaction)?;
         let () = mempool.delete(rwtxn, transaction.txid())?;
     }
     Ok(())
@@ -283,7 +285,17 @@ fn disconnect_tip_(
     let () = state.disconnect_two_way_peg_data(rwtxn, &two_way_peg_data)?;
     let () = state.disconnect_tip(rwtxn, &tip_header, &tip_body)?;
     for transaction in tip_body.authorized_transactions()?.iter().rev() {
-        mempool.put(rwtxn, transaction)?;
+        match mempool.put(rwtxn, transaction) {
+            Ok(()) => {}
+            Err(mempool::Error::DecisionAlreadyClaimedInMempool(_)) => {
+                let _evicted = mempool.evict_decision_claim_conflicts(
+                    rwtxn,
+                    &transaction.transaction,
+                )?;
+                mempool.put(rwtxn, transaction)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
 }
