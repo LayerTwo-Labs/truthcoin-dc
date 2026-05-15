@@ -421,25 +421,31 @@ fn show_row(ui: &mut egui::Ui, row: &mut BallotRow, row_idx: usize) {
                     });
                 }
                 RowValue::Scaled { text } => {
-                    let (min_i, max_i) = match &row.decision.decision_type {
-                        DecisionType::Scaled { min, max } => (*min, *max),
-                        _ => (0, 1),
+                    let (min_f, max_f, step) = match &row.decision.decision_type
+                    {
+                        DecisionType::Scaled {
+                            min,
+                            max,
+                            increment,
+                        } => (*min, *max, *increment),
+                        _ => (0.0, 1.0, 1.0),
                     };
-                    let min_f = min_i as f64;
-                    let max_f = max_i as f64;
                     ui.horizontal(|ui| {
                         let edit = egui::TextEdit::singleline(text)
-                            .hint_text(format!("[{min_i} – {max_i}]"))
-                            .desired_width(120.0);
+                            .hint_text(format!(
+                                "[{min_f} – {max_f}] step {step}"
+                            ))
+                            .desired_width(140.0);
                         ui.add(edit);
                         let mut slider_val =
                             text.parse::<f64>().unwrap_or(min_f);
                         let response = ui.add(
                             egui::Slider::new(&mut slider_val, min_f..=max_f)
+                                .step_by(step)
                                 .show_value(false),
                         );
                         if response.changed() {
-                            *text = format!("{slider_val:.4}");
+                            *text = format!("{slider_val}");
                         }
                     });
                 }

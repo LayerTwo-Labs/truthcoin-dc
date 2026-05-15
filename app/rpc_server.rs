@@ -32,8 +32,8 @@ use truthcoin_dc::{
 };
 use truthcoin_dc_app_rpc_api::{
     ConsensusResults, CreateTradeRequest, CreateTradeResponse, DecisionFilter,
-    DecisionListItem, DecisionState, DecisionSummary, MarketBuyRequest,
-    MarketBuyResponse, MarketSellRequest, MarketSellResponse,
+    DecisionListItem, DecisionState, DecisionSummary, MarketAmplifyBetaRequest,
+    MarketBuyRequest, MarketBuyResponse, MarketSellRequest, MarketSellResponse,
     ParticipationStats, PeriodStats, RpcServer, SubmitBallotRequest, TxInfo,
     VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
 };
@@ -117,18 +117,13 @@ impl RpcServerImpl {
                     truthcoin_dc_app_rpc_api::DecisionContentInfo::Decision({
                         let id = hex::encode(decision.id());
                         let mm = hex::encode(decision.market_maker_pubkey_hash);
-                        let is_sc = decision.is_scaled();
-                        let mn = decision.scale_min();
-                        let mx = decision.scale_max();
                         truthcoin_dc_app_rpc_api::DecisionInfo {
                             id,
                             market_maker_pubkey_hash: mm,
                             is_standard: decision_id.is_standard(),
-                            is_scaled: is_sc,
+                            decision_type: decision.decision_type,
                             header: decision.header,
                             description: decision.description,
-                            min: mn,
-                            max: mx,
                             tags: decision.tags,
                         }
                     })
@@ -227,7 +222,7 @@ impl RpcServerImpl {
             .collect();
 
         let resolution = if computed_state
-            == truthcoin_dc::state::markets::MarketState::Ossified
+            == truthcoin_dc::state::markets::MarketState::Settled
         {
             let final_prices = market.final_prices();
             let mut winning_outcomes = Vec::new();
@@ -1109,18 +1104,13 @@ impl RpcServer for RpcServerImpl {
                 let decision = entry.decision.map(|d| {
                     let id = hex::encode(d.id());
                     let mm = hex::encode(d.market_maker_pubkey_hash);
-                    let is_sc = d.is_scaled();
-                    let mn = d.scale_min();
-                    let mx = d.scale_max();
                     truthcoin_dc_app_rpc_api::DecisionInfo {
                         id,
                         market_maker_pubkey_hash: mm,
                         is_standard: did.is_standard(),
-                        is_scaled: is_sc,
+                        decision_type: d.decision_type,
                         header: d.header,
                         description: d.description,
-                        min: mn,
-                        max: mx,
                         tags: d.tags,
                     }
                 });
@@ -1148,7 +1138,9 @@ impl RpcServer for RpcServerImpl {
     async fn decision_claim(
         &self,
         request: truthcoin_dc_app_rpc_api::DecisionClaimRequest,
-    ) -> RpcResult<Txid> {
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionClaimResponse> {
+        use std::collections::BTreeSet;
+        use truthcoin_dc::math::decisions as math_decisions;
         use truthcoin_dc::state::decisions::DecisionType;
         use truthcoin_dc::types::DecisionClaimEntry;
 
@@ -1161,9 +1153,11 @@ impl RpcServer for RpcServerImpl {
                 let max_val = request.max.ok_or_else(|| {
                     custom_err_msg("max is required for scaled decisions")
                 })?;
+                let increment = request.increment.unwrap_or(1.0);
                 DecisionType::Scaled {
                     min: min_val,
                     max: max_val,
+                    increment,
                 }
             }
             "category" => {
@@ -1193,31 +1187,92 @@ impl RpcServer for RpcServerImpl {
             }
         };
 
-        let mut entries = Vec::new();
-        for item in &request.decisions {
+        let pending_claim_ids: BTreeSet<[u8; 3]> = self
+            .app
+            .node
+            .get_pending_decision_claim_ids()
+            .map_err(custom_err)?;
+
+        let mut per_period_picked: std::collections::BTreeMap<
+            u32,
+            BTreeSet<u32>,
+        > = std::collections::BTreeMap::new();
+        let mut entries = Vec::with_capacity(request.decisions.len());
+        let mut decision_ids_hex = Vec::with_capacity(request.decisions.len());
+        let mut listing_fee_paid_sats: u64 = 0;
+
+        for (i, item) in request.decisions.iter().enumerate() {
             if item.header.len() > 100 {
                 return Err(custom_err_msg(format!(
-                    "Header for decision {} \
-                     must be 100 bytes or less",
-                    item.decision_id_hex
+                    "Header for entry {i} (period {}) must be 100 bytes \
+                     or less",
+                    item.period_index
                 )));
             }
             let desc = item.description.clone().unwrap_or_default();
             if desc.len() > 2000 {
                 return Err(custom_err_msg(format!(
-                    "Description for decision {} \
-                     must be 2000 bytes or less",
-                    item.decision_id_hex
+                    "Description for entry {i} (period {}) must be 2000 \
+                     bytes or less",
+                    item.period_index
                 )));
             }
 
-            let decision_id = DecisionValidator::parse_decision_id_from_hex(
-                &item.decision_id_hex,
+            let pricing = self
+                .app
+                .node
+                .get_listing_fee_info(item.period_index)
+                .map_err(custom_err)?
+                .ok_or_else(|| {
+                    custom_err_msg(format!(
+                        "no pricing record for period {}",
+                        item.period_index
+                    ))
+                })?;
+
+            let available = self
+                .app
+                .node
+                .get_available_decisions_in_period(
+                    truthcoin_dc::state::voting::types::VotingPeriodId::new(
+                        item.period_index,
+                    ),
+                )
+                .map_err(custom_err)?;
+
+            let picked_set =
+                per_period_picked.entry(item.period_index).or_default();
+
+            let picked = available
+                .into_iter()
+                .find(|id| {
+                    math_decisions::slot_unlocked(
+                        id.decision_index(),
+                        pricing.mints,
+                    ) && !pending_claim_ids.contains(&id.as_bytes())
+                        && !picked_set.contains(&id.decision_index())
+                })
+                .ok_or_else(|| {
+                    custom_err_msg(format!(
+                        "No available standard slot in period {}",
+                        item.period_index
+                    ))
+                })?;
+
+            picked_set.insert(picked.decision_index());
+
+            let fee = math_decisions::fee_for_index(
+                pricing.p_period,
+                pricing.mints,
+                picked.decision_index(),
             )
-            .map_err(custom_err)?;
+            .map_err(|e| custom_err_msg(e.to_string()))?;
+            listing_fee_paid_sats = listing_fee_paid_sats
+                .checked_add(fee)
+                .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
 
             entries.push(DecisionClaimEntry {
-                decision_id_bytes: decision_id.as_bytes(),
+                decision_id_bytes: picked.as_bytes(),
                 header: item.header.clone(),
                 description: desc,
                 option_0_label: item.option_0_label.clone(),
@@ -1225,9 +1280,24 @@ impl RpcServer for RpcServerImpl {
                 option_labels: item.option_labels.clone(),
                 tags: item.tags.clone(),
             });
+            decision_ids_hex.push(picked.to_hex());
         }
 
-        let fee = Amount::from_sat(request.fee_sats);
+        if let Some(cap) = request.max_listing_fee_sats
+            && listing_fee_paid_sats > cap
+        {
+            return Err(custom_err_msg(format!(
+                "Listing fee {listing_fee_paid_sats} exceeds \
+                 max_listing_fee_sats {cap}"
+            )));
+        }
+
+        let total_fee = Amount::from_sat(
+            listing_fee_paid_sats
+                .checked_add(request.tx_fee_sats)
+                .ok_or_else(|| custom_err_msg("total fee overflow"))?,
+        );
+
         let tx = self
             .app
             .wallet
@@ -1236,32 +1306,53 @@ impl RpcServer for RpcServerImpl {
                     decision_type,
                     decisions: entries,
                 },
-                fee,
+                total_fee,
             )
             .map_err(custom_err)?;
 
         let txid = tx.txid();
         self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(txid)
+        Ok(truthcoin_dc_app_rpc_api::DecisionClaimResponse {
+            txid,
+            decision_ids: decision_ids_hex,
+            listing_fee_paid_sats,
+        })
     }
 
     async fn decision_listing_fee(
         &self,
         period: u32,
     ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionListingFeeInfo> {
-        let (next_fee, claimed_standard_count, available) = self
+        use truthcoin_dc::math::decisions as math_decisions;
+        let pricing = self
             .node()
             .get_listing_fee_info(period)
-            .map_err(custom_err)?;
-
-        let free_count = available / 5;
+            .map_err(custom_err)?
+            .ok_or_else(|| {
+                custom_err_msg(format!("no pricing record for period {period}"))
+            })?;
 
         Ok(truthcoin_dc_app_rpc_api::DecisionListingFeeInfo {
-            next_fee,
-            claimed_standard_count,
-            available,
-            free_count,
+            p_period: pricing.p_period,
+            p_floor: pricing.p_floor,
+            mints: pricing.mints,
+            tier_prices: math_decisions::tier_prices(pricing.p_period),
+            last_reprice_block: pricing.last_reprice_block,
+            period_capacity: pricing.period_capacity(),
+            claimed: pricing.claimed,
         })
+    }
+
+    async fn decision_fee_for_id(
+        &self,
+        decision_id_hex: String,
+    ) -> RpcResult<u64> {
+        use truthcoin_dc::state::decisions::DecisionId;
+        let decision_id = DecisionId::from_hex(&decision_id_hex)
+            .map_err(|e| custom_err_msg(format!("invalid decision id: {e}")))?;
+        self.node()
+            .fee_for_decision_id(decision_id)
+            .map_err(custom_err)
     }
 
     async fn market_create(
@@ -1609,6 +1700,30 @@ impl RpcServer for RpcServerImpl {
         })
     }
 
+    async fn market_amplify_beta(
+        &self,
+        request: MarketAmplifyBetaRequest,
+    ) -> RpcResult<String> {
+        let market_id = parse_market_id(&request.market_id)?;
+        let market = self
+            .node()
+            .get_market_by_id(&market_id)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Market not found"))?;
+        let tx = self
+            .app
+            .wallet
+            .amplify_beta(
+                market_id,
+                request.amount_sats,
+                market.creator_address,
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid.to_string())
+    }
+
     async fn market_positions(
         &self,
         address: Address,
@@ -1731,24 +1846,16 @@ impl RpcServer for RpcServerImpl {
     async fn vote_voters(&self) -> RpcResult<Vec<VoterInfo>> {
         let rotxn = self.node().read_txn().map_err(custom_err)?;
 
-        let all_voters = self
+        let reputations = self
             .app
             .node
-            .voting_state()
-            .databases()
-            .get_all_voters(&rotxn)
+            .reputation()
+            .get_all_reputations(&rotxn)
             .map_err(custom_err)?;
 
-        let mut voter_infos = Vec::new();
+        let mut voter_infos = Vec::with_capacity(reputations.len());
 
-        for voter_address in all_voters {
-            let votecoin_balance = self
-                .app
-                .node
-                .reputation()
-                .get_reputation(&rotxn, &voter_address)
-                .map_err(custom_err)?;
-
+        for (voter_address, votecoin_balance) in reputations {
             let votes = self
                 .app
                 .node
@@ -2092,23 +2199,22 @@ impl RpcServer for RpcServerImpl {
             .map(|decision_id| {
                 let entry_opt =
                     self.node().get_decision_entry(*decision_id).ok().flatten();
-                let (header, is_standard, is_scaled) = entry_opt
+                let (header, is_standard, decision_type) = entry_opt
                     .and_then(|s| s.decision)
                     .map(|d| {
-                        let is_sc = d.is_scaled();
-                        (d.header, decision_id.is_standard(), is_sc)
+                        (d.header, decision_id.is_standard(), d.decision_type)
                     })
                     .unwrap_or((
                         String::new(),
                         decision_id.is_standard(),
-                        false,
+                        truthcoin_dc::state::decisions::DecisionType::Binary,
                     ));
 
                 DecisionSummary {
                     decision_id_hex: decision_id.to_hex(),
                     header,
                     is_standard,
-                    is_scaled,
+                    decision_type,
                 }
             })
             .collect();

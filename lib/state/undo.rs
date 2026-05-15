@@ -10,19 +10,19 @@ use crate::types::{Address, FilledOutput, OutPoint};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Undo data for market ossification and automatic payouts (C1).
+/// Undo data for market settlement and automatic payouts (C1).
 ///
 /// Captured before `transition_and_payout_resolved_markets` during connect.
-/// Used to restore markets from Ossified back to Trading during disconnect.
+/// Used to restore markets from Settled back to Trading during disconnect.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OssificationUndoData {
-    pub entries: Vec<OssificationUndoEntry>,
+pub struct SettlementUndoData {
+    pub entries: Vec<SettlementUndoEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OssificationUndoEntry {
-    /// The complete market state before ossification (Trading state, no final prices)
-    pub pre_ossification_market: Market,
+pub struct SettlementUndoEntry {
+    /// The complete market state before settlement (Trading state, no final prices)
+    pub pre_settlement_market: Market,
     /// The payout summary that was applied (needed for revert_automatic_share_payouts)
     pub payout_summary: MarketPayoutSummary,
     /// Treasury UTXO that existed before payouts consumed it

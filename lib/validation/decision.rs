@@ -150,51 +150,18 @@ impl DecisionValidator {
         }
 
         let mut total_listing_fee: u64 = 0;
-        let standard_entries: Vec<_> = claim
-            .decisions
-            .iter()
-            .filter(|e| {
-                DecisionId::from_bytes(e.decision_id_bytes)
-                    .map(|id| id.is_standard())
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if !standard_entries.is_empty() {
-            use crate::state::decisions::calculate_listing_fee;
-
-            let first_id =
-                DecisionId::from_bytes(standard_entries[0].decision_id_bytes)?;
-            let period = first_id.period_index();
-
-            let base_count = decisions_db
-                .get_standard_claimed_count_in_period(rotxn, period)?;
-            let available = decisions_db.get_available_decisions(
-                rotxn,
-                period,
-                current_ts,
-                current_height,
-                genesis_ts,
-            )?;
-
-            for (i, _entry) in standard_entries.iter().enumerate() {
-                let n = base_count + i as u64;
-                let fee =
-                    calculate_listing_fee(n, available).ok_or_else(|| {
-                        Error::InvalidTransaction {
-                            reason: format!(
-                                "Period {period} is full \
-                                 ({available} standard decisions \
-                                 max)"
-                            ),
-                        }
-                    })?;
-                total_listing_fee = total_listing_fee
-                    .checked_add(fee)
-                    .ok_or_else(|| Error::InvalidTransaction {
-                        reason: "Listing fee overflow".to_string(),
-                    })?;
+        for entry in &claim.decisions {
+            let id = DecisionId::from_bytes(entry.decision_id_bytes)?;
+            if !id.is_standard() {
+                continue;
             }
+            let fee = decisions_db.fee_for_decision_id(rotxn, id)?;
+            total_listing_fee =
+                total_listing_fee.checked_add(fee).ok_or_else(|| {
+                    Error::InvalidTransaction {
+                        reason: "Listing fee overflow".to_string(),
+                    }
+                })?;
         }
 
         if total_listing_fee > 0 {

@@ -726,12 +726,12 @@ impl Market {
                     0 => format!(
                         "{}: {} (Min)",
                         decision.header,
-                        decision.scale_min().unwrap_or(0)
+                        decision.scale_min().unwrap_or(0.0)
                     ),
                     1 => format!(
                         "{}: {} (Max)",
                         decision.header,
-                        decision.scale_max().unwrap_or(100)
+                        decision.scale_max().unwrap_or(100.0)
                     ),
                     _ => format!("{}: Abstain", decision.header),
                 }

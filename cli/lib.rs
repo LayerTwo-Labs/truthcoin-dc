@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use http::HeaderMap;
 use jsonrpsee::{core::client::ClientT, http_client::HttpClientBuilder};
 use serde::Serialize;
@@ -47,6 +47,79 @@ where
     T: Serialize,
 {
     Ok(serde_json::to_string_pretty(data)?)
+}
+
+fn render_period_slot_grid(
+    period: u32,
+    info: &truthcoin_dc_app_rpc_api::DecisionListingFeeInfo,
+    claimed_indexes: &[u32],
+) -> String {
+    use std::collections::HashSet;
+    use std::fmt::Write as _;
+    const SLOTS_PER_TIER_PER_MINT: u64 = 5;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Period {period}\np_period: {} sats   mints: {}/20   last reprice: block {}",
+        info.p_period, info.mints, info.last_reprice_block
+    );
+    let cells_per_tier = (info.mints * SLOTS_PER_TIER_PER_MINT) as usize;
+    let claimed_set: HashSet<u32> = claimed_indexes.iter().copied().collect();
+    let max_label_width = info
+        .tier_prices
+        .iter()
+        .map(|p| format_with_commas(*p).len())
+        .max()
+        .unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "{:>width$}   {:cells$}      claimed",
+        "sats",
+        "slots",
+        width = max_label_width,
+        cells = cells_per_tier,
+    );
+    for tier in 0..5u32 {
+        let price = info.tier_prices[tier as usize];
+        let mut row = String::new();
+        let mut claimed_in_tier = 0u64;
+        for pos in 0..cells_per_tier as u32 {
+            let idx = tier * 100 + pos;
+            if claimed_set.contains(&idx) {
+                row.push('\u{2588}');
+                claimed_in_tier += 1;
+            } else {
+                row.push('\u{2591}');
+            }
+        }
+        let _ = writeln!(
+            out,
+            "{:>width$}   {row}      {claimed_in_tier}/{cells_per_tier}",
+            format_with_commas(price),
+            width = max_label_width,
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nPeriod total: {} / {}",
+        info.claimed, info.period_capacity
+    );
+    out
+}
+
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in bytes.iter().enumerate() {
+        let pos_from_end = bytes.len() - i;
+        if i > 0 && pos_from_end.is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*c as char);
+    }
+    out
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -273,7 +346,7 @@ pub enum Command {
         /// Filter by period
         #[arg(long)]
         period: Option<u32>,
-        /// Filter by status: available, claimed, voting, ossified
+        /// Filter by status: available, claimed, voting, settled
         #[arg(long)]
         status: Option<String>,
     },
@@ -292,33 +365,46 @@ pub enum Command {
         period: u32,
     },
 
-    /// Claim a decision
+    /// Get the listing fee for a specific decision_id
+    #[command(name = "decision-fee-for-id")]
+    DecisionFeeForId {
+        /// Decision ID (hex)
+        decision_id: String,
+    },
+
+    /// Claim a decision. The application picks the cheapest available
+    /// unlocked standard slot in `period_index` automatically.
     #[command(name = "decision-claim", alias = "claim")]
     DecisionClaim {
         #[arg(long)]
         period_index: u32,
+        /// Decision type: "binary", "scaled", or "category"
         #[arg(long)]
-        decision_index: u32,
-        #[arg(long, action = ArgAction::Set)]
-        is_standard: bool,
-        #[arg(long, action = ArgAction::Set)]
-        is_scaled: bool,
+        decision_type: String,
         #[arg(long)]
         header: String,
         #[arg(long)]
         description: Option<String>,
         #[arg(long)]
-        min: Option<i64>,
+        min: Option<f64>,
         #[arg(long)]
-        max: Option<i64>,
+        max: Option<f64>,
+        /// Step size for valid scaled-vote values (default 1.0).
+        /// Honored only with --decision-type scaled.
+        #[arg(long)]
+        increment: Option<f64>,
         #[arg(long)]
         option_0_label: Option<String>,
         #[arg(long)]
         option_1_label: Option<String>,
         #[arg(long, value_delimiter = ',')]
         option_labels: Option<Vec<String>>,
+        /// Miner fee (sats)
         #[arg(long, default_value = "1000")]
-        fee_sats: u64,
+        tx_fee_sats: u64,
+        /// Optional cap on the protocol-set listing fee
+        #[arg(long)]
+        max_listing_fee_sats: Option<u64>,
     },
 
     /// Create prediction market
@@ -390,6 +476,15 @@ pub enum Command {
         /// Minimum proceeds to accept (slippage protection)
         #[arg(long, default_value = "0")]
         min_proceeds: u64,
+    },
+
+    /// Amplify a market's LMSR beta by funding its treasury (market author only)
+    #[command(name = "market-amplify-beta")]
+    MarketAmplifyBeta {
+        #[arg(long)]
+        market_id: String,
+        #[arg(long)]
+        amount_sats: u64,
     },
 
     /// Get share positions for an address
@@ -793,7 +888,7 @@ where
                 "created" | "available" => Ok(DecisionState::Created),
                 "claimed" => Ok(DecisionState::Claimed),
                 "voting" => Ok(DecisionState::Voting),
-                "resolved" | "ossified" => Ok(DecisionState::Resolved),
+                "resolved" | "settled" => Ok(DecisionState::Resolved),
                 "invalid" => Ok(DecisionState::Invalid),
                 other => Err(anyhow::anyhow!(
                     "Unrecognized decision status: '{other}'. Valid values: created, claimed, voting, resolved, invalid"
@@ -808,7 +903,27 @@ where
                 None
             };
             let decisions = rpc_client.decision_list(filter).await?;
-            json_response(&decisions)?
+            if let Some(p) = period {
+                let info = rpc_client.decision_listing_fee(p).await.ok();
+                let mut out = String::new();
+                if let Some(info) = info {
+                    let claimed_indexes: Vec<u32> = decisions
+                        .iter()
+                        .filter(|d| d.period_index == p)
+                        .map(|d| d.decision_index)
+                        .collect();
+                    out.push_str(&render_period_slot_grid(
+                        p,
+                        &info,
+                        &claimed_indexes,
+                    ));
+                    out.push('\n');
+                }
+                out.push_str(&json_response(&decisions)?);
+                out
+            } else {
+                json_response(&decisions)?
+            }
         }
         Command::DecisionGet { decision_id } => {
             let entry = rpc_client.decision_get(decision_id).await?;
@@ -818,28 +933,36 @@ where
             let info = rpc_client.decision_listing_fee(period).await?;
             json_response(&info)?
         }
+        Command::DecisionFeeForId { decision_id } => {
+            let fee = rpc_client.decision_fee_for_id(decision_id).await?;
+            format!("{fee} sats")
+        }
         Command::DecisionClaim {
             period_index,
-            decision_index,
-            is_standard,
-            is_scaled,
+            decision_type,
             header,
             description,
             min,
             max,
+            increment,
             option_0_label,
             option_1_label,
             option_labels,
-            fee_sats,
+            tx_fee_sats,
+            max_listing_fee_sats,
         } => {
             use truthcoin_dc_app_rpc_api::{
                 DecisionClaimItem, DecisionClaimRequest,
             };
 
-            if is_scaled && option_labels.is_some() {
-                return Err(anyhow::anyhow!(
-                    "--is-scaled and --option-labels are mutually exclusive"
-                ));
+            match decision_type.as_str() {
+                "binary" | "scaled" | "category" => {}
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Invalid --decision-type '{other}': must be \
+                         'binary', 'scaled', or 'category'"
+                    ));
+                }
             }
 
             if let Some(ref labels) = option_labels
@@ -851,24 +974,10 @@ where
                 ));
             }
 
-            let decision_type = if option_labels.is_some() {
-                "category"
-            } else if is_scaled {
-                "scaled"
-            } else {
-                "binary"
-            };
-
-            let std_bit: u32 = if is_standard { 0 } else { 1 };
-            let decision_id_hex = format!(
-                "{:06x}",
-                (std_bit << 23) | (period_index << 16) | decision_index
-            );
-
             let request = DecisionClaimRequest {
-                decision_type: decision_type.to_string(),
+                decision_type,
                 decisions: vec![DecisionClaimItem {
-                    decision_id_hex,
+                    period_index,
                     header,
                     description,
                     option_0_label,
@@ -878,11 +987,18 @@ where
                 }],
                 min,
                 max,
-                fee_sats,
+                increment,
+                tx_fee_sats,
+                max_listing_fee_sats,
             };
 
-            let txid = rpc_client.decision_claim(request).await?;
-            format!("Decision claimed: {txid}")
+            let resp = rpc_client.decision_claim(request).await?;
+            format!(
+                "Decision claimed:\n  txid: {}\n  decision_ids: {}\n  listing_fee_paid_sats: {}",
+                resp.txid,
+                resp.decision_ids.join(", "),
+                resp.listing_fee_paid_sats
+            )
         }
 
         Command::MarketCreate {
@@ -1040,6 +1156,18 @@ where
                 result.net_proceeds_sats,
                 txid_display
             )
+        }
+        Command::MarketAmplifyBeta {
+            market_id,
+            amount_sats,
+        } => {
+            use truthcoin_dc_app_rpc_api::MarketAmplifyBetaRequest;
+            let request = MarketAmplifyBetaRequest {
+                market_id: market_id.clone(),
+                amount_sats,
+            };
+            let txid = rpc_client.market_amplify_beta(request).await?;
+            format!("AmplifyBeta submitted for market {market_id}: {txid}")
         }
         Command::CalculateShareCost {
             market_id,

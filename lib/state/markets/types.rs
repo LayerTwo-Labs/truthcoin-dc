@@ -51,7 +51,7 @@ pub enum MarketState {
     Trading = 1,
     Cancelled = 3,
     Invalid = 4,
-    Ossified = 5,
+    Settled = 5,
 }
 
 impl MarketState {
@@ -61,12 +61,12 @@ impl MarketState {
             (Trading, Trading)
             | (Cancelled, Cancelled)
             | (Invalid, Invalid)
-            | (Ossified, Ossified) => true,
-            (Trading, Cancelled | Invalid | Ossified) => true,
-            (Invalid, Ossified) => true,
-            (Cancelled, Trading | Invalid | Ossified) => false,
+            | (Settled, Settled) => true,
+            (Trading, Cancelled | Invalid | Settled) => true,
+            (Invalid, Settled) => true,
+            (Cancelled, Trading | Invalid | Settled) => false,
             (Invalid, Trading | Cancelled) => false,
-            (Ossified, Trading | Cancelled | Invalid) => false,
+            (Settled, Trading | Cancelled | Invalid) => false,
         }
     }
 

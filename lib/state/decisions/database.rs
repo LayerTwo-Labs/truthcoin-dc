@@ -6,13 +6,18 @@ use heed::types::SerdeBincode;
 use sneed::{DatabaseUnique, Env, RoTxn, RwTxn};
 use std::collections::BTreeSet;
 
+use super::pricing::{
+    self, GENESIS_P_PERIOD_SATS, PeriodPricing, apply_reprice_with_floor,
+};
 use super::types::{
     Decision, DecisionConfig, DecisionEntry, DecisionId, DecisionState,
     DecisionStateHistory, FUTURE_PERIODS, INITIAL_DECISIONS_PER_PERIOD,
-    calculate_listing_fee, period_to_string,
+    period_to_string,
 };
 
 const DECISIONS_DECLINING_RATE: u64 = 25;
+
+pub type PeriodPricingUndoEntry = (u32, Option<PeriodPricing>);
 
 #[derive(Clone)]
 pub struct Dbs {
@@ -24,11 +29,17 @@ pub struct Dbs {
         SerdeBincode<DecisionId>,
         SerdeBincode<DecisionStateHistory>,
     >,
+    period_pricing:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<PeriodPricing>>,
+    period_pricing_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<Vec<PeriodPricingUndoEntry>>,
+    >,
     config: DecisionConfig,
 }
 
 impl Dbs {
-    pub const NUM_DBS: u32 = 2;
+    pub const NUM_DBS: u32 = 4;
 
     /// Derive claimed decision IDs from period_decisions (a decision is claimed if decision.is_some())
     fn get_claimed_decision_ids_for_period(
@@ -66,6 +77,16 @@ impl Dbs {
                 env,
                 rwtxn,
                 "decision_state_histories",
+            )?,
+            period_pricing: DatabaseUnique::create(
+                env,
+                rwtxn,
+                "period_pricing",
+            )?,
+            period_pricing_undo: DatabaseUnique::create(
+                env,
+                rwtxn,
+                "period_pricing_undo",
             )?,
             config,
         })
@@ -124,22 +145,203 @@ impl Dbs {
     ) -> Result<(), Error> {
         let current_period =
             self.get_current_period(ts_secs, Some(block_height), genesis_ts)?;
-        self.mint_periods_up_to(rwtxn, current_period + FUTURE_PERIODS - 1)?;
+        let target = current_period + FUTURE_PERIODS - 1;
+        self.mint_periods_up_to(rwtxn, target)?;
+        for period in current_period..=target {
+            if self.period_pricing.try_get(rwtxn, &period)?.is_some() {
+                continue;
+            }
+            let offset = period - current_period;
+            let mints = (FUTURE_PERIODS as u64).saturating_sub(offset as u64);
+            let pricing = PeriodPricing {
+                p_period: GENESIS_P_PERIOD_SATS,
+                p_floor: GENESIS_P_PERIOD_SATS / 16,
+                mints,
+                claimed: 0,
+                last_reprice_block: block_height,
+                window_open_claimed: 0,
+                window_open_mints: mints,
+            };
+            self.period_pricing.put(rwtxn, &period, &pricing)?;
+        }
         Ok(())
     }
 
-    pub fn mint_up_to(
+    /// Snapshot the entire `period_pricing` table into the undo log for
+    /// `block_height`. Must be called BEFORE any modifications at this height.
+    pub fn snapshot_period_pricing(
         &self,
         rwtxn: &mut RwTxn<'_>,
-        ts_secs: u64,
         block_height: u32,
+    ) -> Result<(), Error> {
+        let mut snapshots: Vec<PeriodPricingUndoEntry> = Vec::new();
+        {
+            let mut iter = self.period_pricing.iter(rwtxn)?;
+            while let Some((period, p)) = iter.next()? {
+                snapshots.push((period, Some(p)));
+            }
+        }
+        self.period_pricing_undo
+            .put(rwtxn, &block_height, &snapshots)?;
+        Ok(())
+    }
+
+    /// Restore `period_pricing` from the undo log for `block_height` and
+    /// delete the undo entry. Used during disconnect.
+    pub fn restore_period_pricing_undo(
+        &self,
+        rwtxn: &mut RwTxn<'_>,
+        block_height: u32,
+    ) -> Result<(), Error> {
+        let snapshots =
+            match self.period_pricing_undo.try_get(rwtxn, &block_height)? {
+                Some(v) => v,
+                None => return Ok(()),
+            };
+        let snap_keys: std::collections::HashSet<u32> =
+            snapshots.iter().map(|(p, _)| *p).collect();
+
+        let mut current_keys: Vec<u32> = Vec::new();
+        {
+            let mut iter = self.period_pricing.iter(rwtxn)?;
+            while let Some((period, _)) = iter.next()? {
+                current_keys.push(period);
+            }
+        }
+        for k in &current_keys {
+            if !snap_keys.contains(k) {
+                self.period_pricing.delete(rwtxn, k)?;
+            }
+        }
+        for (period, prior) in snapshots {
+            if let Some(pp) = prior {
+                self.period_pricing.put(rwtxn, &period, &pp)?;
+            }
+        }
+        self.period_pricing_undo.delete(rwtxn, &block_height)?;
+        Ok(())
+    }
+
+    /// Apply per-block pricing updates: mint new periods on transition,
+    /// increment `mints` for surviving periods on transition (with forced
+    /// reprice), or fire scheduled reprice when the interval has elapsed.
+    /// Caller must call `snapshot_period_pricing` first.
+    pub fn process_block_pricing(
+        &self,
+        rwtxn: &mut RwTxn<'_>,
+        block_height: u32,
+        ts_secs: u64,
         genesis_ts: u64,
     ) -> Result<(), Error> {
-        let current_period =
+        let new_current =
             self.get_current_period(ts_secs, Some(block_height), genesis_ts)?;
-        let target_period = current_period + FUTURE_PERIODS - 1;
-        self.mint_periods_up_to(rwtxn, target_period)?;
+        let target = new_current + FUTURE_PERIODS - 1;
+        let prev_highest = self.get_highest_minted_period(rwtxn)?.unwrap_or(0);
+        // After genesis the invariant is `prev_highest == prev_current + FUTURE_PERIODS - 1`,
+        // so `prev_current = prev_highest + 1 - FUTURE_PERIODS`. The
+        // `saturating_sub` covers the genesis-adjacent case where
+        // `prev_highest == 0` (no prior mint), in which case we treat the
+        // chain as having just transitioned into `new_current`.
+        let prev_current = (prev_highest + 1).saturating_sub(FUTURE_PERIODS);
+        debug_assert!(
+            prev_current <= new_current,
+            "current_period must monotonically advance: prev={prev_current} new={new_current}"
+        );
+
+        self.mint_periods_up_to(rwtxn, target)?;
+
+        let did_transition = new_current > prev_current;
+
+        if did_transition {
+            for new_period in (prev_highest + 1)..=target {
+                let p_seed = self.compute_p_average(rwtxn, new_current)?;
+                let pricing = PeriodPricing::new_seeded(p_seed, block_height);
+                self.period_pricing.put(rwtxn, &new_period, &pricing)?;
+            }
+            let surviving_end = prev_highest.min(target);
+            if new_current <= surviving_end {
+                for period in new_current..=surviving_end {
+                    let mut pricing =
+                        match self.period_pricing.try_get(rwtxn, &period)? {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                    let transitions = new_current - prev_current;
+                    pricing.mints =
+                        pricing.mints.saturating_add(transitions as u64);
+                    apply_reprice_with_floor(&mut pricing, block_height);
+                    self.period_pricing.put(rwtxn, &period, &pricing)?;
+                }
+            }
+        } else {
+            let interval = pricing::reprice_interval(&self.config);
+            let any_due = self.any_period_due_for_reprice(
+                rwtxn,
+                block_height,
+                interval,
+                new_current,
+            )?;
+            if any_due {
+                let active_end = new_current + FUTURE_PERIODS - 1;
+                for period in new_current..=active_end {
+                    let mut pricing =
+                        match self.period_pricing.try_get(rwtxn, &period)? {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                    apply_reprice_with_floor(&mut pricing, block_height);
+                    self.period_pricing.put(rwtxn, &period, &pricing)?;
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    fn any_period_due_for_reprice(
+        &self,
+        rotxn: &RoTxn,
+        block_height: u32,
+        interval: u32,
+        current_period: u32,
+    ) -> Result<bool, Error> {
+        let active_end = current_period + FUTURE_PERIODS - 1;
+        for period in current_period..=active_end {
+            if let Some(p) = self.period_pricing.try_get(rotxn, &period)?
+                && block_height.saturating_sub(p.last_reprice_block) >= interval
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn compute_p_average(
+        &self,
+        rotxn: &RoTxn,
+        current_period: u32,
+    ) -> Result<u64, Error> {
+        let mut sum: u128 = 0;
+        let mut count: u128 = 0;
+        for offset in 1..FUTURE_PERIODS {
+            let period = current_period + offset;
+            if let Some(p) = self.period_pricing.try_get(rotxn, &period)? {
+                sum += p.p_period as u128;
+                count += 1;
+            }
+        }
+        match sum.checked_div(count) {
+            Some(avg) => Ok(avg as u64),
+            None => Ok(GENESIS_P_PERIOD_SATS),
+        }
+    }
+
+    pub fn get_period_pricing(
+        &self,
+        rotxn: &RoTxn,
+        period: u32,
+    ) -> Result<Option<PeriodPricing>, Error> {
+        Ok(self.period_pricing.try_get(rotxn, &period)?)
     }
 
     fn mint_periods_up_to(
@@ -157,11 +359,9 @@ impl Dbs {
             }
         }
 
+        let empty_period: BTreeSet<DecisionEntry> = BTreeSet::new();
         for period in (highest_existing + 1)..=target_period {
-            if self.period_decisions.try_get(rwtxn, &period)?.is_none() {
-                let empty_period: BTreeSet<DecisionEntry> = BTreeSet::new();
-                self.period_decisions.put(rwtxn, &period, &empty_period)?;
-            }
+            self.period_decisions.put(rwtxn, &period, &empty_period)?;
         }
 
         Ok(())
@@ -182,6 +382,10 @@ impl Dbs {
         Ok(highest)
     }
 
+    /// Delete all `period_decisions` entries above `max_period`. The
+    /// `period_pricing` table is rolled back separately via the undo log
+    /// (`restore_period_pricing_undo`), so it is intentionally not touched
+    /// here.
     pub fn delete_periods_above(
         &self,
         rwtxn: &mut RwTxn<'_>,
@@ -196,8 +400,8 @@ impl Dbs {
                 }
             }
         }
-        for period in to_delete {
-            self.period_decisions.delete(rwtxn, &period)?;
+        for period in &to_delete {
+            self.period_decisions.delete(rwtxn, period)?;
         }
         Ok(())
     }
@@ -263,7 +467,7 @@ impl Dbs {
         period_to_string(period_idx, &self.config)
     }
 
-    pub fn is_period_ossified(
+    pub fn is_period_settled(
         &self,
         decision_period: u32,
         current_ts: u64,
@@ -276,7 +480,7 @@ impl Dbs {
         current_period > decision_period.saturating_add(7)
     }
 
-    pub fn is_decision_ossified(
+    pub fn is_decision_settled(
         &self,
         decision_id: DecisionId,
         current_ts: u64,
@@ -284,7 +488,7 @@ impl Dbs {
         genesis_ts: u64,
     ) -> bool {
         let period = decision_id.period_index();
-        self.is_period_ossified(period, current_ts, current_height, genesis_ts)
+        self.is_period_settled(period, current_ts, current_height, genesis_ts)
     }
 
     pub fn is_decision_in_voting(
@@ -341,28 +545,28 @@ impl Dbs {
         )
     }
 
-    pub fn get_ossified_decisions(
+    pub fn get_settled_decisions(
         &self,
         rotxn: &sneed::RoTxn,
         current_ts: u64,
         current_height: Option<u32>,
         genesis_ts: u64,
     ) -> Result<Vec<DecisionEntry>, Error> {
-        let mut ossified_entries = Vec::new();
+        let mut settled_entries = Vec::new();
 
         let mut iter = self.period_decisions.iter(rotxn)?;
         while let Some((period, entries)) = iter.next()? {
-            if self.is_period_ossified(
+            if self.is_period_settled(
                 period,
                 current_ts,
                 current_height,
                 genesis_ts,
             ) {
-                ossified_entries.extend(entries.iter().cloned());
+                settled_entries.extend(entries.iter().cloned());
             }
         }
 
-        Ok(ossified_entries)
+        Ok(settled_entries)
     }
 
     pub fn validate_decision_claim(
@@ -379,7 +583,7 @@ impl Dbs {
         let current_period =
             self.get_current_period(current_ts, current_height, genesis_ts)?;
 
-        if self.is_decision_ossified(
+        if self.is_decision_settled(
             decision_id,
             current_ts,
             current_height,
@@ -387,7 +591,7 @@ impl Dbs {
         ) {
             return Err(Error::DecisionNotAvailable {
                 decision_id,
-                reason: format!("Decision period {period_index} is ossified"),
+                reason: format!("Decision period {period_index} is settled"),
             });
         }
 
@@ -425,21 +629,23 @@ impl Dbs {
                 });
             }
 
-            let total_decisions = self.total_for(
-                rotxn,
-                period_index,
-                current_ts,
-                current_height,
-                genesis_ts,
-            )?;
-            if decision_index as u64 >= total_decisions {
+            let pricing = self
+                .period_pricing
+                .try_get(rotxn, &period_index)?
+                .ok_or(Error::DecisionNotAvailable {
+                    decision_id,
+                    reason: format!(
+                        "no pricing record for period {period_index}"
+                    ),
+                })?;
+            if !pricing::slot_unlocked(decision_index, pricing.mints) {
                 return Err(Error::DecisionNotAvailable {
                     decision_id,
                     reason: format!(
-                        "Standard decision index \
-                         {decision_index} exceeds available \
-                         decisions {total_decisions} for period \
-                         {period_index}"
+                        "decision_index {decision_index} not yet \
+                         unlocked in period {period_index} \
+                         (mints={})",
+                        pricing.mints
                     ),
                 });
             }
@@ -487,6 +693,19 @@ impl Dbs {
             &decision_id,
             &decision_history,
         )?;
+
+        if decision_id.is_standard() {
+            let mut pricing = self
+                .period_pricing
+                .try_get(rwtxn, &period_index)?
+                .ok_or_else(|| Error::InvalidTransaction {
+                    reason: format!(
+                        "no pricing record for period {period_index}"
+                    ),
+                })?;
+            pricing.claimed = pricing.claimed.saturating_add(1);
+            self.period_pricing.put(rwtxn, &period_index, &pricing)?;
+        }
 
         Ok(())
     }
@@ -537,21 +756,32 @@ impl Dbs {
             current_height,
             genesis_ts,
         )?;
+        if total_decisions == 0 {
+            return Ok(Vec::new());
+        }
 
-        let max_decision_index = total_decisions;
-
-        let mut available_decisions =
-            Vec::with_capacity(max_decision_index as usize);
+        let Some(pricing) =
+            self.period_pricing.try_get(rotxn, &period_index)?
+        else {
+            return Ok(Vec::new());
+        };
 
         let claimed_decisions =
             self.get_claimed_decision_ids_for_period(rotxn, period_index)?;
 
-        for decision_index in 0..max_decision_index {
-            let decision_id =
-                DecisionId::new(true, period_index, decision_index as u32)?;
+        let unlocked_per_tier =
+            pricing.mints * pricing::SLOTS_PER_TIER_PER_MINT;
+        let mut available_decisions = Vec::with_capacity(
+            (unlocked_per_tier as usize) * (pricing::TIER_COUNT),
+        );
 
-            if !claimed_decisions.contains(&decision_id) {
-                available_decisions.push(decision_id);
+        for tier in 0..pricing::TIER_COUNT as u64 {
+            for pos in 0..unlocked_per_tier {
+                let idx = (tier * pricing::SLOTS_PER_TIER + pos) as u32;
+                let decision_id = DecisionId::new(true, period_index, idx)?;
+                if !claimed_decisions.contains(&decision_id) {
+                    available_decisions.push(decision_id);
+                }
             }
         }
 
@@ -602,19 +832,33 @@ impl Dbs {
         &self,
         rotxn: &sneed::RoTxn,
         period_index: u32,
-        current_ts: u64,
-        current_height: Option<u32>,
-        genesis_ts: u64,
-    ) -> Result<(u64, u64, u64), Error> {
-        let current_period =
-            self.get_current_period(current_ts, current_height, genesis_ts)?;
-        let available =
-            self.calculate_available_decisions(period_index, current_period);
-        let claimed_standard =
-            self.get_standard_claimed_count_in_period(rotxn, period_index)?;
-        let next_fee = calculate_listing_fee(claimed_standard, available)
-            .unwrap_or(u64::MAX);
-        Ok((next_fee, claimed_standard, available))
+    ) -> Result<Option<PeriodPricing>, Error> {
+        Ok(self.period_pricing.try_get(rotxn, &period_index)?)
+    }
+
+    /// Fee for claiming a single decision_id at its deterministic tier
+    /// (`tier = decision_index / 100`). Validates that the slot is unlocked
+    /// and the index is in range.
+    pub fn fee_for_decision_id(
+        &self,
+        rotxn: &sneed::RoTxn,
+        decision_id: DecisionId,
+    ) -> Result<u64, Error> {
+        let period_index = decision_id.period_index();
+        let pricing = self
+            .period_pricing
+            .try_get(rotxn, &period_index)?
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: format!("no pricing record for period {period_index}"),
+            })?;
+        pricing::fee_for_index(
+            pricing.p_period,
+            pricing.mints,
+            decision_id.decision_index(),
+        )
+        .map_err(|e| Error::InvalidTransaction {
+            reason: e.to_string(),
+        })
     }
 
     pub fn get_all_claimed_decisions(
@@ -921,5 +1165,13 @@ impl DecisionValidationInterface for Dbs {
             current_height,
             genesis_ts,
         )
+    }
+
+    fn fee_for_decision_id(
+        &self,
+        rotxn: &RoTxn,
+        decision_id: DecisionId,
+    ) -> Result<u64, Error> {
+        self.fee_for_decision_id(rotxn, decision_id)
     }
 }

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui::{self, Button, RichText, ScrollArea};
+use truthcoin_dc::state::decisions::DecisionType;
 use truthcoin_dc::state::markets::DEFAULT_TRADING_FEE;
 use truthcoin_dc::state::voting::types::VotingPeriodId;
 use truthcoin_dc::wallet::CreateMarketInput;
@@ -13,7 +14,7 @@ const DEFAULT_LIQUIDITY_SATS: u64 = 10_000;
 struct ClaimedDecisionInfo {
     decision_id_hex: String,
     header: String,
-    is_scaled: bool,
+    decision_type: DecisionType,
     is_categorical: bool,
     option_count: usize,
     claiming_txid: [u8; 32],
@@ -111,7 +112,7 @@ impl CreateMarket {
                             self.claimed_decisions.push(ClaimedDecisionInfo {
                                 decision_id_hex: decision_id_hex.clone(),
                                 header: decision.header.clone(),
-                                is_scaled: decision.is_scaled(),
+                                decision_type: decision.decision_type.clone(),
                                 is_categorical: decision.is_categorical(),
                                 option_count: decision
                                     .option_count()
@@ -500,7 +501,7 @@ impl CreateMarket {
                                         {
                                             continue;
                                         }
-                                        let kind_suffix = if claimed.is_scaled {
+                                        let type_suffix = if matches!(claimed.decision_type, DecisionType::Scaled { .. }) {
                                             " [Scaled]".to_string()
                                         } else if claimed.is_categorical {
                                             format!(" [Categorical: {}]", claimed.option_count)
@@ -515,7 +516,7 @@ impl CreateMarket {
                                             } else {
                                                 claimed.header.clone()
                                             },
-                                            kind_suffix
+                                            type_suffix
                                         );
                                         ui.selectable_value(
                                             &mut new_value,

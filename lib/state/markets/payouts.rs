@@ -363,7 +363,11 @@ mod payout_tests {
 
         let decision = Decision::new(
             [0u8; 20],
-            DecisionType::Scaled { min: 0, max: 100 },
+            DecisionType::Scaled {
+                min: 0.0,
+                max: 100.0,
+                increment: 1.0,
+            },
             "Test".to_string(),
             "Scaled decision".to_string(),
             None,

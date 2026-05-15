@@ -255,11 +255,18 @@ Markets require decisions. Decisions must be claimed and confirmed before they c
 
 ### 1. Claim a Decision
 
+The application picks the cheapest available unlocked slot in `--period-index`
+automatically — callers just specify the period and metadata. The response
+includes the assigned `decision_id` and the listing fee paid.
+
 ```bash
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
---period-index 0 --decision-index 0 --is-standard true --is-scaled false \
---question "Will BTC hit $100K?" --fee-sats 1000
+--period-index 0 --decision-type binary \
+--header "Will BTC hit $100K?" --tx-fee-sats 1000
 ```
+
+Add `--max-listing-fee-sats N` to cap the protocol-set listing fee (slippage
+protection); omit to accept whatever the protocol currently charges.
 
 ### 2. Mine Blocks to Confirm
 
@@ -354,10 +361,18 @@ verify-signature --signature SIG --verifying-key KEY --dst DST --msg "MSG"
 ```
 decision-status                 Decision system status
 decision-list [--period N] [--status STATUS]
-                            List decisions (status: available, claimed, voting, ossified)
+                            List decisions (status: available, claimed, voting, settled)
 decision-get <DECISION_ID>          Get decision details
-decision-claim --period-index N --decision-index N --is-standard BOOL --is-scaled BOOL \
-           --question "<Q>" [--min N] [--max N] [--fee-sats N]
+decision-fee <PERIOD>               Listing-fee snapshot for a period (p_period, tier prices, claimed)
+decision-fee-for-id <DECISION_ID>   Compute listing fee for a specific decision_id
+decision-claim --period-index N --decision-type binary|scaled|category --header "<H>" \
+           [--description "<D>"] [--min N] [--max N] \
+           [--option-0-label "<A>"] [--option-1-label "<B>"] \
+           [--option-labels "A,B,C"] \
+           --tx-fee-sats N [--max-listing-fee-sats N]
+                            Claim a decision. App auto-picks the cheapest available
+                            unlocked standard slot in the period; the response includes
+                            the assigned decision_id and listing_fee_paid_sats.
 ```
 
 ### market_* (Prediction Markets)
@@ -400,21 +415,28 @@ Markets are built from decisions. Each decision can be **binary** (Yes/No) or **
 
 ### Decision Types
 
-**Binary Decision** (is_scaled=false): Resolves to Yes (1.0) or No (0.0)
+**Binary** (`--decision-type binary`): Resolves to Yes (1.0) or No (0.0)
 ```bash
-# Claim a binary decision
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
---period-index 0 --decision-index 0 --is-standard true --is-scaled false \
---question "Will BTC exceed $100K by end of 2025?" --fee-sats 1000
+--period-index 0 --decision-type binary \
+--header "Will BTC exceed $100K by end of 2025?" --tx-fee-sats 1000
 ```
 
-**Scalar Decision** (is_scaled=true): Resolves to a value within min/max range
+**Scaled** (`--decision-type scaled`): Resolves to a value within `--min`/`--max`
 ```bash
-# Claim a scalar decision (e.g., electoral votes 0-538)
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
---period-index 0 --decision-index 1 --is-standard true --is-scaled true \
---question "How many electoral votes will the Republican candidate receive?" \
---min 0 --max 538 --fee-sats 1000
+--period-index 0 --decision-type scaled \
+--header "How many electoral votes will the Republican candidate receive?" \
+--min 0 --max 538 --tx-fee-sats 1000
+```
+
+**Categorical** (`--decision-type category`): Resolves to one of N labeled outcomes
+```bash
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
+--period-index 0 --decision-type category \
+--header "Who will win the 2028 election?" \
+--option-labels "Candidate A,Candidate B,Candidate C" \
+--tx-fee-sats 1000
 ```
 
 ---
@@ -428,23 +450,23 @@ The `--dimensions` parameter uses bracket notation to define market structures.
 Simple Yes/No prediction using one binary decision.
 
 ```bash
-# Claim the decision
+# Claim the decision (response prints the assigned decision_id)
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
---period-index 0 --decision-index 0 --is-standard true --is-scaled false \
---question "Will BTC hit $100K?" --fee-sats 1000
+--period-index 0 --decision-type binary \
+--header "Will BTC hit $100K?" --tx-fee-sats 1000
 
 # Mine to confirm
 ./mine_blocks.sh 1
 
-# Get the decision ID
+# Or look it up after the fact
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-list --period 0 --status claimed
-# Returns: decision_id = "000000"
+# Returns: decision_id = "800000"
 
 # Create market
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "Will BTC hit $100K?" \
 --description "Resolves Yes if Bitcoin reaches $100,000 USD" \
---dimensions "[000000]" --beta 7.0 --fee-sats 1000
+--dimensions "[800000]" --beta 7.0 --fee-sats 1000
 
 # Outcomes: Yes, No (2 outcomes)
 ```
@@ -454,19 +476,19 @@ Simple Yes/No prediction using one binary decision.
 Predict a numeric value within a defined range.
 
 ```bash
-# Claim a scalar decision
+# Claim a scaled decision
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
---period-index 0 --decision-index 1 --is-standard true --is-scaled true \
---question "BTC price on Dec 31, 2025 (in thousands USD)" \
---min 0 --max 500 --fee-sats 1000
+--period-index 0 --decision-type scaled \
+--header "BTC price on Dec 31, 2025 (in thousands USD)" \
+--min 0 --max 500 --tx-fee-sats 1000
 
-# Mine and get decision ID "000001"
+# Mine and read the assigned decision_id from the response (e.g. "800001")
 
 # Create market
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "BTC Year-End Price Prediction" \
 --description "What will BTC price be on Dec 31, 2025? (in $1000s)" \
---dimensions "[000001]" --beta 7.0 --fee-sats 1000
+--dimensions "[800001]" --beta 7.0 --fee-sats 1000
 
 # Outcomes: Under, Over (2 outcomes based on scalar midpoint)
 ```
@@ -476,22 +498,22 @@ Predict a numeric value within a defined range.
 Combine independent Yes/No decisions. All combinations are tradeable.
 
 ```bash
-# Claim multiple binary decisions
+# Claim multiple binary decisions (each call's response includes its assigned decision_id)
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
---period-index 0 --decision-index 2 --is-standard true --is-scaled false \
---question "Will ETH hit $10K?" --fee-sats 1000
+--period-index 0 --decision-type binary \
+--header "Will ETH hit $10K?" --tx-fee-sats 1000
 
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
---period-index 0 --decision-index 3 --is-standard true --is-scaled false \
---question "Will SOL hit $500?" --fee-sats 1000
+--period-index 0 --decision-type binary \
+--header "Will SOL hit $500?" --tx-fee-sats 1000
 
-# Mine and get decision IDs "000002" and "000003"
+# Mine and read the assigned decision_ids (e.g. "800002" and "800003")
 
 # Create parlay market
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "Crypto Price Parlay" \
 --description "Combined predictions on ETH and SOL prices" \
---dimensions "[000002,000003]" --beta 7.0 --fee-sats 1000
+--dimensions "[800002,800003]" --beta 7.0 --fee-sats 1000
 
 # Outcomes (4 total):
 #   0: ETH-Yes + SOL-Yes
@@ -502,24 +524,25 @@ Combine independent Yes/No decisions. All combinations are tradeable.
 
 ### 4. Categorical Market (Mutually Exclusive)
 
-One winner from multiple options. Use double brackets `[[...]]` and claim decisions as a category.
+A categorical decision carries its own option labels — claim ONE decision with
+`--decision-type category` and `--option-labels "A,B,C"`. The market then
+references that single decision_id inside `[[...]]`.
 
 ```bash
-# Claim category {decision}s (atomic transaction)
-./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim-category \
---{decision}-ids "000004,000005,000006" \
---questions "Will Candidate A win?,Will Candidate B win?,Will Candidate C win?" \
---is-standard true --fee-sats 1000
+# Claim a single categorical decision with three labeled outcomes
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
+--period-index 0 --decision-type category \
+--header "Who will win the 2028 US Presidential Election?" \
+--option-labels "Candidate A,Candidate B,Candidate C" \
+--tx-fee-sats 1000
 
-# Mine and note the category txid returned (e.g., "abc123def456...")
-./mine_blocks.sh 1
+# Mine and read the assigned decision_id from the response (e.g. "800004")
 
-# Create categorical market with --category-txids referencing the claim transaction
+# Create categorical market
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "2028 Presidential Election Winner" \
 --description "Which candidate will win the 2028 US Presidential Election?" \
---dimensions "[[000004,000005,000006]]" \
---category-txids "abc123def456..." \
+--dimensions "[[800004]]" \
 --beta 7.0 --fee-sats 1000
 
 # Outcomes (3 mutually exclusive):
@@ -530,24 +553,24 @@ One winner from multiple options. Use double brackets `[[...]]` and claim decisi
 
 ### 4b. Categorical Market with Residual Outcome
 
-Add a "catch-all" residual outcome for options not explicitly listed.
+Add a "catch-all" residual outcome for options not explicitly labeled.
 
 ```bash
-# Claim category {decision}s for known candidates
-./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim-category \
---{decision}-ids "000004,000005,000006" \
---questions "Will Candidate A win?,Will Candidate B win?,Will Candidate C win?" \
---is-standard true --fee-sats 1000
+# Claim categorical decision with the explicit candidates
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
+--period-index 0 --decision-type category \
+--header "Who will win the 2028 US Presidential Election?" \
+--option-labels "Candidate A,Candidate B,Candidate C" \
+--tx-fee-sats 1000
+# Assigned decision_id, e.g. "800004"
 
-# Mine and note the category txid
 ./mine_blocks.sh 1
 
 # Create market with residual outcome for "Other candidate"
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "2028 Presidential Election Winner" \
 --description "Which candidate will win the 2028 US Presidential Election?" \
---dimensions "[[000004,000005,000006]]" \
---category-txids "abc123def456..." \
+--dimensions "[[800004]]" \
 --residual-names "Other" \
 --beta 7.0 --fee-sats 1000
 
@@ -560,27 +583,27 @@ Add a "catch-all" residual outcome for options not explicitly listed.
 
 ### 5. Binary + Categorical Combination
 
-Combine an independent binary decision with a categorical group.
+Combine an independent binary decision with a categorical decision.
 
 ```bash
-# Binary {decision}: "Will there be a recession?"
-# Decision ID: "000007"
+# Binary decision: "Will there be a recession?"
+# Assigned decision_id from claim response: e.g. "800007"
 
-# Claim category {decision}s for sector leadership
-./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim-category \
---{decision}-ids "000008,000009,00000a" \
---questions "Tech sector leads?,Finance sector leads?,Energy sector leads?" \
---is-standard true --fee-sats 1000
-# Returns category txid: "sector123..."
+# Claim a categorical decision for sector leadership
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
+--period-index 0 --decision-type category \
+--header "Which sector will lead?" \
+--option-labels "Tech,Finance,Energy" \
+--tx-fee-sats 1000
+# Assigned decision_id: e.g. "800008"
 
 ./mine_blocks.sh 1
 
-# Create combined market with --category-txids
+# Create combined market
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "Economy & Sector Performance" \
 --description "Recession prediction combined with leading sector" \
---dimensions "[000007,[000008,000009,00000a]]" \
---category-txids "sector123..." \
+--dimensions "[800007,[800008]]" \
 --beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 3 = 6 total):
@@ -614,27 +637,26 @@ Combine two separate categorical decisions.
 
 ```bash
 # Claim Category 1: Conference winner (East, West)
-./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim-category \
---{decision}-ids "00000e,00000f" \
---questions "East wins conference?,West wins conference?" \
---is-standard true --fee-sats 1000
-# Returns: "conf123..."
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
+--period-index 0 --decision-type category \
+--header "Conference winner" --option-labels "East,West" \
+--tx-fee-sats 1000
+# Assigned decision_id from response, e.g. "80000e"
 
 # Claim Category 2: MVP winner (Player A, Player B, Player C)
-./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim-category \
---{decision}-ids "000010,000011,000012" \
---questions "Player A MVP?,Player B MVP?,Player C MVP?" \
---is-standard true --fee-sats 1000
-# Returns: "mvp456..."
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
+--period-index 0 --decision-type category \
+--header "Season MVP" --option-labels "Player A,Player B,Player C" \
+--tx-fee-sats 1000
+# Assigned decision_id, e.g. "800010"
 
 ./mine_blocks.sh 1
 
-# Create market with both category txids (comma-separated, in dimension order)
+# Create market with both categorical decisions
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "NBA Season Predictions" \
 --description "Conference champion and MVP predictions" \
---dimensions "[[00000e,00000f],[000010,000011,000012]]" \
---category-txids "conf123...,mvp456..." \
+--dimensions "[[80000e],[800010]]" \
 --beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 3 = 6 total):
@@ -700,20 +722,20 @@ Combine a numeric prediction with mutually exclusive options.
 # Scalar {decision}: "S&P 500 year-end value" (min=3000, max=6000)
 # Decision ID: "000017"
 
-# Claim category {decision}s for sector leadership
-./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim-category \
---{decision}-ids "000018,000019,00001a" \
---questions "Tech leads?,Finance leads?,Healthcare leads?" \
---is-standard true --fee-sats 1000
-# Returns: "sector789..."
+# Claim a categorical decision for sector leadership
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
+--period-index 0 --decision-type category \
+--header "Which sector will lead?" \
+--option-labels "Tech,Finance,Healthcare" \
+--tx-fee-sats 1000
+# Assigned decision_id, e.g. "800018"
 
 ./mine_blocks.sh 1
 
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "Market Performance & Sector Leader" \
 --description "S&P 500 level combined with leading sector" \
---dimensions "[000017,[000018,000019,00001a]]" \
---category-txids "sector789..." \
+--dimensions "[800017,[800018]]" \
 --beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 3 = 6 total):
@@ -736,20 +758,20 @@ Three different decision types combined.
 # Binary {decision}: "Will there be a spot BTC ETF approval?"
 # Decision ID: "00001c"
 
-# Claim category {decision}s for market regime
-./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim-category \
---{decision}-ids "00001d,00001e,00001f" \
---questions "Bull market?,Bear market?,Sideways?" \
---is-standard true --fee-sats 1000
-# Returns: "regime123..."
+# Claim a categorical decision for market regime
+./target/debug/truthcoin_dc_app_cli --rpc-port 18332 decision-claim \
+--period-index 0 --decision-type category \
+--header "Market regime" \
+--option-labels "Bull,Bear,Sideways" \
+--tx-fee-sats 1000
+# Assigned decision_id, e.g. "80001d"
 
 ./mine_blocks.sh 1
 
 ./target/debug/truthcoin_dc_app_cli --rpc-port 18332 market-create \
 --title "Crypto Market Comprehensive" \
 --description "BTC price, ETF approval, and market regime" \
---dimensions "[00001b,00001c,[00001d,00001e,00001f]]" \
---category-txids "regime123..." \
+--dimensions "[80001b,80001c,[80001d]]" \
 --beta 10.0 --fee-sats 1000
 
 # Outcomes (2 x 2 x 3 = 12 total):

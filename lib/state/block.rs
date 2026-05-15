@@ -735,21 +735,7 @@ pub fn connect_prevalidated(
         .get_highest_minted_period(rwtxn)?
         .unwrap_or(0);
 
-    if height == 0 {
-        state.decisions().mint_genesis(
-            rwtxn,
-            mainchain_timestamp,
-            height,
-            genesis_ts,
-        )?;
-    } else {
-        state.decisions().mint_up_to(
-            rwtxn,
-            mainchain_timestamp,
-            height,
-            genesis_ts,
-        )?;
-    }
+    state.decisions().snapshot_period_pricing(rwtxn, height)?;
 
     state
         .minting_undo
@@ -863,7 +849,7 @@ pub fn connect_prevalidated(
                 apply_transfer_reputation(state, rwtxn, filled_tx, height)?;
             }
             Some(TxData::AmplifyBeta { .. }) => {
-                apply_amplify_beta(state, rwtxn, filled_tx, &mut state_update)?;
+                apply_amplify_beta(filled_tx, &mut state_update)?;
             }
             None => {}
         }
@@ -890,6 +876,22 @@ pub fn connect_prevalidated(
         state
             .consolidation_undo
             .put(rwtxn, &height, &consolidation_undo)?;
+    }
+
+    if height == 0 {
+        state.decisions().mint_genesis(
+            rwtxn,
+            mainchain_timestamp,
+            height,
+            genesis_ts,
+        )?;
+    } else {
+        state.decisions().process_block_pricing(
+            rwtxn,
+            height,
+            mainchain_timestamp,
+            genesis_ts,
+        )?;
     }
 
     // Resolve Voting → Resolved (grouped by period, ascending order).
@@ -951,7 +953,7 @@ pub fn connect_prevalidated(
     }
 
     {
-        let (payout_results, ossification_undo_entries) =
+        let (payout_results, settlement_undo_entries) =
             state.markets().transition_and_payout_resolved_markets(
                 rwtxn,
                 state,
@@ -967,7 +969,7 @@ pub fn connect_prevalidated(
                     .map(|r| r.amount_sats)
                     .unwrap_or(0);
                 tracing::info!(
-                    "Protocol: Market {} auto-ossified with {} sats treasury + {} sats fees distributed to {} shareholders ({} sats refunded to creator)",
+                    "Protocol: Market {} auto-settled with {} sats treasury + {} sats fees distributed to {} shareholders ({} sats refunded to creator)",
                     market_id,
                     summary.treasury_distributed,
                     summary.total_fees_distributed,
@@ -977,12 +979,21 @@ pub fn connect_prevalidated(
             }
         }
 
-        if !ossification_undo_entries.is_empty() {
-            let undo_data = crate::state::undo::OssificationUndoData {
-                entries: ossification_undo_entries,
+        if !settlement_undo_entries.is_empty() {
+            let undo_data = crate::state::undo::SettlementUndoData {
+                entries: settlement_undo_entries,
             };
-            state.ossification_undo.put(rwtxn, &height, &undo_data)?;
+            state.settlement_undo.put(rwtxn, &height, &undo_data)?;
         }
+    }
+
+    if !skipped_tx_indices.is_empty() {
+        let mut indices: Vec<u32> =
+            skipped_tx_indices.iter().map(|i| *i as u32).collect();
+        indices.sort_unstable();
+        state
+            .skipped_tx_indices_undo
+            .put(rwtxn, &height, &indices)?;
     }
 
     let block_hash = header.hash();
@@ -1021,12 +1032,12 @@ pub fn disconnect_tip(
     }
     let height = state.try_get_height(rwtxn)?.ok_or(Error::NoTip)?;
 
-    // 2. Revert market ossification/payouts (runs last in connect, so first here)
-    if let Some(ossification_undo) =
-        state.ossification_undo.try_get(rwtxn, &height)?
+    // 2. Revert market settlement/payouts (runs last in connect, so first here)
+    if let Some(settlement_undo) =
+        state.settlement_undo.try_get(rwtxn, &height)?
     {
-        revert_ossification(state, rwtxn, &ossification_undo, height)?;
-        state.ossification_undo.delete(rwtxn, &height)?;
+        revert_settlement(state, rwtxn, &settlement_undo, height)?;
+        state.settlement_undo.delete(rwtxn, &height)?;
     }
 
     // 3. Revert consensus voting state
@@ -1048,7 +1059,17 @@ pub fn disconnect_tip(
     // 5. Revert transaction-level UTXOs and tx-specific state
     let mut trade_share_deltas: Vec<TradeShareDelta> = Vec::new();
 
-    for tx in body.transactions.iter().rev() {
+    let skipped_tx_indices: HashSet<u32> = state
+        .skipped_tx_indices_undo
+        .try_get(rwtxn, &height)?
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    for (idx, tx) in body.transactions.iter().enumerate().rev() {
+        if skipped_tx_indices.contains(&(idx as u32)) {
+            continue;
+        }
         let txid = tx.txid();
         let filled_tx = state.fill_transaction_from_stxos(rwtxn, tx.clone())?;
         match &tx.data {
@@ -1071,9 +1092,6 @@ pub fn disconnect_tip(
                 let () = revert_submit_ballot(state, rwtxn, &filled_tx)?;
             }
             Some(TxData::TransferReputation { .. }) => {}
-            // AmplifyBeta only deposits bitcoin to the treasury; the
-            // consolidation undo step already reverts the treasury UTXO,
-            // so there is no transaction-level state to revert here.
             Some(TxData::AmplifyBeta { .. }) => {}
         }
 
@@ -1104,6 +1122,10 @@ pub fn disconnect_tip(
                 })
             }
         })?;
+    }
+
+    if !skipped_tx_indices.is_empty() {
+        state.skipped_tx_indices_undo.delete(rwtxn, &height)?;
     }
 
     // 3b. Apply batched share account changes from trade reverts
@@ -1200,6 +1222,11 @@ pub fn disconnect_tip(
             .delete_periods_above(rwtxn, prev_highest)?;
         state.minting_undo.delete(rwtxn, &height)?;
     }
+
+    // 7c. Restore period_pricing from undo log
+    state
+        .decisions()
+        .restore_period_pricing_undo(rwtxn, height)?;
 
     // 8. Update tip/height to previous (existing)
     match (header.prev_side_hash, height) {
@@ -1305,11 +1332,11 @@ fn revert_consolidation(
     Ok(())
 }
 
-/// Revert market ossification and payouts (C1)
-fn revert_ossification(
+/// Revert market settlement and payouts (C1)
+fn revert_settlement(
     state: &State,
     rwtxn: &mut RwTxn,
-    undo: &crate::state::undo::OssificationUndoData,
+    undo: &crate::state::undo::SettlementUndoData,
     block_height: u32,
 ) -> Result<(), Error> {
     for entry in undo.entries.iter().rev() {
@@ -1326,7 +1353,7 @@ fn revert_ossification(
             state.insert_utxo(rwtxn, outpoint, filled_output)?;
             state.markets().set_market_funds_utxo(
                 rwtxn,
-                &entry.pre_ossification_market.id,
+                &entry.pre_settlement_market.id,
                 false,
                 outpoint,
             )?;
@@ -1337,20 +1364,20 @@ fn revert_ossification(
             state.insert_utxo(rwtxn, outpoint, filled_output)?;
             state.markets().set_market_funds_utxo(
                 rwtxn,
-                &entry.pre_ossification_market.id,
+                &entry.pre_settlement_market.id,
                 true,
                 outpoint,
             )?;
         }
 
-        // Restore market to pre-ossification state (Trading, no final prices)
+        // Restore market to pre-settlement state (Trading, no final prices)
         state
             .markets()
-            .restore_market(rwtxn, &entry.pre_ossification_market)?;
+            .restore_market(rwtxn, &entry.pre_settlement_market)?;
 
         tracing::info!(
-            "Reverted ossification for market {}",
-            entry.pre_ossification_market.id
+            "Reverted settlement for market {}",
+            entry.pre_settlement_market.id
         );
     }
     Ok(())
@@ -1507,8 +1534,8 @@ fn configure_market_builder(
 }
 
 /// Derive the current effective beta for a market.
-/// Beta is `treasury / ln(num_outcomes)`, where treasury is the confirmed
-/// treasury UTXO value plus any pending mempool amplify_beta deposits.
+/// `beta = confirmed_treasury / ln(num_outcomes)`. Mempool-pending
+/// `AmplifyBeta` deposits are not counted until they confirm.
 fn market_beta(
     state: &State,
     rotxn: &RoTxn,
@@ -1518,10 +1545,8 @@ fn market_beta(
     let confirmed = state
         .markets()
         .get_market_funds_sats(rotxn, state, market_id, false)?;
-    let pending = state.get_mempool_treasury_delta(rotxn, market_id)?;
-    let total = confirmed.saturating_add(pending);
     Ok(trading::derive_beta_from_liquidity(
-        total,
+        confirmed,
         market.shares().len(),
     ))
 }
@@ -1603,13 +1628,6 @@ fn revert_create_market(
     })?;
 
     let market_id = market.id;
-
-    if let Some(outpoint) = state
-        .markets()
-        .get_market_funds_utxo(rwtxn, &market_id, false)?
-    {
-        state.delete_utxo(rwtxn, &outpoint)?;
-    }
 
     state.markets().delete_market(rwtxn, &market_id)?;
 
@@ -2116,8 +2134,6 @@ fn apply_market_creation(
 }
 
 fn apply_amplify_beta(
-    state: &State,
-    rwtxn: &mut RwTxn,
     filled_tx: &FilledTransaction,
     state_update: &mut StateUpdate,
 ) -> Result<(), Error> {
@@ -2143,31 +2159,6 @@ fn apply_amplify_beta(
         market_fee_sats: 0,
         transaction_id: filled_tx.transaction.txid().0,
     });
-
-    let pending_delta =
-        state.get_mempool_treasury_delta(rwtxn, &amplify.market_id)?;
-    let remaining_delta = match pending_delta.checked_sub(amplify.amount) {
-        Some(remaining) => remaining,
-        None => {
-            tracing::warn!(
-                "apply_amplify_beta: mempool treasury delta {} for market \
-                 {:?} is less than applied amount {}; resetting to 0",
-                pending_delta,
-                amplify.market_id,
-                amplify.amount
-            );
-            0
-        }
-    };
-    if remaining_delta == 0 {
-        state.clear_mempool_treasury_delta(rwtxn, &amplify.market_id)?;
-    } else {
-        state.put_mempool_treasury_delta(
-            rwtxn,
-            &amplify.market_id,
-            remaining_delta,
-        )?;
-    }
 
     Ok(())
 }

@@ -345,20 +345,12 @@ where
                             )?;
                         }
                     }
-                    crate::types::TxData::AmplifyBeta {
-                        market_id,
-                        amount,
-                        ..
-                    } => {
-                        self.update_mempool_amplify_beta(
-                            &mut rwtxn, *market_id, *amount,
-                        )?;
-                    }
                     crate::types::TxData::ClaimDecision { .. }
                     | crate::types::TxData::CreateMarket { .. }
                     | crate::types::TxData::SubmitVote { .. }
                     | crate::types::TxData::SubmitBallot { .. }
-                    | crate::types::TxData::TransferReputation { .. } => {}
+                    | crate::types::TxData::TransferReputation { .. }
+                    | crate::types::TxData::AmplifyBeta { .. } => {}
                 }
             }
 
@@ -376,6 +368,13 @@ where
         self.state
             .get_mempool_shares(&rotxn, market_id)
             .map_err(|e| Error::State(Box::new(e)))
+    }
+
+    pub fn get_pending_decision_claim_ids(
+        &self,
+    ) -> Result<std::collections::BTreeSet<[u8; 3]>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.mempool.pending_decision_claim_ids(&rotxn)?)
     }
 
     /// Single unified watch stream - fires when state or mempool changes.
@@ -533,59 +532,21 @@ where
         Ok(())
     }
 
-    fn update_mempool_amplify_beta(
-        &self,
-        rwtxn: &mut RwTxn,
-        market_id: MarketId,
-        amount: u64,
-    ) -> Result<(), Error> {
-        let existing_delta = self
-            .state
-            .get_mempool_treasury_delta(rwtxn, &market_id)
-            .map_err(|e| Error::State(Box::new(e)))?;
-        let new_delta =
-            existing_delta.checked_add(amount).ok_or_else(|| {
-                Error::State(Box::new(crate::state::Error::InvalidDecisionId {
-                    reason: "Mempool treasury delta overflow".to_string(),
-                }))
-            })?;
-        self.state
-            .put_mempool_treasury_delta(rwtxn, &market_id, new_delta)
-            .map_err(|e| Error::State(Box::new(e)))
-    }
-
-    pub fn get_mempool_treasury_delta(
-        &self,
-        market_id: &crate::state::markets::MarketId,
-    ) -> Result<u64, Error> {
-        let rotxn = self.env.read_txn()?;
-        self.state
-            .get_mempool_treasury_delta(&rotxn, market_id)
-            .map_err(|e| Error::State(Box::new(e)))
-    }
-
-    /// Returns the effective treasury (confirmed treasury UTXO value plus
-    /// any pending amplify_beta deposits in the mempool). This is the basis
-    /// for the effective beta used in price calculations.
+    /// Returns the confirmed market treasury value in sats.
     pub fn get_effective_market_treasury_sats(
         &self,
         market_id: &crate::state::markets::MarketId,
     ) -> Result<u64, Error> {
         let rotxn = self.env.read_txn()?;
-        let confirmed = self
-            .state
+        self.state
             .markets()
             .get_market_funds_sats(&rotxn, &self.state, market_id, false)
-            .map_err(|e| Error::State(Box::new(e)))?;
-        let pending = self
-            .state
-            .get_mempool_treasury_delta(&rotxn, market_id)
-            .map_err(|e| Error::State(Box::new(e)))?;
-        Ok(confirmed.saturating_add(pending))
+            .map_err(|e| Error::State(Box::new(e)))
     }
 
     /// Derive the current effective LMSR beta for a market.
-    /// `beta = (confirmed_treasury + pending_mempool_delta) / ln(num_outcomes)`
+    /// `beta = confirmed_treasury / ln(num_outcomes)`. Pending mempool
+    /// `AmplifyBeta` deposits are not counted until they confirm.
     fn derive_market_beta(
         &self,
         rotxn: &sneed::RoTxn,
@@ -597,12 +558,8 @@ where
             .markets()
             .get_market_funds_sats(rotxn, &self.state, market_id, false)
             .map_err(|e| Error::State(Box::new(e)))?;
-        let pending = self
-            .state
-            .get_mempool_treasury_delta(rotxn, market_id)
-            .map_err(|e| Error::State(Box::new(e)))?;
         Ok(trading::derive_beta_from_liquidity(
-            confirmed.saturating_add(pending),
+            confirmed,
             market.shares().len(),
         ))
     }
@@ -1421,7 +1378,7 @@ where
                 );
             }
         }
-        if let Some((bundle, _)) = bundle {
+        if let Some((bundle, _bundle_h)) = bundle {
             let m6id = bundle.compute_m6id();
             let mut cusf_mainchain_wallet_lock =
                 cusf_mainchain_wallet.lock().await;
@@ -1494,11 +1451,11 @@ where
         Ok(self.state.is_decision_in_voting(&rotxn, decision_id)?)
     }
 
-    pub fn get_ossified_decisions(
+    pub fn get_settled_decisions(
         &self,
     ) -> Result<Vec<crate::state::decisions::DecisionEntry>, Error> {
         let rotxn = self.env.read_txn()?;
-        Ok(self.state.get_ossified_decisions(&rotxn)?)
+        Ok(self.state.get_settled_decisions(&rotxn)?)
     }
 
     pub fn get_voting_periods(&self) -> Result<Vec<(u32, u64, u64)>, Error> {
@@ -1526,20 +1483,23 @@ where
     pub fn get_listing_fee_info(
         &self,
         period: u32,
-    ) -> Result<(u64, u64, u64), Error> {
+    ) -> Result<Option<crate::state::decisions::PeriodPricing>, Error> {
         let rotxn = self.env.read_txn()?;
-        let current_ts =
-            self.state.try_get_mainchain_timestamp(&rotxn)?.unwrap_or(0);
-        let current_height = self.state.try_get_height(&rotxn)?;
-        let genesis_ts =
-            self.state.try_get_genesis_timestamp(&rotxn)?.unwrap_or(0);
-        Ok(self.state.decisions().get_listing_fee_info(
-            &rotxn,
-            period,
-            current_ts,
-            current_height,
-            genesis_ts,
-        )?)
+        Ok(self
+            .state
+            .decisions()
+            .get_listing_fee_info(&rotxn, period)?)
+    }
+
+    pub fn fee_for_decision_id(
+        &self,
+        decision_id: crate::state::decisions::DecisionId,
+    ) -> Result<u64, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .decisions()
+            .fee_for_decision_id(&rotxn, decision_id)?)
     }
 
     pub fn is_decisions_testing_mode(&self) -> bool {

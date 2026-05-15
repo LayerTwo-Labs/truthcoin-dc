@@ -532,7 +532,7 @@ mod tests {
         assert!(
             MarketStateValidator::validate_market_state_transition(
                 MarketState::Trading,
-                MarketState::Ossified
+                MarketState::Settled
             )
             .is_ok()
         );
@@ -563,7 +563,7 @@ mod tests {
     fn state_transition_invalid() {
         assert!(
             MarketStateValidator::validate_market_state_transition(
-                MarketState::Ossified,
+                MarketState::Settled,
                 MarketState::Trading
             )
             .is_err()

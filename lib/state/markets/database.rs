@@ -32,12 +32,6 @@ pub struct MarketsDatabase {
     /// is_fee=false for treasury, is_fee=true for author fees
     market_funds_utxos:
         DatabaseUnique<SerdeBincode<([u8; 6], bool)>, SerdeBincode<OutPoint>>,
-    /// Cumulative pending treasury deposits from unconfirmed amplify_beta
-    /// transactions. Since beta = treasury / ln(num_outcomes), this delta
-    /// is sufficient to derive the effective beta for pricing on reads.
-    /// Cleared when the corresponding block is applied.
-    market_mempool_treasury_delta:
-        DatabaseUnique<SerdeBincode<[u8; 6]>, SerdeBincode<u64>>,
     /// Pending per-outcome share totals from unconfirmed trades.
     /// Cleared when the corresponding block is applied.
     mempool_shares:
@@ -45,7 +39,7 @@ pub struct MarketsDatabase {
 }
 
 impl MarketsDatabase {
-    pub const NUM_DBS: u32 = 8;
+    pub const NUM_DBS: u32 = 7;
 
     pub fn new(env: &Env, rwtxn: &mut RwTxn) -> Result<Self, Error> {
         let markets = DatabaseUnique::create(env, rwtxn, "markets")?;
@@ -59,11 +53,6 @@ impl MarketsDatabase {
             DatabaseUnique::create(env, rwtxn, "share_accounts")?;
         let market_funds_utxos =
             DatabaseUnique::create(env, rwtxn, "market_funds_utxos")?;
-        let market_mempool_treasury_delta = DatabaseUnique::create(
-            env,
-            rwtxn,
-            "market_mempool_treasury_delta",
-        )?;
         let mempool_shares =
             DatabaseUnique::create(env, rwtxn, "mempool_shares")?;
 
@@ -74,7 +63,6 @@ impl MarketsDatabase {
             decision_index,
             share_accounts,
             market_funds_utxos,
-            market_mempool_treasury_delta,
             mempool_shares,
         })
     }
@@ -240,8 +228,8 @@ impl MarketsDatabase {
     }
 
     /// Like `update_market` but bypasses the state-machine transition check.
-    /// Used only on reorg to restore a market's pre-ossification state, where
-    /// the forward-direction transition (Ossified → Trading) is illegal but
+    /// Used only on reorg to restore a market's pre-settlement state, where
+    /// the forward-direction transition (Settled → Trading) is illegal but
     /// legitimate in undo.
     pub fn restore_market(
         &self,
@@ -361,7 +349,7 @@ impl MarketsDatabase {
         Ok(())
     }
 
-    /// Transition resolved markets directly from Trading -> Ossified with automatic share payouts.
+    /// Transition resolved markets directly from Trading -> Settled with automatic share payouts.
     /// Called every block from connect_body. Checks ALL trading markets to see if
     /// their decisions are now Resolved in the DecisionStateHistory database.
     #[allow(clippy::type_complexity)]
@@ -374,7 +362,7 @@ impl MarketsDatabase {
     ) -> Result<
         (
             Vec<(MarketId, MarketPayoutSummary)>,
-            Vec<crate::state::undo::OssificationUndoEntry>,
+            Vec<crate::state::undo::SettlementUndoEntry>,
         ),
         Error,
     > {
@@ -431,8 +419,8 @@ impl MarketsDatabase {
             if all_decisions_resolved {
                 let market_id = market.id;
 
-                // Capture pre-ossification state for undo
-                let pre_ossification_market = market.clone();
+                // Capture pre-settlement state for undo
+                let pre_settlement_market = market.clone();
 
                 // Capture treasury and fee UTXOs before they are consumed
                 let treasury_utxo = if let Some(outpoint) =
@@ -497,20 +485,20 @@ impl MarketsDatabase {
                 market
                     .update_state(
                         current_height,
-                        Some(MarketState::Ossified),
+                        Some(MarketState::Settled),
                         None,
                         None,
                     )
                     .map_err(|e| {
                         Error::DatabaseError(format!(
-                            "Failed to ossify market: {e:?}"
+                            "Failed to settle market: {e:?}"
                         ))
                     })?;
 
                 self.update_market(txn, &market)?;
 
-                undo_entries.push(crate::state::undo::OssificationUndoEntry {
-                    pre_ossification_market,
+                undo_entries.push(crate::state::undo::SettlementUndoEntry {
+                    pre_settlement_market,
                     payout_summary: payout_summary.clone(),
                     treasury_utxo,
                     fee_utxo,
@@ -579,41 +567,6 @@ impl MarketsDatabase {
         market_id: &MarketId,
     ) -> Result<(), Error> {
         self.mempool_shares.delete(rwtxn, &market_id.0)?;
-        Ok(())
-    }
-
-    pub fn get_mempool_treasury_delta(
-        &self,
-        rotxn: &RoTxn,
-        market_id: &MarketId,
-    ) -> Result<u64, Error> {
-        Ok(self
-            .market_mempool_treasury_delta
-            .try_get(rotxn, market_id.as_bytes())?
-            .unwrap_or(0))
-    }
-
-    pub fn put_mempool_treasury_delta(
-        &self,
-        rwtxn: &mut RwTxn,
-        market_id: &MarketId,
-        delta: u64,
-    ) -> Result<(), Error> {
-        self.market_mempool_treasury_delta.put(
-            rwtxn,
-            market_id.as_bytes(),
-            &delta,
-        )?;
-        Ok(())
-    }
-
-    pub fn clear_mempool_treasury_delta(
-        &self,
-        rwtxn: &mut RwTxn,
-        market_id: &MarketId,
-    ) -> Result<(), Error> {
-        self.market_mempool_treasury_delta
-            .delete(rwtxn, market_id.as_bytes())?;
         Ok(())
     }
 

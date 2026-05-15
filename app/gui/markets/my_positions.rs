@@ -297,7 +297,7 @@ impl MyPositions {
                     for (idx, pos) in self.positions.iter().enumerate() {
                         let state_str = match pos.market_state {
                             MarketState::Trading => "",
-                            MarketState::Ossified => " [Resolved]",
+                            MarketState::Settled => " [Resolved]",
                             MarketState::Cancelled => " [Cancelled]",
                             MarketState::Invalid => " [Invalid]",
                         };

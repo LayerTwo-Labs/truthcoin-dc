@@ -1,4 +1,5 @@
 pub mod allocation;
+pub mod decisions;
 pub mod lmsr;
 pub mod markets;
 pub mod safe_math;

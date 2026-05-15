@@ -87,8 +87,11 @@ mod expected_phase2 {
     /// Scaled decision parameters and expected outcomes
     pub mod scaled {
         /// BTC price prediction range
-        pub const BTC_PRICE_MIN: i64 = 10000;
-        pub const BTC_PRICE_MAX: i64 = 200000;
+        pub const BTC_PRICE_MIN: f64 = 10000.0;
+        pub const BTC_PRICE_MAX: f64 = 200000.0;
+        /// Step size for BTC price votes. 143_000 / 152_500 / 162_000 are all
+        /// divisible by 100, so existing batch votes stay aligned.
+        pub const BTC_PRICE_INCREMENT: f64 = 100.0;
 
         /// Expected consensus for scaled BTC price (weighted median)
         /// Votes: [0.75, 0.80, 0.70, 0.75, 0.78, 0.76, 0.74]
@@ -253,16 +256,16 @@ mod debug_helpers {
         Ok(())
     }
 
-    /// Assert ossified market treasury is zero with detailed logging
+    /// Assert settled market treasury is zero with detailed logging
     pub fn assert_treasury_zero(
         market: &MarketData,
         market_id: &str,
     ) -> anyhow::Result<()> {
-        if market.state == "Ossified" && market.treasury != 0.0 {
-            tracing::error!("=== TREASURY NOT ZERO FOR OSSIFIED MARKET ===");
+        if market.state == "Settled" && market.treasury != 0.0 {
+            tracing::error!("=== TREASURY NOT ZERO FOR SETTLED MARKET ===");
             log_market_detail(market, &format!("Market {market_id}"));
             anyhow::bail!(
-                "Ossified market {} should have zero treasury, got {}",
+                "Settled market {} should have zero treasury, got {}",
                 market_id,
                 market.treasury
             );
@@ -715,6 +718,55 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
+    // Reprice baseline. With --decision-config-testing 10, BLOCKS_PER_PERIOD=10
+    // and REPRICE_INTERVAL=2, so a period sees 5 reprice events: heights 2/4/6/8
+    // (mid-period) plus the transition at height 10 (forced reprice on surviving
+    // periods, completing MID_PERIOD_REPRICES=5). With zero sales in this period,
+    // each reprice halves p_period; after the 4th mid-period reprice it sits at
+    // p_floor=GENESIS_P_PERIOD_SATS/16=625 and stays there until claims push
+    // it up. By this point the chain has advanced past height 8 (Phase 1
+    // votecoin distribution + four deposits each BMM sidechain blocks), so we
+    // expect period 3 to be at floor. We assert invariants that hold regardless:
+    //   - p_floor == GENESIS_P_PERIOD_SATS/16 (proves seeding source)
+    //   - claimed == 0 (no claims yet in this period)
+    //   - tier_prices derives correctly from p_period
+    //   - p_period is between p_floor and GENESIS_P_PERIOD_SATS
+    let pricing_pre_phase2 = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .decision_listing_fee(3)
+        .await?;
+    anyhow::ensure!(
+        pricing_pre_phase2.p_floor == 625,
+        "Expected p_floor=625 (GENESIS_P_PERIOD_SATS/16), got {}",
+        pricing_pre_phase2.p_floor
+    );
+    anyhow::ensure!(
+        pricing_pre_phase2.claimed == 0,
+        "Expected claimed=0 before phase 2 claims, got {}",
+        pricing_pre_phase2.claimed
+    );
+    anyhow::ensure!(
+        pricing_pre_phase2.p_period >= pricing_pre_phase2.p_floor
+            && pricing_pre_phase2.p_period <= 10_000,
+        "p_period {} outside [floor={}, genesis=10_000]",
+        pricing_pre_phase2.p_period,
+        pricing_pre_phase2.p_floor
+    );
+    let p = pricing_pre_phase2.p_period;
+    anyhow::ensure!(
+        pricing_pre_phase2.tier_prices
+            == [p / 4, p / 2, p, p.saturating_mul(2), p.saturating_mul(4)],
+        "tier_prices {:?} don't derive from p_period={}",
+        pricing_pre_phase2.tier_prices,
+        p
+    );
+    tracing::info!(
+        "✓ Reprice baseline: period 3 at p_period={}, p_floor={}, claimed=0",
+        pricing_pre_phase2.p_period,
+        pricing_pre_phase2.p_floor
+    );
+
     let decision_claims = [
         (voter_addr_0, 0, "Will Bitcoin reach $100k in 2025?"),
         (
@@ -726,26 +778,23 @@ async fn roundtrip_task_inner(
         (voter_addr_3, 3, "Will BIP 444 activate"),
     ];
 
-    for (i, (_voter_addr, decision_index, header)) in
-        decision_claims.iter().enumerate()
-    {
-        let voter_node = match i {
-            0 => &truthcoin_nodes.voter_0,
-            1 => &truthcoin_nodes.voter_1,
-            2 => &truthcoin_nodes.voter_2,
-            3 => &truthcoin_nodes.voter_3,
-            _ => unreachable!(),
-        };
-
-        voter_node
+    // All four claims go through the issuer's node (single mempool). With
+    // auto-pick the slot picker reads only the local mempool; in a star
+    // topology where voters peer with the issuer but not each other,
+    // parallel claims from different voter nodes can't see each other's
+    // pending txs and auto-pick the same slot. Routing through the issuer
+    // gives every claim a coherent view of pending state in one mempool, so
+    // all four land in distinct slots in a single block. The market_maker
+    // for each decision becomes the issuer's address; the test counts fee
+    // UTXOs per market_id, not per owner, so this is invariant-preserving.
+    for (_voter_addr, _decision_index, header) in &decision_claims {
+        truthcoin_nodes
+            .issuer
             .rpc_client
             .decision_claim(DecisionClaimRequest {
                 decision_type: "binary".to_string(),
                 decisions: vec![DecisionClaimItem {
-                    decision_id_hex: format!(
-                        "{:06x}",
-                        (3u32 << 16) | decision_index
-                    ),
+                    period_index: 3,
                     header: header.to_string(),
                     description: None,
                     option_0_label: None,
@@ -755,7 +804,9 @@ async fn roundtrip_task_inner(
                 }],
                 min: None,
                 max: None,
-                fee_sats: 1000,
+                increment: None,
+                tx_fee_sats: 1_000,
+                max_listing_fee_sats: None,
             })
             .await?;
     }
@@ -768,6 +819,40 @@ async fn roundtrip_task_inner(
         .await?;
 
     sleep(std::time::Duration::from_secs(2)).await;
+
+    // Reprice observation after phase 2 claims confirm. Per the sequencing
+    // fix, the block that includes the claims runs the tx loop first, then
+    // process_block_pricing — so any reprice that fires in this block sees
+    // the 4 sales. We assert the observable path fired (claimed counted,
+    // p_period within bounds) rather than reproducing the reprice formula.
+    let pricing_post_phase2 = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .decision_listing_fee(3)
+        .await?;
+    anyhow::ensure!(
+        pricing_post_phase2.claimed == 4,
+        "Expected 4 claimed after phase 2, got {}",
+        pricing_post_phase2.claimed
+    );
+    anyhow::ensure!(
+        pricing_post_phase2.p_period <= pricing_pre_phase2.p_period,
+        "p_period unexpectedly increased: pre={} post={}",
+        pricing_pre_phase2.p_period,
+        pricing_post_phase2.p_period
+    );
+    anyhow::ensure!(
+        pricing_post_phase2.p_period >= pricing_pre_phase2.p_floor,
+        "p_period {} fell below floor {}",
+        pricing_post_phase2.p_period,
+        pricing_pre_phase2.p_floor
+    );
+    tracing::info!(
+        "✓ Reprice after phase 2: claimed={}, p_period={} (pre={})",
+        pricing_post_phase2.claimed,
+        pricing_post_phase2.p_period,
+        pricing_pre_phase2.p_period
+    );
 
     let issuer_height =
         truthcoin_nodes.issuer.rpc_client.getblockcount().await?;
@@ -1682,6 +1767,54 @@ async fn roundtrip_task_inner(
 
     tracing::info!("✓ Phase 7: Voting period closed");
 
+    // Period-transition assertion: the bulk BMM above crossed at least one
+    // period boundary. Verify that the transition code paths fired by
+    // checking a surviving period's last_reprice_block is recent and that
+    // the chain has minted forward (a period that didn't exist before now
+    // does, with sensible pricing).
+    let post_phase7_height =
+        truthcoin_nodes.issuer.rpc_client.getblockcount().await?;
+    let post_phase7_status =
+        truthcoin_nodes.issuer.rpc_client.decision_status().await?;
+    let surviving_period = post_phase7_status.current_period.saturating_add(1);
+    let surviving_pricing = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .decision_listing_fee(surviving_period)
+        .await?;
+    anyhow::ensure!(
+        u64::from(surviving_pricing.last_reprice_block) + 20
+            >= u64::from(post_phase7_height),
+        "Surviving period {surviving_period}: last_reprice_block={} \
+         far behind current height {post_phase7_height}",
+        surviving_pricing.last_reprice_block
+    );
+
+    let new_period = post_phase7_status.current_period + 19;
+    let new_pricing = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .decision_listing_fee(new_period)
+        .await?;
+    anyhow::ensure!(
+        new_pricing.claimed == 0,
+        "Newly seeded period {new_period} should have no claims, got {}",
+        new_pricing.claimed
+    );
+    anyhow::ensure!(
+        new_pricing.p_period >= new_pricing.p_floor,
+        "Newly seeded period {new_period}: p_period {} below floor {}",
+        new_pricing.p_period,
+        new_pricing.p_floor
+    );
+    tracing::info!(
+        "✓ Period-transition: surviving period {surviving_period} \
+         last_reprice_block={}, new period {new_period} \
+         seeded with p_period={}",
+        surviving_pricing.last_reprice_block,
+        new_pricing.p_period
+    );
+
     // ==========================================================================
     // Phase 8: Period Resolution (Consensus + Redistribution + Market Redemption)
     // ==========================================================================
@@ -1791,16 +1924,16 @@ async fn roundtrip_task_inner(
         );
     }
 
-    // Verify market ossification and share redemption
-    let ossified_markets =
+    // Verify market settlement and share redemption
+    let settled_markets =
         truthcoin_nodes.issuer.rpc_client.market_list().await?;
     anyhow::ensure!(
-        ossified_markets.len() == 4,
+        settled_markets.len() == 4,
         "Expected 4 markets, got {}",
-        ossified_markets.len()
+        settled_markets.len()
     );
 
-    for market_summary in &ossified_markets {
+    for market_summary in &settled_markets {
         let market_data = truthcoin_nodes
             .issuer
             .rpc_client
@@ -1815,8 +1948,8 @@ async fn roundtrip_task_inner(
 
         let market = market_data.unwrap();
         anyhow::ensure!(
-            market.state == "Ossified",
-            "Expected market {} to be Ossified, got {}",
+            market.state == "Settled",
+            "Expected market {} to be Settled, got {}",
             market_summary.market_id,
             market.state
         );
@@ -1834,7 +1967,7 @@ async fn roundtrip_task_inner(
     }
 
     // Verify market payouts based on consensus outcomes
-    for market_summary in &ossified_markets {
+    for market_summary in &settled_markets {
         let market_data = truthcoin_nodes
             .issuer
             .rpc_client
@@ -1920,32 +2053,31 @@ async fn roundtrip_task_inner(
     }
 
     // Verify market UTXOs consumed after payout distribution
-    let post_ossification_utxos =
+    let post_settlement_utxos =
         truthcoin_nodes.issuer.rpc_client.list_utxos().await?;
     let remaining_treasury_utxos =
-        utxo_verification::get_market_treasury_utxos(&post_ossification_utxos);
-    let remaining_fee_utxos = utxo_verification::get_market_author_fee_utxos(
-        &post_ossification_utxos,
-    );
+        utxo_verification::get_market_treasury_utxos(&post_settlement_utxos);
+    let remaining_fee_utxos =
+        utxo_verification::get_market_author_fee_utxos(&post_settlement_utxos);
 
     for market_id in &market_ids {
         anyhow::ensure!(
             !remaining_treasury_utxos.contains_key(market_id),
-            "Market {market_id} treasury UTXO should be consumed after ossification"
+            "Market {market_id} treasury UTXO should be consumed after settlement"
         );
         anyhow::ensure!(
             !remaining_fee_utxos.contains_key(market_id),
-            "Market {market_id} author fee UTXO should be consumed after ossification"
+            "Market {market_id} author fee UTXO should be consumed after settlement"
         );
     }
 
     anyhow::ensure!(
         remaining_treasury_utxos.is_empty(),
-        "No market treasury UTXOs should remain after ossification"
+        "No market treasury UTXOs should remain after settlement"
     );
     anyhow::ensure!(
         remaining_fee_utxos.is_empty(),
-        "No market author fee UTXOs should remain after ossification"
+        "No market author fee UTXOs should remain after settlement"
     );
 
     // Verify reputation is not mutated by market payout distribution
@@ -2041,14 +2173,22 @@ async fn roundtrip_task_inner(
     }
     sleep(std::time::Duration::from_secs(1)).await;
 
+    // All Phase 9 claims route through the issuer's node. With auto-pick the
+    // slot picker reads only the local mempool; in this star topology
+    // (issuer ↔ each voter, voters not peered) parallel claims from
+    // different voter nodes can't see each other's pending txs and would
+    // collide on the same slot. Submitting through one node serializes
+    // auto-pick over a single mempool, so all 12 claims land in distinct
+    // slots in the same block — no extra BMMs and no period-timing shift.
+
     // Claim scaled decision for Market A (BTC price prediction)
-    truthcoin_nodes
-        .voter_0
+    let scaled_a_resp = truthcoin_nodes
+        .issuer
         .rpc_client
         .decision_claim(DecisionClaimRequest {
             decision_type: "scaled".to_string(),
             decisions: vec![DecisionClaimItem {
-                decision_id_hex: format!("{:06x}", test_period << 16),
+                period_index: test_period,
                 header: "What will BTC price be EOY 2025? (USD)".to_string(),
                 description: None,
                 option_0_label: None,
@@ -2058,20 +2198,21 @@ async fn roundtrip_task_inner(
             }],
             min: Some(expected_phase2::scaled::BTC_PRICE_MIN),
             max: Some(expected_phase2::scaled::BTC_PRICE_MAX),
-            fee_sats: 1000,
+            increment: Some(expected_phase2::scaled::BTC_PRICE_INCREMENT),
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
         })
         .await?;
+    let scaled_dec_0 = scaled_a_resp.decision_ids[0].clone();
 
     // Claim categorical decision for Market B (3-way: Election)
-    let cat_dec_10_hex = format!("{:06x}", (test_period << 16) | 10);
-
-    let _category_b_txid = truthcoin_nodes
-        .voter_1
+    let category_b_resp = truthcoin_nodes
+        .issuer
         .rpc_client
         .decision_claim(DecisionClaimRequest {
             decision_type: "category".to_string(),
             decisions: vec![DecisionClaimItem {
-                decision_id_hex: cat_dec_10_hex.clone(),
+                period_index: test_period,
                 header: "Who will win the 2028 election?".to_string(),
                 description: None,
                 option_0_label: None,
@@ -2085,20 +2226,21 @@ async fn roundtrip_task_inner(
             }],
             min: None,
             max: None,
-            fee_sats: 1000,
+            increment: None,
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
         })
         .await?;
+    let cat_dec_10 = category_b_resp.decision_ids[0].clone();
 
     // Claim categorical decision for Market C (4-way: TVL)
-    let cat_dec_20_hex = format!("{:06x}", (test_period << 16) | 20);
-
-    let _category_c_txid = truthcoin_nodes
-        .voter_2
+    let category_c_resp = truthcoin_nodes
+        .issuer
         .rpc_client
         .decision_claim(DecisionClaimRequest {
             decision_type: "category".to_string(),
             decisions: vec![DecisionClaimItem {
-                decision_id_hex: cat_dec_20_hex.clone(),
+                period_index: test_period,
                 header: "Which chain will have highest TVL?".to_string(),
                 description: None,
                 option_0_label: None,
@@ -2113,63 +2255,35 @@ async fn roundtrip_task_inner(
             }],
             min: None,
             max: None,
-            fee_sats: 1000,
+            increment: None,
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
         })
         .await?;
+    let cat_dec_20 = category_c_resp.decision_ids[0].clone();
 
-    // Claim binary decisions for Markets D, E, and F
-    let binary_claims: &[(&PostSetup, u32, &str)] = &[
-        (
-            &truthcoin_nodes.voter_3,
-            30,
-            "Will inflation exceed 3% in 2025?",
-        ),
-        (
-            &truthcoin_nodes.voter_4,
-            31,
-            "Will the Fed cut rates in 2025?",
-        ),
-        (
-            &truthcoin_nodes.voter_5,
-            32,
-            "Will unemployment rise above 5%?",
-        ),
-        (
-            &truthcoin_nodes.voter_6,
-            33,
-            "Will GDP growth exceed 3% in 2025?",
-        ),
-        (
-            &truthcoin_nodes.voter_0,
-            34,
-            "Will housing prices rise in 2025?",
-        ),
-        (
-            &truthcoin_nodes.voter_1,
-            35,
-            "Will consumer confidence increase?",
-        ),
-        (
-            &truthcoin_nodes.voter_2,
-            36,
-            "Will retail sales exceed $7T?",
-        ),
-        (
-            &truthcoin_nodes.voter_3,
-            37,
-            "Will manufacturing output increase?",
-        ),
+    // Claim binary decisions for Markets D, E, and F (all via the issuer)
+    let binary_claim_headers: &[&str] = &[
+        "Will inflation exceed 3% in 2025?",
+        "Will the Fed cut rates in 2025?",
+        "Will unemployment rise above 5%?",
+        "Will GDP growth exceed 3% in 2025?",
+        "Will housing prices rise in 2025?",
+        "Will consumer confidence increase?",
+        "Will retail sales exceed $7T?",
+        "Will manufacturing output increase?",
     ];
 
-    for (node, idx, header) in binary_claims {
-        node.rpc_client
+    let mut binary_dec_ids: Vec<String> =
+        Vec::with_capacity(binary_claim_headers.len());
+    for header in binary_claim_headers {
+        let resp = truthcoin_nodes
+            .issuer
+            .rpc_client
             .decision_claim(DecisionClaimRequest {
                 decision_type: "binary".to_string(),
                 decisions: vec![DecisionClaimItem {
-                    decision_id_hex: format!(
-                        "{:06x}",
-                        (test_period << 16) | idx
-                    ),
+                    period_index: test_period,
                     header: header.to_string(),
                     description: None,
                     option_0_label: None,
@@ -2179,19 +2293,22 @@ async fn roundtrip_task_inner(
                 }],
                 min: None,
                 max: None,
-                fee_sats: 1000,
+                increment: None,
+                tx_fee_sats: 1_000,
+                max_listing_fee_sats: None,
             })
             .await?;
+        binary_dec_ids.push(resp.decision_ids[0].clone());
     }
 
     // Claim second scaled decision for Market I (ETH/BTC ratio)
-    truthcoin_nodes
-        .voter_4
+    let scaled_b_resp = truthcoin_nodes
+        .issuer
         .rpc_client
         .decision_claim(DecisionClaimRequest {
             decision_type: "scaled".to_string(),
             decisions: vec![DecisionClaimItem {
-                decision_id_hex: format!("{:06x}", (test_period << 16) | 1),
+                period_index: test_period,
                 header: "ETH/BTC ratio at end of 2025".to_string(),
                 description: None,
                 option_0_label: None,
@@ -2199,11 +2316,14 @@ async fn roundtrip_task_inner(
                 option_labels: None,
                 tags: None,
             }],
-            min: Some(0),
-            max: Some(100),
-            fee_sats: 1000,
+            min: Some(0.0),
+            max: Some(100.0),
+            increment: None,
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
         })
         .await?;
+    let scaled_dec_1 = scaled_b_resp.decision_ids[0].clone();
 
     sleep(std::time::Duration::from_secs(2)).await;
     truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
@@ -2287,19 +2407,22 @@ async fn roundtrip_task_inner(
     }
     truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
 
-    // Collect decision IDs for market creation
-    let scaled_dec_0 = format!("{:06x}", test_period << 16);
-    let scaled_dec_1 = format!("{:06x}", (test_period << 16) | 1);
-    let cat_dec_10 = format!("{:06x}", (test_period << 16) | 10);
-    let cat_dec_20 = format!("{:06x}", (test_period << 16) | 20);
-    let bin_dec_30 = format!("{:06x}", (test_period << 16) | 30);
-    let bin_dec_31 = format!("{:06x}", (test_period << 16) | 31);
-    let bin_dec_32 = format!("{:06x}", (test_period << 16) | 32);
-    let bin_dec_33 = format!("{:06x}", (test_period << 16) | 33);
-    let bin_dec_34 = format!("{:06x}", (test_period << 16) | 34);
-    let bin_dec_35 = format!("{:06x}", (test_period << 16) | 35);
-    let bin_dec_36 = format!("{:06x}", (test_period << 16) | 36);
-    let bin_dec_37 = format!("{:06x}", (test_period << 16) | 37);
+    // Decision IDs for market creation come from the auto-pick responses
+    // captured above (scaled_dec_0/_1, cat_dec_10/_20). The 8 binary
+    // decisions are addressed positionally from binary_dec_ids.
+    anyhow::ensure!(
+        binary_dec_ids.len() == 8,
+        "Expected 8 binary decisions, got {}",
+        binary_dec_ids.len()
+    );
+    let bin_dec_30 = binary_dec_ids[0].clone();
+    let bin_dec_31 = binary_dec_ids[1].clone();
+    let bin_dec_32 = binary_dec_ids[2].clone();
+    let bin_dec_33 = binary_dec_ids[3].clone();
+    let bin_dec_34 = binary_dec_ids[4].clone();
+    let bin_dec_35 = binary_dec_ids[5].clone();
+    let bin_dec_36 = binary_dec_ids[6].clone();
+    let bin_dec_37 = binary_dec_ids[7].clone();
 
     // Refresh wallets for market creation (including issuer for mempool sync)
     for voter in [
@@ -3597,8 +3720,8 @@ async fn roundtrip_task_inner(
     );
 
     // Prepare vote values
-    let btc_min = expected_phase2::scaled::BTC_PRICE_MIN as f64;
-    let btc_max = expected_phase2::scaled::BTC_PRICE_MAX as f64;
+    let btc_min = expected_phase2::scaled::BTC_PRICE_MIN;
+    let btc_max = expected_phase2::scaled::BTC_PRICE_MAX;
     let btc_range = btc_max - btc_min;
 
     // ETH/BTC ratio range: 0 to 100 (representing 0.00 to 0.10)
@@ -3738,6 +3861,19 @@ async fn roundtrip_task_inner(
         voter.rpc_client.vote_submit(vote_items, 1000).await?;
     }
 
+    let misaligned = vec![BallotItem {
+        decision_id: scaled_dec_0.clone(),
+        vote_value: 152_557.0,
+    }];
+    assert!(
+        truthcoin_nodes
+            .voter_0
+            .rpc_client
+            .vote_submit(misaligned, 1000)
+            .await
+            .is_err()
+    );
+
     sleep(std::time::Duration::from_millis(500)).await;
     truthcoin_nodes
         .issuer
@@ -3875,7 +4011,7 @@ async fn roundtrip_task_inner(
         }
     }
 
-    // Verify markets ossified
+    // Verify markets settled
     let market_a_data = truthcoin_nodes
         .issuer
         .rpc_client
@@ -4096,7 +4232,7 @@ async fn roundtrip_task_inner(
     let remaining_fees =
         utxo_verification::get_market_author_fee_utxos(&final_utxos);
 
-    // Check that ossified markets have no remaining UTXOs
+    // Check that settled markets have no remaining UTXOs
     for market_id in [
         &market_a_id,
         &market_b_id,
@@ -4116,19 +4252,147 @@ async fn roundtrip_task_inner(
             .await?
             .ok_or_else(|| anyhow::anyhow!("Market not found"))?;
 
-        if market_data.state == "Ossified" {
+        if market_data.state == "Settled" {
             anyhow::ensure!(
                 !remaining_treasury.contains_key(market_id),
-                "Ossified market {market_id} should not have remaining treasury UTXO"
+                "Settled market {market_id} should not have remaining treasury UTXO"
             );
             anyhow::ensure!(
                 !remaining_fees.contains_key(market_id),
-                "Ossified market {market_id} should not have remaining fee UTXO"
+                "Settled market {market_id} should not have remaining fee UTXO"
             );
         }
     }
 
     tracing::info!("✓ All phases completed successfully");
+
+    // ==========================================================================
+    // Phase 14: Reprice exercise — drive p_period UP with sales, then DOWN
+    // ==========================================================================
+    //
+    // Pick the latest claimable period (current_period + 19), which was
+    // freshly seeded at the most recent transition with mints=1 and a
+    // narrow 25-slot window. Claim ~80% of the unlocked slots: with sales
+    // exceeding the 50% midpoint, the reprice formula moves p_period UP off
+    // the floor. Then stop claiming and BMM across a reprice interval with
+    // zero sales — p_period drops back. This is a smoke-level check that
+    // both directions of the reprice curve are wired correctly; a dedicated
+    // reprice test could exercise the math more thoroughly.
+
+    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
+    sleep(std::time::Duration::from_secs(1)).await;
+
+    let status_pre_reprice =
+        truthcoin_nodes.issuer.rpc_client.decision_status().await?;
+    let exercise_period = status_pre_reprice.current_period + 19;
+
+    let pricing_pre_exercise = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .decision_listing_fee(exercise_period)
+        .await?;
+    anyhow::ensure!(
+        pricing_pre_exercise.period_capacity >= 5,
+        "Late period {exercise_period} has period_capacity={}, \
+         too small to exercise reprice",
+        pricing_pre_exercise.period_capacity
+    );
+
+    let claim_count = (pricing_pre_exercise.period_capacity * 4 / 5) as u32;
+
+    for i in 0..claim_count {
+        truthcoin_nodes
+            .issuer
+            .rpc_client
+            .decision_claim(DecisionClaimRequest {
+                decision_type: "binary".to_string(),
+                decisions: vec![DecisionClaimItem {
+                    period_index: exercise_period,
+                    header: format!("reprice exercise {i}"),
+                    description: None,
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                }],
+                min: None,
+                max: None,
+                increment: None,
+                tx_fee_sats: 1_000,
+                max_listing_fee_sats: None,
+            })
+            .await?;
+        sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // BMM 3 blocks: confirm claims (block 1) and span at least one reprice
+    // interval (REPRICE_INTERVAL=2 in testing config).
+    truthcoin_nodes
+        .issuer
+        .bmm(&mut enforcer_post_setup, 3)
+        .await?;
+    sleep(std::time::Duration::from_millis(500)).await;
+
+    let pricing_after_claims = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .decision_listing_fee(exercise_period)
+        .await?;
+    anyhow::ensure!(
+        pricing_after_claims.claimed >= u64::from(claim_count),
+        "Expected at least {claim_count} claims, got {}",
+        pricing_after_claims.claimed
+    );
+    anyhow::ensure!(
+        pricing_after_claims.p_period > pricing_pre_exercise.p_period,
+        "p_period should rise after sales > 50%: pre={} post={}",
+        pricing_pre_exercise.p_period,
+        pricing_after_claims.p_period
+    );
+    tracing::info!(
+        "✓ Reprice up: period {exercise_period} p_period {} → {} \
+         after {} sales of {}",
+        pricing_pre_exercise.p_period,
+        pricing_after_claims.p_period,
+        pricing_after_claims.claimed,
+        pricing_pre_exercise.period_capacity
+    );
+
+    // Stop claiming. BMM 4 blocks (≥2 reprice intervals) so a zero-sales
+    // reprice fires and p_period drops back toward floor.
+    truthcoin_nodes
+        .issuer
+        .bmm(&mut enforcer_post_setup, 4)
+        .await?;
+    sleep(std::time::Duration::from_millis(500)).await;
+
+    let pricing_after_decay = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .decision_listing_fee(exercise_period)
+        .await?;
+    anyhow::ensure!(
+        pricing_after_decay.p_period < pricing_after_claims.p_period
+            || pricing_after_decay.p_period == pricing_after_decay.p_floor,
+        "p_period should drop after zero-sales reprice (or sit at floor): \
+         was {} now {} (floor={})",
+        pricing_after_claims.p_period,
+        pricing_after_decay.p_period,
+        pricing_after_decay.p_floor
+    );
+    anyhow::ensure!(
+        pricing_after_decay.p_period >= pricing_after_decay.p_floor,
+        "Floor honored: p_period {} >= p_floor {}",
+        pricing_after_decay.p_period,
+        pricing_after_decay.p_floor
+    );
+    tracing::info!(
+        "✓ Reprice down: period {exercise_period} p_period {} → {} \
+         after zero-sales blocks (floor={})",
+        pricing_after_claims.p_period,
+        pricing_after_decay.p_period,
+        pricing_after_decay.p_floor
+    );
 
     {
         drop(truthcoin_nodes);

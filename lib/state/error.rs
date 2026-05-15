@@ -73,8 +73,8 @@ pub enum Error {
     AuthorizationError,
     #[error("bad coinbase output content")]
     BadCoinbaseOutputContent,
-    #[error("invalid range: min must be less than max")]
-    InvalidRange,
+    #[error("invalid scaled decision: {reason}")]
+    InvalidScaled { reason: String },
     #[error("invalid decision ID: {reason}")]
     InvalidDecisionId { reason: String },
     #[error("invalid decision state: {reason}")]

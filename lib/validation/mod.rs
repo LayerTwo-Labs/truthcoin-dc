@@ -49,4 +49,10 @@ pub trait DecisionValidationInterface {
         current_height: Option<u32>,
         genesis_ts: u64,
     ) -> Result<u64, Error>;
+
+    fn fee_for_decision_id(
+        &self,
+        rotxn: &RoTxn,
+        decision_id: DecisionId,
+    ) -> Result<u64, Error>;
 }

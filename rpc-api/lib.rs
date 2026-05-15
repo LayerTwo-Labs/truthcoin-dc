@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use truthcoin_dc::{
     authorization::{Dst, Signature},
     net::{Peer, PeerConnectionStatus},
+    state::decisions::DecisionType,
     types::{
         Address, AssetId, Authorization, BitcoinOutputContent, Block,
         BlockHash, Body, EncryptionPubKey, FilledOutputContent, Header,
@@ -55,6 +56,12 @@ pub struct MarketBuyRequest {
     pub dry_run: Option<bool>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketAmplifyBetaRequest {
+    pub market_id: String,
+    pub amount_sats: u64,
+}
+
 /// Request to build and sign (but not submit) a Trade transaction with
 /// a caller-supplied `prev_block_hash`.
 ///
@@ -83,7 +90,7 @@ pub struct CreateTradeResponse {
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct DecisionClaimItem {
-    pub decision_id_hex: String,
+    pub period_index: u32,
     pub header: String,
     pub description: Option<String>,
     pub option_0_label: Option<String>,
@@ -96,9 +103,21 @@ pub struct DecisionClaimItem {
 pub struct DecisionClaimRequest {
     pub decision_type: String,
     pub decisions: Vec<DecisionClaimItem>,
-    pub min: Option<i64>,
-    pub max: Option<i64>,
-    pub fee_sats: u64,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    /// Step size for valid vote values. Honored only when
+    /// `decision_type == "scaled"`. Defaults to `1.0` when omitted.
+    /// `(max - min)` must be an integer multiple of `increment`.
+    pub increment: Option<f64>,
+    pub tx_fee_sats: u64,
+    pub max_listing_fee_sats: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct DecisionClaimResponse {
+    pub txid: Txid,
+    pub decision_ids: Vec<String>,
+    pub listing_fee_paid_sats: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -163,7 +182,7 @@ pub struct DecisionSummary {
     pub decision_id_hex: String,
     pub header: String,
     pub is_standard: bool,
-    pub is_scaled: bool,
+    pub decision_type: DecisionType,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -226,11 +245,9 @@ pub struct DecisionInfo {
     pub id: String,
     pub market_maker_pubkey_hash: String,
     pub is_standard: bool,
-    pub is_scaled: bool,
+    pub decision_type: DecisionType,
     pub header: String,
     pub description: String,
-    pub min: Option<i64>,
-    pub max: Option<i64>,
     pub tags: Vec<String>,
 }
 
@@ -244,10 +261,13 @@ pub struct DecisionPeriodStatus {
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct DecisionListingFeeInfo {
-    pub next_fee: u64,
-    pub claimed_standard_count: u64,
-    pub available: u64,
-    pub free_count: u64,
+    pub p_period: u64,
+    pub p_floor: u64,
+    pub mints: u64,
+    pub tier_prices: [u64; 5],
+    pub last_reprice_block: u32,
+    pub period_capacity: u64,
+    pub claimed: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -385,8 +405,8 @@ pub struct InitialLiquidityCalculation {
 pub struct BallotItem {
     pub decision_id: String,
     /// The vote value in real units (e.g., 270 for electoral votes).
-    /// For scaled decisions with min/max bounds, enter the actual value
-    /// within those bounds. The system handles internal normalization.
+    /// For scaled decisions, the value must equal `min + k * increment`
+    /// for some non-negative integer `k`, with `vote_value <= max`.
     /// For binary decisions, use 0.0 (No) or 1.0 (Yes).
     pub vote_value: f64,
 }
@@ -411,8 +431,8 @@ pub struct VoteInfo {
     pub voter_address: String,
     pub decision_id: String,
     /// The vote value in real units (e.g., 270 for electoral votes).
-    /// For scaled decisions, this is the denormalized value within the
-    /// decision's min/max bounds. For binary decisions, this is 0.0 or 1.0.
+    /// For scaled decisions, the denormalized value aligned to the
+    /// decision's increment. For binary decisions, this is 0.0 or 1.0.
     pub vote_value: f64,
     pub period_id: u32,
     pub block_height: u32,
@@ -432,6 +452,7 @@ pub struct ScoreChange {
     truthcoin_schema::SocketAddr, Address, AssetId, Authorization,
     BitcoinOutputContent, BlockHash, Body,
     CalculateInitialLiquidityRequest, DecisionClaimItem, DecisionClaimRequest,
+    DecisionClaimResponse,
     ConsensusResults, CreateMarketRequest, DecisionSummary,
     EncryptionPubKey, FilledOutputContent, Header, InitialLiquidityCalculation,
     MarketBuyRequest, MarketBuyResponse, MarketData, MarketOutcome,
@@ -439,7 +460,7 @@ pub struct ScoreChange {
     MerkleRoot, OutPoint, Output, OutputContent,
     ParticipationStats, PeerConnectionStatus, PeriodStats,
     ScoreChange,
-    SharePosition, Signature, DecisionDetails, DecisionFilter, DecisionListItem, DecisionListingFeeInfo, DecisionState, DecisionPeriodStatus,
+    SharePosition, Signature, DecisionDetails, DecisionFilter, DecisionListItem, DecisionListingFeeInfo, DecisionState, DecisionPeriodStatus, DecisionType,
     Transaction, TxData, Txid, TxIn, UserHoldings,
     BallotItem, VoteFilter, VoteInfo, VoterInfo, VoterInfoFull,
     VotingPeriodFull, WithdrawalOutputContent, VerifyingKey,
@@ -749,7 +770,7 @@ pub trait Rpc {
     async fn decision_claim(
         &self,
         request: DecisionClaimRequest,
-    ) -> RpcResult<Txid>;
+    ) -> RpcResult<DecisionClaimResponse>;
 
     /// Get listing fee info for a period
     #[open_api_method(output_schema(ToSchema))]
@@ -758,6 +779,16 @@ pub trait Rpc {
         &self,
         period: u32,
     ) -> RpcResult<DecisionListingFeeInfo>;
+
+    /// Compute the listing fee (sats) for claiming a specific decision_id.
+    /// The tier (and therefore the price multiplier) is determined by the
+    /// id's decision_index field.
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "decision_fee_for_id")]
+    async fn decision_fee_for_id(
+        &self,
+        decision_id_hex: String,
+    ) -> RpcResult<u64>;
 
     /// Create a new prediction market
     #[method(name = "market_create")]
@@ -795,6 +826,13 @@ pub trait Rpc {
         &self,
         request: MarketSellRequest,
     ) -> RpcResult<MarketSellResponse>;
+
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "market_amplify_beta")]
+    async fn market_amplify_beta(
+        &self,
+        request: MarketAmplifyBetaRequest,
+    ) -> RpcResult<String>;
 
     /// Get share positions for an address (optionally filtered by market)
     #[open_api_method(output_schema(ToSchema))]

@@ -132,20 +132,59 @@ impl DecisionId {
 }
 
 #[derive(
-    Clone,
-    Debug,
-    Deserialize,
-    Serialize,
-    Eq,
-    PartialEq,
-    Ord,
-    PartialOrd,
-    BorshSerialize,
+    Clone, Debug, Deserialize, Serialize, BorshSerialize, utoipa::ToSchema,
 )]
 pub enum DecisionType {
     Binary,
-    Scaled { min: i64, max: i64 },
+    Scaled { min: f64, max: f64, increment: f64 },
     Category { options: Vec<String> },
+}
+
+fn is_step_aligned(delta: f64, step: f64) -> bool {
+    let k = (delta / step).round();
+    let tolerance = (step.abs() * 1e-9).max(1e-12);
+    (delta - k * step).abs() <= tolerance
+}
+
+impl PartialEq for DecisionType {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for DecisionType {}
+
+impl PartialOrd for DecisionType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DecisionType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use DecisionType::{Binary, Category, Scaled};
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Binary, Binary) => Ordering::Equal,
+            (
+                Scaled {
+                    min: a,
+                    max: b,
+                    increment: c,
+                },
+                Scaled {
+                    min: d,
+                    max: e,
+                    increment: f,
+                },
+            ) => a.total_cmp(d).then(b.total_cmp(e)).then(c.total_cmp(f)),
+            (Category { options: a }, Category { options: b }) => a.cmp(b),
+            (Binary, _) => Ordering::Less,
+            (_, Binary) => Ordering::Greater,
+            (Scaled { .. }, _) => Ordering::Less,
+            (_, Scaled { .. }) => Ordering::Greater,
+        }
+    }
 }
 
 #[derive(
@@ -194,20 +233,45 @@ impl Decision {
             }
         }
 
-        if let DecisionType::Scaled { min, max } = &decision_type
-            && min >= max
-        {
-            return Err(Error::InvalidRange);
-        }
-
-        if let DecisionType::Category { options } = &decision_type
-            && options.len() < 2
-        {
-            return Err(Error::InvalidDecisionId {
-                reason: "Category decisions require \
-                         at least 2 options"
-                    .to_string(),
-            });
+        match &decision_type {
+            DecisionType::Binary => {}
+            DecisionType::Scaled {
+                min,
+                max,
+                increment,
+            } => {
+                if !min.is_finite()
+                    || !max.is_finite()
+                    || !increment.is_finite()
+                    || min >= max
+                    || *increment <= 0.0
+                {
+                    return Err(Error::InvalidScaled {
+                        reason: format!(
+                            "invalid bounds: min={min}, max={max}, \
+                             increment={increment}"
+                        ),
+                    });
+                }
+                if !is_step_aligned(max - min, *increment) {
+                    return Err(Error::InvalidScaled {
+                        reason: format!(
+                            "(max - min) = {} is not an integer multiple of \
+                             increment {increment}",
+                            max - min
+                        ),
+                    });
+                }
+            }
+            DecisionType::Category { options } => {
+                if options.len() < 2 {
+                    return Err(Error::InvalidDecisionId {
+                        reason: "Category decisions require \
+                                 at least 2 options"
+                            .to_string(),
+                    });
+                }
+            }
         }
 
         Ok(Decision {
@@ -247,14 +311,14 @@ impl Decision {
         }
     }
 
-    pub fn scale_min(&self) -> Option<i64> {
+    pub fn scale_min(&self) -> Option<f64> {
         match &self.decision_type {
             DecisionType::Scaled { min, .. } => Some(*min),
             _ => None,
         }
     }
 
-    pub fn scale_max(&self) -> Option<i64> {
+    pub fn scale_max(&self) -> Option<f64> {
         match &self.decision_type {
             DecisionType::Scaled { max, .. } => Some(*max),
             _ => None,
@@ -290,9 +354,7 @@ impl Decision {
         }
 
         match &self.decision_type {
-            DecisionType::Scaled { min, max } => {
-                let min = *min as f64;
-                let max = *max as f64;
+            DecisionType::Scaled { min, max, .. } => {
                 let range = max - min;
                 if range == 0.0 {
                     return 0.5;
@@ -309,9 +371,7 @@ impl Decision {
         }
 
         match &self.decision_type {
-            DecisionType::Scaled { min, max } => {
-                let min = *min as f64;
-                let max = *max as f64;
+            DecisionType::Scaled { min, max, .. } => {
                 let range = max - min;
                 internal_value * range + min
             }
@@ -330,15 +390,24 @@ impl Decision {
         }
 
         match &self.decision_type {
-            DecisionType::Scaled { min, max } => {
-                let min_f = *min as f64;
-                let max_f = *max as f64;
-                if user_value < min_f || user_value > max_f {
+            DecisionType::Scaled {
+                min,
+                max,
+                increment,
+            } => {
+                if user_value < *min || user_value > *max {
                     return Err(Error::InvalidVoteValue {
                         reason: format!(
                             "Value {user_value} is outside \
-                             allowed range \
-                             [{min_f}, {max_f}]"
+                             allowed range [{min}, {max}]"
+                        ),
+                    });
+                }
+                if !is_step_aligned(user_value - min, *increment) {
+                    return Err(Error::InvalidVoteValue {
+                        reason: format!(
+                            "Value {user_value} is not a multiple of \
+                             increment {increment} from min {min}"
                         ),
                     });
                 }
@@ -377,7 +446,7 @@ impl Decision {
 
     pub fn get_display_range(&self) -> (f64, f64) {
         match &self.decision_type {
-            DecisionType::Scaled { min, max } => (*min as f64, *max as f64),
+            DecisionType::Scaled { min, max, .. } => (*min, *max),
             DecisionType::Binary => (0.0, 1.0),
             DecisionType::Category { options } => (0.0, options.len() as f64),
         }
@@ -540,22 +609,6 @@ pub struct DecisionEntry {
 
 pub(crate) const FUTURE_PERIODS: u32 = 20;
 pub(crate) const INITIAL_DECISIONS_PER_PERIOD: u64 = 500;
-pub const BASE_LISTING_FEE: u64 = 10_000;
-const FREE_DECISION_DIVISOR: u64 = 5;
-
-pub fn calculate_listing_fee(
-    claimed_standard_count: u64,
-    available: u64,
-) -> Option<u64> {
-    let free_count = available / FREE_DECISION_DIVISOR;
-    if claimed_standard_count < free_count {
-        Some(0)
-    } else if claimed_standard_count < available {
-        Some((claimed_standard_count - free_count + 1) * BASE_LISTING_FEE)
-    } else {
-        None
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct DecisionConfig {

@@ -120,9 +120,9 @@ pub struct State {
     >,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
     // Undo databases for disconnect_tip chain reorganization support
-    ossification_undo: DatabaseUnique<
+    settlement_undo: DatabaseUnique<
         SerdeBincode<u32>,
-        SerdeBincode<undo::OssificationUndoData>,
+        SerdeBincode<undo::SettlementUndoData>,
     >,
     consensus_undo: DatabaseUnique<
         SerdeBincode<u32>,
@@ -138,6 +138,8 @@ pub struct State {
         SerdeBincode<u32>,
         SerdeBincode<undo::ReputationTransferUndoData>,
     >,
+    pub(crate) skipped_tx_indices_undo:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Vec<u32>>>,
 }
 
 impl DecisionValidationInterface for State {
@@ -203,11 +205,23 @@ impl DecisionValidationInterface for State {
             genesis_ts,
         )
     }
+
+    fn fee_for_decision_id(
+        &self,
+        rotxn: &RoTxn,
+        decision_id: DecisionId,
+    ) -> Result<u64, Error> {
+        DecisionValidationInterface::fee_for_decision_id(
+            self.decisions(),
+            rotxn,
+            decision_id,
+        )
+    }
 }
 
 impl State {
     const BASE_DBS: u32 = 13;
-    const UNDO_DBS: u32 = 5;
+    const UNDO_DBS: u32 = 6;
 
     pub const NUM_DBS: u32 = reputation::ReputationDbs::NUM_DBS
         + decisions::Dbs::NUM_DBS
@@ -274,8 +288,8 @@ impl State {
         if version.try_get(&rwtxn, &())?.is_none() {
             version.put(&mut rwtxn, &(), &*VERSION)?;
         }
-        let ossification_undo =
-            DatabaseUnique::create(env, &mut rwtxn, "ossification_undo")?;
+        let settlement_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "settlement_undo")?;
         let consensus_undo =
             DatabaseUnique::create(env, &mut rwtxn, "consensus_undo")?;
         let consolidation_undo =
@@ -287,6 +301,8 @@ impl State {
             &mut rwtxn,
             "reputation_transfer_undo",
         )?;
+        let skipped_tx_indices_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "skipped_tx_indices_undo")?;
         rwtxn.commit()?;
         Ok(Self {
             tip,
@@ -306,11 +322,12 @@ impl State {
             withdrawal_bundle_event_blocks,
             deposit_blocks,
             _version: version,
-            ossification_undo,
+            settlement_undo,
             consensus_undo,
             consolidation_undo,
             minting_undo,
             reputation_transfer_undo,
+            skipped_tx_indices_undo,
         })
     }
 
@@ -496,32 +513,6 @@ impl State {
         market_id: &crate::state::markets::MarketId,
     ) -> Result<(), Error> {
         self.markets.clear_mempool_shares(rwtxn, market_id)
-    }
-
-    pub fn get_mempool_treasury_delta(
-        &self,
-        rotxn: &RoTxn,
-        market_id: &crate::state::markets::MarketId,
-    ) -> Result<u64, Error> {
-        self.markets.get_mempool_treasury_delta(rotxn, market_id)
-    }
-
-    pub fn put_mempool_treasury_delta(
-        &self,
-        rwtxn: &mut RwTxn,
-        market_id: &crate::state::markets::MarketId,
-        delta: u64,
-    ) -> Result<(), Error> {
-        self.markets
-            .put_mempool_treasury_delta(rwtxn, market_id, delta)
-    }
-
-    pub fn clear_mempool_treasury_delta(
-        &self,
-        rwtxn: &mut RwTxn,
-        market_id: &crate::state::markets::MarketId,
-    ) -> Result<(), Error> {
-        self.markets.clear_mempool_treasury_delta(rwtxn, market_id)
     }
 
     pub fn get_latest_failed_withdrawal_bundle(
@@ -880,13 +871,13 @@ impl State {
         )
     }
 
-    pub fn get_ossified_decisions(
+    pub fn get_settled_decisions(
         &self,
         rotxn: &RoTxn,
     ) -> Result<Vec<crate::state::decisions::DecisionEntry>, Error> {
         let (current_ts, current_height, genesis_ts) =
             self.period_context(rotxn)?;
-        self.decisions.get_ossified_decisions(
+        self.decisions.get_settled_decisions(
             rotxn,
             current_ts,
             current_height,

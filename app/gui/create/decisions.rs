@@ -1,10 +1,17 @@
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 
-use eframe::egui::{self, Button, RichText, ScrollArea};
+use eframe::egui::{self, Button, Color32, RichText, ScrollArea};
 use futures::Stream;
-use truthcoin_dc::state::decisions::{DecisionEntry, DecisionId, DecisionType};
+use truthcoin_dc::math::decisions::{
+    SLOTS_PER_TIER_PER_MINT, TIER_COUNT, fee_for_index, slot_price,
+    slot_unlocked,
+};
+use truthcoin_dc::state::decisions::{
+    DecisionEntry, DecisionId, DecisionType, PeriodPricing,
+};
 use truthcoin_dc::types::DecisionClaimEntry;
 use truthcoin_dc::wallet::DecisionClaimInput;
 
@@ -13,15 +20,15 @@ use crate::util::PromiseStream;
 
 type NodeUpdates = PromiseStream<Pin<Box<dyn Stream<Item = ()> + Send>>>;
 
-const DEFAULT_FEE_SATS: u64 = 1000;
-
 pub struct Decisions {
     current_period: u32,
     periods: Vec<(u32, u64)>,
     selected_period: Option<u32>,
     available_decisions: Vec<DecisionId>,
     claimed_decisions: Vec<DecisionEntry>,
-    claim_form: ClaimForm,
+    pending_claim_ids: BTreeSet<DecisionId>,
+    pricing: Option<PeriodPricing>,
+    claim: Claim,
     error: Option<String>,
     success: Option<String>,
     is_blocks_mode: bool,
@@ -37,7 +44,9 @@ impl Default for Decisions {
             selected_period: None,
             available_decisions: Vec::new(),
             claimed_decisions: Vec::new(),
-            claim_form: ClaimForm::default(),
+            pending_claim_ids: BTreeSet::new(),
+            pricing: None,
+            claim: Claim::default(),
             error: None,
             success: None,
             is_blocks_mode: true,
@@ -47,44 +56,37 @@ impl Default for Decisions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DecisionKind {
-    Binary,
-    Scaled,
-    Categorical,
-}
-
-struct ClaimForm {
-    decision_id_input: String,
+struct Claim {
     header: String,
     description: String,
-    kind: DecisionKind,
+    r#type: DecisionType,
     min_input: String,
     max_input: String,
+    increment_input: String,
     option_0_label: String,
     option_1_label: String,
     outcomes: Vec<String>,
     tags_input: String,
-    fee_input: String,
-    expanded: bool,
+    tx_fee_sats_input: String,
+    max_listing_fee_sats_input: String,
     is_processing: bool,
 }
 
-impl Default for ClaimForm {
+impl Default for Claim {
     fn default() -> Self {
         Self {
-            decision_id_input: String::new(),
             header: String::new(),
             description: String::new(),
-            kind: DecisionKind::Binary,
+            r#type: DecisionType::Binary,
             min_input: String::new(),
             max_input: String::new(),
+            increment_input: String::new(),
             option_0_label: String::new(),
             option_1_label: String::new(),
             outcomes: vec![String::new(), String::new()],
             tags_input: String::new(),
-            fee_input: DEFAULT_FEE_SATS.to_string(),
-            expanded: false,
+            tx_fee_sats_input: "1000".to_string(),
+            max_listing_fee_sats_input: String::new(),
             is_processing: false,
         }
     }
@@ -94,7 +96,7 @@ impl Decisions {
     fn ensure_subscribed(&mut self, app: &App) {
         if self.node_updated.is_none() {
             let stream: Pin<Box<dyn Stream<Item = ()> + Send>> =
-                Box::pin(app.node.watch_state());
+                app.node.watch();
             self.node_updated =
                 Some(PromiseStream::new(stream, app.runtime.handle().clone()));
         }
@@ -180,33 +182,11 @@ impl Decisions {
         }
 
         if let Some(period) = self.selected_period {
-            match state.get_available_decisions_in_period(&rotxn, period) {
-                Ok(available) => self.available_decisions = available,
-                Err(e) => {
-                    self.error = Some(format!(
-                        "Failed to load available decisions: {e:#}"
-                    ));
-                    tracing::error!(
-                        "Failed to load available decisions: {e:#}"
-                    );
-                }
-            }
-            match state
-                .decisions()
-                .get_claimed_decisions_in_period(&rotxn, period)
-            {
-                Ok(claimed) => self.claimed_decisions = claimed,
-                Err(e) => {
-                    self.error = Some(format!(
-                        "Failed to load claimed decisions: {e:#}"
-                    ));
-                    tracing::error!("Failed to load claimed decisions: {e:#}");
-                }
-            }
+            self.load_period(app, period);
         }
     }
 
-    fn refresh_decisions_for_period(&mut self, app: &App, period: u32) {
+    fn load_period(&mut self, app: &App, period: u32) {
         let rotxn = match app.node.read_txn() {
             Ok(t) => t,
             Err(e) => {
@@ -234,46 +214,73 @@ impl Decisions {
                 tracing::error!("Failed to load claimed decisions: {e:#}");
             }
         }
+        self.pricing = state
+            .decisions()
+            .get_listing_fee_info(&rotxn, period)
+            .ok()
+            .flatten();
+        match app.node.get_pending_decision_claim_ids() {
+            Ok(ids) => {
+                self.pending_claim_ids = ids
+                    .into_iter()
+                    .filter_map(|bytes| DecisionId::from_bytes(bytes).ok())
+                    .filter(|id| {
+                        id.is_standard() && id.period_index() == period
+                    })
+                    .collect();
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load pending claims: {e:#}");
+            }
+        }
+    }
+
+    fn next_target(&self) -> Option<(DecisionId, u64)> {
+        let pricing = self.pricing.as_ref()?;
+        let id = self.available_decisions.iter().copied().find(|id| {
+            slot_unlocked(id.decision_index(), pricing.mints)
+                && !self.pending_claim_ids.contains(id)
+        })?;
+        let fee =
+            fee_for_index(pricing.p_period, pricing.mints, id.decision_index())
+                .ok()?;
+        Some((id, fee))
+    }
+
+    fn claimed_index_set(&self) -> BTreeSet<u32> {
+        self.claimed_decisions
+            .iter()
+            .filter(|e| e.decision_id.is_standard())
+            .map(|e| e.decision_id.decision_index())
+            .collect()
+    }
+
+    fn pending_index_set(&self) -> BTreeSet<u32> {
+        self.pending_claim_ids
+            .iter()
+            .map(|id| id.decision_index())
+            .collect()
     }
 
     fn claim_decision(&mut self, app: &App) {
         self.error = None;
         self.success = None;
 
-        let decision_id_bytes =
-            match DecisionId::from_hex(&self.claim_form.decision_id_input) {
-                Ok(decision_id) => decision_id.as_bytes(),
-                Err(e) => {
-                    self.error = Some(format!("Invalid decision ID: {e}"));
-                    return;
-                }
-            };
+        let Some((decision_id, listing_fee)) = self.next_target() else {
+            self.error = Some("No available slots in this period".to_string());
+            return;
+        };
 
-        if self.claim_form.header.trim().is_empty() {
-            self.error = Some("Header is required".to_string());
+        if self.claim.header.trim().is_empty() {
+            self.error = Some("Question is required".to_string());
             return;
         }
 
-        let fee_sats = match self.claim_form.fee_input.parse::<u64>() {
-            Ok(v) if v > 0 => v,
-            Ok(_) => {
-                self.error = Some("Fee must be greater than 0".to_string());
-                return;
-            }
-            Err(_) => {
-                self.error =
-                    Some("Invalid fee: must be a positive number".to_string());
-                return;
-            }
-        };
-
         let (decision_type, option_0_label, option_1_label, option_labels) =
-            match self.claim_form.kind {
-                DecisionKind::Binary => {
-                    let opt0 =
-                        self.claim_form.option_0_label.trim().to_string();
-                    let opt1 =
-                        self.claim_form.option_1_label.trim().to_string();
+            match &self.claim.r#type {
+                DecisionType::Binary => {
+                    let opt0 = self.claim.option_0_label.trim().to_string();
+                    let opt1 = self.claim.option_1_label.trim().to_string();
                     (
                         DecisionType::Binary,
                         (!opt0.is_empty()).then_some(opt0),
@@ -281,52 +288,50 @@ impl Decisions {
                         None,
                     )
                 }
-                DecisionKind::Scaled => {
-                    let min = match self.claim_form.min_input.parse::<i64>() {
+                DecisionType::Scaled { .. } => {
+                    let min = match self.claim.min_input.parse::<f64>() {
                         Ok(v) => v,
-                        Err(_) if self.claim_form.min_input.is_empty() => {
-                            self.error = Some(
-                                "Min value is required for scaled decisions"
-                                    .to_string(),
-                            );
-                            return;
-                        }
                         Err(_) => {
-                            self.error = Some(
-                                "Invalid min value: must be a number"
-                                    .to_string(),
-                            );
+                            self.error =
+                                Some("Min must be a number".to_string());
                             return;
                         }
                     };
-                    let max = match self.claim_form.max_input.parse::<i64>() {
+                    let max = match self.claim.max_input.parse::<f64>() {
                         Ok(v) => v,
-                        Err(_) if self.claim_form.max_input.is_empty() => {
-                            self.error = Some(
-                                "Max value is required for scaled decisions"
-                                    .to_string(),
-                            );
-                            return;
-                        }
                         Err(_) => {
-                            self.error = Some(
-                                "Invalid max value: must be a number"
-                                    .to_string(),
-                            );
+                            self.error =
+                                Some("Max must be a number".to_string());
                             return;
                         }
                     };
-                    if min >= max {
-                        self.error = Some(format!(
-                            "Min ({min}) must be less than max ({max})"
-                        ));
-                        return;
-                    }
-                    (DecisionType::Scaled { min, max }, None, None, None)
+                    let increment = if self.claim.increment_input.is_empty() {
+                        1.0
+                    } else {
+                        match self.claim.increment_input.parse::<f64>() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                self.error = Some(
+                                    "Increment must be a number".to_string(),
+                                );
+                                return;
+                            }
+                        }
+                    };
+                    (
+                        DecisionType::Scaled {
+                            min,
+                            max,
+                            increment,
+                        },
+                        None,
+                        None,
+                        None,
+                    )
                 }
-                DecisionKind::Categorical => {
+                DecisionType::Category { .. } => {
                     let trimmed: Vec<String> = self
-                        .claim_form
+                        .claim
                         .outcomes
                         .iter()
                         .map(|o| o.trim().to_string())
@@ -357,7 +362,7 @@ impl Decisions {
             };
 
         let tags: Vec<String> = self
-            .claim_form
+            .claim
             .tags_input
             .split(',')
             .map(|t| t.trim().to_string())
@@ -373,10 +378,43 @@ impl Decisions {
             return;
         }
 
+        let tx_fee_sats =
+            match self.claim.tx_fee_sats_input.trim().parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    self.error =
+                        Some("Invalid miner fee: must be a number".to_string());
+                    return;
+                }
+            };
+
+        let trimmed_max = self.claim.max_listing_fee_sats_input.trim();
+        let max_listing_fee_sats: Option<u64> = if trimmed_max.is_empty() {
+            None
+        } else {
+            match trimmed_max.parse::<u64>() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    self.error = Some(
+                        "Invalid max listing fee: must be a number".to_string(),
+                    );
+                    return;
+                }
+            }
+        };
+
+        if let Some(cap) = max_listing_fee_sats
+            && listing_fee > cap
+        {
+            self.error =
+                Some(format!("Listing fee {listing_fee} exceeds max ({cap})"));
+            return;
+        }
+
         let entry = DecisionClaimEntry {
-            decision_id_bytes,
-            header: self.claim_form.header.clone(),
-            description: self.claim_form.description.clone(),
+            decision_id_bytes: decision_id.as_bytes(),
+            header: self.claim.header.clone(),
+            description: self.claim.description.clone(),
             option_0_label,
             option_1_label,
             option_labels,
@@ -388,25 +426,27 @@ impl Decisions {
             decisions: vec![entry],
         };
 
-        let tx_fee = bitcoin::Amount::from_sat(fee_sats);
+        let total_fee =
+            bitcoin::Amount::from_sat(listing_fee.saturating_add(tx_fee_sats));
 
-        match app.wallet.claim_decision(input, tx_fee) {
+        match app.wallet.claim_decision(input, total_fee) {
             Ok(tx) => {
                 if let Err(e) = app.sign_and_send(tx) {
                     self.error = Some(format!("Failed to send: {e:#}"));
                     tracing::error!("Decision claim failed: {e:#}");
                 } else {
                     self.success = Some(format!(
-                        "Decision {} claimed successfully!",
-                        self.claim_form.decision_id_input
+                        "Decision claimed in period {} \
+                         (listing fee paid: {listing_fee} sats)",
+                        decision_id.period_index()
                     ));
                     tracing::info!(
-                        "Decision claimed: {}",
-                        self.claim_form.decision_id_input
+                        "Decision claimed: {} (listing_fee={listing_fee})",
+                        decision_id.to_hex()
                     );
-                    self.claim_form = ClaimForm::default();
+                    self.claim = Claim::default();
                     if let Some(period) = self.selected_period {
-                        self.refresh_decisions_for_period(app, period);
+                        self.load_period(app, period);
                     }
                 }
             }
@@ -430,7 +470,7 @@ impl Decisions {
         }
 
         ui.horizontal(|ui| {
-            ui.heading("Decisions");
+            ui.heading("Create Decision");
             ui.label(
                 RichText::new(format!(
                     "(Current: Period {})",
@@ -447,10 +487,10 @@ impl Decisions {
         ui.separator();
 
         if let Some(msg) = &self.success {
-            ui.colored_label(egui::Color32::GREEN, msg);
+            ui.colored_label(Color32::GREEN, msg);
         }
         if let Some(err) = &self.error {
-            ui.colored_label(egui::Color32::RED, err);
+            ui.colored_label(Color32::RED, err);
         }
 
         ui.add_space(5.0);
@@ -462,8 +502,7 @@ impl Decisions {
                 .selected_text(
                     self.selected_period
                         .map(|p| {
-                            let is_current = p == self.current_period;
-                            if is_current {
+                            if p == self.current_period {
                                 format!("Period {p} (current)")
                             } else {
                                 format!("Period {p}")
@@ -475,7 +514,9 @@ impl Decisions {
                     for (period, available) in &self.periods {
                         let is_current = *period == self.current_period;
                         let label = if is_current {
-                            format!("Period {period} ({available} available) \u{2190} current")
+                            format!(
+                                "Period {period} ({available} available) \u{2190} current"
+                            )
                         } else {
                             format!("Period {period} ({available} available)")
                         };
@@ -489,234 +530,235 @@ impl Decisions {
             if self.selected_period != prev_selection
                 && let Some(period) = self.selected_period
             {
-                self.refresh_decisions_for_period(app, period);
+                self.load_period(app, period);
             }
         });
 
         ui.add_space(10.0);
 
-        if self.selected_period.is_some() {
-            ScrollArea::vertical()
-                .id_salt("decisions_body")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    self.show_period_body(app, ui);
-                });
-        } else {
+        if self.selected_period.is_none() {
             ui.centered_and_justified(|ui| {
-                ui.label("Select a period to view decisions");
+                ui.label("Select a period to continue");
             });
+            return;
         }
-    }
 
-    fn show_period_body(&mut self, app: &App, ui: &mut egui::Ui) {
-        ui.columns(2, |cols| {
-            cols[0].heading("Available Decisions");
-            cols[0].label(
-                RichText::new(format!(
-                    "{} unclaimed",
-                    self.available_decisions.len()
-                ))
-                .weak(),
-            );
-
-            ScrollArea::vertical()
-                .id_salt("available_decisions")
-                .max_height(200.0)
-                .show(&mut cols[0], |ui| {
-                    if self.available_decisions.is_empty() {
-                        ui.label("No available decisions in this period");
-                    } else {
-                        for decision_id in &self.available_decisions {
-                            let entry_hex = hex::encode(decision_id.as_bytes());
-                            let idx = decision_id.decision_index();
-                            let decision_type =
-                                if idx < 500 { "std" } else { "non-std" };
-
-                            ui.horizontal(|ui| {
-                                ui.monospace(&entry_hex);
-                                ui.label(format!("[{decision_type}]"));
-                                if ui.small_button("Claim").clicked() {
-                                    self.claim_form.decision_id_input =
-                                        entry_hex.clone();
-                                    self.claim_form.expanded = true;
-                                }
-                            });
-                        }
-                    }
-                });
-
-            cols[1].heading("Claimed Decisions");
-            cols[1].label(
-                RichText::new(format!(
-                    "{} claimed",
-                    self.claimed_decisions.len()
-                ))
-                .weak(),
-            );
-
-            ScrollArea::vertical()
-                .id_salt("claimed_decisions")
-                .max_height(200.0)
-                .show(&mut cols[1], |ui| {
-                    if self.claimed_decisions.is_empty() {
-                        ui.label("No claimed decisions in this period");
-                    } else {
-                        for entry in &self.claimed_decisions {
-                            let entry_hex =
-                                hex::encode(entry.decision_id.as_bytes());
-
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.monospace(&entry_hex);
-                                    if ui.small_button("Copy").clicked() {
-                                        ui.ctx().copy_text(entry_hex.clone());
-                                    }
-                                });
-
-                                if let Some(decision) = &entry.decision {
-                                    ui.label(&decision.header);
-                                    ui.horizontal(|ui| {
-                                        if entry.decision_id.is_standard() {
-                                            ui.label(
-                                                RichText::new("Standard")
-                                                    .small()
-                                                    .weak(),
-                                            );
-                                        }
-                                        if decision.is_categorical() {
-                                            let labels = decision
-                                                .get_category_labels()
-                                                .unwrap_or(&[]);
-                                            let shown = if labels.len() > 4 {
-                                                format!(
-                                                    "{}/…",
-                                                    labels[..4].join("/")
-                                                )
-                                            } else {
-                                                labels.join("/")
-                                            };
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "Category [{shown}]"
-                                                ))
-                                                .small()
-                                                .weak(),
-                                            );
-                                        } else if decision.is_scaled() {
-                                            let range = format!(
-                                                "Scaled [{}-{}]",
-                                                decision
-                                                    .scale_min()
-                                                    .unwrap_or(0),
-                                                decision
-                                                    .scale_max()
-                                                    .unwrap_or(100)
-                                            );
-                                            ui.label(
-                                                RichText::new(range)
-                                                    .small()
-                                                    .weak(),
-                                            );
-                                        } else {
-                                            let (label0, label1) =
-                                                decision.get_binary_labels();
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "Binary [{label0}/{label1}]"
-                                                ))
-                                                .small()
-                                                .weak(),
-                                            );
-                                        }
-                                    });
-                                }
-                            });
-                        }
-                    }
-                });
-        });
-
-        ui.add_space(15.0);
-        ui.separator();
-
-        let open_override = if self.claim_form.expanded {
-            Some(true)
-        } else {
-            None
-        };
-        egui::CollapsingHeader::new(RichText::new("Claim Decision").heading())
-            .id_salt("claim_decision")
-            .open(open_override)
+        ScrollArea::vertical()
+            .id_salt("decisions_body")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.show_claim_form(app, ui);
+                self.show_period_grid(ui);
+                ui.add_space(15.0);
+                ui.separator();
+                self.show_claim(app, ui);
+                ui.add_space(15.0);
+                ui.separator();
+                self.show_existing(ui);
             });
-        self.claim_form.expanded = false;
     }
 
-    fn show_claim_form(&mut self, app: &App, ui: &mut egui::Ui) {
-        egui::Grid::new("claim_form")
+    fn show_period_grid(&self, ui: &mut egui::Ui) {
+        let Some(period) = self.selected_period else {
+            return;
+        };
+        let Some(pricing) = self.pricing.as_ref() else {
+            ui.label("No pricing data for this period");
+            return;
+        };
+
+        let cells_per_tier = (pricing.mints * SLOTS_PER_TIER_PER_MINT) as u32;
+        let claimed = self.claimed_index_set();
+        let pending = self.pending_index_set();
+        let next_idx = self.next_target().map(|(id, _)| id.decision_index());
+
+        let max_label_width = (0..TIER_COUNT)
+            .map(|t| format_with_commas(slot_price(pricing.p_period, t)).len())
+            .max()
+            .unwrap_or(0);
+
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Period {period}")).strong());
+                ui.label(
+                    RichText::new(format!(
+                        "p_period {} sats   mints {}/20",
+                        format_with_commas(pricing.p_period),
+                        pricing.mints,
+                    ))
+                    .weak()
+                    .small(),
+                );
+            });
+            ui.add_space(4.0);
+
+            ScrollArea::horizontal()
+                .id_salt("tier_grid_scroll")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for tier in 0..TIER_COUNT as u32 {
+                        let price = slot_price(pricing.p_period, tier as usize);
+                        let mut claimed_in_tier = 0u64;
+                        ui.horizontal(|ui| {
+                            let price_text = format_with_commas(price);
+                            let pad = max_label_width
+                                .saturating_sub(price_text.len());
+                            ui.monospace(format!(
+                                "{}{} sats",
+                                " ".repeat(pad),
+                                price_text,
+                            ));
+                            ui.add_space(8.0);
+                            for pos in 0..cells_per_tier {
+                                let idx = tier * 100 + pos;
+                                let is_claimed = claimed.contains(&idx);
+                                let is_pending = pending.contains(&idx);
+                                let is_next = next_idx == Some(idx);
+                                if is_claimed || is_pending {
+                                    claimed_in_tier += 1;
+                                }
+                                let (ch, color) = if is_claimed {
+                                    ('\u{2588}', Color32::from_rgb(220, 80, 80))
+                                } else if is_pending {
+                                    (
+                                        '\u{2588}',
+                                        Color32::from_rgb(230, 200, 80),
+                                    )
+                                } else if is_next {
+                                    (
+                                        '\u{2588}',
+                                        Color32::from_rgb(110, 200, 130),
+                                    )
+                                } else {
+                                    ('\u{2591}', Color32::from_gray(80))
+                                };
+                                ui.label(
+                                    RichText::new(ch).monospace().color(color),
+                                );
+                            }
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "{claimed_in_tier}/{cells_per_tier}"
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                        });
+                    }
+                });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Period total: {} / {}",
+                        pricing.claimed,
+                        pricing.period_capacity(),
+                    ))
+                    .weak(),
+                );
+            });
+
+            ui.add_space(4.0);
+            match self.next_target() {
+                Some((_, fee)) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Current Slot \u{2014} {} sats",
+                            format_with_commas(fee),
+                        ))
+                        .color(Color32::from_rgb(110, 200, 130)),
+                    );
+                }
+                None => {
+                    ui.colored_label(
+                        Color32::YELLOW,
+                        "No slots available in this period",
+                    );
+                }
+            }
+        });
+    }
+
+    fn show_claim(&mut self, app: &App, ui: &mut egui::Ui) {
+        egui::Grid::new("claim")
             .num_columns(2)
             .spacing([10.0, 8.0])
             .show(ui, |ui| {
-                ui.label("Decision ID (hex):");
+                ui.label("Question:");
                 ui.add(
-                    egui::TextEdit::singleline(
-                        &mut self.claim_form.decision_id_input,
-                    )
-                    .hint_text("e.g., 0a1b2c")
-                    .desired_width(150.0)
-                    .font(egui::TextStyle::Monospace),
-                );
-                ui.end_row();
-
-                ui.label("Header:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.claim_form.header)
+                    egui::TextEdit::singleline(&mut self.claim.header)
                         .hint_text("Short title (max 100 bytes)")
-                        .desired_width(300.0),
+                        .desired_width(360.0),
                 );
                 ui.end_row();
 
                 ui.label("Description:");
                 ui.add(
-                    egui::TextEdit::multiline(&mut self.claim_form.description)
+                    egui::TextEdit::multiline(&mut self.claim.description)
                         .hint_text("Detailed description (max 2000 bytes)")
-                        .desired_width(300.0)
+                        .desired_width(360.0)
                         .desired_rows(3),
                 );
                 ui.end_row();
 
                 ui.label("Type:");
                 ui.horizontal(|ui| {
-                    let prev_kind = self.claim_form.kind;
-                    ui.selectable_value(
-                        &mut self.claim_form.kind,
-                        DecisionKind::Binary,
-                        "Binary",
-                    );
-                    ui.selectable_value(
-                        &mut self.claim_form.kind,
-                        DecisionKind::Scaled,
-                        "Scaled",
-                    );
-                    ui.selectable_value(
-                        &mut self.claim_form.kind,
-                        DecisionKind::Categorical,
-                        "Categorical",
-                    );
-                    if prev_kind != self.claim_form.kind {
-                        match prev_kind {
-                            DecisionKind::Binary => {
-                                self.claim_form.option_0_label.clear();
-                                self.claim_form.option_1_label.clear();
+                    let prev_type = self.claim.r#type.clone();
+                    if ui
+                        .selectable_label(
+                            matches!(self.claim.r#type, DecisionType::Binary),
+                            "Binary",
+                        )
+                        .clicked()
+                    {
+                        self.claim.r#type = DecisionType::Binary;
+                    }
+                    if ui
+                        .selectable_label(
+                            matches!(
+                                self.claim.r#type,
+                                DecisionType::Scaled { .. }
+                            ),
+                            "Scaled",
+                        )
+                        .clicked()
+                    {
+                        self.claim.r#type = DecisionType::Scaled {
+                            min: 0.0,
+                            max: 0.0,
+                            increment: 1.0,
+                        };
+                    }
+                    if ui
+                        .selectable_label(
+                            matches!(
+                                self.claim.r#type,
+                                DecisionType::Category { .. }
+                            ),
+                            "Categorical",
+                        )
+                        .clicked()
+                    {
+                        self.claim.r#type = DecisionType::Category {
+                            options: Vec::new(),
+                        };
+                    }
+                    if std::mem::discriminant(&prev_type)
+                        != std::mem::discriminant(&self.claim.r#type)
+                    {
+                        match prev_type {
+                            DecisionType::Binary => {
+                                self.claim.option_0_label.clear();
+                                self.claim.option_1_label.clear();
                             }
-                            DecisionKind::Scaled => {
-                                self.claim_form.min_input.clear();
-                                self.claim_form.max_input.clear();
+                            DecisionType::Scaled { .. } => {
+                                self.claim.min_input.clear();
+                                self.claim.max_input.clear();
+                                self.claim.increment_input.clear();
                             }
-                            DecisionKind::Categorical => {
-                                self.claim_form.outcomes =
+                            DecisionType::Category { .. } => {
+                                self.claim.outcomes =
                                     vec![String::new(), String::new()];
                             }
                         }
@@ -724,35 +766,35 @@ impl Decisions {
                 });
                 ui.end_row();
 
-                match self.claim_form.kind {
-                    DecisionKind::Binary => {
+                match &self.claim.r#type {
+                    DecisionType::Binary => {
                         ui.label("Option 0 label:");
                         ui.add(
                             egui::TextEdit::singleline(
-                                &mut self.claim_form.option_0_label,
+                                &mut self.claim.option_0_label,
                             )
                             .hint_text("e.g., False (default: No)")
-                            .desired_width(200.0),
+                            .desired_width(220.0),
                         );
                         ui.end_row();
 
                         ui.label("Option 1 label:");
                         ui.add(
                             egui::TextEdit::singleline(
-                                &mut self.claim_form.option_1_label,
+                                &mut self.claim.option_1_label,
                             )
                             .hint_text("e.g., True (default: Yes)")
-                            .desired_width(200.0),
+                            .desired_width(220.0),
                         );
                         ui.end_row();
                     }
-                    DecisionKind::Scaled => {
+                    DecisionType::Scaled { .. } => {
                         ui.label("Scale Range:");
                         ui.horizontal(|ui| {
                             ui.label("Min:");
                             ui.add(
                                 egui::TextEdit::singleline(
-                                    &mut self.claim_form.min_input,
+                                    &mut self.claim.min_input,
                                 )
                                 .hint_text("e.g., 0")
                                 .desired_width(80.0),
@@ -760,19 +802,29 @@ impl Decisions {
                             ui.label("Max:");
                             ui.add(
                                 egui::TextEdit::singleline(
-                                    &mut self.claim_form.max_input,
+                                    &mut self.claim.max_input,
                                 )
                                 .hint_text("e.g., 100")
                                 .desired_width(80.0),
                             );
                         });
                         ui.end_row();
+
+                        ui.label("Increment:");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.claim.increment_input,
+                            )
+                            .hint_text("e.g., 0.5 (default: 1)")
+                            .desired_width(80.0),
+                        );
+                        ui.end_row();
                     }
-                    DecisionKind::Categorical => {
+                    DecisionType::Category { .. } => {
                         let mut remove_idx: Option<usize> = None;
-                        let can_remove = self.claim_form.outcomes.len() > 2;
+                        let can_remove = self.claim.outcomes.len() > 2;
                         for (idx, outcome) in
-                            self.claim_form.outcomes.iter_mut().enumerate()
+                            self.claim.outcomes.iter_mut().enumerate()
                         {
                             ui.label(format!("Outcome {}:", idx + 1));
                             ui.horizontal(|ui| {
@@ -798,11 +850,11 @@ impl Decisions {
                             ui.end_row();
                         }
                         if let Some(idx) = remove_idx {
-                            self.claim_form.outcomes.remove(idx);
+                            self.claim.outcomes.remove(idx);
                         }
                         ui.label("");
                         if ui.button("\u{2795} Add outcome").clicked() {
-                            self.claim_form.outcomes.push(String::new());
+                            self.claim.outcomes.push(String::new());
                         }
                         ui.end_row();
                     }
@@ -810,44 +862,157 @@ impl Decisions {
 
                 ui.label("Tags:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.claim_form.tags_input)
+                    egui::TextEdit::singleline(&mut self.claim.tags_input)
                         .hint_text(
                             "Comma-separated (max 10 tags, 50 bytes each)",
                         )
-                        .desired_width(300.0),
+                        .desired_width(360.0),
                 );
                 ui.end_row();
 
-                ui.label("Fee (sats):");
+                ui.label("Miner fee (sats):");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.claim_form.fee_input)
-                        .desired_width(100.0),
+                    egui::TextEdit::singleline(
+                        &mut self.claim.tx_fee_sats_input,
+                    )
+                    .hint_text("e.g. 1000")
+                    .desired_width(120.0),
                 );
                 ui.end_row();
             });
 
+        ui.collapsing("Advanced", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Max listing fee (sats):");
+                ui.add(
+                    egui::TextEdit::singleline(
+                        &mut self.claim.max_listing_fee_sats_input,
+                    )
+                    .hint_text("blank = accept current")
+                    .desired_width(160.0),
+                );
+            });
+        });
+
         ui.add_space(10.0);
 
-        let categorical_ok = self.claim_form.kind != DecisionKind::Categorical
-            || (self.claim_form.outcomes.len() >= 2
-                && self
-                    .claim_form
-                    .outcomes
-                    .iter()
-                    .all(|o| !o.trim().is_empty()));
+        let categorical_ok =
+            !matches!(self.claim.r#type, DecisionType::Category { .. })
+                || (self.claim.outcomes.len() >= 2
+                    && self
+                        .claim
+                        .outcomes
+                        .iter()
+                        .all(|o| !o.trim().is_empty()));
 
-        let can_claim = !self.claim_form.decision_id_input.is_empty()
-            && !self.claim_form.header.trim().is_empty()
+        let has_slot = self.next_target().is_some();
+        let can_claim = !self.claim.header.trim().is_empty()
             && categorical_ok
-            && !self.claim_form.is_processing;
+            && has_slot
+            && !self.claim.is_processing;
 
         if ui
-            .add_enabled(can_claim, Button::new("Claim Decision"))
+            .add_enabled(can_claim, Button::new("Create Decision"))
             .clicked()
         {
-            self.claim_form.is_processing = true;
+            self.claim.is_processing = true;
             self.claim_decision(app);
-            self.claim_form.is_processing = false;
+            self.claim.is_processing = false;
         }
     }
+
+    fn show_existing(&self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new(format!(
+            "Existing decisions in this period ({})",
+            self.claimed_decisions.len()
+        ))
+        .id_salt("existing_decisions")
+        .show(ui, |ui| {
+            if self.claimed_decisions.is_empty() {
+                ui.label(
+                    RichText::new("None yet \u{2014} be the first")
+                        .weak()
+                        .italics(),
+                );
+                return;
+            }
+            ScrollArea::vertical()
+                .id_salt("existing_decisions_scroll")
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for entry in &self.claimed_decisions {
+                        let entry_hex =
+                            hex::encode(entry.decision_id.as_bytes());
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.monospace(&entry_hex);
+                                if ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(entry_hex.clone());
+                                }
+                            });
+                            if let Some(decision) = &entry.decision {
+                                ui.label(&decision.header);
+                                ui.horizontal(|ui| {
+                                    if decision.is_categorical() {
+                                        let labels = decision
+                                            .get_category_labels()
+                                            .unwrap_or(&[]);
+                                        let shown = if labels.len() > 4 {
+                                            format!(
+                                                "{}/\u{2026}",
+                                                labels[..4].join("/")
+                                            )
+                                        } else {
+                                            labels.join("/")
+                                        };
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Categorical [{shown}]"
+                                            ))
+                                            .small()
+                                            .weak(),
+                                        );
+                                    } else if decision.is_scaled() {
+                                        let range = format!(
+                                            "Scaled [{}-{}]",
+                                            decision.scale_min().unwrap_or(0.0),
+                                            decision
+                                                .scale_max()
+                                                .unwrap_or(100.0),
+                                        );
+                                        ui.label(
+                                            RichText::new(range).small().weak(),
+                                        );
+                                    } else {
+                                        let (label0, label1) =
+                                            decision.get_binary_labels();
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Binary [{label0}/{label1}]"
+                                            ))
+                                            .small()
+                                            .weak(),
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+        });
+    }
+}
+
+fn format_with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in bytes.iter().enumerate() {
+        let pos_from_end = bytes.len() - i;
+        if i > 0 && pos_from_end.is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*c as char);
+    }
+    out
 }
