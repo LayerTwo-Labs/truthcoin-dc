@@ -1143,7 +1143,12 @@ impl NetTask {
                             .map_err(|_| Error::SendReorgResultOneshot)?;
                     }
 
-                    let _ = reorg_result?;
+                    if let Err(err) = reorg_result {
+                        tracing::error!(
+                            ?new_tip,
+                            "Reorg failed; continuing to serve peers: {err:#}"
+                        );
+                    }
                 }
                 MailboxItem::PeerInfo(None) => {
                     return Err(Error::PeerInfoRxClosed);
