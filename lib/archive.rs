@@ -163,12 +163,10 @@ impl Archive {
                 if db_version
                     < Version {
                         major: 0,
-                        minor: 12,
-                        patch: 0,
+                        minor: 15,
+                        patch: 1,
                     } =>
             {
-                // `deposits` and `main_bmm_commitments` were removed in
-                // 0.12.0, and `main_block_infos` was added
                 return Err(Error::IncompatibleVersion {
                     version: db_version,
                     db_path: env.path().to_path_buf(),
