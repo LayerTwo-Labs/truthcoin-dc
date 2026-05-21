@@ -1254,13 +1254,11 @@ impl Browse {
     fn picker_options(&self, decision: &Decision) -> Vec<(usize, String)> {
         if decision.is_categorical() {
             let labels = decision.get_category_labels().unwrap_or(&[]);
-            let mut opts: Vec<(usize, String)> = labels
+            labels
                 .iter()
                 .enumerate()
                 .map(|(i, l)| (i, l.clone()))
-                .collect();
-            opts.push((labels.len(), "Inconclusive".to_string()));
-            opts
+                .collect()
         } else if decision.is_scaled() {
             vec![
                 (0, format!("Min: {}", decision.scale_min().unwrap_or(0.0))),

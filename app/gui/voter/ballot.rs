@@ -44,7 +44,7 @@ impl Default for Ballot {
     fn default() -> Self {
         Self {
             rows: Vec::new(),
-            fee_sats: String::new(),
+            fee_sats: String::from("1000"),
             error: None,
             last_submit: None,
             current_period: 0,
@@ -232,15 +232,6 @@ impl Ballot {
                     ui.add_space(10.0);
                     ui.separator();
                     ui.add_space(8.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label("Fee (sats):");
-                        let fee_edit =
-                            egui::TextEdit::singleline(&mut self.fee_sats)
-                                .hint_text("e.g. 1000")
-                                .desired_width(100.0);
-                        ui.add(fee_edit);
-                    });
 
                     let (enabled, disabled_reason) =
                         self.submit_gate(total_reputation);

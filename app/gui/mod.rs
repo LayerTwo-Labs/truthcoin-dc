@@ -223,27 +223,27 @@ pub struct EguiApp {
 #[derive(Clone, Copy, Default, Eq, PartialEq, strum::Display)]
 enum Tab {
     #[default]
-    #[strum(to_string = "Parent Chain")]
-    ParentChain,
-    #[strum(to_string = "Coins")]
-    Coins,
     #[strum(to_string = "Markets")]
     Markets,
     #[strum(to_string = "Create")]
     Create,
-    #[strum(to_string = "Voter")]
-    Voter,
+    #[strum(to_string = "Parent Chain")]
+    ParentChain,
+    #[strum(to_string = "Coins")]
+    Coins,
     #[strum(to_string = "Activity")]
     Activity,
     #[strum(to_string = "Console / Logs")]
     ConsoleLogs,
+    #[strum(to_string = "Voter")]
+    Voter,
 }
 
 impl Tab {
     fn sections() -> &'static [[Tab; 2]] {
         &[
-            [Tab::Coins, Tab::Markets],
-            [Tab::Create, Tab::Voter],
+            [Tab::Markets, Tab::Create],
+            [Tab::ParentChain, Tab::Coins],
             [Tab::Activity, Tab::ConsoleLogs],
         ]
     }
@@ -319,13 +319,10 @@ impl eframe::App for EguiApp {
         } else {
             egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.tab,
-                        Tab::ParentChain,
-                        Tab::ParentChain.to_string(),
-                    );
-                    for section in Tab::sections() {
-                        ui.separator();
+                    for (i, section) in Tab::sections().iter().enumerate() {
+                        if i > 0 {
+                            ui.separator();
+                        }
                         for tab in section {
                             ui.selectable_value(
                                 &mut self.tab,
@@ -334,6 +331,16 @@ impl eframe::App for EguiApp {
                             );
                         }
                     }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.selectable_value(
+                                &mut self.tab,
+                                Tab::Voter,
+                                Tab::Voter.to_string(),
+                            );
+                        },
+                    );
                 });
             });
             egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
