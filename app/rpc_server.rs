@@ -52,6 +52,124 @@ where
     custom_err_msg(format!("{error:#}"))
 }
 
+/// Per-decision slot allocation request.
+pub(crate) struct SlotRequest {
+    pub period_index: u32,
+    pub decision_type: truthcoin_dc::state::decisions::DecisionType,
+    pub header: String,
+    pub description: String,
+    pub option_0_label: Option<String>,
+    pub option_1_label: Option<String>,
+    pub option_labels: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+}
+
+/// Result of allocating a slot for one decision: assigned ID + entry + fee.
+#[allow(dead_code)]
+pub(crate) struct AllocatedSlot {
+    pub decision_id: truthcoin_dc::state::decisions::DecisionId,
+    pub decision_type: truthcoin_dc::state::decisions::DecisionType,
+    pub entry: truthcoin_dc::types::DecisionClaimEntry,
+    pub listing_fee_sats: u64,
+}
+
+/// Allocate slots and compute listing fees for a batch of new decision
+/// claims. For each request, picks the cheapest unlocked slot in the
+/// requested period, considering tier pricing and the mempool's pending
+/// claims. Returns one [`AllocatedSlot`] per request in input order.
+pub(crate) fn allocate_decision_slots(
+    node: &Node,
+    requests: &[SlotRequest],
+) -> RpcResult<Vec<AllocatedSlot>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use truthcoin_dc::math::decisions as math_decisions;
+    use truthcoin_dc::types::DecisionClaimEntry;
+
+    let pending_claim_ids: BTreeSet<[u8; 3]> =
+        node.get_pending_decision_claim_ids().map_err(custom_err)?;
+
+    let mut per_period_picked: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    let mut allocated = Vec::with_capacity(requests.len());
+
+    for (i, req) in requests.iter().enumerate() {
+        if req.header.len() > 100 {
+            return Err(custom_err_msg(format!(
+                "Header for entry {i} (period {}) must be 100 bytes or less",
+                req.period_index
+            )));
+        }
+        if req.description.len() > 2000 {
+            return Err(custom_err_msg(format!(
+                "Description for entry {i} (period {}) must be 2000 bytes \
+                 or less",
+                req.period_index
+            )));
+        }
+
+        let pricing = node
+            .get_listing_fee_info(req.period_index)
+            .map_err(custom_err)?
+            .ok_or_else(|| {
+                custom_err_msg(format!(
+                    "no pricing record for period {}",
+                    req.period_index
+                ))
+            })?;
+
+        let available = node
+            .get_available_decisions_in_period(
+                truthcoin_dc::state::voting::types::VotingPeriodId::new(
+                    req.period_index,
+                ),
+            )
+            .map_err(custom_err)?;
+
+        let picked_set = per_period_picked.entry(req.period_index).or_default();
+
+        let picked = available
+            .into_iter()
+            .find(|id| {
+                math_decisions::slot_unlocked(
+                    id.decision_index(),
+                    pricing.mints,
+                ) && !pending_claim_ids.contains(&id.as_bytes())
+                    && !picked_set.contains(&id.decision_index())
+            })
+            .ok_or_else(|| {
+                custom_err_msg(format!(
+                    "No available standard slot in period {}",
+                    req.period_index
+                ))
+            })?;
+
+        picked_set.insert(picked.decision_index());
+
+        let listing_fee_sats = math_decisions::fee_for_index(
+            pricing.p_period,
+            pricing.mints,
+            picked.decision_index(),
+        )
+        .map_err(|e| custom_err_msg(e.to_string()))?;
+
+        allocated.push(AllocatedSlot {
+            decision_id: picked,
+            decision_type: req.decision_type.clone(),
+            entry: DecisionClaimEntry {
+                decision_id_bytes: picked.as_bytes(),
+                header: req.header.clone(),
+                description: req.description.clone(),
+                option_0_label: req.option_0_label.clone(),
+                option_1_label: req.option_1_label.clone(),
+                option_labels: req.option_labels.clone(),
+                tags: req.tags.clone(),
+            },
+            listing_fee_sats,
+        });
+    }
+
+    Ok(allocated)
+}
+
 fn parse_market_id(
     market_id: &str,
 ) -> RpcResult<truthcoin_dc::state::MarketId> {
@@ -1139,10 +1257,7 @@ impl RpcServer for RpcServerImpl {
         &self,
         request: truthcoin_dc_app_rpc_api::DecisionClaimRequest,
     ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionClaimResponse> {
-        use std::collections::BTreeSet;
-        use truthcoin_dc::math::decisions as math_decisions;
         use truthcoin_dc::state::decisions::DecisionType;
-        use truthcoin_dc::types::DecisionClaimEntry;
 
         let decision_type = match request.decision_type.as_str() {
             "binary" => DecisionType::Binary,
@@ -1187,101 +1302,28 @@ impl RpcServer for RpcServerImpl {
             }
         };
 
-        let pending_claim_ids: BTreeSet<[u8; 3]> = self
-            .app
-            .node
-            .get_pending_decision_claim_ids()
-            .map_err(custom_err)?;
-
-        let mut per_period_picked: std::collections::BTreeMap<
-            u32,
-            BTreeSet<u32>,
-        > = std::collections::BTreeMap::new();
-        let mut entries = Vec::with_capacity(request.decisions.len());
-        let mut decision_ids_hex = Vec::with_capacity(request.decisions.len());
-        let mut listing_fee_paid_sats: u64 = 0;
-
-        for (i, item) in request.decisions.iter().enumerate() {
-            if item.header.len() > 100 {
-                return Err(custom_err_msg(format!(
-                    "Header for entry {i} (period {}) must be 100 bytes \
-                     or less",
-                    item.period_index
-                )));
-            }
-            let desc = item.description.clone().unwrap_or_default();
-            if desc.len() > 2000 {
-                return Err(custom_err_msg(format!(
-                    "Description for entry {i} (period {}) must be 2000 \
-                     bytes or less",
-                    item.period_index
-                )));
-            }
-
-            let pricing = self
-                .app
-                .node
-                .get_listing_fee_info(item.period_index)
-                .map_err(custom_err)?
-                .ok_or_else(|| {
-                    custom_err_msg(format!(
-                        "no pricing record for period {}",
-                        item.period_index
-                    ))
-                })?;
-
-            let available = self
-                .app
-                .node
-                .get_available_decisions_in_period(
-                    truthcoin_dc::state::voting::types::VotingPeriodId::new(
-                        item.period_index,
-                    ),
-                )
-                .map_err(custom_err)?;
-
-            let picked_set =
-                per_period_picked.entry(item.period_index).or_default();
-
-            let picked = available
-                .into_iter()
-                .find(|id| {
-                    math_decisions::slot_unlocked(
-                        id.decision_index(),
-                        pricing.mints,
-                    ) && !pending_claim_ids.contains(&id.as_bytes())
-                        && !picked_set.contains(&id.decision_index())
-                })
-                .ok_or_else(|| {
-                    custom_err_msg(format!(
-                        "No available standard slot in period {}",
-                        item.period_index
-                    ))
-                })?;
-
-            picked_set.insert(picked.decision_index());
-
-            let fee = math_decisions::fee_for_index(
-                pricing.p_period,
-                pricing.mints,
-                picked.decision_index(),
-            )
-            .map_err(|e| custom_err_msg(e.to_string()))?;
-            listing_fee_paid_sats = listing_fee_paid_sats
-                .checked_add(fee)
-                .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
-
-            entries.push(DecisionClaimEntry {
-                decision_id_bytes: picked.as_bytes(),
+        let slot_requests: Vec<SlotRequest> = request
+            .decisions
+            .iter()
+            .map(|item| SlotRequest {
+                period_index: item.period_index,
+                decision_type: decision_type.clone(),
                 header: item.header.clone(),
-                description: desc,
+                description: item.description.clone().unwrap_or_default(),
                 option_0_label: item.option_0_label.clone(),
                 option_1_label: item.option_1_label.clone(),
                 option_labels: item.option_labels.clone(),
                 tags: item.tags.clone(),
-            });
-            decision_ids_hex.push(picked.to_hex());
-        }
+            })
+            .collect();
+
+        let allocated =
+            allocate_decision_slots(&self.app.node, &slot_requests)?;
+
+        let listing_fee_paid_sats: u64 = allocated
+            .iter()
+            .try_fold(0u64, |acc, slot| acc.checked_add(slot.listing_fee_sats))
+            .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
 
         if let Some(cap) = request.max_listing_fee_sats
             && listing_fee_paid_sats > cap
@@ -1291,6 +1333,13 @@ impl RpcServer for RpcServerImpl {
                  max_listing_fee_sats {cap}"
             )));
         }
+
+        let entries: Vec<_> =
+            allocated.iter().map(|slot| slot.entry.clone()).collect();
+        let decision_ids_hex: Vec<String> = allocated
+            .iter()
+            .map(|slot| slot.decision_id.to_hex())
+            .collect();
 
         let total_fee = Amount::from_sat(
             listing_fee_paid_sats
@@ -1406,6 +1455,7 @@ impl RpcServer for RpcServerImpl {
                     tx_pow_hash_selector: request.tx_pow_hash_selector,
                     tx_pow_ordering: request.tx_pow_ordering,
                     tx_pow_difficulty: request.tx_pow_difficulty,
+                    new_claims: Vec::new(),
                 },
                 bitcoin::Amount::from_sat(request.fee_sats),
             )
@@ -1414,6 +1464,308 @@ impl RpcServer for RpcServerImpl {
         self.app.sign_and_send(tx).map_err(custom_err)?;
 
         Ok(market_id.to_string())
+    }
+
+    async fn market_create_v2(
+        &self,
+        request: truthcoin_dc_app_rpc_api::MarketCreateV2Request,
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::MarketCreateV2Response> {
+        use truthcoin_dc::state::decisions::{DecisionId, DecisionType};
+        use truthcoin_dc::types::ClaimDecisionPayload;
+        use truthcoin_dc_app_rpc_api::{
+            ClaimedDecisionInfo, DimensionInput, MarketCreateV2Response,
+        };
+
+        if request.dimensions.is_empty() {
+            return Err(custom_err_msg(
+                "market_create_v2 requires at least one dimension",
+            ));
+        }
+
+        let mut slot_requests: Vec<SlotRequest> = Vec::new();
+        let mut existing_ids: Vec<Option<DecisionId>> = Vec::new();
+
+        for (i, dim) in request.dimensions.iter().enumerate() {
+            match dim {
+                DimensionInput::Existing { id } => {
+                    let decision_id =
+                        DecisionId::from_hex(id).map_err(|e| {
+                            custom_err_msg(format!(
+                                "Dimension {i}: invalid decision id {id}: {e}"
+                            ))
+                        })?;
+                    existing_ids.push(Some(decision_id));
+                }
+                DimensionInput::New {
+                    period_index,
+                    decision_type,
+                    header,
+                    description,
+                    option_0_label,
+                    option_1_label,
+                    option_labels,
+                    tags,
+                    min,
+                    max,
+                    increment,
+                } => {
+                    let ty = match decision_type.as_str() {
+                        "binary" => DecisionType::Binary,
+                        "scaled" => {
+                            let min_v = min.ok_or_else(|| {
+                                custom_err_msg(format!(
+                                    "Dimension {i}: scaled decision requires \
+                                     min"
+                                ))
+                            })?;
+                            let max_v = max.ok_or_else(|| {
+                                custom_err_msg(format!(
+                                    "Dimension {i}: scaled decision requires \
+                                     max"
+                                ))
+                            })?;
+                            let inc = increment.unwrap_or(1.0);
+                            DecisionType::Scaled {
+                                min: min_v,
+                                max: max_v,
+                                increment: inc,
+                            }
+                        }
+                        "category" => {
+                            let labels =
+                                option_labels.clone().ok_or_else(|| {
+                                    custom_err_msg(format!(
+                                        "Dimension {i}: category decision \
+                                         requires option_labels"
+                                    ))
+                                })?;
+                            if labels.len() < 2 {
+                                return Err(custom_err_msg(format!(
+                                    "Dimension {i}: category decision requires \
+                                     at least 2 option_labels"
+                                )));
+                            }
+                            DecisionType::Category { options: labels }
+                        }
+                        other => {
+                            return Err(custom_err_msg(format!(
+                                "Dimension {i}: unknown decision_type '{other}'"
+                            )));
+                        }
+                    };
+
+                    slot_requests.push(SlotRequest {
+                        period_index: *period_index,
+                        decision_type: ty,
+                        header: header.clone(),
+                        description: description.clone().unwrap_or_default(),
+                        option_0_label: option_0_label.clone(),
+                        option_1_label: option_1_label.clone(),
+                        option_labels: option_labels.clone(),
+                        tags: tags.clone(),
+                    });
+                    existing_ids.push(None);
+                }
+            }
+        }
+
+        let allocated =
+            allocate_decision_slots(&self.app.node, &slot_requests)?;
+
+        let total_listing_fee: u64 = allocated
+            .iter()
+            .try_fold(0u64, |acc, slot| acc.checked_add(slot.listing_fee_sats))
+            .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
+
+        if let Some(cap) = request.max_listing_fee_sats
+            && total_listing_fee > cap
+        {
+            return Err(custom_err_msg(format!(
+                "Listing fee {total_listing_fee} exceeds \
+                 max_listing_fee_sats {cap}"
+            )));
+        }
+
+        let mut resolved: Vec<(DecisionId, DecisionType)> =
+            Vec::with_capacity(request.dimensions.len());
+        let mut new_decisions_info: Vec<ClaimedDecisionInfo> = Vec::new();
+        let mut alloc_iter = allocated.iter();
+        for (i, dim) in request.dimensions.iter().enumerate() {
+            match dim {
+                DimensionInput::Existing { .. } => {
+                    let decision_id = existing_ids[i]
+                        .expect("existing dim must have resolved id");
+                    let entry = self
+                        .app
+                        .node
+                        .get_decision_entry(decision_id)
+                        .map_err(custom_err)?
+                        .ok_or_else(|| {
+                            custom_err_msg(format!(
+                                "Dimension {i}: decision {} does not exist",
+                                decision_id.to_hex()
+                            ))
+                        })?;
+                    let decision = entry.decision.ok_or_else(|| {
+                        custom_err_msg(format!(
+                            "Dimension {i}: decision {} was never claimed",
+                            decision_id.to_hex()
+                        ))
+                    })?;
+                    resolved
+                        .push((decision_id, decision.decision_type.clone()));
+                }
+                DimensionInput::New { period_index, .. } => {
+                    let slot = alloc_iter.next().expect(
+                        "allocated count must match new dimension count",
+                    );
+                    resolved
+                        .push((slot.decision_id, slot.decision_type.clone()));
+                    new_decisions_info.push(ClaimedDecisionInfo {
+                        id: slot.decision_id.to_hex(),
+                        period_index: *period_index,
+                        listing_fee_paid_sats: slot.listing_fee_sats,
+                    });
+                }
+            }
+        }
+
+        let dimensions_str = {
+            let inner: Vec<String> = resolved
+                .iter()
+                .map(|(id, ty)| match ty {
+                    DecisionType::Category { .. } => {
+                        format!("[{}]", id.to_hex())
+                    }
+                    _ => id.to_hex(),
+                })
+                .collect();
+            format!("[{}]", inner.join(","))
+        };
+
+        let category_option_counts: Vec<usize> = resolved
+            .iter()
+            .filter_map(|(_, ty)| match ty {
+                DecisionType::Category { options } => Some(options.len()),
+                _ => None,
+            })
+            .collect();
+        let category_option_counts = if category_option_counts.is_empty() {
+            None
+        } else {
+            Some(category_option_counts)
+        };
+
+        let new_claims: Vec<ClaimDecisionPayload> = allocated
+            .iter()
+            .map(|slot| ClaimDecisionPayload {
+                decision_type: slot.decision_type.clone(),
+                decisions: vec![slot.entry.clone()],
+            })
+            .collect();
+
+        let total_fee = Amount::from_sat(
+            total_listing_fee
+                .checked_add(request.tx_fee_sats)
+                .ok_or_else(|| custom_err_msg("total fee overflow"))?,
+        );
+
+        let (tx, market_id) = self
+            .app
+            .wallet
+            .create_market(
+                CreateMarketInput {
+                    title: request.title,
+                    description: request.description,
+                    dimensions: dimensions_str,
+                    beta: request.beta,
+                    trading_fee: request.trading_fee,
+                    initial_liquidity: request.initial_liquidity,
+                    category_option_counts,
+                    tx_pow_hash_selector: request.tx_pow_hash_selector,
+                    tx_pow_ordering: request.tx_pow_ordering,
+                    tx_pow_difficulty: request.tx_pow_difficulty,
+                    new_claims,
+                },
+                total_fee,
+            )
+            .map_err(custom_err)?;
+
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+
+        Ok(MarketCreateV2Response {
+            txid,
+            market_id: market_id.to_string(),
+            claimed_decisions: new_decisions_info,
+        })
+    }
+
+    async fn list_open_periods_with_pricing(
+        &self,
+    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::PeriodPricingSummary>> {
+        use truthcoin_dc::math::decisions as math_decisions;
+        use truthcoin_dc::state::voting::types::VotingPeriodId;
+        use truthcoin_dc_app_rpc_api::PeriodPricingSummary;
+
+        let current = self.app.node.get_current_period().map_err(custom_err)?;
+
+        const PERIODS_AHEAD: u32 = 19;
+        let mut summaries = Vec::with_capacity(PERIODS_AHEAD as usize + 1);
+
+        for period in current..=current.saturating_add(PERIODS_AHEAD) {
+            let Some(pricing) = self
+                .app
+                .node
+                .get_listing_fee_info(period)
+                .map_err(custom_err)?
+            else {
+                continue;
+            };
+
+            let available = self
+                .app
+                .node
+                .get_available_decisions_in_period(VotingPeriodId::new(period))
+                .map_err(custom_err)?;
+
+            let mut slots_by_tier = [0u32; 5];
+            let mut cheapest_tier: Option<u8> = None;
+            let mut cheapest_fee: Option<u64> = None;
+            for id in &available {
+                if !math_decisions::slot_unlocked(
+                    id.decision_index(),
+                    pricing.mints,
+                ) {
+                    continue;
+                }
+                let tier = (id.decision_index() / 100) as usize;
+                if tier >= 5 {
+                    continue;
+                }
+                slots_by_tier[tier] = slots_by_tier[tier].saturating_add(1);
+                if cheapest_tier.is_none_or(|t| (tier as u8) < t) {
+                    cheapest_tier = Some(tier as u8);
+                    cheapest_fee = math_decisions::fee_for_index(
+                        pricing.p_period,
+                        pricing.mints,
+                        id.decision_index(),
+                    )
+                    .ok();
+                }
+            }
+
+            if let (Some(tier), Some(fee)) = (cheapest_tier, cheapest_fee) {
+                summaries.push(PeriodPricingSummary {
+                    period_index: period,
+                    cheapest_available_slot_sats: fee,
+                    cheapest_available_tier: tier,
+                    slots_available_by_tier: slots_by_tier.to_vec(),
+                });
+            }
+        }
+
+        Ok(summaries)
     }
 
     async fn market_list(

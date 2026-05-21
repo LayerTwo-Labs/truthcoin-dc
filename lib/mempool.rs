@@ -207,11 +207,21 @@ impl MemPool {
         use crate::types::TransactionData;
 
         let mut decision_ids = Vec::new();
-        if let Some(ref data) = transaction.data
-            && let TransactionData::ClaimDecision { decisions, .. } = data
-        {
-            for entry in decisions {
-                decision_ids.push(entry.decision_id_bytes);
+        if let Some(ref data) = transaction.data {
+            match data {
+                TransactionData::ClaimDecision(payload) => {
+                    for entry in &payload.decisions {
+                        decision_ids.push(entry.decision_id_bytes);
+                    }
+                }
+                TransactionData::CreateMarketV2 { new_claims, .. } => {
+                    for payload in new_claims {
+                        for entry in &payload.decisions {
+                            decision_ids.push(entry.decision_id_bytes);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         decision_ids
@@ -601,10 +611,12 @@ mod tests {
             inputs: vec![input_outpoint(input_seed)],
             outputs: vec![],
             memo: Vec::new(),
-            data: Some(TransactionData::ClaimDecision {
-                decision_type: DecisionType::Binary,
-                decisions: entries,
-            }),
+            data: Some(TransactionData::ClaimDecision(
+                crate::types::ClaimDecisionPayload {
+                    decision_type: DecisionType::Binary,
+                    decisions: entries,
+                },
+            )),
         };
         Authorized {
             transaction: tx,

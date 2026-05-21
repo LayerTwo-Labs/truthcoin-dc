@@ -26,11 +26,11 @@ pub use hashes::{AssetId, BlockHash, Hash, M6id, MerkleRoot, Txid};
 pub use keys::{EncryptionPubKey, VerifyingKey};
 pub use transaction::{
     AssetOutput, AssetOutputContent, Authorized, AuthorizedTransaction,
-    BallotItem, BitcoinOutput, BitcoinOutputContent, ClaimDecision,
+    BallotItem, BitcoinOutput, BitcoinOutputContent, ClaimDecisionPayload,
     CreateMarket, DecisionClaimEntry, FilledOutput, FilledOutputContent,
-    FilledTransaction, InPoint, OutPoint, OutPointKey, Output, OutputContent,
-    PointedOutput, SpentOutput, Transaction, TransactionData, TxData, TxInputs,
-    WithdrawalOutputContent,
+    FilledTransaction, InPoint, MarketCreationView, OutPoint, OutPointKey,
+    Output, OutputContent, PointedOutput, SpentOutput, Transaction,
+    TransactionData, TxData, TxInputs, WithdrawalOutputContent,
 };
 
 pub const THIS_SIDECHAIN: u8 = 13;

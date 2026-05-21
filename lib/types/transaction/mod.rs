@@ -323,6 +323,47 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn claim_decision_variant_wire_format() -> anyhow::Result<()> {
+        use super::{
+            ClaimDecisionPayload, DecisionClaimEntry, TransactionData,
+        };
+        use crate::state::decisions::DecisionType;
+
+        let payload = ClaimDecisionPayload {
+            decision_type: DecisionType::Binary,
+            decisions: vec![DecisionClaimEntry {
+                decision_id_bytes: [0x01, 0x02, 0x03],
+                header: "h".to_string(),
+                description: "d".to_string(),
+                option_0_label: None,
+                option_1_label: None,
+                option_labels: None,
+                tags: None,
+            }],
+        };
+
+        let payload_bytes = borsh::to_vec(&payload)?;
+        let variant_bytes =
+            borsh::to_vec(&TransactionData::ClaimDecision(payload.clone()))?;
+
+        anyhow::ensure!(
+            !variant_bytes.is_empty(),
+            "variant encoding must not be empty"
+        );
+        anyhow::ensure!(
+            variant_bytes[0] == 0u8,
+            "ClaimDecision must be variant index 0 (got {})",
+            variant_bytes[0]
+        );
+        anyhow::ensure!(
+            &variant_bytes[1..] == payload_bytes.as_slice(),
+            "tuple-variant body must equal raw payload encoding"
+        );
+
+        Ok(())
+    }
 }
 
 /// Reference to a tx input.
@@ -377,17 +418,22 @@ pub struct DecisionClaimEntry {
     pub tags: Option<Vec<String>>,
 }
 
+#[derive(
+    BorshSerialize, Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema,
+)]
+pub struct ClaimDecisionPayload {
+    #[schema(value_type = String)]
+    pub decision_type: DecisionType,
+    pub decisions: Vec<DecisionClaimEntry>,
+}
+
 #[allow(clippy::enum_variant_names)]
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
 #[schema(as = TxData)]
 pub enum TransactionData {
     /// Claim one or more decisions.
     /// Binary: 1 entry. Scaled: 1 entry. Category: 2+ entries.
-    ClaimDecision {
-        #[schema(value_type = String)]
-        decision_type: DecisionType,
-        decisions: Vec<DecisionClaimEntry>,
-    },
+    ClaimDecision(ClaimDecisionPayload),
     /// Create a prediction market using dimension bracket notation.
     /// The initial LMSR beta is derived from the treasury output amount
     /// (`beta = treasury / ln(num_outcomes)`), so no beta field is needed.
@@ -441,17 +487,41 @@ pub enum TransactionData {
         amount: u64,
         market_author: Address,
     },
+    /// V2: create a market with optional decision claims processed
+    /// before market construction within the same tx.
+    /// V1 `CreateMarket` continues to deserialize unchanged for historical
+    /// blocks.
+    CreateMarketV2 {
+        title: String,
+        description: String,
+        #[schema(value_type = Vec<String>)]
+        dimension_specs: Vec<DimensionSpec>,
+        new_claims: Vec<ClaimDecisionPayload>,
+        trading_fee: Option<f64>,
+        category_txids: Option<Vec<[u8; 32]>>,
+        residual_names: Option<Vec<String>>,
+        tx_pow_hash_selector: Option<u8>,
+        tx_pow_ordering: Option<u8>,
+        tx_pow_difficulty: Option<u8>,
+    },
 }
 
 pub type TxData = TransactionData;
 
 impl TxData {
     pub fn is_claim_decision(&self) -> bool {
-        matches!(self, Self::ClaimDecision { .. })
+        matches!(self, Self::ClaimDecision(_))
     }
 
     pub fn is_create_market(&self) -> bool {
-        matches!(self, Self::CreateMarket { .. })
+        matches!(
+            self,
+            Self::CreateMarket { .. } | Self::CreateMarketV2 { .. }
+        )
+    }
+
+    pub fn is_create_market_v2(&self) -> bool {
+        matches!(self, Self::CreateMarketV2 { .. })
     }
 
     pub fn is_trade(&self) -> bool {
@@ -475,12 +545,6 @@ impl TxData {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ClaimDecision {
-    pub decision_type: DecisionType,
-    pub decisions: Vec<DecisionClaimEntry>,
-}
-
 /// Struct describing a market creation using dimension specifications
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateMarket {
@@ -493,6 +557,22 @@ pub struct CreateMarket {
     pub tx_pow_hash_selector: Option<u8>,
     pub tx_pow_ordering: Option<u8>,
     pub tx_pow_difficulty: Option<u8>,
+}
+
+/// Borrowed view over market-creation data that abstracts V1 `CreateMarket`
+/// and V2 `CreateMarketV2`. V1 yields an empty `new_claims` slice.
+#[derive(Clone, Debug)]
+pub struct MarketCreationView<'a> {
+    pub title: &'a str,
+    pub description: &'a str,
+    pub dimension_specs: &'a [DimensionSpec],
+    pub trading_fee: Option<f64>,
+    pub category_txids: Option<&'a [[u8; 32]]>,
+    pub residual_names: Option<&'a [String]>,
+    pub tx_pow_hash_selector: Option<u8>,
+    pub tx_pow_ordering: Option<u8>,
+    pub tx_pow_difficulty: Option<u8>,
+    pub new_claims: &'a [ClaimDecisionPayload],
 }
 
 /// Struct describing a trade operation (buy or sell shares).
@@ -642,6 +722,13 @@ impl FilledTransaction {
         }
     }
 
+    pub fn is_create_market_v2(&self) -> bool {
+        match &self.transaction.data {
+            Some(tx_data) => tx_data.is_create_market_v2(),
+            None => false,
+        }
+    }
+
     pub fn is_submit_vote(&self) -> bool {
         match &self.transaction.data {
             Some(tx_data) => tx_data.is_submit_vote(),
@@ -663,20 +750,67 @@ impl FilledTransaction {
         }
     }
 
-    pub fn claim_decision(&self) -> Option<ClaimDecision> {
+    pub fn claim_decision(&self) -> Option<&ClaimDecisionPayload> {
         match &self.transaction.data {
-            Some(TransactionData::ClaimDecision {
-                decision_type,
-                decisions,
-            }) => Some(ClaimDecision {
-                decision_type: decision_type.clone(),
-                decisions: decisions.clone(),
+            Some(TransactionData::ClaimDecision(payload)) => Some(payload),
+            _ => None,
+        }
+    }
+
+    /// If the tx is a market creation, returns a borrowed view that
+    /// abstracts over V1 `CreateMarket` and V2 `CreateMarketV2`.
+    pub fn as_market_creation(&self) -> Option<MarketCreationView<'_>> {
+        match &self.transaction.data {
+            Some(TransactionData::CreateMarket {
+                title,
+                description,
+                dimension_specs,
+                trading_fee,
+                category_txids,
+                residual_names,
+                tx_pow_hash_selector,
+                tx_pow_ordering,
+                tx_pow_difficulty,
+            }) => Some(MarketCreationView {
+                title: title.as_str(),
+                description: description.as_str(),
+                dimension_specs: dimension_specs.as_slice(),
+                trading_fee: *trading_fee,
+                category_txids: category_txids.as_deref(),
+                residual_names: residual_names.as_deref(),
+                tx_pow_hash_selector: *tx_pow_hash_selector,
+                tx_pow_ordering: *tx_pow_ordering,
+                tx_pow_difficulty: *tx_pow_difficulty,
+                new_claims: &[],
+            }),
+            Some(TransactionData::CreateMarketV2 {
+                title,
+                description,
+                dimension_specs,
+                new_claims,
+                trading_fee,
+                category_txids,
+                residual_names,
+                tx_pow_hash_selector,
+                tx_pow_ordering,
+                tx_pow_difficulty,
+            }) => Some(MarketCreationView {
+                title: title.as_str(),
+                description: description.as_str(),
+                dimension_specs: dimension_specs.as_slice(),
+                trading_fee: *trading_fee,
+                category_txids: category_txids.as_deref(),
+                residual_names: residual_names.as_deref(),
+                tx_pow_hash_selector: *tx_pow_hash_selector,
+                tx_pow_ordering: *tx_pow_ordering,
+                tx_pow_difficulty: *tx_pow_difficulty,
+                new_claims: new_claims.as_slice(),
             }),
             _ => None,
         }
     }
 
-    /// If the tx is a market creation, returns the corresponding [`CreateMarket`].
+    /// If the tx is a V1 market creation, returns the corresponding [`CreateMarket`].
     pub fn create_market(&self) -> Option<CreateMarket> {
         match &self.transaction.data {
             Some(TransactionData::CreateMarket {

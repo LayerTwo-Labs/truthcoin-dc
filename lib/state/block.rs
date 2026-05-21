@@ -815,7 +815,9 @@ pub fn connect_prevalidated(
                     }
                 }
             }
-            Some(TxData::CreateMarket { .. }) => {
+            Some(
+                TxData::CreateMarket { .. } | TxData::CreateMarketV2 { .. },
+            ) => {
                 apply_market_creation(
                     state,
                     rwtxn,
@@ -824,7 +826,7 @@ pub fn connect_prevalidated(
                     height,
                 )?;
             }
-            Some(TxData::ClaimDecision { .. }) => {
+            Some(TxData::ClaimDecision(_)) => {
                 apply_decision_claim(state, rwtxn, filled_tx, height)?;
             }
             Some(TxData::SubmitVote { .. }) => {
@@ -1074,10 +1076,12 @@ pub fn disconnect_tip(
         let filled_tx = state.fill_transaction_from_stxos(rwtxn, tx.clone())?;
         match &tx.data {
             None => (),
-            Some(TxData::ClaimDecision { .. }) => {
+            Some(TxData::ClaimDecision(_)) => {
                 let () = revert_decision_claim(state, rwtxn, &filled_tx)?;
             }
-            Some(TxData::CreateMarket { .. }) => {
+            Some(
+                TxData::CreateMarket { .. } | TxData::CreateMarketV2 { .. },
+            ) => {
                 let () = revert_create_market(state, rwtxn, &filled_tx)?;
             }
             Some(TxData::Trade { .. }) => {
@@ -1571,32 +1575,26 @@ fn revert_create_market(
     rwtxn: &mut RwTxn,
     filled_tx: &FilledTransaction,
 ) -> Result<(), Error> {
-    use crate::state::{MarketBuilder, markets::DimensionSpec};
+    use crate::state::{
+        MarketBuilder, decisions::DecisionId, markets::DimensionSpec,
+    };
     use std::collections::HashMap;
 
-    let market_data =
-        filled_tx
-            .create_market()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a market creation transaction".to_string(),
-            })?;
+    let view = filled_tx.as_market_creation().ok_or_else(|| {
+        Error::InvalidTransaction {
+            reason: "Not a market creation transaction".to_string(),
+        }
+    })?;
 
     let creator_address = extract_creator_address(filled_tx)?;
-    let dimension_specs = market_data.dimension_specs.clone();
+    let dimension_specs = view.dimension_specs.to_vec();
 
     let mut decisions = HashMap::new();
 
     for spec in &dimension_specs {
         match spec {
-            DimensionSpec::Single(decision_id) => {
-                if let Some(entry) =
-                    state.decisions().get_decision_entry(rwtxn, *decision_id)?
-                    && let Some(decision) = entry.decision
-                {
-                    decisions.insert(*decision_id, decision);
-                }
-            }
-            DimensionSpec::Categorical(decision_id) => {
+            DimensionSpec::Single(decision_id)
+            | DimensionSpec::Categorical(decision_id) => {
                 if let Some(entry) =
                     state.decisions().get_decision_entry(rwtxn, *decision_id)?
                     && let Some(decision) = entry.decision
@@ -1608,19 +1606,15 @@ fn revert_create_market(
     }
 
     let mut builder =
-        MarketBuilder::new(market_data.title.clone(), creator_address);
-    builder = configure_market_builder(
-        builder,
-        &market_data.description,
-        market_data.trading_fee,
-    );
+        MarketBuilder::new(view.title.to_string(), creator_address);
+    builder =
+        configure_market_builder(builder, view.description, view.trading_fee);
 
     let computed_tags = compute_market_tags(&decisions);
     builder = builder.with_tags(computed_tags);
 
     let builder = builder.with_dimensions(dimension_specs);
 
-    // Reconstruct the market to get its ID (height doesn't affect ID)
     let market = builder.build(0, None, &decisions).map_err(|e| {
         Error::InvalidTransaction {
             reason: format!("Market reconstruction failed: {e}"),
@@ -1630,6 +1624,15 @@ fn revert_create_market(
     let market_id = market.id;
 
     state.markets().delete_market(rwtxn, &market_id)?;
+
+    for payload in view.new_claims {
+        for entry in &payload.decisions {
+            let decision_id = DecisionId::from_bytes(entry.decision_id_bytes)?;
+            state
+                .decisions()
+                .revert_decision_claim(rwtxn, decision_id)?;
+        }
+    }
 
     Ok(())
 }
@@ -2023,51 +2026,74 @@ fn apply_market_creation(
     state_update: &mut StateUpdate,
     height: u32,
 ) -> Result<(), Error> {
-    use crate::state::{MarketBuilder, markets::DimensionSpec};
+    use crate::state::{
+        MarketBuilder,
+        decisions::{Decision, DecisionId},
+        markets::DimensionSpec,
+    };
     use std::collections::HashMap;
 
-    let market_data =
-        filled_tx
-            .create_market()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a market creation transaction".to_string(),
-            })?;
+    let view = filled_tx.as_market_creation().ok_or_else(|| {
+        Error::InvalidTransaction {
+            reason: "Not a market creation transaction".to_string(),
+        }
+    })?;
 
     let creator_address = extract_creator_address(filled_tx)?;
-    let dimension_specs = market_data.dimension_specs.clone();
+    let creator_address_bytes = creator_address.0;
+    let claiming_txid = filled_tx.transaction.txid();
 
-    let mut decisions = HashMap::new();
-    for spec in &dimension_specs {
-        let decision_ids = match spec {
-            DimensionSpec::Single(decision_id) => vec![*decision_id],
-            DimensionSpec::Categorical(decision_id) => vec![*decision_id],
-        };
-
-        for decision_id in decision_ids {
-            let decision_entry = state
-                .decisions()
-                .get_decision_entry(rwtxn, decision_id)?
-                .ok_or_else(|| Error::InvalidDecisionId {
-                    reason: format!("Decision {decision_id:?} does not exist"),
-                })?;
-
-            let decision = decision_entry.decision.ok_or_else(|| {
-                Error::InvalidDecisionId {
-                    reason: format!("Decision {decision_id:?} has no decision"),
-                }
-            })?;
-
-            decisions.insert(decision_id, decision);
+    for payload in view.new_claims {
+        for entry in &payload.decisions {
+            let decision_id = DecisionId::from_bytes(entry.decision_id_bytes)?;
+            let decision = Decision::new(
+                creator_address_bytes,
+                payload.decision_type.clone(),
+                entry.header.clone(),
+                entry.description.clone(),
+                entry.option_0_label.clone(),
+                entry.option_1_label.clone(),
+                entry.tags.clone().unwrap_or_default(),
+            )?;
+            state.decisions().claim_decision(
+                rwtxn,
+                decision_id,
+                decision,
+                claiming_txid,
+                Some(height),
+            )?;
         }
     }
 
+    let dimension_specs = view.dimension_specs.to_vec();
+
+    let mut decisions = HashMap::new();
+    for spec in &dimension_specs {
+        let decision_id = match spec {
+            DimensionSpec::Single(decision_id)
+            | DimensionSpec::Categorical(decision_id) => *decision_id,
+        };
+
+        let decision_entry = state
+            .decisions()
+            .get_decision_entry(rwtxn, decision_id)?
+            .ok_or_else(|| Error::InvalidDecisionId {
+                reason: format!("Decision {decision_id:?} does not exist"),
+            })?;
+
+        let decision = decision_entry.decision.ok_or_else(|| {
+            Error::InvalidDecisionId {
+                reason: format!("Decision {decision_id:?} has no decision"),
+            }
+        })?;
+
+        decisions.insert(decision_id, decision);
+    }
+
     let mut builder =
-        MarketBuilder::new(market_data.title.clone(), creator_address);
-    builder = configure_market_builder(
-        builder,
-        &market_data.description,
-        market_data.trading_fee,
-    );
+        MarketBuilder::new(view.title.to_string(), creator_address);
+    builder =
+        configure_market_builder(builder, view.description, view.trading_fee);
 
     let computed_tags = compute_market_tags(&decisions);
     builder = builder.with_tags(computed_tags);
@@ -2075,16 +2101,13 @@ fn apply_market_creation(
     let builder = builder
         .with_dimensions(dimension_specs.clone())
         .with_tx_pow(
-            market_data.tx_pow_hash_selector.unwrap_or(0),
-            market_data.tx_pow_ordering.unwrap_or(0),
-            market_data.tx_pow_difficulty.unwrap_or(0),
+            view.tx_pow_hash_selector.unwrap_or(0),
+            view.tx_pow_ordering.unwrap_or(0),
+            view.tx_pow_difficulty.unwrap_or(0),
         );
 
     let market = builder.build(height, None, &decisions).map_err(|e| {
-        tracing::warn!(
-            "Market creation failed for '{}': {e}",
-            market_data.title
-        );
+        tracing::warn!("Market creation failed for '{}': {e}", view.title);
         Error::InvalidTransaction {
             reason: format!("Market creation failed: {e}"),
         }

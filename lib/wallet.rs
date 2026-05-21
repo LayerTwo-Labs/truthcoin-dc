@@ -58,6 +58,10 @@ pub struct DecisionClaimInput {
 /// - Multiple independent decisions: `[dec1,dec2,dec3]`
 /// - Categorical (mutually exclusive): `[[dec1,dec2,dec3]]`
 /// - Mixed dimensions: `[dec1,[dec2,dec3],dec4]`
+///
+/// `new_claims` lets the caller claim decisions in the same tx that
+/// creates the market. Decision IDs referenced inside `dimensions` may
+/// resolve to entries in `new_claims` instead of pre-existing chain state.
 #[derive(Clone, Debug)]
 pub struct CreateMarketInput {
     pub title: String,
@@ -77,6 +81,9 @@ pub struct CreateMarketInput {
     pub tx_pow_hash_selector: Option<u8>,
     pub tx_pow_ordering: Option<u8>,
     pub tx_pow_difficulty: Option<u8>,
+    /// Decisions to claim inside this market creation tx. Empty for
+    /// markets that reuse only already-claimed decisions.
+    pub new_claims: Vec<crate::types::ClaimDecisionPayload>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, utoipa::ToSchema)]
@@ -644,10 +651,11 @@ impl Wallet {
         self.push_bitcoin_change(&mut outputs, change)?;
 
         let mut tx = Transaction::new(inputs, outputs);
-        tx.data = Some(TxData::ClaimDecision {
-            decision_type,
-            decisions,
-        });
+        tx.data =
+            Some(TxData::ClaimDecision(crate::types::ClaimDecisionPayload {
+                decision_type,
+                decisions,
+            }));
 
         Ok(tx)
     }
@@ -681,6 +689,7 @@ impl Wallet {
             tx_pow_hash_selector,
             tx_pow_ordering,
             tx_pow_difficulty,
+            new_claims,
         } = input;
 
         let dimension_specs = parse_dimensions(&dimensions).map_err(|_| {
@@ -767,10 +776,11 @@ impl Wallet {
         );
         let market_id_bytes = *market_id.as_bytes();
 
-        let tx_data = TxData::CreateMarket {
+        let tx_data = TxData::CreateMarketV2 {
             title,
             description,
             dimension_specs,
+            new_claims,
             trading_fee,
             category_txids: None,
             residual_names: None,

@@ -1,6 +1,6 @@
 use crate::state::Error;
 use crate::state::decisions::DecisionId;
-use crate::types::FilledTransaction;
+use crate::types::{Address, ClaimDecisionPayload, FilledTransaction};
 use sneed::RoTxn;
 
 use super::{DecisionValidationInterface, MarketValidator};
@@ -14,36 +14,35 @@ impl DecisionValidator {
         DecisionId::from_hex(decision_id_hex)
     }
 
-    pub fn validate_complete_decision_claim<T>(
+    /// Validate a single claim payload's type constraints and slot
+    /// availability. Returns the total listing fee that this payload owes.
+    /// Caller is responsible for verifying the enclosing tx pays at least
+    /// the summed listing fees.
+    pub fn validate_claim_payload<T>(
         decisions_db: &T,
         rotxn: &RoTxn,
-        tx: &FilledTransaction,
+        payload: &ClaimDecisionPayload,
+        market_maker_address: Address,
         override_height: Option<u32>,
-    ) -> Result<(), Error>
+    ) -> Result<u64, Error>
     where
         T: DecisionValidationInterface,
     {
         use crate::state::decisions::DecisionType;
 
-        let claim =
-            tx.claim_decision()
-                .ok_or_else(|| Error::InvalidTransaction {
-                    reason: "Not a decision claim transaction".to_string(),
-                })?;
-
-        match &claim.decision_type {
+        match &payload.decision_type {
             DecisionType::Binary | DecisionType::Scaled { .. } => {
-                if claim.decisions.len() != 1 {
+                if payload.decisions.len() != 1 {
                     return Err(Error::InvalidTransaction {
                         reason: format!(
                             "{:?} claim must have exactly 1 \
                              decision, got {}",
-                            claim.decision_type,
-                            claim.decisions.len()
+                            payload.decision_type,
+                            payload.decisions.len()
                         ),
                     });
                 }
-                if claim.decisions[0].option_labels.is_some() {
+                if payload.decisions[0].option_labels.is_some() {
                     return Err(Error::InvalidTransaction {
                         reason: "option_labels must not be set \
                              for binary/scaled decisions"
@@ -52,12 +51,12 @@ impl DecisionValidator {
                 }
             }
             DecisionType::Category { options } => {
-                if claim.decisions.len() != 1 {
+                if payload.decisions.len() != 1 {
                     return Err(Error::InvalidTransaction {
                         reason: format!(
                             "Category claim must have exactly \
                              1 decision entry, got {}",
-                            claim.decisions.len()
+                            payload.decisions.len()
                         ),
                     });
                 }
@@ -68,7 +67,7 @@ impl DecisionValidator {
                             .to_string(),
                     });
                 }
-                let entry = &claim.decisions[0];
+                let entry = &payload.decisions[0];
                 let entry_labels = entry.option_labels.as_ref().ok_or(
                     Error::InvalidTransaction {
                         reason: "Category claim entry must \
@@ -96,8 +95,6 @@ impl DecisionValidator {
             }
         }
 
-        let market_maker_address = MarketValidator::validate_maker_auth(tx)?;
-
         let current_ts = decisions_db
             .try_get_mainchain_timestamp(rotxn)?
             .unwrap_or(0);
@@ -108,10 +105,9 @@ impl DecisionValidator {
         let genesis_ts =
             decisions_db.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
 
-        for entry in &claim.decisions {
+        for entry in &payload.decisions {
             let decision_id = DecisionId::from_bytes(entry.decision_id_bytes)?;
-
-            let entry_type = claim.decision_type.clone();
+            let entry_type = payload.decision_type.clone();
 
             let decision = crate::state::decisions::Decision::new(
                 market_maker_address.0,
@@ -150,7 +146,7 @@ impl DecisionValidator {
         }
 
         let mut total_listing_fee: u64 = 0;
-        for entry in &claim.decisions {
+        for entry in &payload.decisions {
             let id = DecisionId::from_bytes(entry.decision_id_bytes)?;
             if !id.is_standard() {
                 continue;
@@ -163,6 +159,34 @@ impl DecisionValidator {
                     }
                 })?;
         }
+
+        Ok(total_listing_fee)
+    }
+
+    pub fn validate_complete_decision_claim<T>(
+        decisions_db: &T,
+        rotxn: &RoTxn,
+        tx: &FilledTransaction,
+        override_height: Option<u32>,
+    ) -> Result<(), Error>
+    where
+        T: DecisionValidationInterface,
+    {
+        let payload =
+            tx.claim_decision()
+                .ok_or_else(|| Error::InvalidTransaction {
+                    reason: "Not a decision claim transaction".to_string(),
+                })?;
+
+        let market_maker_address = MarketValidator::validate_maker_auth(tx)?;
+
+        let total_listing_fee = Self::validate_claim_payload(
+            decisions_db,
+            rotxn,
+            payload,
+            market_maker_address,
+            override_height,
+        )?;
 
         if total_listing_fee > 0 {
             let tx_fee = tx

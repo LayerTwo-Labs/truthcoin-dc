@@ -1,7 +1,12 @@
+use std::collections::HashMap;
+
 use crate::state::Error;
+use crate::state::decisions::{DecisionId, DecisionType};
 use crate::state::markets::{DimensionSpec, MarketState};
-use crate::types::{Address, FilledTransaction};
+use crate::types::{Address, DecisionClaimEntry, FilledTransaction};
 use sneed::RoTxn;
+
+use super::DecisionValidator;
 
 pub struct MarketValidator;
 
@@ -31,15 +36,71 @@ impl MarketValidator {
         state: &crate::state::State,
         rotxn: &RoTxn,
         tx: &FilledTransaction,
-        _override_height: Option<u32>,
+        override_height: Option<u32>,
     ) -> Result<(), Error> {
-        let market_data =
-            tx.create_market()
-                .ok_or_else(|| Error::InvalidTransaction {
-                    reason: "Not a market creation transaction".to_string(),
+        let view = tx.as_market_creation().ok_or_else(|| {
+            Error::InvalidTransaction {
+                reason: "Not a market creation transaction".to_string(),
+            }
+        })?;
+
+        let market_maker_address = Self::validate_maker_auth(tx)?;
+
+        let mut pending_claims: HashMap<DecisionId, &DecisionClaimEntry> =
+            HashMap::new();
+        let mut pending_types: HashMap<DecisionId, DecisionType> =
+            HashMap::new();
+        let mut total_listing_fee: u64 = 0;
+
+        for payload in view.new_claims {
+            let fee = DecisionValidator::validate_claim_payload(
+                state.decisions(),
+                rotxn,
+                payload,
+                market_maker_address,
+                override_height,
+            )?;
+            total_listing_fee =
+                total_listing_fee.checked_add(fee).ok_or_else(|| {
+                    Error::InvalidTransaction {
+                        reason: "Listing fee overflow".to_string(),
+                    }
                 })?;
 
-        let dimension_specs = &market_data.dimension_specs;
+            for entry in &payload.decisions {
+                let decision_id =
+                    DecisionId::from_bytes(entry.decision_id_bytes)?;
+
+                if pending_claims.contains_key(&decision_id) {
+                    return Err(Error::InvalidTransaction {
+                        reason: format!(
+                            "Duplicate new claim for decision {}",
+                            hex::encode(entry.decision_id_bytes)
+                        ),
+                    });
+                }
+
+                if state
+                    .decisions()
+                    .get_decision_entry(rotxn, decision_id)?
+                    .is_some_and(|e| e.decision.is_some())
+                {
+                    return Err(Error::InvalidTransaction {
+                        reason: format!(
+                            "New claim for decision {} collides with \
+                             already-claimed decision",
+                            hex::encode(entry.decision_id_bytes)
+                        ),
+                    });
+                }
+
+                pending_claims.insert(decision_id, entry);
+                pending_types
+                    .insert(decision_id, payload.decision_type.clone());
+            }
+        }
+
+        let dimension_specs = view.dimension_specs;
 
         if dimension_specs.is_empty() {
             return Err(Error::InvalidTransaction {
@@ -49,9 +110,36 @@ impl MarketValidator {
 
         for spec in dimension_specs {
             let decision_id = match spec {
-                DimensionSpec::Single(id) => id,
-                DimensionSpec::Categorical(id) => id,
+                DimensionSpec::Single(id) | DimensionSpec::Categorical(id) => {
+                    id
+                }
             };
+
+            if let Some(ty) = pending_types.get(decision_id) {
+                if let DimensionSpec::Categorical(_) = spec {
+                    match ty {
+                        DecisionType::Category { options } => {
+                            if options.len() < 2 {
+                                return Err(Error::InvalidTransaction {
+                                    reason: "Categorical dimensions \
+                                         require at least 2 options"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                        _ => {
+                            return Err(Error::InvalidTransaction {
+                                reason: format!(
+                                    "Categorical dimension references new \
+                                     decision {decision_id:?} which is not a \
+                                     Category type"
+                                ),
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
 
             let entry = state
                 .decisions()
@@ -88,7 +176,7 @@ impl MarketValidator {
             }
         }
 
-        if let Some(fee) = market_data.trading_fee
+        if let Some(fee) = view.trading_fee
             && (!(0.0..=1.0).contains(&fee))
         {
             return Err(Error::InvalidTransaction {
@@ -98,12 +186,12 @@ impl MarketValidator {
             });
         }
 
-        if let Some(difficulty) = market_data.tx_pow_difficulty
+        if let Some(difficulty) = view.tx_pow_difficulty
             && difficulty > 0
         {
             let config = crate::types::tx_pow::TxPowConfig {
-                hash_selector: market_data.tx_pow_hash_selector.unwrap_or(0),
-                ordering: market_data.tx_pow_ordering.unwrap_or(0),
+                hash_selector: view.tx_pow_hash_selector.unwrap_or(0),
+                ordering: view.tx_pow_ordering.unwrap_or(0),
                 difficulty,
             };
             if !config.validate() {
@@ -118,22 +206,15 @@ impl MarketValidator {
             }
         }
 
-        let market_maker_address = Self::validate_maker_auth(tx)?;
-
-        // Compute expected market_id and validate treasury output
         use crate::state::markets::compute_market_id;
         let expected_market_id = compute_market_id(
-            &market_data.title,
-            &market_data.description,
+            view.title,
+            view.description,
             &market_maker_address,
             dimension_specs,
         );
         let expected_market_id_bytes = *expected_market_id.as_bytes();
 
-        // Check for MarketFunds (treasury) output with matching market_id
-        // and a strictly positive amount. Beta is derived from the treasury
-        // as `beta = treasury / ln(num_outcomes)`, so a zero-sat treasury
-        // would produce a degenerate beta and break LMSR pricing.
         let treasury_amount_sats = tx
             .outputs()
             .iter()
@@ -159,6 +240,25 @@ impl MarketValidator {
                 reason: "CreateMarket treasury output must be positive"
                     .to_string(),
             });
+        }
+
+        if total_listing_fee > 0 {
+            let tx_fee = tx
+                .bitcoin_fee()
+                .map_err(|_| Error::InvalidTransaction {
+                    reason: "Failed to compute tx fee".to_string(),
+                })?
+                .ok_or(Error::NotEnoughValueIn)?;
+            if tx_fee.to_sat() < total_listing_fee {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Insufficient listing fee for new claims: tx fee \
+                         is {} sats but listing fees require {} sats",
+                        tx_fee.to_sat(),
+                        total_listing_fee
+                    ),
+                });
+            }
         }
 
         Ok(())

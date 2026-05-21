@@ -345,8 +345,9 @@ where
                             )?;
                         }
                     }
-                    crate::types::TxData::ClaimDecision { .. }
+                    crate::types::TxData::ClaimDecision(_)
                     | crate::types::TxData::CreateMarket { .. }
+                    | crate::types::TxData::CreateMarketV2 { .. }
                     | crate::types::TxData::SubmitVote { .. }
                     | crate::types::TxData::SubmitBallot { .. }
                     | crate::types::TxData::TransferReputation { .. }
@@ -1113,8 +1114,9 @@ where
                 tracing::debug!("check_trade_slippage: Trade passed");
                 Ok(true)
             }
-            TxData::ClaimDecision { .. }
+            TxData::ClaimDecision(_)
             | TxData::CreateMarket { .. }
+            | TxData::CreateMarketV2 { .. }
             | TxData::SubmitVote { .. }
             | TxData::SubmitBallot { .. }
             | TxData::TransferReputation { .. }

@@ -381,6 +381,85 @@ pub struct CreateMarketRequest {
     pub fee_sats: u64,
 }
 
+/// Per-dimension input for `market_create_v2`. Each dimension is either
+/// a reference to an already-claimed decision (`Existing`) or a request to
+/// claim a new decision (`New`). The wallet derives the `Single` vs
+/// `Categorical` `DimensionSpec` from the decision's type.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DimensionInput {
+    /// Reuse an existing on-chain decision by ID (hex).
+    Existing { id: String },
+    /// Claim a new decision in this same tx.
+    /// `decision_type` is "binary", "scaled", or "category".
+    /// For "scaled", `min`/`max` are required; `increment` defaults to 1.0.
+    /// For "category", `option_labels` (>= 2) are required.
+    New {
+        period_index: u32,
+        decision_type: String,
+        header: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        option_0_label: Option<String>,
+        #[serde(default)]
+        option_1_label: Option<String>,
+        #[serde(default)]
+        option_labels: Option<Vec<String>>,
+        #[serde(default)]
+        tags: Option<Vec<String>>,
+        #[serde(default)]
+        min: Option<f64>,
+        #[serde(default)]
+        max: Option<f64>,
+        #[serde(default)]
+        increment: Option<f64>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketCreateV2Request {
+    pub title: String,
+    pub description: String,
+    pub dimensions: Vec<DimensionInput>,
+    pub beta: Option<f64>,
+    pub trading_fee: Option<f64>,
+    pub initial_liquidity: Option<u64>,
+    pub tx_pow_hash_selector: Option<u8>,
+    pub tx_pow_ordering: Option<u8>,
+    pub tx_pow_difficulty: Option<u8>,
+    pub tx_fee_sats: u64,
+    /// Optional cap on the total listing fee paid for new claims.
+    /// If the computed total exceeds this, the RPC errors before broadcasting.
+    pub max_listing_fee_sats: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct ClaimedDecisionInfo {
+    pub id: String,
+    pub period_index: u32,
+    pub listing_fee_paid_sats: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketCreateV2Response {
+    pub txid: Txid,
+    pub market_id: String,
+    pub claimed_decisions: Vec<ClaimedDecisionInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PeriodPricingSummary {
+    pub period_index: u32,
+    /// Sats charged for the next claim if dropped into this period
+    /// (cheapest available unlocked slot's tier price).
+    pub cheapest_available_slot_sats: u64,
+    /// Tier index (0..=4) of the cheapest available slot.
+    pub cheapest_available_tier: u8,
+    /// Remaining unlocked slots per tier (length 5).
+    pub slots_available_by_tier: Vec<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct CalculateInitialLiquidityRequest {
     pub beta: f64,
@@ -451,8 +530,9 @@ pub struct ScoreChange {
     truthcoin_schema::BitcoinTransaction, truthcoin_schema::BitcoinOutPoint,
     truthcoin_schema::SocketAddr, Address, AssetId, Authorization,
     BitcoinOutputContent, BlockHash, Body,
-    CalculateInitialLiquidityRequest, DecisionClaimItem, DecisionClaimRequest,
-    DecisionClaimResponse,
+    CalculateInitialLiquidityRequest, ClaimedDecisionInfo, DecisionClaimItem,
+    DecisionClaimRequest, DecisionClaimResponse, DimensionInput,
+    MarketCreateV2Request, MarketCreateV2Response, PeriodPricingSummary,
     ConsensusResults, CreateMarketRequest, DecisionSummary,
     EncryptionPubKey, FilledOutputContent, Header, InitialLiquidityCalculation,
     MarketBuyRequest, MarketBuyResponse, MarketData, MarketOutcome,
@@ -796,6 +876,26 @@ pub trait Rpc {
         &self,
         request: CreateMarketRequest,
     ) -> RpcResult<String>;
+
+    /// Create a prediction market, optionally claiming new decisions in
+    /// the same tx. Each dimension references either an existing claimed
+    /// decision or carries new-claim metadata that will be allocated a
+    /// slot and claimed before the market is built.
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "market_create_v2")]
+    async fn market_create_v2(
+        &self,
+        request: MarketCreateV2Request,
+    ) -> RpcResult<MarketCreateV2Response>;
+
+    /// List open voting periods with the price the next claim would pay
+    /// for the cheapest available unlocked slot in each. For the GUI's
+    /// per-dimension period picker.
+    #[open_api_method(output_schema(ToSchema = "Vec<PeriodPricingSummary>"))]
+    #[method(name = "list_open_periods_with_pricing")]
+    async fn list_open_periods_with_pricing(
+        &self,
+    ) -> RpcResult<Vec<PeriodPricingSummary>>;
 
     /// List all markets
     #[open_api_method(output_schema(ToSchema = "Vec<MarketSummary>"))]

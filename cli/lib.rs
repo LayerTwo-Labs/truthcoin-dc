@@ -440,6 +440,42 @@ pub enum Command {
         fee_sats: u64,
     },
 
+    /// Create prediction market with optional new-decision claims.
+    /// Pass `--dimensions-json` containing a JSON array of DimensionInput
+    /// values (`{"type":"existing","id":"..."}` or
+    /// `{"type":"new","period_index":N,"decision_type":"binary","header":"..."}`).
+    /// Decisions tagged `type:new` are claimed in the same block.
+    #[command(name = "market-create-v2", alias = "cmv2")]
+    MarketCreateV2 {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        description: String,
+        /// JSON array of dimension inputs (see command help).
+        #[arg(long)]
+        dimensions_json: String,
+        #[arg(long)]
+        beta: Option<f64>,
+        #[arg(long, default_value = "0.005")]
+        trading_fee: f64,
+        #[arg(long)]
+        initial_liquidity: Option<u64>,
+        #[arg(long)]
+        tx_pow_hash_selector: Option<u8>,
+        #[arg(long)]
+        tx_pow_ordering: Option<u8>,
+        #[arg(long)]
+        tx_pow_difficulty: Option<u8>,
+        #[arg(long, default_value = "1000")]
+        tx_fee_sats: u64,
+        #[arg(long)]
+        max_listing_fee_sats: Option<u64>,
+    },
+
+    /// List open periods and the cheapest available slot price per period.
+    #[command(name = "list-open-periods", alias = "lop")]
+    ListOpenPeriods,
+
     /// List all markets
     #[command(name = "market-list", alias = "markets")]
     MarketList,
@@ -1034,6 +1070,74 @@ where
             };
             let txid = rpc_client.market_create(request).await?;
             format!("Market '{title}' created: {txid}")
+        }
+        Command::MarketCreateV2 {
+            title,
+            description,
+            dimensions_json,
+            beta,
+            trading_fee,
+            initial_liquidity,
+            tx_pow_hash_selector,
+            tx_pow_ordering,
+            tx_pow_difficulty,
+            tx_fee_sats,
+            max_listing_fee_sats,
+        } => {
+            use truthcoin_dc_app_rpc_api::{
+                DimensionInput, MarketCreateV2Request,
+            };
+            let dimensions: Vec<DimensionInput> =
+                serde_json::from_str(&dimensions_json).map_err(|e| {
+                    anyhow::anyhow!("failed to parse --dimensions-json: {e}")
+                })?;
+            let request = MarketCreateV2Request {
+                title: title.clone(),
+                description,
+                dimensions,
+                beta,
+                trading_fee: Some(trading_fee),
+                initial_liquidity,
+                tx_pow_hash_selector,
+                tx_pow_ordering,
+                tx_pow_difficulty,
+                tx_fee_sats,
+                max_listing_fee_sats,
+            };
+            let resp = rpc_client.market_create_v2(request).await?;
+            let mut out = format!(
+                "Market '{title}' created: txid={}, market_id={}",
+                resp.txid, resp.market_id
+            );
+            if !resp.claimed_decisions.is_empty() {
+                out.push_str("\nClaimed decisions:");
+                for d in &resp.claimed_decisions {
+                    out.push_str(&format!(
+                        "\n  - id={} period={} fee_sats={}",
+                        d.id, d.period_index, d.listing_fee_paid_sats
+                    ));
+                }
+            }
+            out
+        }
+        Command::ListOpenPeriods => {
+            let periods = rpc_client.list_open_periods_with_pricing().await?;
+            if periods.is_empty() {
+                "No open periods.".to_string()
+            } else {
+                let mut out = String::from("Open periods:\n");
+                for p in periods {
+                    out.push_str(&format!(
+                        "  period {} — cheapest: {} sats (tier {}), \
+                         slots/tier {:?}\n",
+                        p.period_index,
+                        p.cheapest_available_slot_sats,
+                        p.cheapest_available_tier,
+                        p.slots_available_by_tier,
+                    ));
+                }
+                out
+            }
         }
         Command::MarketList => {
             let markets = rpc_client.market_list().await?;
