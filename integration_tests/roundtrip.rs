@@ -1080,9 +1080,117 @@ async fn roundtrip_task_inner(
     }
     sleep(std::time::Duration::from_secs(1)).await;
 
-    // Snapshot the current tip so we can later exercise the validator's
-    // out-of-window rejection for a trade whose `prev_block_hash` was fresh
-    // at submission time but has since fallen outside POW_BOUND_WINDOW_BLOCKS.
+    {
+        use truthcoin_dc_app_rpc_api::{DimensionInput, MarketCreateV2Request};
+
+        let open_periods = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .list_open_periods_with_pricing()
+            .await?;
+        anyhow::ensure!(
+            !open_periods.is_empty(),
+            "expected at least one open period for claim+create"
+        );
+        let target_period = open_periods[0].period_index;
+
+        let pre_decisions = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .decision_list(Some(DecisionFilter {
+                period: Some(target_period),
+                status: Some(DecisionState::Claimed),
+            }))
+            .await?;
+        let pre_market_count =
+            truthcoin_nodes.issuer.rpc_client.market_list().await?.len();
+
+        let v2_response = truthcoin_nodes
+            .voter_0
+            .rpc_client
+            .market_create_v2(MarketCreateV2Request {
+                title: "V2: new-claim binary".to_string(),
+                description: "Single-block claim + market create".to_string(),
+                dimensions: vec![DimensionInput::New {
+                    period_index: target_period,
+                    decision_type: "binary".to_string(),
+                    header: "V2 question".to_string(),
+                    description: Some("V2 claim test".to_string()),
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                    min: None,
+                    max: None,
+                    increment: None,
+                }],
+                beta: None,
+                trading_fee: Some(0.005),
+                initial_liquidity: Some(expected_costs::INITIAL_LIQUIDITY),
+                tx_pow_hash_selector: None,
+                tx_pow_ordering: None,
+                tx_pow_difficulty: None,
+                tx_fee_sats: 1000,
+                max_listing_fee_sats: None,
+            })
+            .await?;
+
+        anyhow::ensure!(
+            v2_response.claimed_decisions.len() == 1,
+            "expected exactly one decision claimed"
+        );
+        let claimed_id = &v2_response.claimed_decisions[0].id;
+
+        sleep(std::time::Duration::from_millis(500)).await;
+        truthcoin_nodes
+            .issuer
+            .bmm_single(&mut enforcer_post_setup)
+            .await?;
+        sleep(std::time::Duration::from_secs(2)).await;
+
+        let post_decisions = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .decision_list(Some(DecisionFilter {
+                period: Some(target_period),
+                status: Some(DecisionState::Claimed),
+            }))
+            .await?;
+        anyhow::ensure!(
+            post_decisions.len() == pre_decisions.len() + 1,
+            "claim should have added exactly one claimed decision in \
+             period {target_period} (before: {}, after: {})",
+            pre_decisions.len(),
+            post_decisions.len()
+        );
+        anyhow::ensure!(
+            post_decisions
+                .iter()
+                .any(|d| d.decision_id_hex == *claimed_id),
+            "claimed decision id {claimed_id} must appear in state"
+        );
+
+        let post_markets =
+            truthcoin_nodes.issuer.rpc_client.market_list().await?;
+        anyhow::ensure!(
+            post_markets.len() == pre_market_count + 1,
+            "exactly one new market should exist after V2 tx"
+        );
+        anyhow::ensure!(
+            post_markets
+                .iter()
+                .any(|m| m.market_id == v2_response.market_id),
+            "expected market_id {} in market_list",
+            v2_response.market_id
+        );
+
+        tracing::info!(
+            "✓ V2 claim+create: market {} claimed decision {} in one block",
+            v2_response.market_id,
+            claimed_id
+        );
+    }
+
     let pre_trade_tip = truthcoin_nodes
         .issuer
         .rpc_client
