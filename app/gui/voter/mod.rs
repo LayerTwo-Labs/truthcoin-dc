@@ -13,15 +13,19 @@ type NodeUpdates = PromiseStream<Pin<Box<dyn Stream<Item = ()> + Send>>>;
 
 mod ballot;
 mod history;
+mod reputation;
 
 use ballot::Ballot;
 use history::History;
+use reputation::Reputation;
 
 #[derive(Default, EnumIter, Eq, PartialEq, strum::Display)]
 enum Tab {
     #[default]
     #[strum(to_string = "Ballot")]
     Ballot,
+    #[strum(to_string = "Reputation")]
+    Reputation,
     #[strum(to_string = "History")]
     History,
 }
@@ -31,6 +35,7 @@ pub struct Voter {
     header: VoterHeader,
     ballot: Ballot,
     history: History,
+    reputation: Reputation,
 }
 
 impl Voter {
@@ -40,6 +45,7 @@ impl Voter {
             header: VoterHeader::default(),
             ballot: Ballot::default(),
             history: History::default(),
+            reputation: Reputation,
         }
     }
 
@@ -68,6 +74,9 @@ impl Voter {
         egui::CentralPanel::default().show(ui.ctx(), |ui| match self.tab {
             Tab::Ballot => {
                 self.ballot.show(app, ui, current_period, total_reputation);
+            }
+            Tab::Reputation => {
+                self.reputation.show(Some(app), ui);
             }
             Tab::History => {
                 self.history.show(app, ui, current_period);
