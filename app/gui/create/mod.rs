@@ -1,5 +1,4 @@
 use eframe::egui;
-use strum::{EnumIter, IntoEnumIterator};
 
 use crate::app::App;
 
@@ -9,38 +8,49 @@ mod markets;
 use decisions::Decisions;
 use markets::CreateMarket;
 
-#[derive(Default, EnumIter, Eq, PartialEq, strum::Display)]
-enum Tab {
+#[derive(Default, Eq, PartialEq)]
+enum View {
     #[default]
-    #[strum(to_string = "Decisions")]
-    Decisions,
-    #[strum(to_string = "Markets")]
-    Markets,
+    Market,
+    Decision,
 }
 
 #[derive(Default)]
 pub struct Create {
-    tab: Tab,
+    view: View,
     decisions: Decisions,
     markets: CreateMarket,
 }
 
 impl Create {
     pub fn show(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
-        egui::TopBottomPanel::top("create_tabs").show(ui.ctx(), |ui| {
-            ui.horizontal(|ui| {
-                Tab::iter().for_each(|tab_variant| {
-                    let tab_name = tab_variant.to_string();
-                    ui.selectable_value(&mut self.tab, tab_variant, tab_name);
-                })
+        egui::CentralPanel::default().show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| match self.view {
+                View::Market => {
+                    ui.heading("Create Prediction Market");
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui
+                                .button(egui::RichText::new("Claim decision"))
+                                .clicked()
+                            {
+                                self.view = View::Decision;
+                            }
+                        },
+                    );
+                }
+                View::Decision => {
+                    if ui.button("← Back").clicked() {
+                        self.view = View::Market;
+                    }
+                    ui.heading("Claim decision");
+                }
             });
-        });
-        egui::CentralPanel::default().show(ui.ctx(), |ui| match self.tab {
-            Tab::Decisions => {
-                self.decisions.show(app, ui);
-            }
-            Tab::Markets => {
-                self.markets.show(app, ui);
+            ui.separator();
+            match self.view {
+                View::Market => self.markets.show(app, ui),
+                View::Decision => self.decisions.show(app, ui),
             }
         });
     }

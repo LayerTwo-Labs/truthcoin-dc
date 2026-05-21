@@ -696,7 +696,7 @@ impl Decisions {
                 ui.label("Description:");
                 ui.add(
                     egui::TextEdit::multiline(&mut self.claim.description)
-                        .hint_text("Detailed description (max 2000 bytes)")
+                        .hint_text("Description (max 2000 bytes)")
                         .desired_width(360.0)
                         .desired_rows(3),
                 );
