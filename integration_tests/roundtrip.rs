@@ -20,9 +20,10 @@ use truthcoin_dc::{
     types::{Address, FilledOutputContent, GetAddress as _},
 };
 use truthcoin_dc_app_rpc_api::{
-    BallotItem, CreateMarketRequest, CreateTradeRequest, DecisionClaimItem,
-    DecisionClaimRequest, DecisionContentInfo, DecisionFilter, DecisionState,
-    MarketBuyRequest, MarketSellRequest, RpcClient as _, VoteFilter,
+    BallotItem, CreateTradeRequest, DecisionClaimItem, DecisionClaimRequest,
+    DecisionContentInfo, DecisionFilter, DecisionState, DimensionInput,
+    MarketBuyRequest, MarketCreateV2Request, MarketSellRequest, RpcClient as _,
+    VoteFilter,
 };
 
 use crate::{
@@ -383,6 +384,22 @@ impl TruthcoinNodes {
                 .await?;
         }
         Ok(res)
+    }
+
+    async fn refresh_all_wallets(&self) -> anyhow::Result<()> {
+        for node in [
+            &self.issuer,
+            &self.voter_0,
+            &self.voter_1,
+            &self.voter_2,
+            &self.voter_3,
+            &self.voter_4,
+            &self.voter_5,
+            &self.voter_6,
+        ] {
+            node.rpc_client.refresh_wallet().await?;
+        }
+        Ok(())
     }
 }
 
@@ -877,14 +894,7 @@ async fn roundtrip_task_inner(
     }
 
     // Manual wallet refresh for multi-node test environment (8 nodes on one machine)
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
 
     let wallet_utxos = truthcoin_nodes
         .voter_0
@@ -956,47 +966,36 @@ async fn roundtrip_task_inner(
         ),
     ];
 
-    // Create markets using both valid parameter paths:
-    // - Market 0: initial_liquidity only (primary user-facing path)
-    // - Market 1: beta only (advanced path)
-    // - Market 2: initial_liquidity only (different amount)
-    // - Market 3: beta only (same beta, verifies consistency)
-    // Note: "neither" path uses DEFAULT_MARKET_BETA=7.0 which is too low for trading tests
+    // Create markets via v2 with Existing dimension referencing each
+    // Phase 2 decision. Same-period decisions are still in Claimed state
+    // (no period boundary has crossed since Phase 2), so Existing resolves.
     for (idx, (voter_node, decision_idx, title, description)) in
         market_configs.iter().enumerate()
     {
-        use truthcoin_dc_app_rpc_api::CreateMarketRequest;
-
-        let decision_id = &market_decision_ids[*decision_idx];
-        let dimensions = format!("[{decision_id}]");
+        let decision_id = market_decision_ids[*decision_idx].clone();
 
         let (beta, initial_liquidity) = match idx {
-            // Market 0: initial_liquidity only (primary user-facing)
             0 => (None, Some(expected_costs::INITIAL_LIQUIDITY)),
-            // Market 1: beta only (advanced)
             1 => (Some(expected_costs::BETA), None),
-            // Market 2: initial_liquidity only (higher liquidity)
             2 => (None, Some(expected_costs::INITIAL_LIQUIDITY * 2)),
-            // Market 3: beta only (same beta as market 1)
             _ => (Some(expected_costs::BETA), None),
         };
 
-        let request = CreateMarketRequest {
+        let request = MarketCreateV2Request {
             title: title.to_string(),
             description: description.to_string(),
-            dimensions,
+            dimensions: vec![DimensionInput::Existing { id: decision_id }],
             beta,
             trading_fee: Some(0.005),
             initial_liquidity,
-            category_txids: None,
-            residual_names: None,
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            fee_sats: 1000,
+            tx_fee_sats: 1000,
+            max_listing_fee_sats: None,
         };
 
-        voter_node.rpc_client.market_create(request).await?;
+        voter_node.rpc_client.market_create_v2(request).await?;
     }
 
     sleep(std::time::Duration::from_millis(500)).await;
@@ -1070,126 +1069,8 @@ async fn roundtrip_task_inner(
         );
     }
 
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_secs(1)).await;
-
-    {
-        use truthcoin_dc_app_rpc_api::{DimensionInput, MarketCreateV2Request};
-
-        let open_periods = truthcoin_nodes
-            .issuer
-            .rpc_client
-            .list_open_periods_with_pricing()
-            .await?;
-        anyhow::ensure!(
-            !open_periods.is_empty(),
-            "expected at least one open period for claim+create"
-        );
-        let target_period = open_periods[0].period_index;
-
-        let pre_decisions = truthcoin_nodes
-            .issuer
-            .rpc_client
-            .decision_list(Some(DecisionFilter {
-                period: Some(target_period),
-                status: Some(DecisionState::Claimed),
-            }))
-            .await?;
-        let pre_market_count =
-            truthcoin_nodes.issuer.rpc_client.market_list().await?.len();
-
-        let v2_response = truthcoin_nodes
-            .voter_0
-            .rpc_client
-            .market_create_v2(MarketCreateV2Request {
-                title: "V2: new-claim binary".to_string(),
-                description: "Single-block claim + market create".to_string(),
-                dimensions: vec![DimensionInput::New {
-                    period_index: target_period,
-                    decision_type: "binary".to_string(),
-                    header: "V2 question".to_string(),
-                    description: Some("V2 claim test".to_string()),
-                    option_0_label: None,
-                    option_1_label: None,
-                    option_labels: None,
-                    tags: None,
-                    min: None,
-                    max: None,
-                    increment: None,
-                }],
-                beta: None,
-                trading_fee: Some(0.005),
-                initial_liquidity: Some(expected_costs::INITIAL_LIQUIDITY),
-                tx_pow_hash_selector: None,
-                tx_pow_ordering: None,
-                tx_pow_difficulty: None,
-                tx_fee_sats: 1000,
-                max_listing_fee_sats: None,
-            })
-            .await?;
-
-        anyhow::ensure!(
-            v2_response.claimed_decisions.len() == 1,
-            "expected exactly one decision claimed"
-        );
-        let claimed_id = &v2_response.claimed_decisions[0].id;
-
-        sleep(std::time::Duration::from_millis(500)).await;
-        truthcoin_nodes
-            .issuer
-            .bmm_single(&mut enforcer_post_setup)
-            .await?;
-        sleep(std::time::Duration::from_secs(2)).await;
-
-        let post_decisions = truthcoin_nodes
-            .issuer
-            .rpc_client
-            .decision_list(Some(DecisionFilter {
-                period: Some(target_period),
-                status: Some(DecisionState::Claimed),
-            }))
-            .await?;
-        anyhow::ensure!(
-            post_decisions.len() == pre_decisions.len() + 1,
-            "claim should have added exactly one claimed decision in \
-             period {target_period} (before: {}, after: {})",
-            pre_decisions.len(),
-            post_decisions.len()
-        );
-        anyhow::ensure!(
-            post_decisions
-                .iter()
-                .any(|d| d.decision_id_hex == *claimed_id),
-            "claimed decision id {claimed_id} must appear in state"
-        );
-
-        let post_markets =
-            truthcoin_nodes.issuer.rpc_client.market_list().await?;
-        anyhow::ensure!(
-            post_markets.len() == pre_market_count + 1,
-            "exactly one new market should exist after V2 tx"
-        );
-        anyhow::ensure!(
-            post_markets
-                .iter()
-                .any(|m| m.market_id == v2_response.market_id),
-            "expected market_id {} in market_list",
-            v2_response.market_id
-        );
-
-        tracing::info!(
-            "✓ V2 claim+create: market {} claimed decision {} in one block",
-            v2_response.market_id,
-            claimed_id
-        );
-    }
 
     let pre_trade_tip = truthcoin_nodes
         .issuer
@@ -1227,14 +1108,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
     truthcoin_nodes.voter_1.rpc_client.refresh_wallet().await?;
@@ -1258,14 +1132,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
     truthcoin_nodes.voter_2.rpc_client.refresh_wallet().await?;
@@ -1289,14 +1156,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
     let voter_2_deposit_address =
@@ -1382,17 +1242,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
     let voter_0_deposit_address =
@@ -1428,17 +1278,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
     truthcoin_nodes.voter_0.rpc_client.refresh_wallet().await?;
@@ -1462,22 +1302,10 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
-    for voter in [&truthcoin_nodes.voter_0, &truthcoin_nodes.voter_1] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
     // Market 3 batched trades:
@@ -1513,17 +1341,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
     let final_height =
@@ -1651,17 +1469,7 @@ async fn roundtrip_task_inner(
 
     sleep(std::time::Duration::from_secs(2)).await;
 
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_secs(3)).await;
 
     let final_height =
@@ -1783,9 +1591,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(2)).await;
 
-    for voter in voters {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
     for decision_id in voting_decision_ids.iter() {
@@ -2257,70 +2063,69 @@ async fn roundtrip_task_inner(
     sleep(std::time::Duration::from_secs(1)).await;
 
     // ==========================================================================
-    // Phase 9: Additional DecisionEntry Claims
-    // Claims: scaled decisions, categorical decisions, additional binary decisions
+    // Phase 9: Build 10 markets (A-J) via market_create_v2 with bundled claims.
+    //
+    // Markets are split into 3 blocks based on decision dependency order.
+    // Same-block Existing refs are unsafe because the mempool packs txs in
+    // txid order, not insertion order, so a referencer could land before its
+    // claimer. Each block's claims must commit before the next block runs.
+    //   Block 1 (claimers, all-New):   A, B, C, D claim 5 decisions
+    //   Block 2 (uses Block 1):        E (claims 32), G, H, I (claims 1), J
+    //   Block 3 (uses Block 2's 32):   F (claims 33-37)
     // ==========================================================================
 
-    // Calculate dynamic test period based on current block height
     let phase9_height =
         truthcoin_nodes.issuer.rpc_client.getblockcount().await?;
     let current_period = phase9_height / 10;
     let test_period = current_period + 3;
 
-    // Refresh all voter wallets
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_secs(1)).await;
 
-    // All Phase 9 claims route through the issuer's node. With auto-pick the
-    // slot picker reads only the local mempool; in this star topology
-    // (issuer ↔ each voter, voters not peered) parallel claims from
-    // different voter nodes can't see each other's pending txs and would
-    // collide on the same slot. Submitting through one node serializes
-    // auto-pick over a single mempool, so all 12 claims land in distinct
-    // slots in the same block — no extra BMMs and no period-timing shift.
+    // ------ Block 1: A, B, C, D (claim 5 fresh decisions) ------
 
-    // Claim scaled decision for Market A (BTC price prediction)
-    let scaled_a_resp = truthcoin_nodes
+    let market_a_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .decision_claim(DecisionClaimRequest {
-            decision_type: "scaled".to_string(),
-            decisions: vec![DecisionClaimItem {
+        .market_create_v2(MarketCreateV2Request {
+            title: "BTC Price Prediction Market".to_string(),
+            description: "Market based on BTC price prediction".to_string(),
+            dimensions: vec![DimensionInput::New {
                 period_index: test_period,
+                decision_type: "scaled".to_string(),
                 header: "What will BTC price be EOY 2025? (USD)".to_string(),
                 description: None,
                 option_0_label: None,
                 option_1_label: None,
                 option_labels: None,
                 tags: None,
+                min: Some(expected_phase2::scaled::BTC_PRICE_MIN),
+                max: Some(expected_phase2::scaled::BTC_PRICE_MAX),
+                increment: Some(expected_phase2::scaled::BTC_PRICE_INCREMENT),
             }],
-            min: Some(expected_phase2::scaled::BTC_PRICE_MIN),
-            max: Some(expected_phase2::scaled::BTC_PRICE_MAX),
-            increment: Some(expected_phase2::scaled::BTC_PRICE_INCREMENT),
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
             tx_fee_sats: 1_000,
             max_listing_fee_sats: None,
         })
         .await?;
-    let scaled_dec_0 = scaled_a_resp.decision_ids[0].clone();
+    let market_a_id = market_a_response.market_id.clone();
+    let scaled_dec_0 = market_a_response.claimed_decisions[0].id.clone();
 
-    // Claim categorical decision for Market B (3-way: Election)
-    let category_b_resp = truthcoin_nodes
+    let market_b_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .decision_claim(DecisionClaimRequest {
-            decision_type: "category".to_string(),
-            decisions: vec![DecisionClaimItem {
+        .market_create_v2(MarketCreateV2Request {
+            title: "2028 Presidential Election".to_string(),
+            description: "Who will win the 2028 presidential election?"
+                .to_string(),
+            dimensions: vec![DimensionInput::New {
                 period_index: test_period,
+                decision_type: "category".to_string(),
                 header: "Who will win the 2028 election?".to_string(),
                 description: None,
                 option_0_label: None,
@@ -2331,24 +2136,34 @@ async fn roundtrip_task_inner(
                     "Candidate C".to_string(),
                 ]),
                 tags: None,
+                min: None,
+                max: None,
+                increment: None,
             }],
-            min: None,
-            max: None,
-            increment: None,
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
             tx_fee_sats: 1_000,
             max_listing_fee_sats: None,
         })
         .await?;
-    let cat_dec_10 = category_b_resp.decision_ids[0].clone();
+    let market_b_id = market_b_response.market_id.clone();
+    let cat_dec_10 = market_b_response.claimed_decisions[0].id.clone();
 
-    // Claim categorical decision for Market C (4-way: TVL)
-    let category_c_resp = truthcoin_nodes
+    let market_c_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .decision_claim(DecisionClaimRequest {
-            decision_type: "category".to_string(),
-            decisions: vec![DecisionClaimItem {
+        .market_create_v2(MarketCreateV2Request {
+            title: "2025 DeFi TVL Leader".to_string(),
+            description:
+                "Which chain will have the highest TVL at end of 2025?"
+                    .to_string(),
+            dimensions: vec![DimensionInput::New {
                 period_index: test_period,
+                decision_type: "category".to_string(),
                 header: "Which chain will have highest TVL?".to_string(),
                 description: None,
                 option_0_label: None,
@@ -2360,103 +2175,364 @@ async fn roundtrip_task_inner(
                     "Other".to_string(),
                 ]),
                 tags: None,
+                min: None,
+                max: None,
+                increment: None,
             }],
-            min: None,
-            max: None,
-            increment: None,
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
             tx_fee_sats: 1_000,
             max_listing_fee_sats: None,
         })
         .await?;
-    let cat_dec_20 = category_c_resp.decision_ids[0].clone();
+    let market_c_id = market_c_response.market_id.clone();
+    let cat_dec_20 = market_c_response.claimed_decisions[0].id.clone();
 
-    // Claim binary decisions for Markets D, E, and F (all via the issuer)
-    let binary_claim_headers: &[&str] = &[
-        "Will inflation exceed 3% in 2025?",
-        "Will the Fed cut rates in 2025?",
-        "Will unemployment rise above 5%?",
-        "Will GDP growth exceed 3% in 2025?",
-        "Will housing prices rise in 2025?",
-        "Will consumer confidence increase?",
-        "Will retail sales exceed $7T?",
-        "Will manufacturing output increase?",
-    ];
-
-    let mut binary_dec_ids: Vec<String> =
-        Vec::with_capacity(binary_claim_headers.len());
-    for header in binary_claim_headers {
-        let resp = truthcoin_nodes
-            .issuer
-            .rpc_client
-            .decision_claim(DecisionClaimRequest {
-                decision_type: "binary".to_string(),
-                decisions: vec![DecisionClaimItem {
+    let market_d_response = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .market_create_v2(MarketCreateV2Request {
+            title: "Inflation & Fed Policy".to_string(),
+            description: "Combined market on inflation and Fed rate decisions"
+                .to_string(),
+            dimensions: vec![
+                DimensionInput::New {
                     period_index: test_period,
-                    header: header.to_string(),
+                    decision_type: "binary".to_string(),
+                    header: "Will inflation exceed 3% in 2025?".to_string(),
                     description: None,
                     option_0_label: None,
                     option_1_label: None,
                     option_labels: None,
                     tags: None,
-                }],
-                min: None,
-                max: None,
-                increment: None,
-                tx_fee_sats: 1_000,
-                max_listing_fee_sats: None,
-            })
-            .await?;
-        binary_dec_ids.push(resp.decision_ids[0].clone());
-    }
-
-    // Claim second scaled decision for Market I (ETH/BTC ratio)
-    let scaled_b_resp = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .decision_claim(DecisionClaimRequest {
-            decision_type: "scaled".to_string(),
-            decisions: vec![DecisionClaimItem {
-                period_index: test_period,
-                header: "ETH/BTC ratio at end of 2025".to_string(),
-                description: None,
-                option_0_label: None,
-                option_1_label: None,
-                option_labels: None,
-                tags: None,
-            }],
-            min: Some(0.0),
-            max: Some(100.0),
-            increment: None,
+                    min: None,
+                    max: None,
+                    increment: None,
+                },
+                DimensionInput::New {
+                    period_index: test_period,
+                    decision_type: "binary".to_string(),
+                    header: "Will the Fed cut rates in 2025?".to_string(),
+                    description: None,
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                    min: None,
+                    max: None,
+                    increment: None,
+                },
+            ],
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
             tx_fee_sats: 1_000,
             max_listing_fee_sats: None,
         })
         .await?;
-    let scaled_dec_1 = scaled_b_resp.decision_ids[0].clone();
+    let market_d_id = market_d_response.market_id.clone();
+    let bin_dec_30 = market_d_response.claimed_decisions[0].id.clone();
+    let bin_dec_31 = market_d_response.claimed_decisions[1].id.clone();
 
+    sleep(std::time::Duration::from_secs(2)).await;
+    truthcoin_nodes
+        .issuer
+        .bmm_single(&mut enforcer_post_setup)
+        .await?;
     sleep(std::time::Duration::from_secs(2)).await;
     truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
 
-    // Mine blocks to confirm claims (may need multiple blocks)
-    for _ in 0..3 {
-        truthcoin_nodes
-            .issuer
-            .bmm_single(&mut enforcer_post_setup)
-            .await?;
-        sleep(std::time::Duration::from_secs(1)).await;
+    // ------ Block 2: E, G, H, I, J (use Block 1 decisions) ------
 
-        let claimed_decisions = truthcoin_nodes
-            .issuer
-            .rpc_client
-            .decision_list(Some(DecisionFilter {
-                period: Some(test_period),
-                status: Some(DecisionState::Claimed),
-            }))
-            .await?;
+    let market_e_response = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .market_create_v2(MarketCreateV2Request {
+            title: "Macro Indicators 2025".to_string(),
+            description:
+                "Combined market on inflation, Fed policy, and unemployment"
+                    .to_string(),
+            dimensions: vec![
+                DimensionInput::Existing {
+                    id: bin_dec_30.clone(),
+                },
+                DimensionInput::Existing {
+                    id: bin_dec_31.clone(),
+                },
+                DimensionInput::New {
+                    period_index: test_period,
+                    decision_type: "binary".to_string(),
+                    header: "Will unemployment rise above 5%?".to_string(),
+                    description: None,
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                    min: None,
+                    max: None,
+                    increment: None,
+                },
+            ],
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
+        })
+        .await?;
+    let market_e_id = market_e_response.market_id.clone();
+    let bin_dec_32 = market_e_response.claimed_decisions[0].id.clone();
 
-        if claimed_decisions.len() >= 12 {
-            break;
-        }
-    }
+    let market_g_response = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .market_create_v2(MarketCreateV2Request {
+            title: "BTC Price vs Inflation".to_string(),
+            description: "Combined scaled (BTC) and binary (inflation) market"
+                .to_string(),
+            dimensions: vec![
+                DimensionInput::Existing {
+                    id: scaled_dec_0.clone(),
+                },
+                DimensionInput::Existing {
+                    id: bin_dec_30.clone(),
+                },
+            ],
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
+        })
+        .await?;
+    let market_g_id = market_g_response.market_id.clone();
+
+    let market_h_response = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .market_create_v2(MarketCreateV2Request {
+            title: "BTC Price vs Election".to_string(),
+            description:
+                "Combined scaled (BTC) and categorical (election) market"
+                    .to_string(),
+            dimensions: vec![
+                DimensionInput::Existing {
+                    id: scaled_dec_0.clone(),
+                },
+                DimensionInput::Existing {
+                    id: cat_dec_10.clone(),
+                },
+            ],
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
+        })
+        .await?;
+    let market_h_id = market_h_response.market_id.clone();
+
+    let market_i_response = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .market_create_v2(MarketCreateV2Request {
+            title: "BTC Price vs ETH/BTC Ratio".to_string(),
+            description: "Combined two-scaled market".to_string(),
+            dimensions: vec![
+                DimensionInput::Existing {
+                    id: scaled_dec_0.clone(),
+                },
+                DimensionInput::New {
+                    period_index: test_period,
+                    decision_type: "scaled".to_string(),
+                    header: "ETH/BTC ratio at end of 2025".to_string(),
+                    description: None,
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                    min: Some(0.0),
+                    max: Some(100.0),
+                    increment: None,
+                },
+            ],
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
+        })
+        .await?;
+    let market_i_id = market_i_response.market_id.clone();
+    let scaled_dec_1 = market_i_response.claimed_decisions[0].id.clone();
+
+    let market_j_response = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .market_create_v2(MarketCreateV2Request {
+            title: "Ultimate Macro Predictor".to_string(),
+            description: "Combined scaled, binary, and categorical market"
+                .to_string(),
+            dimensions: vec![
+                DimensionInput::Existing {
+                    id: scaled_dec_0.clone(),
+                },
+                DimensionInput::Existing {
+                    id: bin_dec_30.clone(),
+                },
+                DimensionInput::Existing {
+                    id: bin_dec_31.clone(),
+                },
+                DimensionInput::Existing {
+                    id: cat_dec_10.clone(),
+                },
+            ],
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
+        })
+        .await?;
+    let market_j_id = market_j_response.market_id.clone();
+
+    sleep(std::time::Duration::from_secs(2)).await;
+    truthcoin_nodes
+        .issuer
+        .bmm_single(&mut enforcer_post_setup)
+        .await?;
+    sleep(std::time::Duration::from_secs(2)).await;
+    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
+
+    // ------ Block 3: F (uses Block 2's bin_dec_32) ------
+
+    let market_f_response = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .market_create_v2(MarketCreateV2Request {
+            title: "2025 Macro Indicators Full".to_string(),
+            description: "8-way binary market on macro indicators".to_string(),
+            dimensions: vec![
+                DimensionInput::Existing {
+                    id: bin_dec_30.clone(),
+                },
+                DimensionInput::Existing {
+                    id: bin_dec_31.clone(),
+                },
+                DimensionInput::Existing {
+                    id: bin_dec_32.clone(),
+                },
+                DimensionInput::New {
+                    period_index: test_period,
+                    decision_type: "binary".to_string(),
+                    header: "Will GDP growth exceed 3% in 2025?".to_string(),
+                    description: None,
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                    min: None,
+                    max: None,
+                    increment: None,
+                },
+                DimensionInput::New {
+                    period_index: test_period,
+                    decision_type: "binary".to_string(),
+                    header: "Will housing prices rise in 2025?".to_string(),
+                    description: None,
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                    min: None,
+                    max: None,
+                    increment: None,
+                },
+                DimensionInput::New {
+                    period_index: test_period,
+                    decision_type: "binary".to_string(),
+                    header: "Will consumer confidence increase?".to_string(),
+                    description: None,
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                    min: None,
+                    max: None,
+                    increment: None,
+                },
+                DimensionInput::New {
+                    period_index: test_period,
+                    decision_type: "binary".to_string(),
+                    header: "Will retail sales exceed $7T?".to_string(),
+                    description: None,
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                    min: None,
+                    max: None,
+                    increment: None,
+                },
+                DimensionInput::New {
+                    period_index: test_period,
+                    decision_type: "binary".to_string(),
+                    header: "Will manufacturing output increase?".to_string(),
+                    description: None,
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                    min: None,
+                    max: None,
+                    increment: None,
+                },
+            ],
+            beta: Some(expected_costs::BETA),
+            trading_fee: Some(0.005),
+            initial_liquidity: None,
+            tx_pow_hash_selector: None,
+            tx_pow_ordering: None,
+            tx_pow_difficulty: None,
+            tx_fee_sats: 1_000,
+            max_listing_fee_sats: None,
+        })
+        .await?;
+    let market_f_id = market_f_response.market_id.clone();
+    let bin_dec_33 = market_f_response.claimed_decisions[0].id.clone();
+    let bin_dec_34 = market_f_response.claimed_decisions[1].id.clone();
+    let bin_dec_35 = market_f_response.claimed_decisions[2].id.clone();
+    let bin_dec_36 = market_f_response.claimed_decisions[3].id.clone();
+    let bin_dec_37 = market_f_response.claimed_decisions[4].id.clone();
+
+    sleep(std::time::Duration::from_secs(2)).await;
+    truthcoin_nodes
+        .issuer
+        .bmm_single(&mut enforcer_post_setup)
+        .await?;
+    sleep(std::time::Duration::from_secs(2)).await;
 
     let claimed_decisions = truthcoin_nodes
         .issuer
@@ -2466,25 +2542,22 @@ async fn roundtrip_task_inner(
             status: Some(DecisionState::Claimed),
         }))
         .await?;
-
     anyhow::ensure!(
-        claimed_decisions.len() >= 12,
-        "Expected at least 12 claimed decisions in period {}, found {}",
+        claimed_decisions.len() == 12,
+        "Expected 12 claimed decisions in period {}, found {}",
         test_period,
         claimed_decisions.len()
     );
 
-    tracing::info!("✓ Phase 9: Claimed {} decisions", claimed_decisions.len());
+    truthcoin_nodes.refresh_all_wallets().await?;
+    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
 
-    // Sync all voter nodes to issuer's tip so they have the
-    // decisions in their local state before creating markets
     let issuer_tip = truthcoin_nodes
         .issuer
         .rpc_client
         .get_best_sidechain_block_hash()
         .await?
         .expect("Issuer should have a tip");
-
     let issuer_height =
         truthcoin_nodes.issuer.rpc_client.getblockcount().await?;
 
@@ -2513,330 +2586,10 @@ async fn roundtrip_task_inner(
         );
         voter.rpc_client.refresh_wallet().await?;
     }
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    // Decision IDs for market creation come from the auto-pick responses
-    // captured above (scaled_dec_0/_1, cat_dec_10/_20). The 8 binary
-    // decisions are addressed positionally from binary_dec_ids.
-    anyhow::ensure!(
-        binary_dec_ids.len() == 8,
-        "Expected 8 binary decisions, got {}",
-        binary_dec_ids.len()
-    );
-    let bin_dec_30 = binary_dec_ids[0].clone();
-    let bin_dec_31 = binary_dec_ids[1].clone();
-    let bin_dec_32 = binary_dec_ids[2].clone();
-    let bin_dec_33 = binary_dec_ids[3].clone();
-    let bin_dec_34 = binary_dec_ids[4].clone();
-    let bin_dec_35 = binary_dec_ids[5].clone();
-    let bin_dec_36 = binary_dec_ids[6].clone();
-    let bin_dec_37 = binary_dec_ids[7].clone();
-
-    // Refresh wallets for market creation (including issuer for mempool sync)
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
     sleep(std::time::Duration::from_millis(500)).await;
-
-    // Create all markets from the issuer node so transactions go directly
-    // into the issuer's mempool (avoids P2P propagation delays).
-    // All markets are created then mined in a single block to match
-    // the original block height cadence.
-
-    let market_a_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "BTC Price Prediction Market".to_string(),
-            description: "Market based on BTC price prediction".to_string(),
-            dimensions: format!("[{scaled_dec_0}]"),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market A created: id={market_a_id}");
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    let market_b_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "2028 Presidential Election".to_string(),
-            description: "Who will win the 2028 presidential election?"
-                .to_string(),
-            dimensions: format!("[[{cat_dec_10}]]"),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market B created: id={market_b_id}");
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    let market_c_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "2025 DeFi TVL Leader".to_string(),
-            description:
-                "Which chain will have the highest TVL at end of 2025?"
-                    .to_string(),
-            dimensions: format!("[[{cat_dec_20}]]"),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market C created: id={market_c_id}");
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    let market_d_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "Inflation & Fed Policy".to_string(),
-            description: "Combined market on inflation and Fed rate decisions"
-                .to_string(),
-            dimensions: format!("[{bin_dec_30},{bin_dec_31}]"),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market D created: id={market_d_id}");
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    let market_e_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "Macro Indicators 2025".to_string(),
-            description:
-                "Combined market on inflation, Fed policy, and unemployment"
-                    .to_string(),
-            dimensions: format!("[{bin_dec_30},{bin_dec_31},{bin_dec_32}]"),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market E created: id={market_e_id}");
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    let market_f_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "2025 Macro Indicators Full".to_string(),
-            description: "8-way binary market on macro indicators".to_string(),
-            dimensions: format!(
-                "[{bin_dec_30},{bin_dec_31},{bin_dec_32},\
-                 {bin_dec_33},{bin_dec_34},{bin_dec_35},\
-                 {bin_dec_36},{bin_dec_37}]"
-            ),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market F created: id={market_f_id}");
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    let market_g_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "BTC Price vs Inflation".to_string(),
-            description: "Combined scaled (BTC) and binary (inflation) market"
-                .to_string(),
-            dimensions: format!("[{scaled_dec_0},{bin_dec_30}]"),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market G created: id={market_g_id}");
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    let market_h_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "BTC Price vs Election".to_string(),
-            description:
-                "Combined scaled (BTC) and categorical (election) market"
-                    .to_string(),
-            dimensions: format!("[{scaled_dec_0},[{cat_dec_10}]]"),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market H created: id={market_h_id}");
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    let market_i_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "BTC Price vs ETH/BTC Ratio".to_string(),
-            description: "Combined two-scaled market".to_string(),
-            dimensions: format!("[{scaled_dec_0},{scaled_dec_1}]"),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market I created: id={market_i_id}");
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    let market_j_id = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .market_create(CreateMarketRequest {
-            title: "Ultimate Macro Predictor".to_string(),
-            description: "Combined scaled, binary, and categorical market"
-                .to_string(),
-            dimensions: format!(
-                "[{scaled_dec_0},{bin_dec_30},{bin_dec_31},[{cat_dec_10}]]"
-            ),
-            beta: Some(expected_costs::BETA),
-            trading_fee: Some(0.005),
-            initial_liquidity: None,
-            category_txids: None,
-            residual_names: None,
-            tx_pow_hash_selector: None,
-            tx_pow_ordering: None,
-            tx_pow_difficulty: None,
-            fee_sats: 1000,
-        })
-        .await?;
-    tracing::info!("Market J created: id={market_j_id}");
-
-    // Mine all market creation transactions in a single block
-    sleep(std::time::Duration::from_secs(2)).await;
-    truthcoin_nodes
-        .issuer
-        .bmm_single(&mut enforcer_post_setup)
-        .await?;
-    sleep(std::time::Duration::from_secs(2)).await;
 
     let markets = truthcoin_nodes.issuer.rpc_client.market_list().await?;
-    tracing::info!("After mining all markets: {} markets", markets.len());
-    for m in &markets {
-        tracing::info!(
-            "  id={} title={:?} state={}",
-            m.market_id,
-            m.title,
-            m.state
-        );
-    }
-
-    // Refresh all wallets after mining
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-
-    // Sync all voters to issuer's tip
-    let issuer_tip = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .get_best_sidechain_block_hash()
-        .await?
-        .expect("Issuer should have a tip");
-
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        drop(voter.rpc_client.sync_to_tip(issuer_tip).await);
-        voter.rpc_client.refresh_wallet().await?;
-    }
-    truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
-    sleep(std::time::Duration::from_millis(500)).await;
-
-    // Verify markets created correctly
-    let phase2_markets =
-        truthcoin_nodes.issuer.rpc_client.market_list().await?;
-    let phase2_market_ids = [
+    let phase9_market_ids = [
         &market_a_id,
         &market_b_id,
         &market_c_id,
@@ -2848,19 +2601,16 @@ async fn roundtrip_task_inner(
         &market_i_id,
         &market_j_id,
     ];
-    // Verify LMSR invariant for all phase 2 markets
-    for market in &phase2_markets {
-        if phase2_market_ids.contains(&&market.market_id) {
+    for market in &markets {
+        if phase9_market_ids.contains(&&market.market_id) {
             let market_detail = truthcoin_nodes
                 .issuer
                 .rpc_client
                 .market_get(market.market_id.clone())
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Market not found"))?;
-
             let price_sum: f64 =
                 market_detail.outcomes.iter().map(|o| o.current_price).sum();
-
             anyhow::ensure!(
                 (price_sum - 1.0).abs() < expected::PRICE_SUM_TOLERANCE,
                 "LMSR invariant violated for market {}: prices sum to {}",
@@ -2876,35 +2626,13 @@ async fn roundtrip_task_inner(
         .market_get(market_a_id.clone())
         .await?
         .ok_or_else(|| anyhow::anyhow!("Market A not found"))?;
-
     anyhow::ensure!(
         market_a_detail.outcomes.len() == 2,
         "Market A should have 2 outcomes, found {}",
         market_a_detail.outcomes.len()
     );
 
-    tracing::info!("✓ Phase 10: Created 10 markets (A-J)");
-
-    // Sync all voters to the issuer's tip
-    let issuer_tip = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .get_best_sidechain_block_hash()
-        .await?
-        .expect("Issuer should have a tip");
-
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        drop(voter.rpc_client.sync_to_tip(issuer_tip).await);
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    tracing::info!("✓ Phase 9: Built 10 v2 markets (A-J) across 3 blocks");
 
     // Chain-binding rejection checks: verify the validator rejects trades
     // whose `prev_block_hash` is either unknown or outside the recency
@@ -3482,17 +3210,7 @@ async fn roundtrip_task_inner(
     );
 
     // Refresh wallets
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
     // Test 8: Single-address sell
@@ -3616,23 +3334,11 @@ async fn roundtrip_task_inner(
     );
 
     // Refresh all wallets before final verification
-    for voter in [
-        &truthcoin_nodes.voter_0,
-        &truthcoin_nodes.voter_1,
-        &truthcoin_nodes.voter_2,
-        &truthcoin_nodes.voter_3,
-        &truthcoin_nodes.voter_4,
-        &truthcoin_nodes.voter_5,
-        &truthcoin_nodes.voter_6,
-    ] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_millis(500)).await;
 
     // Trade on Market D (2x2)
-    for voter in [&truthcoin_nodes.voter_3, &truthcoin_nodes.voter_4] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     truthcoin_nodes
         .voter_3
         .rpc_client
@@ -3662,9 +3368,7 @@ async fn roundtrip_task_inner(
     sleep(std::time::Duration::from_secs(1)).await;
 
     // Trade on Market F (256 outcomes)
-    for voter in [&truthcoin_nodes.voter_5, &truthcoin_nodes.voter_6] {
-        voter.rpc_client.refresh_wallet().await?;
-    }
+    truthcoin_nodes.refresh_all_wallets().await?;
     for (voter, outcome_idx) in [
         (&truthcoin_nodes.voter_5, 0usize),
         (&truthcoin_nodes.voter_6, 255usize),
