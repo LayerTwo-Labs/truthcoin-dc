@@ -1225,6 +1225,23 @@ impl NetTask {
                                         self.ctxt.env.write_txn().map_err(
                                             crate::mempool::Error::from,
                                         )?;
+                                    // Validate the peer-supplied transaction
+                                    // before accepting it into the mempool,
+                                    // mirroring the RPC path
+                                    // (`Node::submit_transaction`). Without
+                                    // this, invalid-signature txs are accepted
+                                    // and re-broadcast to other peers.
+                                    let _: bitcoin::Amount = self
+                                        .ctxt
+                                        .state
+                                        .validate_transaction(
+                                            &self.ctxt.archive,
+                                            &rwtxn,
+                                            &new_tx,
+                                        )
+                                        .map_err(
+                                            crate::mempool::Error::Validation,
+                                        )?;
                                     self.ctxt
                                         .mempool
                                         .put(&mut rwtxn, &new_tx)?;
