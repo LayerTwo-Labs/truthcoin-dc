@@ -353,35 +353,7 @@ pub struct UserHoldings {
     pub last_updated_height: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct CreateMarketRequest {
-    pub title: String,
-    pub description: String,
-    /// Dimension specification in bracket notation.
-    /// Examples: "[004008]", "[004008,004009]", "[[004008,004009]]"
-    pub dimensions: String,
-    /// Advanced: LMSR liquidity parameter controlling price sensitivity.
-    /// Higher beta = more liquid = smaller price moves per trade.
-    /// Mutually exclusive with initial_liquidity - specify one or the other.
-    pub beta: Option<f64>,
-    pub trading_fee: Option<f64>,
-    /// Initial liquidity in satoshis to fund the market (recommended).
-    /// Beta is derived: β = liquidity / ln(num_outcomes)
-    /// Mutually exclusive with beta - specify one or the other.
-    pub initial_liquidity: Option<u64>,
-    /// Txid(s) for categorical dimensions in hex format - required when using [[...]] notation
-    /// Each txid must be a ClaimDecision transaction with Category type
-    pub category_txids: Option<Vec<String>>,
-    /// Names for residual outcomes in categorical dimensions (one per [[...]])
-    /// e.g., ["Bengals"] when explicit decisions are Steelers/Ravens/Browns
-    pub residual_names: Option<Vec<String>>,
-    pub tx_pow_hash_selector: Option<u8>,
-    pub tx_pow_ordering: Option<u8>,
-    pub tx_pow_difficulty: Option<u8>,
-    pub fee_sats: u64,
-}
-
-/// Per-dimension input for `market_create_v2`. Each dimension is either
+/// Per-dimension input for `market_create`. Each dimension is either
 /// a reference to an already-claimed decision (`Existing`) or a request to
 /// claim a new decision (`New`). The wallet derives the `Single` vs
 /// `Categorical` `DimensionSpec` from the decision's type.
@@ -418,7 +390,7 @@ pub enum DimensionInput {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketCreateV2Request {
+pub struct MarketCreateRequest {
     pub title: String,
     pub description: String,
     pub dimensions: Vec<DimensionInput>,
@@ -442,7 +414,7 @@ pub struct ClaimedDecisionInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketCreateV2Response {
+pub struct MarketCreateResponse {
     pub txid: Txid,
     pub market_id: String,
     pub claimed_decisions: Vec<ClaimedDecisionInfo>,
@@ -532,8 +504,8 @@ pub struct ScoreChange {
     BitcoinOutputContent, BlockHash, Body,
     CalculateInitialLiquidityRequest, ClaimedDecisionInfo, DecisionClaimItem,
     DecisionClaimRequest, DecisionClaimResponse, DimensionInput,
-    MarketCreateV2Request, MarketCreateV2Response, PeriodPricingSummary,
-    ConsensusResults, CreateMarketRequest, DecisionSummary,
+    MarketCreateRequest, MarketCreateResponse, PeriodPricingSummary,
+    ConsensusResults, DecisionSummary,
     EncryptionPubKey, FilledOutputContent, Header, InitialLiquidityCalculation,
     MarketBuyRequest, MarketBuyResponse, MarketData, MarketOutcome,
     MarketSellRequest, MarketSellResponse, MarketSummary,
@@ -870,23 +842,16 @@ pub trait Rpc {
         decision_id_hex: String,
     ) -> RpcResult<u64>;
 
-    /// Create a new prediction market
-    #[method(name = "market_create")]
-    async fn market_create(
-        &self,
-        request: CreateMarketRequest,
-    ) -> RpcResult<String>;
-
     /// Create a prediction market, optionally claiming new decisions in
     /// the same tx. Each dimension references either an existing claimed
     /// decision or carries new-claim metadata that will be allocated a
     /// slot and claimed before the market is built.
     #[open_api_method(output_schema(ToSchema))]
-    #[method(name = "market_create_v2")]
-    async fn market_create_v2(
+    #[method(name = "market_create")]
+    async fn market_create(
         &self,
-        request: MarketCreateV2Request,
-    ) -> RpcResult<MarketCreateV2Response>;
+        request: MarketCreateRequest,
+    ) -> RpcResult<MarketCreateResponse>;
 
     /// List open voting periods with the price the next claim would pay
     /// for the cheapest available unlocked slot in each. For the GUI's

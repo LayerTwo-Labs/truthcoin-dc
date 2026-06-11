@@ -27,10 +27,10 @@ pub use keys::{EncryptionPubKey, VerifyingKey};
 pub use transaction::{
     AssetOutput, AssetOutputContent, Authorized, AuthorizedTransaction,
     BallotItem, BitcoinOutput, BitcoinOutputContent, ClaimDecisionPayload,
-    CreateMarket, DecisionClaimEntry, FilledOutput, FilledOutputContent,
-    FilledTransaction, InPoint, MarketCreationView, OutPoint, OutPointKey,
-    Output, OutputContent, PointedOutput, SpentOutput, Transaction,
-    TransactionData, TxData, TxInputs, WithdrawalOutputContent,
+    DecisionClaimEntry, FilledOutput, FilledOutputContent, FilledTransaction,
+    InPoint, MarketCreationView, OutPoint, OutPointKey, Output, OutputContent,
+    PointedOutput, SpentOutput, Transaction, TransactionData, TxData, TxInputs,
+    WithdrawalOutputContent,
 };
 
 pub const THIS_SIDECHAIN: u8 = 13;

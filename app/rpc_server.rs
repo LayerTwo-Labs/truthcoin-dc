@@ -1406,79 +1406,17 @@ impl RpcServer for RpcServerImpl {
 
     async fn market_create(
         &self,
-        request: truthcoin_dc_app_rpc_api::CreateMarketRequest,
-    ) -> RpcResult<String> {
-        use truthcoin_dc::state::markets::{DimensionSpec, parse_dimensions};
-
-        let category_option_counts = {
-            let specs = parse_dimensions(&request.dimensions).map_err(|e| {
-                custom_err_msg(format!("Failed to parse dimensions: {e}"))
-            })?;
-            let mut counts = Vec::new();
-            for spec in &specs {
-                if let DimensionSpec::Categorical(id) = spec {
-                    let n = self
-                        .node()
-                        .get_decision_entry(*id)
-                        .map_err(custom_err)?
-                        .and_then(|e| e.decision)
-                        .and_then(|d| d.option_count())
-                        .ok_or_else(|| {
-                            custom_err_msg(format!(
-                                "Categorical decision {} \
-                                 not found or not claimed",
-                                id.to_hex()
-                            ))
-                        })?;
-                    counts.push(n);
-                }
-            }
-            if counts.is_empty() {
-                None
-            } else {
-                Some(counts)
-            }
-        };
-
-        let (tx, market_id) = self
-            .app
-            .wallet
-            .create_market(
-                CreateMarketInput {
-                    title: request.title,
-                    description: request.description,
-                    dimensions: request.dimensions,
-                    beta: request.beta,
-                    trading_fee: request.trading_fee,
-                    initial_liquidity: request.initial_liquidity,
-                    category_option_counts,
-                    tx_pow_hash_selector: request.tx_pow_hash_selector,
-                    tx_pow_ordering: request.tx_pow_ordering,
-                    tx_pow_difficulty: request.tx_pow_difficulty,
-                    new_claims: Vec::new(),
-                },
-                bitcoin::Amount::from_sat(request.fee_sats),
-            )
-            .map_err(custom_err)?;
-
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-
-        Ok(market_id.to_string())
-    }
-
-    async fn market_create_v2(
-        &self,
-        request: truthcoin_dc_app_rpc_api::MarketCreateV2Request,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::MarketCreateV2Response> {
+        request: truthcoin_dc_app_rpc_api::MarketCreateRequest,
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::MarketCreateResponse> {
         use truthcoin_dc::state::decisions::{DecisionId, DecisionType};
         use truthcoin_dc::types::ClaimDecisionPayload;
         use truthcoin_dc_app_rpc_api::{
-            ClaimedDecisionInfo, DimensionInput, MarketCreateV2Response,
+            ClaimedDecisionInfo, DimensionInput, MarketCreateResponse,
         };
 
         if request.dimensions.is_empty() {
             return Err(custom_err_msg(
-                "market_create_v2 requires at least one dimension",
+                "market_create requires at least one dimension",
             ));
         }
 
@@ -1694,7 +1632,7 @@ impl RpcServer for RpcServerImpl {
         let txid = tx.txid();
         self.app.sign_and_send(tx).map_err(custom_err)?;
 
-        Ok(MarketCreateV2Response {
+        Ok(MarketCreateResponse {
             txid,
             market_id: market_id.to_string(),
             claimed_decisions: new_decisions_info,

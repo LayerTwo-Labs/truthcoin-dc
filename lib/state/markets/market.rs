@@ -736,9 +736,10 @@ impl Market {
                     _ => format!("{}: Abstain", decision.header),
                 }
             } else {
+                let (label0, label1) = decision.get_binary_labels();
                 match positions[i] {
-                    0 => format!("{}: No", decision.header),
-                    1 => format!("{}: Yes", decision.header),
+                    0 => format!("{}: {}", decision.header, label0),
+                    1 => format!("{}: {}", decision.header, label1),
                     _ => format!("{}: Abstain", decision.header),
                 }
             };

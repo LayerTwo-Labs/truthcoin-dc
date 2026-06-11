@@ -815,9 +815,7 @@ pub fn connect_prevalidated(
                     }
                 }
             }
-            Some(
-                TxData::CreateMarket { .. } | TxData::CreateMarketV2 { .. },
-            ) => {
+            Some(TxData::CreateMarket { .. }) => {
                 apply_market_creation(
                     state,
                     rwtxn,
@@ -1079,9 +1077,7 @@ pub fn disconnect_tip(
             Some(TxData::ClaimDecision(_)) => {
                 let () = revert_decision_claim(state, rwtxn, &filled_tx)?;
             }
-            Some(
-                TxData::CreateMarket { .. } | TxData::CreateMarketV2 { .. },
-            ) => {
+            Some(TxData::CreateMarket { .. }) => {
                 let () = revert_create_market(state, rwtxn, &filled_tx)?;
             }
             Some(TxData::Trade { .. }) => {

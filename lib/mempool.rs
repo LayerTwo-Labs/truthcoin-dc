@@ -214,7 +214,7 @@ impl MemPool {
                         decision_ids.push(entry.decision_id_bytes);
                     }
                 }
-                TransactionData::CreateMarketV2 { new_claims, .. } => {
+                TransactionData::CreateMarket { new_claims, .. } => {
                     for payload in new_claims {
                         for entry in &payload.decisions {
                             decision_ids.push(entry.decision_id_bytes);

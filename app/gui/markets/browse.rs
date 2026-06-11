@@ -705,18 +705,21 @@ impl Browse {
                 && let Ok(Some(entry)) =
                     app.node.get_decision_entry(*decision_id)
                 && let Some(decision) = &entry.decision
-                && let Some(labels) = decision.get_category_labels()
             {
+                if let Some(labels) = decision.get_category_labels() {
+                    return match combo.first() {
+                        Some(&idx) if idx < labels.len() => labels[idx].clone(),
+                        _ => format!("Outcome {outcome_display_idx}"),
+                    };
+                }
+                let (label0, label1) = decision.get_binary_labels();
                 return match combo.first() {
-                    Some(&idx) if idx < labels.len() => labels[idx].clone(),
+                    Some(0) => label0,
+                    Some(1) => label1,
                     _ => format!("Outcome {outcome_display_idx}"),
                 };
             }
-            match combo.first() {
-                Some(0) => return "No".to_string(),
-                Some(1) => return "Yes".to_string(),
-                _ => return format!("Outcome {outcome_display_idx}"),
-            }
+            return format!("Outcome {outcome_display_idx}");
         }
 
         let decisions_map: HashMap<DecisionId, Decision> = market
@@ -1376,6 +1379,15 @@ impl Browse {
         let mut indexed: Vec<(usize, &Vec<usize>, f64)> = valid_combos
             .iter()
             .enumerate()
+            .filter(|(_, (_, combo))| {
+                self.picker_state
+                    .iter()
+                    .enumerate()
+                    .all(|(dim, sel)| match sel {
+                        Some(state) => combo.get(dim) == Some(state),
+                        None => true,
+                    })
+            })
             .map(|(i, (_, combo))| {
                 (i, *combo, prices.get(i).copied().unwrap_or(0.0))
             })

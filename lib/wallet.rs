@@ -776,7 +776,7 @@ impl Wallet {
         );
         let market_id_bytes = *market_id.as_bytes();
 
-        let tx_data = TxData::CreateMarketV2 {
+        let tx_data = TxData::CreateMarket {
             title,
             description,
             dimension_specs,

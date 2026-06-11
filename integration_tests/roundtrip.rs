@@ -22,7 +22,7 @@ use truthcoin_dc::{
 use truthcoin_dc_app_rpc_api::{
     BallotItem, CreateTradeRequest, DecisionClaimItem, DecisionClaimRequest,
     DecisionContentInfo, DecisionFilter, DecisionState, DimensionInput,
-    MarketBuyRequest, MarketCreateV2Request, MarketSellRequest, RpcClient as _,
+    MarketBuyRequest, MarketCreateRequest, MarketSellRequest, RpcClient as _,
     VoteFilter,
 };
 
@@ -981,7 +981,7 @@ async fn roundtrip_task_inner(
             _ => (Some(expected_costs::BETA), None),
         };
 
-        let request = MarketCreateV2Request {
+        let request = MarketCreateRequest {
             title: title.to_string(),
             description: description.to_string(),
             dimensions: vec![DimensionInput::Existing { id: decision_id }],
@@ -995,7 +995,7 @@ async fn roundtrip_task_inner(
             max_listing_fee_sats: None,
         };
 
-        voter_node.rpc_client.market_create_v2(request).await?;
+        voter_node.rpc_client.market_create(request).await?;
     }
 
     sleep(std::time::Duration::from_millis(500)).await;
@@ -2063,7 +2063,7 @@ async fn roundtrip_task_inner(
     sleep(std::time::Duration::from_secs(1)).await;
 
     // ==========================================================================
-    // Phase 9: Build 10 markets (A-J) via market_create_v2 with bundled claims.
+    // Phase 9: Build 10 markets (A-J) via market_create with bundled claims.
     //
     // Markets are split into 3 blocks based on decision dependency order.
     // Same-block Existing refs are unsafe because the mempool packs txs in
@@ -2087,7 +2087,7 @@ async fn roundtrip_task_inner(
     let market_a_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "BTC Price Prediction Market".to_string(),
             description: "Market based on BTC price prediction".to_string(),
             dimensions: vec![DimensionInput::New {
@@ -2119,7 +2119,7 @@ async fn roundtrip_task_inner(
     let market_b_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "2028 Presidential Election".to_string(),
             description: "Who will win the 2028 presidential election?"
                 .to_string(),
@@ -2156,7 +2156,7 @@ async fn roundtrip_task_inner(
     let market_c_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "2025 DeFi TVL Leader".to_string(),
             description:
                 "Which chain will have the highest TVL at end of 2025?"
@@ -2195,7 +2195,7 @@ async fn roundtrip_task_inner(
     let market_d_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "Inflation & Fed Policy".to_string(),
             description: "Combined market on inflation and Fed rate decisions"
                 .to_string(),
@@ -2254,7 +2254,7 @@ async fn roundtrip_task_inner(
     let market_e_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "Macro Indicators 2025".to_string(),
             description:
                 "Combined market on inflation, Fed policy, and unemployment"
@@ -2296,7 +2296,7 @@ async fn roundtrip_task_inner(
     let market_g_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "BTC Price vs Inflation".to_string(),
             description: "Combined scaled (BTC) and binary (inflation) market"
                 .to_string(),
@@ -2323,7 +2323,7 @@ async fn roundtrip_task_inner(
     let market_h_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "BTC Price vs Election".to_string(),
             description:
                 "Combined scaled (BTC) and categorical (election) market"
@@ -2351,7 +2351,7 @@ async fn roundtrip_task_inner(
     let market_i_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "BTC Price vs ETH/BTC Ratio".to_string(),
             description: "Combined two-scaled market".to_string(),
             dimensions: vec![
@@ -2388,7 +2388,7 @@ async fn roundtrip_task_inner(
     let market_j_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "Ultimate Macro Predictor".to_string(),
             description: "Combined scaled, binary, and categorical market"
                 .to_string(),
@@ -2431,7 +2431,7 @@ async fn roundtrip_task_inner(
     let market_f_response = truthcoin_nodes
         .issuer
         .rpc_client
-        .market_create_v2(MarketCreateV2Request {
+        .market_create(MarketCreateRequest {
             title: "2025 Macro Indicators Full".to_string(),
             description: "8-way binary market on macro indicators".to_string(),
             dimensions: vec![

@@ -19,15 +19,6 @@ use truthcoin_dc::{
 use truthcoin_dc_app_rpc_api::RpcClient;
 use url::{Host, Url};
 
-/// Parse comma-separated input into filtered string vector
-pub fn parse_comma_separated(input: &str) -> Vec<String> {
-    input
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 /// Format transaction success messages consistently
 pub fn format_tx_success(
     operation: &str,
@@ -407,46 +398,13 @@ pub enum Command {
         max_listing_fee_sats: Option<u64>,
     },
 
-    /// Create prediction market
-    #[command(name = "market-create", alias = "cm")]
-    MarketCreate {
-        #[arg(long)]
-        title: String,
-        #[arg(long)]
-        description: String,
-        /// Dimensions: "[dec1]", "[dec1,dec2]", "[[dec1,dec2,dec3]]"
-        #[arg(long)]
-        dimensions: String,
-        #[arg(long, default_value = "7.0")]
-        beta: f64,
-        #[arg(long, default_value = "0.005")]
-        trading_fee: f64,
-        /// Category txids (deprecated, ignored)
-        #[arg(long)]
-        category_txids: Option<String>,
-        /// Residual outcome names for categorical dimensions (comma-separated)
-        #[arg(long)]
-        residual_names: Option<String>,
-        /// TX-PoW hash function bitmask (byte 0: which hash functions)
-        #[arg(long)]
-        tx_pow_hash_selector: Option<u8>,
-        /// TX-PoW ordering byte (Lehmer code for hash chain order)
-        #[arg(long)]
-        tx_pow_ordering: Option<u8>,
-        /// TX-PoW difficulty (number of leading zero bits required)
-        #[arg(long)]
-        tx_pow_difficulty: Option<u8>,
-        #[arg(long, default_value = "1000")]
-        fee_sats: u64,
-    },
-
     /// Create prediction market with optional new-decision claims.
     /// Pass `--dimensions-json` containing a JSON array of DimensionInput
     /// values (`{"type":"existing","id":"..."}` or
     /// `{"type":"new","period_index":N,"decision_type":"binary","header":"..."}`).
     /// Decisions tagged `type:new` are claimed in the same block.
-    #[command(name = "market-create-v2", alias = "cmv2")]
-    MarketCreateV2 {
+    #[command(name = "market-create", alias = "cm")]
+    MarketCreate {
         #[arg(long)]
         title: String,
         #[arg(long)]
@@ -1040,40 +998,6 @@ where
         Command::MarketCreate {
             title,
             description,
-            dimensions,
-            beta,
-            trading_fee,
-            category_txids,
-            residual_names,
-            tx_pow_hash_selector,
-            tx_pow_ordering,
-            tx_pow_difficulty,
-            fee_sats,
-        } => {
-            use truthcoin_dc_app_rpc_api::CreateMarketRequest;
-            let parsed_residual_names =
-                residual_names.map(|t| parse_comma_separated(&t));
-            let _ = category_txids;
-            let request = CreateMarketRequest {
-                title: title.clone(),
-                description,
-                dimensions,
-                beta: Some(beta),
-                trading_fee: Some(trading_fee),
-                initial_liquidity: None,
-                category_txids: None,
-                residual_names: parsed_residual_names,
-                tx_pow_hash_selector,
-                tx_pow_ordering,
-                tx_pow_difficulty,
-                fee_sats,
-            };
-            let txid = rpc_client.market_create(request).await?;
-            format!("Market '{title}' created: {txid}")
-        }
-        Command::MarketCreateV2 {
-            title,
-            description,
             dimensions_json,
             beta,
             trading_fee,
@@ -1085,13 +1009,13 @@ where
             max_listing_fee_sats,
         } => {
             use truthcoin_dc_app_rpc_api::{
-                DimensionInput, MarketCreateV2Request,
+                DimensionInput, MarketCreateRequest,
             };
             let dimensions: Vec<DimensionInput> =
                 serde_json::from_str(&dimensions_json).map_err(|e| {
                     anyhow::anyhow!("failed to parse --dimensions-json: {e}")
                 })?;
-            let request = MarketCreateV2Request {
+            let request = MarketCreateRequest {
                 title: title.clone(),
                 description,
                 dimensions,
@@ -1104,7 +1028,7 @@ where
                 tx_fee_sats,
                 max_listing_fee_sats,
             };
-            let resp = rpc_client.market_create_v2(request).await?;
+            let resp = rpc_client.market_create(request).await?;
             let mut out = format!(
                 "Market '{title}' created: txid={}, market_id={}",
                 resp.txid, resp.market_id
