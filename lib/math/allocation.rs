@@ -74,10 +74,16 @@ pub fn allocate_proportionally_u64<K: Clone>(
     // Phase 1: Calculate allocations with Rounding::Nearest
     let mut allocations: Vec<(K, u64)> = Vec::with_capacity(participants.len());
     let mut total_allocated: u64 = 0;
+    let mut fallback: Option<(K, f64)> = None;
 
     for (key, weight) in participants {
         if weight < f64::EPSILON {
             continue;
+        }
+
+        match &fallback {
+            Some((_, best)) if *best >= weight => {}
+            _ => fallback = Some((key.clone(), weight)),
         }
 
         let proportion = weight / total_weight;
@@ -91,47 +97,47 @@ pub fn allocate_proportionally_u64<K: Clone>(
     }
 
     // Phase 2: Adjust for rounding remainder
-    if !allocations.is_empty() {
-        match total_allocated.cmp(&total_pool) {
-            std::cmp::Ordering::Less => {
-                // Under-allocated: add remainder to largest
-                let remainder = total_pool - total_allocated;
-                let largest_idx = allocations
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, (_, amt))| *amt)
-                    .map(|(idx, _)| idx)
-                    .unwrap();
-                allocations[largest_idx].1 += remainder;
-                total_allocated += remainder;
-            }
-            std::cmp::Ordering::Greater => {
-                let excess = total_allocated - total_pool;
-                allocations.sort_by_key(|(_, amt)| *amt);
-                let mut remaining = excess;
-                for (_, amt) in allocations.iter_mut() {
-                    if remaining == 0 {
-                        break;
-                    }
-                    let take = (*amt).min(remaining);
-                    *amt -= take;
-                    remaining -= take;
+    match total_allocated.cmp(&total_pool) {
+        std::cmp::Ordering::Less => {
+            let remainder = total_pool - total_allocated;
+            match allocations
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (_, amt))| *amt)
+                .map(|(idx, _)| idx)
+            {
+                Some(largest_idx) => allocations[largest_idx].1 += remainder,
+                None => {
+                    let (key, _) = fallback
+                        .ok_or(SatoshiError::Overflow(remainder as f64))?;
+                    allocations.push((key, remainder));
                 }
-                if remaining != 0 {
-                    return Err(SatoshiError::Overflow(remaining as f64));
-                }
-                total_allocated = allocations.iter().map(|(_, a)| *a).sum();
             }
-            std::cmp::Ordering::Equal => {
-                // Perfect allocation, no adjustment needed
-            }
+            total_allocated += remainder;
         }
+        std::cmp::Ordering::Greater => {
+            let excess = total_allocated - total_pool;
+            allocations.sort_by_key(|(_, amt)| *amt);
+            let mut remaining = excess;
+            for (_, amt) in allocations.iter_mut() {
+                if remaining == 0 {
+                    break;
+                }
+                let take = (*amt).min(remaining);
+                *amt -= take;
+                remaining -= take;
+            }
+            if remaining != 0 {
+                return Err(SatoshiError::Overflow(remaining as f64));
+            }
+            total_allocated = allocations.iter().map(|(_, a)| *a).sum();
+        }
+        std::cmp::Ordering::Equal => {}
     }
 
-    debug_assert_eq!(
-        total_allocated, total_pool,
-        "Conservation violated: allocated {total_allocated} but pool was {total_pool}"
-    );
+    if total_allocated != total_pool {
+        return Err(SatoshiError::Overflow(total_pool as f64));
+    }
 
     Ok(AllocationResultU64 {
         allocations,
@@ -177,10 +183,16 @@ pub fn allocate_proportionally_i64<K: Clone>(
     // Phase 1: Calculate allocations with Rounding::Nearest
     let mut allocations: Vec<(K, i64)> = Vec::with_capacity(participants.len());
     let mut total_allocated: i64 = 0;
+    let mut fallback: Option<(K, f64)> = None;
 
     for (key, weight) in participants {
         if weight.abs() < f64::EPSILON {
             continue;
+        }
+
+        match &fallback {
+            Some((_, best)) if *best >= weight.abs() => {}
+            _ => fallback = Some((key.clone(), weight.abs())),
         }
 
         // Use absolute weight for proportion, preserve sign in result
@@ -195,39 +207,28 @@ pub fn allocate_proportionally_i64<K: Clone>(
     }
 
     // Phase 2: Adjust for rounding remainder
-    if !allocations.is_empty() {
-        let diff = total_pool - total_allocated;
-        if diff != 0 {
-            let idx = if total_pool > 0 {
-                if diff > 0 {
-                    allocations
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, (_, amt))| *amt)
-                        .map(|(idx, _)| idx)
-                        .unwrap()
-                } else {
-                    allocations
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, (_, amt))| *amt)
-                        .map(|(idx, _)| idx)
-                        .unwrap()
-                }
-            } else if diff < 0 {
-                allocations
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, (_, amt))| *amt)
-                    .map(|(idx, _)| idx)
-                    .unwrap()
-            } else {
+    let diff = total_pool - total_allocated;
+    if diff != 0 {
+        if allocations.is_empty() {
+            let (key, _) =
+                fallback.ok_or(SatoshiError::Overflow(diff as f64))?;
+            allocations.push((key, diff));
+            total_allocated = diff;
+        } else {
+            let idx = if diff > 0 {
                 allocations
                     .iter()
                     .enumerate()
                     .max_by_key(|(_, (_, amt))| *amt)
                     .map(|(idx, _)| idx)
-                    .unwrap()
+                    .ok_or(SatoshiError::Overflow(diff as f64))?
+            } else {
+                allocations
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, amt))| *amt)
+                    .map(|(idx, _)| idx)
+                    .ok_or(SatoshiError::Overflow(diff as f64))?
             };
             allocations[idx].1 = allocations[idx]
                 .1
@@ -237,10 +238,9 @@ pub fn allocate_proportionally_i64<K: Clone>(
         }
     }
 
-    debug_assert_eq!(
-        total_allocated, total_pool,
-        "Conservation violated: allocated {total_allocated} but pool was {total_pool}"
-    );
+    if total_allocated != total_pool {
+        return Err(SatoshiError::Overflow(total_pool as f64));
+    }
 
     Ok(AllocationResultI64 {
         allocations,
@@ -366,6 +366,34 @@ mod tests {
         let result = allocate_proportionally_u64(participants, 0).unwrap();
         assert!(result.allocations.is_empty());
         assert_eq!(result.total_allocated, 0);
+    }
+
+    #[test]
+    fn test_all_round_to_zero_conserves_u64() {
+        let participants = vec![("a", 1.0), ("b", 1.0), ("c", 1.0)];
+        let result = allocate_proportionally_u64(participants, 1).unwrap();
+        let sum: u64 = result.allocations.iter().map(|(_, a)| *a).sum();
+        assert_eq!(sum, 1);
+        assert_eq!(result.total_allocated, 1);
+        assert_eq!(result.allocations.len(), 1);
+        assert_eq!(result.allocations[0].0, "a");
+    }
+
+    #[test]
+    fn test_all_round_to_zero_conserves_i64() {
+        let participants = vec![("a", 1.0), ("b", 1.0), ("c", 1.0)];
+        let result = allocate_proportionally_i64(participants, 1).unwrap();
+        let sum: i64 = result.allocations.iter().map(|(_, a)| *a).sum();
+        assert_eq!(sum, 1);
+        assert_eq!(result.total_allocated, 1);
+
+        let neg = allocate_proportionally_i64(
+            vec![("a", 1.0), ("b", 1.0), ("c", 1.0)],
+            -1,
+        )
+        .unwrap();
+        let neg_sum: i64 = neg.allocations.iter().map(|(_, a)| *a).sum();
+        assert_eq!(neg_sum, -1);
     }
 
     #[test]
