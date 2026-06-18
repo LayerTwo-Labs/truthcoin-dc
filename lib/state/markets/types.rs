@@ -1,6 +1,6 @@
 use borsh::BorshSerialize;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::math::lmsr::MAX_OUTCOMES;
 use crate::state::decisions::DecisionId;
@@ -213,7 +213,7 @@ impl utoipa::ToSchema for MarketId {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ShareAccount {
-    pub positions: HashMap<(MarketId, u32), i64>,
+    pub positions: BTreeMap<(MarketId, u32), i64>,
     pub nonce: u64,
     pub trade_nonce: u64,
     pub last_updated_height: u32,
@@ -282,7 +282,7 @@ impl ShareAccount {
         self.increment_nonce();
     }
 
-    pub fn get_all_positions(&self) -> &HashMap<(MarketId, u32), i64> {
+    pub fn get_all_positions(&self) -> &BTreeMap<(MarketId, u32), i64> {
         &self.positions
     }
 }
@@ -328,4 +328,27 @@ pub struct MarketPayoutSummary {
     pub fee_payouts: Vec<FeePayoutRecord>,
     pub creator_refund: Option<CreatorRefund>,
     pub block_height: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MarketId, ShareAccount};
+
+    #[test]
+    fn share_account_positions_iterate_in_canonical_order() {
+        let market_id = MarketId::new([1u8; 6]);
+        let mut account = ShareAccount::new();
+        account.add_shares(market_id, 2, 10, 0);
+        account.add_shares(market_id, 0, 20, 0);
+        account.add_shares(market_id, 1, 30, 0);
+
+        let outcomes: Vec<u32> = account
+            .positions
+            .iter()
+            .filter(|((mid, _), _)| *mid == market_id)
+            .map(|((_, outcome_index), _)| *outcome_index)
+            .collect();
+
+        assert_eq!(outcomes, vec![0, 1, 2]);
+    }
 }
