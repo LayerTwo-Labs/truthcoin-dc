@@ -1551,6 +1551,51 @@ fn market_beta(
     ))
 }
 
+/// Effective shares and beta for a market, folding in the trades already
+/// applied to `state_update` earlier in this block. Lets same-block trades
+/// price sequentially against running state instead of stale pre-block state.
+fn running_market_state(
+    state: &State,
+    rotxn: &RoTxn,
+    market_id: &MarketId,
+    market: &crate::state::Market,
+    state_update: &StateUpdate,
+) -> Result<(ndarray::Array1<i64>, f64), Error> {
+    let mut effective_shares = market.shares().clone();
+    for update in &state_update.market_updates {
+        if update.market_id == *market_id
+            && let Some((outcome_index, delta)) = update.share_delta
+        {
+            effective_shares[outcome_index] += delta;
+        }
+    }
+
+    let committed = state
+        .markets()
+        .get_market_funds_sats(rotxn, state, market_id, false)?;
+    let pending_buys: u64 = state_update
+        .pending_buy_settlements
+        .iter()
+        .filter(|s| s.market_id == *market_id)
+        .map(|s| s.lmsr_cost_sats)
+        .sum();
+    let pending_sells: u64 = state_update
+        .pending_sell_payouts
+        .iter()
+        .filter(|p| p.market_id == *market_id)
+        .map(|p| p.payout_sats + p.fee_sats)
+        .sum();
+    let running_treasury = committed
+        .saturating_add(pending_buys)
+        .saturating_sub(pending_sells);
+
+    let beta = trading::derive_beta_from_liquidity(
+        running_treasury,
+        effective_shares.len(),
+    );
+    Ok((effective_shares, beta))
+}
+
 pub fn compute_market_tags(
     decisions: &std::collections::HashMap<
         crate::state::decisions::DecisionId,
@@ -1824,7 +1869,15 @@ fn apply_trade(
         });
     }
 
-    let mut new_shares = market.shares().clone();
+    let (effective_shares, beta) = running_market_state(
+        state,
+        rwtxn,
+        &trade.market_id,
+        &market,
+        state_update,
+    )?;
+
+    let mut new_shares = effective_shares.clone();
     new_shares[outcome_index] += trade.shares;
 
     if new_shares[outcome_index] < 0 {
@@ -1843,15 +1896,16 @@ fn apply_trade(
         })?
         .to_sat();
 
-    let beta = market_beta(state, rwtxn, &trade.market_id, &market)?;
-
     let (volume_sats, fee_sats) = if is_buy {
         // Buy: cost = LMSR(current -> new)
-        let base_cost =
-            trading::calculate_update_cost(market.shares(), &new_shares, beta)
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!("Failed to calculate trade cost: {e:?}"),
-                })?;
+        let base_cost = trading::calculate_update_cost(
+            &effective_shares,
+            &new_shares,
+            beta,
+        )
+        .map_err(|e| Error::InvalidTransaction {
+            reason: format!("Failed to calculate trade cost: {e:?}"),
+        })?;
 
         let buy_cost =
             trading::calculate_buy_cost(base_cost, market.trading_fee())
@@ -1918,11 +1972,14 @@ fn apply_trade(
         }
 
         // Sell: proceeds = LMSR(new -> current) since shares decreased
-        let proceeds =
-            trading::calculate_update_cost(&new_shares, market.shares(), beta)
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!("Failed to calculate sell proceeds: {e:?}"),
-                })?;
+        let proceeds = trading::calculate_update_cost(
+            &new_shares,
+            &effective_shares,
+            beta,
+        )
+        .map_err(|e| Error::InvalidTransaction {
+            reason: format!("Failed to calculate sell proceeds: {e:?}"),
+        })?;
 
         let sell_proceeds =
             trading::calculate_sell_proceeds(proceeds, market.trading_fee())
@@ -2585,5 +2642,75 @@ mod tests {
         );
 
         assert!(effective_owned >= 30);
+    }
+
+    #[test]
+    fn same_block_buys_fold_into_running_state() {
+        use crate::math::trading;
+        use ndarray::array;
+
+        let outcomes = 2usize;
+        let t0 = trading::calculate_lmsr_liquidity(10_000_000.0, outcomes)
+            .round() as u64;
+        let beta0 = trading::derive_beta_from_liquidity(t0, outcomes);
+
+        let s0 = array![0i64, 0i64];
+        let after_one = array![100_000i64, 0i64];
+        let after_two = array![200_000i64, 0i64];
+
+        let base1 = trading::calculate_buy_cost(
+            trading::calculate_update_cost(&s0, &after_one, beta0).unwrap(),
+            0.0,
+        )
+        .unwrap()
+        .base_cost_sats;
+
+        let market_id = MarketId::new([7u8; 6]);
+        let mut state_update = StateUpdate::new();
+        state_update.add_market_update(MarketStateUpdate {
+            market_id,
+            share_delta: Some((0, 100_000)),
+            new_beta: None,
+            transaction_id: None,
+            volume_sats: None,
+            fee_sats: None,
+        });
+        state_update.add_pending_buy_settlement(PendingBuySettlement {
+            market_id,
+            trader_address: Address::ALL_ZEROS,
+            input_value_sats: 0,
+            lmsr_cost_sats: base1,
+            market_fee_sats: 0,
+            transaction_id: [0u8; 32],
+        });
+
+        let mut effective = s0.clone();
+        for update in &state_update.market_updates {
+            if update.market_id == market_id
+                && let Some((oi, d)) = update.share_delta
+            {
+                effective[oi] += d;
+            }
+        }
+        assert_eq!(effective, after_one);
+
+        let pending_buys: u64 = state_update
+            .pending_buy_settlements
+            .iter()
+            .filter(|s| s.market_id == market_id)
+            .map(|s| s.lmsr_cost_sats)
+            .sum();
+        let beta1 =
+            trading::derive_beta_from_liquidity(t0 + pending_buys, outcomes);
+
+        let base2_sequential = trading::calculate_buy_cost(
+            trading::calculate_update_cost(&after_one, &after_two, beta1)
+                .unwrap(),
+            0.0,
+        )
+        .unwrap()
+        .base_cost_sats;
+
+        assert!(base2_sequential > base1);
     }
 }
