@@ -125,7 +125,7 @@ pub fn calculate_lmsr_liquidity(beta: f64, num_outcomes: usize) -> f64 {
     if num_outcomes <= 1 {
         return 0.0;
     }
-    beta * (num_outcomes as f64).ln()
+    beta * libm::log(num_outcomes as f64)
 }
 
 /// `beta = liquidity / ln(num_outcomes)`
@@ -136,7 +136,7 @@ pub fn derive_beta_from_liquidity(
     if num_outcomes <= 1 {
         return crate::state::markets::DEFAULT_MARKET_BETA;
     }
-    let ln_outcomes = (num_outcomes as f64).ln();
+    let ln_outcomes = libm::log(num_outcomes as f64);
     if ln_outcomes <= 0.0 {
         return crate::state::markets::DEFAULT_MARKET_BETA;
     }
@@ -251,5 +251,20 @@ mod tests {
         let new = array![10i64, 0i64];
         let cost = calculate_update_cost(&current, &new, 100.0).unwrap();
         assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn test_beta_math_uses_libm_log() {
+        for num_outcomes in [2usize, 3, 14, 48, 256] {
+            let expected = libm::log(num_outcomes as f64);
+            assert_eq!(
+                calculate_lmsr_liquidity(1.0, num_outcomes).to_bits(),
+                expected.to_bits()
+            );
+            assert_eq!(
+                derive_beta_from_liquidity(1_000_000, num_outcomes).to_bits(),
+                (1_000_000.0_f64 / expected).to_bits()
+            );
+        }
     }
 }
