@@ -2,7 +2,7 @@ use crate::state::{Error, PrevalidatedBlock};
 use crate::types::{
     AmountOverflowError, Authorization, AuthorizedTransaction, Body,
     FilledTransaction, GetAddress as _, GetBitcoinValue as _, Header,
-    OutPointKey, OutputContent, Verify as _,
+    OutPointKey, OutputContent, TransactionData, Verify as _,
 };
 use rayon::prelude::*;
 use sneed::RoTxn;
@@ -83,6 +83,8 @@ impl BlockValidator {
             return Err(Error::UtxoDoubleSpent);
         }
 
+        Self::check_duplicate_decision_claims(&body.transactions)?;
+
         for filled_tx in &filled_txs {
             Self::validate_filled_transaction(
                 state,
@@ -114,6 +116,35 @@ impl BlockValidator {
             coinbase_value,
             next_height,
         })
+    }
+
+    /// Reject a block claiming the same decision id more than once, across both
+    /// `ClaimDecision` transactions and `CreateMarket` new-claim payloads.
+    fn check_duplicate_decision_claims(
+        transactions: &[crate::types::Transaction],
+    ) -> Result<(), Error> {
+        let mut claimed_decision_ids = HashSet::new();
+        for tx in transactions {
+            let payloads = match &tx.data {
+                Some(TransactionData::ClaimDecision(payload)) => {
+                    std::slice::from_ref(payload)
+                }
+                Some(TransactionData::CreateMarket { new_claims, .. }) => {
+                    new_claims.as_slice()
+                }
+                _ => &[],
+            };
+            for payload in payloads {
+                for entry in &payload.decisions {
+                    if !claimed_decision_ids.insert(entry.decision_id_bytes) {
+                        return Err(Error::DuplicateDecisionClaim(
+                            entry.decision_id_bytes,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_filled_transaction(
@@ -327,5 +358,43 @@ mod tests {
         assert!(
             BlockValidator::validate_fees(coinbase, &[], &skipped).is_err()
         );
+    }
+
+    fn claim_tx(ids: &[[u8; 3]]) -> crate::types::Transaction {
+        use crate::state::decisions::DecisionType;
+        use crate::types::{
+            ClaimDecisionPayload, DecisionClaimEntry, Transaction,
+        };
+        let decisions = ids
+            .iter()
+            .map(|id| DecisionClaimEntry {
+                decision_id_bytes: *id,
+                header: String::new(),
+                description: String::new(),
+                option_0_label: None,
+                option_1_label: None,
+                option_labels: None,
+                tags: None,
+            })
+            .collect();
+        Transaction {
+            data: Some(TransactionData::ClaimDecision(ClaimDecisionPayload {
+                decision_type: DecisionType::Binary,
+                decisions,
+            })),
+            ..Transaction::default()
+        }
+    }
+
+    #[test]
+    fn duplicate_decision_claim_across_txs_rejected() {
+        let txs = vec![claim_tx(&[[1, 2, 3]]), claim_tx(&[[1, 2, 3]])];
+        assert!(BlockValidator::check_duplicate_decision_claims(&txs).is_err());
+    }
+
+    #[test]
+    fn distinct_decision_claims_ok() {
+        let txs = vec![claim_tx(&[[1, 2, 3]]), claim_tx(&[[4, 5, 6]])];
+        assert!(BlockValidator::check_duplicate_decision_claims(&txs).is_ok());
     }
 }

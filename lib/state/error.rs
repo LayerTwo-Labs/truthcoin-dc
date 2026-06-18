@@ -146,6 +146,8 @@ pub enum Error {
     },
     #[error("utxo double spent")]
     UtxoDoubleSpent,
+    #[error("duplicate decision claim in block: {0:?}")]
+    DuplicateDecisionClaim([u8; 3]),
     #[error(transparent)]
     WithdrawalBundle(#[from] WithdrawalBundleError),
     #[error("wrong public key for address")]
