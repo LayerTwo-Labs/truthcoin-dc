@@ -782,8 +782,6 @@ impl Wallet {
             dimension_specs,
             new_claims,
             trading_fee,
-            category_txids: None,
-            residual_names: None,
             tx_pow_hash_selector,
             tx_pow_ordering,
             tx_pow_difficulty,

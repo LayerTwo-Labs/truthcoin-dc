@@ -442,9 +442,8 @@ pub enum TransactionData {
         description: String,
         #[schema(value_type = Vec<String>)]
         dimension_specs: Vec<DimensionSpec>,
+        new_claims: Vec<ClaimDecisionPayload>,
         trading_fee: Option<f64>,
-        category_txids: Option<Vec<[u8; 32]>>,
-        residual_names: Option<Vec<String>>,
         tx_pow_hash_selector: Option<u8>,
         tx_pow_ordering: Option<u8>,
         tx_pow_difficulty: Option<u8>,
@@ -487,23 +486,6 @@ pub enum TransactionData {
         amount: u64,
         market_author: Address,
     },
-    /// V2: create a market with optional decision claims processed
-    /// before market construction within the same tx.
-    /// V1 `CreateMarket` continues to deserialize unchanged for historical
-    /// blocks.
-    CreateMarketV2 {
-        title: String,
-        description: String,
-        #[schema(value_type = Vec<String>)]
-        dimension_specs: Vec<DimensionSpec>,
-        new_claims: Vec<ClaimDecisionPayload>,
-        trading_fee: Option<f64>,
-        category_txids: Option<Vec<[u8; 32]>>,
-        residual_names: Option<Vec<String>>,
-        tx_pow_hash_selector: Option<u8>,
-        tx_pow_ordering: Option<u8>,
-        tx_pow_difficulty: Option<u8>,
-    },
 }
 
 pub type TxData = TransactionData;
@@ -514,14 +496,7 @@ impl TxData {
     }
 
     pub fn is_create_market(&self) -> bool {
-        matches!(
-            self,
-            Self::CreateMarket { .. } | Self::CreateMarketV2 { .. }
-        )
-    }
-
-    pub fn is_create_market_v2(&self) -> bool {
-        matches!(self, Self::CreateMarketV2 { .. })
+        matches!(self, Self::CreateMarket { .. })
     }
 
     pub fn is_trade(&self) -> bool {
@@ -545,30 +520,13 @@ impl TxData {
     }
 }
 
-/// Struct describing a market creation using dimension specifications
-#[derive(Clone, Debug, PartialEq)]
-pub struct CreateMarket {
-    pub title: String,
-    pub description: String,
-    pub dimension_specs: Vec<DimensionSpec>,
-    pub trading_fee: Option<f64>,
-    pub category_txids: Option<Vec<[u8; 32]>>,
-    pub residual_names: Option<Vec<String>>,
-    pub tx_pow_hash_selector: Option<u8>,
-    pub tx_pow_ordering: Option<u8>,
-    pub tx_pow_difficulty: Option<u8>,
-}
-
-/// Borrowed view over market-creation data that abstracts V1 `CreateMarket`
-/// and V2 `CreateMarketV2`. V1 yields an empty `new_claims` slice.
+/// Borrowed view over a `CreateMarket` transaction's data.
 #[derive(Clone, Debug)]
 pub struct MarketCreationView<'a> {
     pub title: &'a str,
     pub description: &'a str,
     pub dimension_specs: &'a [DimensionSpec],
     pub trading_fee: Option<f64>,
-    pub category_txids: Option<&'a [[u8; 32]]>,
-    pub residual_names: Option<&'a [String]>,
     pub tx_pow_hash_selector: Option<u8>,
     pub tx_pow_ordering: Option<u8>,
     pub tx_pow_difficulty: Option<u8>,
@@ -722,13 +680,6 @@ impl FilledTransaction {
         }
     }
 
-    pub fn is_create_market_v2(&self) -> bool {
-        match &self.transaction.data {
-            Some(tx_data) => tx_data.is_create_market_v2(),
-            None => false,
-        }
-    }
-
     pub fn is_submit_vote(&self) -> bool {
         match &self.transaction.data {
             Some(tx_data) => tx_data.is_submit_vote(),
@@ -757,40 +708,15 @@ impl FilledTransaction {
         }
     }
 
-    /// If the tx is a market creation, returns a borrowed view that
-    /// abstracts over V1 `CreateMarket` and V2 `CreateMarketV2`.
+    /// If the tx is a market creation, returns a borrowed view over its data.
     pub fn as_market_creation(&self) -> Option<MarketCreationView<'_>> {
         match &self.transaction.data {
             Some(TransactionData::CreateMarket {
                 title,
                 description,
                 dimension_specs,
-                trading_fee,
-                category_txids,
-                residual_names,
-                tx_pow_hash_selector,
-                tx_pow_ordering,
-                tx_pow_difficulty,
-            }) => Some(MarketCreationView {
-                title: title.as_str(),
-                description: description.as_str(),
-                dimension_specs: dimension_specs.as_slice(),
-                trading_fee: *trading_fee,
-                category_txids: category_txids.as_deref(),
-                residual_names: residual_names.as_deref(),
-                tx_pow_hash_selector: *tx_pow_hash_selector,
-                tx_pow_ordering: *tx_pow_ordering,
-                tx_pow_difficulty: *tx_pow_difficulty,
-                new_claims: &[],
-            }),
-            Some(TransactionData::CreateMarketV2 {
-                title,
-                description,
-                dimension_specs,
                 new_claims,
                 trading_fee,
-                category_txids,
-                residual_names,
                 tx_pow_hash_selector,
                 tx_pow_ordering,
                 tx_pow_difficulty,
@@ -799,40 +725,10 @@ impl FilledTransaction {
                 description: description.as_str(),
                 dimension_specs: dimension_specs.as_slice(),
                 trading_fee: *trading_fee,
-                category_txids: category_txids.as_deref(),
-                residual_names: residual_names.as_deref(),
                 tx_pow_hash_selector: *tx_pow_hash_selector,
                 tx_pow_ordering: *tx_pow_ordering,
                 tx_pow_difficulty: *tx_pow_difficulty,
                 new_claims: new_claims.as_slice(),
-            }),
-            _ => None,
-        }
-    }
-
-    /// If the tx is a V1 market creation, returns the corresponding [`CreateMarket`].
-    pub fn create_market(&self) -> Option<CreateMarket> {
-        match &self.transaction.data {
-            Some(TransactionData::CreateMarket {
-                title,
-                description,
-                dimension_specs,
-                trading_fee,
-                category_txids,
-                residual_names,
-                tx_pow_hash_selector,
-                tx_pow_ordering,
-                tx_pow_difficulty,
-            }) => Some(CreateMarket {
-                title: title.clone(),
-                description: description.clone(),
-                dimension_specs: dimension_specs.clone(),
-                trading_fee: *trading_fee,
-                category_txids: category_txids.clone(),
-                residual_names: residual_names.clone(),
-                tx_pow_hash_selector: *tx_pow_hash_selector,
-                tx_pow_ordering: *tx_pow_ordering,
-                tx_pow_difficulty: *tx_pow_difficulty,
             }),
             _ => None,
         }

@@ -1571,10 +1571,7 @@ fn revert_create_market(
     rwtxn: &mut RwTxn,
     filled_tx: &FilledTransaction,
 ) -> Result<(), Error> {
-    use crate::state::{
-        MarketBuilder, decisions::DecisionId, markets::DimensionSpec,
-    };
-    use std::collections::HashMap;
+    use crate::state::{decisions::DecisionId, markets::compute_market_id};
 
     let view = filled_tx.as_market_creation().ok_or_else(|| {
         Error::InvalidTransaction {
@@ -1583,41 +1580,13 @@ fn revert_create_market(
     })?;
 
     let creator_address = extract_creator_address(filled_tx)?;
-    let dimension_specs = view.dimension_specs.to_vec();
 
-    let mut decisions = HashMap::new();
-
-    for spec in &dimension_specs {
-        match spec {
-            DimensionSpec::Single(decision_id)
-            | DimensionSpec::Categorical(decision_id) => {
-                if let Some(entry) =
-                    state.decisions().get_decision_entry(rwtxn, *decision_id)?
-                    && let Some(decision) = entry.decision
-                {
-                    decisions.insert(*decision_id, decision);
-                }
-            }
-        }
-    }
-
-    let mut builder =
-        MarketBuilder::new(view.title.to_string(), creator_address);
-    builder =
-        configure_market_builder(builder, view.description, view.trading_fee);
-
-    let computed_tags = compute_market_tags(&decisions);
-    builder = builder.with_tags(computed_tags);
-
-    let builder = builder.with_dimensions(dimension_specs);
-
-    let market = builder.build(0, None, &decisions).map_err(|e| {
-        Error::InvalidTransaction {
-            reason: format!("Market reconstruction failed: {e}"),
-        }
-    })?;
-
-    let market_id = market.id;
+    let market_id = compute_market_id(
+        view.title,
+        view.description,
+        &creator_address,
+        view.dimension_specs,
+    );
 
     state.markets().delete_market(rwtxn, &market_id)?;
 

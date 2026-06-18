@@ -229,3 +229,43 @@ fn test_fee_split_proportions() {
     assert_eq!(market_author, 250);
     assert_eq!(voter + decision_author + market_author, 1000);
 }
+
+#[test]
+fn built_market_id_matches_compute_market_id() {
+    use crate::state::MarketBuilder;
+    use crate::state::decisions::{Decision, DecisionId, DecisionType};
+    use crate::state::markets::compute_market_id;
+    use crate::types::Address;
+    use std::collections::HashMap;
+
+    let creator = Address::ALL_ZEROS;
+    let decision_id = DecisionId::new(true, 0, 0).unwrap();
+    let decision = Decision::new(
+        creator.0,
+        DecisionType::Binary,
+        "Header".to_string(),
+        "Desc".to_string(),
+        None,
+        None,
+        vec![],
+    )
+    .unwrap();
+
+    let dimension_specs = vec![DimensionSpec::Single(decision_id)];
+    let mut decisions = HashMap::new();
+    decisions.insert(decision_id, decision);
+
+    let title = "My Market".to_string();
+    let description = "A market".to_string();
+
+    let market = MarketBuilder::new(title.clone(), creator)
+        .with_description(description.clone())
+        .with_dimensions(dimension_specs.clone())
+        .build(0, None, &decisions)
+        .unwrap();
+
+    assert_eq!(
+        market.id,
+        compute_market_id(&title, &description, &creator, &dimension_specs)
+    );
+}
