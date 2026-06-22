@@ -74,15 +74,6 @@ enum WithdrawalBundleInfo {
     },
 }
 
-impl WithdrawalBundleInfo {
-    fn is_known(&self) -> bool {
-        match self {
-            Self::Known(_) => true,
-            Self::Unknown | Self::UnknownConfirmed { .. } => false,
-        }
-    }
-}
-
 type WithdrawalBundlesDb = DatabaseUnique<
     SerdeBincode<M6id>,
     SerdeBincode<(
@@ -105,8 +96,8 @@ pub struct State {
     utxos_by_address:
         DatabaseUnique<SerdeBincode<(Address, OutPoint)>, SerdeBincode<()>>,
     stxos: DatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>>,
-    pending_withdrawal_bundle:
-        DatabaseUnique<UnitKey, SerdeBincode<(WithdrawalBundle, u32)>>,
+    /// Pending withdrawal bundle. MUST exist in withdrawal_bundles
+    pending_withdrawal_bundle: DatabaseUnique<UnitKey, SerdeBincode<M6id>>,
     latest_failed_withdrawal_bundle:
         DatabaseUnique<UnitKey, SerdeBincode<RollBack<HeightStamped<M6id>>>>,
     withdrawal_bundles: WithdrawalBundlesDb,
@@ -534,14 +525,23 @@ impl State {
                      not found in withdrawal_bundles"
                 ))
             })?;
-        let bundle_status = bundle_status.latest();
-        if bundle_status.value != WithdrawalBundleStatus::Failed {
-            return Err(Error::DatabaseError(format!(
-                "latest failed bundle has status {:?}, expected Failed",
-                bundle_status.value,
-            )));
-        }
-        Ok(Some((bundle_status.height, latest_failed_m6id)))
+        let failed_height = bundle_status
+            .iter()
+            .rev()
+            .find_map(|status| match status.value {
+                WithdrawalBundleStatus::Failed => Some(status.height),
+                WithdrawalBundleStatus::Confirmed
+                | WithdrawalBundleStatus::Dropped
+                | WithdrawalBundleStatus::Pending
+                | WithdrawalBundleStatus::Submitted
+                | WithdrawalBundleStatus::SubmittedUnexpected => None,
+            })
+            .ok_or_else(|| {
+                Error::DatabaseError(format!(
+                    "missing failure status for {latest_failed_m6id}"
+                ))
+            })?;
+        Ok(Some((failed_height, latest_failed_m6id)))
     }
 
     pub fn fill_transaction(
@@ -614,7 +614,30 @@ impl State {
         &self,
         txn: &RoTxn,
     ) -> Result<Option<(WithdrawalBundle, u32)>, Error> {
-        Ok(self.pending_withdrawal_bundle.try_get(txn, &())?)
+        let Some(m6id) = self.pending_withdrawal_bundle.try_get(txn, &())?
+        else {
+            return Ok(None);
+        };
+        let (bundle_info, bundle_status) = self
+            .withdrawal_bundles
+            .try_get(txn, &m6id)?
+            .ok_or_else(|| {
+                Error::DatabaseError(format!(
+                    "pending withdrawal bundle {m6id} \
+                     unknown in withdrawal_bundles"
+                ))
+            })?;
+        let bundle = match bundle_info {
+            WithdrawalBundleInfo::Known(bundle) => bundle,
+            WithdrawalBundleInfo::Unknown
+            | WithdrawalBundleInfo::UnknownConfirmed { spend_utxos: _ } => {
+                return Err(Error::DatabaseError(format!(
+                    "pending withdrawal bundle {m6id} is not known"
+                )));
+            }
+        };
+        let height = bundle_status.latest().height;
+        Ok(Some((bundle, height)))
     }
 
     pub fn validate_filled_transaction(

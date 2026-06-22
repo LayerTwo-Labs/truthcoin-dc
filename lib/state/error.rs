@@ -144,6 +144,24 @@ pub enum Error {
         event_block_hash: bitcoin::BlockHash,
         m6id: M6id,
     },
+    #[error(
+        "Unknown confirmed withdrawal bundle reconfirmed in \
+         {event_block_hash}: {m6id}"
+    )]
+    UnknownWithdrawalBundleReconfirmed {
+        event_block_hash: bitcoin::BlockHash,
+        m6id: M6id,
+    },
+    #[error(
+        "protocol would be insolvent after confirming unexpected withdrawal \
+         bundle {m6id} in {event_block_hash}; bundle outpoint {outpoint} \
+         already spent"
+    )]
+    UnexpectedWithdrawalBundleInsolvency {
+        event_block_hash: bitcoin::BlockHash,
+        m6id: M6id,
+        outpoint: OutPoint,
+    },
     #[error("utxo double spent")]
     UtxoDoubleSpent,
     #[error("duplicate decision claim in block: {0:?}")]

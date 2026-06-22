@@ -174,16 +174,26 @@ impl Header {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum WithdrawalBundleStatus {
-    Failed,
+pub enum WithdrawalBundleEventStatus {
     Confirmed,
+    Failed,
     Submitted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum WithdrawalBundleStatus {
+    Confirmed,
+    Dropped,
+    Failed,
+    Pending,
+    Submitted,
+    SubmittedUnexpected,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WithdrawalBundleEvent {
     pub m6id: M6id,
-    pub status: WithdrawalBundleStatus,
+    pub status: WithdrawalBundleEventStatus,
 }
 
 pub static OP_DRIVECHAIN_SCRIPT: LazyLock<bitcoin::ScriptBuf> =
