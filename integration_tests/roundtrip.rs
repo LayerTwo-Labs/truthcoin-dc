@@ -5,8 +5,9 @@ use bip300301_enforcer_integration_tests::{
         activate_sidechain, deposit, fund_enforcer, propose_sidechain,
     },
     setup::{
-        Mode, Network, PostSetup as EnforcerPostSetup, Sidechain as _,
-        setup as setup_enforcer,
+        Mode, Network, PostSetup as EnforcerPostSetup,
+        PreSetup as EnforcerPreSetup, SetupOpts as EnforcerSetupOpts,
+        Sidechain as _,
     },
     util::{AbortOnDrop, AsyncTrial, TestFailureCollector, TestFileRegistry},
 };
@@ -349,10 +350,11 @@ impl TruthcoinNodes {
         res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
         enforcer_post_setup: &EnforcerPostSetup,
     ) -> anyhow::Result<Self> {
+        let truthcoin_app = bin_paths.truthcoin()?.clone();
         let setup_single = |suffix: &str| {
             PostSetup::setup(
                 Init {
-                    truthcoin_app: bin_paths.truthcoin.clone(),
+                    truthcoin_app: truthcoin_app.clone(),
                     data_dir_suffix: Some(suffix.to_owned()),
                 },
                 enforcer_post_setup,
@@ -411,13 +413,14 @@ async fn setup(
     bin_paths: &BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<(EnforcerPostSetup, TruthcoinNodes)> {
-    let mut enforcer_post_setup = setup_enforcer(
-        &bin_paths.others,
-        Network::Regtest,
-        Mode::Mempool,
-        res_tx.clone(),
-    )
-    .await?;
+    let enforcer_pre_setup =
+        EnforcerPreSetup::new(&bin_paths.others, Network::Regtest)?;
+    let mut enforcer_post_setup = {
+        let setup_opts: EnforcerSetupOpts = Default::default();
+        enforcer_pre_setup
+            .setup(Mode::Mempool, setup_opts, res_tx.clone())
+            .await?
+    };
     let () = propose_sidechain::<PostSetup>(&mut enforcer_post_setup).await?;
     let () = activate_sidechain::<PostSetup>(&mut enforcer_post_setup).await?;
     let () = fund_enforcer::<PostSetup>(&mut enforcer_post_setup).await?;

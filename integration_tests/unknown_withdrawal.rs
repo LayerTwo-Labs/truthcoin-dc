@@ -6,8 +6,9 @@ use bip300301_enforcer_integration_tests::{
         withdraw_succeed,
     },
     setup::{
-        Mode, Network, PostSetup as EnforcerPostSetup, Sidechain as _,
-        setup as setup_enforcer,
+        Mode, Network, PostSetup as EnforcerPostSetup,
+        PreSetup as EnforcerPreSetup, SetupOpts as EnforcerSetupOpts,
+        Sidechain as _,
     },
     util::{AbortOnDrop, AsyncTrial, TestFailureCollector, TestFileRegistry},
 };
@@ -29,13 +30,14 @@ async fn setup(
     bin_paths: &BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<EnforcerPostSetup> {
-    let mut enforcer_post_setup = setup_enforcer(
-        &bin_paths.others,
-        Network::Regtest,
-        Mode::Mempool,
-        res_tx.clone(),
-    )
-    .await?;
+    let enforcer_pre_setup =
+        EnforcerPreSetup::new(&bin_paths.others, Network::Regtest)?;
+    let mut enforcer_post_setup = {
+        let setup_opts: EnforcerSetupOpts = Default::default();
+        enforcer_pre_setup
+            .setup(Mode::Mempool, setup_opts, res_tx.clone())
+            .await?
+    };
     let () = propose_sidechain::<PostSetup>(&mut enforcer_post_setup).await?;
     tracing::info!("Proposed sidechain successfully");
     let () = activate_sidechain::<PostSetup>(&mut enforcer_post_setup).await?;
@@ -56,7 +58,7 @@ async fn unknown_withdrawal_task(
     let mut enforcer_post_setup = setup(&bin_paths, res_tx.clone()).await?;
     let mut sidechain_withdrawer = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin.clone(),
+            truthcoin_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("withdrawer".to_owned()),
         },
         &enforcer_post_setup,
@@ -87,7 +89,7 @@ async fn unknown_withdrawal_task(
     // New sidechain node, starting from scratch
     let mut sidechain_successor = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin,
+            truthcoin_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("successor".to_owned()),
         },
         &enforcer_post_setup,
