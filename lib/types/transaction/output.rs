@@ -238,6 +238,8 @@ mod withdrawal_content {
     impl crate::types::GetBitcoinValue for WithdrawalContent {
         fn get_bitcoin_value(&self) -> bitcoin::Amount {
             self.value
+                .checked_add(self.main_fee)
+                .unwrap_or(bitcoin::Amount::MAX)
         }
     }
 }
