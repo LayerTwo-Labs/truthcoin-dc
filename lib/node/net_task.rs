@@ -947,7 +947,7 @@ impl NetTask {
             AcceptConnection(
                 Result<
                     Option<SocketAddr>,
-                    <net::error::AcceptConnection as fatality::Split>::Fatal,
+                    <net::error::AcceptConnection as error_fatality::Split>::Fatal,
                 >,
             ),
             // Forward a mainchain task request, along with the peer that
@@ -971,7 +971,7 @@ impl NetTask {
             let env = self.ctxt.env.clone();
             let net = self.ctxt.net.clone();
             let fut = async move {
-                use fatality::Nested as _;
+                use error_fatality::Nested as _;
                 let maybe_socket_addr =
                     net.accept_incoming(env).await.into_nested()?;
                 // / Return:
@@ -987,7 +987,7 @@ impl NetTask {
             Ok(Err(non_fatal_err)) => {
                 // type the error explicitly
                 let non_fatal_err:
-                    <net::error::AcceptConnection as fatality::Split>::Jfyi =
+                    <net::error::AcceptConnection as error_fatality::Split>::Jfyi =
                     non_fatal_err;
                 let non_fatal_err = anyhow::Error::from(non_fatal_err);
                 tracing::error!(
@@ -1052,7 +1052,7 @@ impl NetTask {
                         tracing::trace!(%addr, "accepted new incoming connection");
                     }
                     Err(fatal_err) => {
-                        let fatal_err: <net::error::AcceptConnection as fatality::Split>::Fatal =
+                        let fatal_err: <net::error::AcceptConnection as error_fatality::Split>::Fatal =
                             fatal_err;
                         let fatal_err = anyhow::Error::from(fatal_err);
                         tracing::error!(
