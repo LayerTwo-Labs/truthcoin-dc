@@ -1,33 +1,23 @@
 use std::{
     ffi::{OsStr, OsString},
     path::PathBuf,
+    sync::OnceLock,
 };
 
 use bip300301_enforcer_integration_tests::util::{
-    AbortOnDrop, BinPaths as EnforcerBinPaths, VarError, get_env_var,
+    AbortOnDrop, BinPaths as EnforcerBinPaths, OnceLockExt as _, VarError,
     spawn_command_with_args,
 };
 
-fn load_env_var_from_string(s: &str) -> Result<(), VarError> {
-    dotenvy::from_read_override(s.as_bytes())
-        .map_err(|err| VarError::new(s, err))
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct BinPaths {
-    pub truthcoin: PathBuf,
+    truthcoin: OnceLock<PathBuf>,
     pub others: EnforcerBinPaths,
 }
 
 impl BinPaths {
-    /// Read from environment variables
-    pub fn from_env() -> Result<Self, VarError> {
-        let () = load_env_var_from_string("BITCOIN_UTIL=''")?;
-        let () = load_env_var_from_string("SIGNET_MINER=''")?;
-        Ok(Self {
-            truthcoin: get_env_var("TRUTHCOIN_APP")?.into(),
-            others: EnforcerBinPaths::from_env()?,
-        })
+    pub fn truthcoin(&self) -> Result<&PathBuf, VarError> {
+        self.truthcoin.get_or_try_init_from_env("TRUTHCOIN_APP")
     }
 }
 

@@ -535,7 +535,7 @@ impl Wallet {
                 .checked_add(main_fee)
                 .ok_or(AmountOverflowError)?,
         )?;
-        let change = total - value - fee;
+        let change = total - value - fee - main_fee;
         let inputs = coins.into_keys().collect();
         let mut outputs = vec![Output::new(
             self.get_new_address()?,

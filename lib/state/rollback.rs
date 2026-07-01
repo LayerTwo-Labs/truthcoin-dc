@@ -39,8 +39,15 @@ impl<T> RollBack<HeightStamped<T>> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(in crate::state) fn earliest(&self) -> &HeightStamped<T> {
         self.0.first()
+    }
+
+    pub(in crate::state) fn iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &HeightStamped<T>> {
+        self.0.iter()
     }
 
     pub fn latest(&self) -> &HeightStamped<T> {

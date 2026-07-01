@@ -42,17 +42,6 @@ pub fn calculate_treasury(
     LmsrService::calculate_treasury(&shares_to_f64(shares), beta)
 }
 
-pub fn calculate_amp_b_cost(
-    shares: &Array1<i64>,
-    current_b: f64,
-    new_b: f64,
-) -> Result<f64, LmsrError> {
-    let shares_f64 = shares_to_f64(shares);
-    let current_cost = LmsrService::calculate_treasury(&shares_f64, current_b)?;
-    let new_cost = LmsrService::calculate_treasury(&shares_f64, new_b)?;
-    Ok(new_cost - current_cost)
-}
-
 pub fn validate_lmsr_parameters(
     beta: f64,
     shares: &Array1<i64>,
@@ -81,7 +70,7 @@ pub fn calculate_buy_cost(
     base_cost_f64: f64,
     trading_fee_pct: f64,
 ) -> Result<BuyCost, SatoshiError> {
-    let base_cost_sats = to_sats(base_cost_f64, Rounding::Nearest)?;
+    let base_cost_sats = to_sats(base_cost_f64, Rounding::Up)?;
 
     let fee_f64 = base_cost_f64 * trading_fee_pct;
     let calculated_fee_sats = to_sats(fee_f64, Rounding::Nearest)?;
@@ -101,7 +90,7 @@ pub fn calculate_sell_proceeds(
     gross_proceeds_f64: f64,
     trading_fee_pct: f64,
 ) -> Result<SellProceeds, SatoshiError> {
-    let gross_proceeds_sats = to_sats(gross_proceeds_f64, Rounding::Nearest)?;
+    let gross_proceeds_sats = to_sats(gross_proceeds_f64, Rounding::Down)?;
 
     let fee_f64 = gross_proceeds_f64 * trading_fee_pct;
     let calculated_fee_sats = to_sats(fee_f64, Rounding::Nearest)?;
@@ -148,11 +137,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_buy_cost_uses_nearest_rounding() {
-        let cost1 = calculate_buy_cost(1_000_000.4, 0.01).unwrap();
+    fn test_buy_cost_rounds_up() {
+        let cost1 = calculate_buy_cost(1_000_000.0, 0.01).unwrap();
         assert_eq!(cost1.base_cost_sats, 1_000_000);
 
-        let cost2 = calculate_buy_cost(1_000_000.5, 0.01).unwrap();
+        let cost2 = calculate_buy_cost(1_000_000.1, 0.01).unwrap();
         assert_eq!(cost2.base_cost_sats, 1_000_001);
     }
 
@@ -166,12 +155,12 @@ mod tests {
     }
 
     #[test]
-    fn test_sell_proceeds_uses_nearest_rounding() {
-        let proceeds1 = calculate_sell_proceeds(1_000_000.4, 0.01).unwrap();
+    fn test_sell_proceeds_rounds_down() {
+        let proceeds1 = calculate_sell_proceeds(1_000_000.0, 0.01).unwrap();
         assert_eq!(proceeds1.gross_proceeds_sats, 1_000_000);
 
-        let proceeds2 = calculate_sell_proceeds(1_000_000.5, 0.01).unwrap();
-        assert_eq!(proceeds2.gross_proceeds_sats, 1_000_001);
+        let proceeds2 = calculate_sell_proceeds(1_000_000.9, 0.01).unwrap();
+        assert_eq!(proceeds2.gross_proceeds_sats, 1_000_000);
     }
 
     #[test]
@@ -242,6 +231,78 @@ mod tests {
         let prices = calculate_prices(&shares, 100.0).unwrap();
         assert!((prices[0] - 0.5).abs() < 1e-6);
         assert!((prices[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fixed_redemption_solvent_under_liquidity_base_beta() {
+        use ndarray::Array1;
+
+        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        let mut rng = |bound: u64| -> u64 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % bound.max(1)
+        };
+
+        let betas = [50u64, 200, 1443];
+
+        for scenario in 0..4 {
+            let n: usize = if scenario == 3 { 4 } else { 2 };
+            let winner: usize = if n == 4 { 2 } else { 1 };
+
+            for _trial in 0..3000 {
+                let liquidity_base = betas[rng(3) as usize]
+                    * (calculate_lmsr_liquidity(1.0, n).round() as u64).max(1);
+                let beta = derive_beta_from_liquidity(liquidity_base, n);
+
+                let mut shares: Array1<i64> = Array1::zeros(n);
+                let mut treasury: u64 =
+                    calculate_treasury(&shares, beta).unwrap().ceil() as u64;
+
+                let steps = 3 + rng(40);
+                for _ in 0..steps {
+                    let j = if rng(100) < 75 {
+                        winner
+                    } else {
+                        rng(n as u64) as usize
+                    };
+                    let d = 1 + rng(2000) as i64;
+                    let mut new_shares = shares.clone();
+                    new_shares[j] += d;
+                    let base =
+                        calculate_update_cost(&shares, &new_shares, beta)
+                            .unwrap();
+                    let cost =
+                        calculate_buy_cost(base, 0.0).unwrap().base_cost_sats;
+                    treasury += cost;
+                    shares = new_shares;
+                }
+
+                let mut p = vec![0.0f64; n];
+                match scenario {
+                    1 => {
+                        p[0] = 0.5;
+                        p[1] = 0.5;
+                    }
+                    2 => {
+                        let o = 0.01 + (rng(98) as f64) / 100.0;
+                        p[0] = 1.0 - o;
+                        p[1] = o;
+                    }
+                    _ => p[winner] = 1.0,
+                }
+
+                let total_payout: u64 = (0..n)
+                    .map(|i| (shares[i] as f64 * p[i]).round().max(0.0) as u64)
+                    .sum();
+
+                assert!(
+                    total_payout <= treasury,
+                    "insolvent: scenario {scenario} payout {total_payout} > treasury {treasury}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -13,9 +13,9 @@ use super::types::{
 use crate::math::lmsr::MAX_OUTCOMES;
 use crate::math::markets;
 
-/// Market metadata. The LMSR `beta` parameter is not stored here — it is
-/// always derived from the current treasury UTXO (plus any pending mempool
-/// amplify_beta deposits) via `beta = treasury / ln(num_outcomes)`.
+/// Market metadata. The LMSR `beta` parameter is derived from the author-funded
+/// liquidity base (the creation seed plus any `amplify_beta` deposits, excluding
+/// ordinary trade proceeds) via `beta = liquidity_base_sats / ln(num_outcomes)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
     pub id: MarketId,
@@ -32,6 +32,7 @@ pub struct Market {
     pub storage_fee_sats: u64,
     pub market_state: MarketState,
     pub trading_fee: f64,
+    pub liquidity_base_sats: u64,
     #[serde(with = "ndarray_1d_i64_serde")]
     pub shares: Array<i64, Ix1>,
     #[serde(with = "ndarray_1d_serde")]
@@ -313,6 +314,7 @@ impl Market {
             storage_fee_sats: 0,
             market_state: MarketState::Trading,
             trading_fee,
+            liquidity_base_sats: 0,
             shares: Array::zeros(0),
             final_prices: Array::zeros(0),
             version: 0,
@@ -439,36 +441,6 @@ impl Market {
                 let n = self.shares.len();
                 Array::from_elem(n, 1.0 / n as f64)
             })
-    }
-
-    /// For single-decision markets (binary or scaled), calculate the implied value (0-1).
-    /// Returns p_max / (p_min + p_max) where:
-    /// - p_min is the price of outcome 0 (No/Min)
-    /// - p_max is the price of outcome 1 (Yes/Max)
-    ///
-    /// For binary decisions: 0.0 = "No", 1.0 = "Yes"
-    /// For scaled decisions: 0.0 = min bound, 1.0 = max bound
-    ///
-    /// Returns None if market has multiple decisions or invalid structure.
-    pub fn get_implied_value_normalized(&self, beta: f64) -> Option<f64> {
-        if self.decision_ids.len() != 1 || self.state_combos.len() != 3 {
-            return None;
-        }
-
-        let prices = self.current_prices(beta);
-        if prices.len() < 2 {
-            return None;
-        }
-
-        let p_min = prices[0];
-        let p_max = prices[1];
-        let sum = p_min + p_max;
-
-        if sum > 0.0 {
-            Some(p_max / sum)
-        } else {
-            Some(0.5) // Default to 50% if no price info
-        }
     }
 
     pub fn update_shares(
@@ -628,14 +600,6 @@ impl Market {
         self.get_valid_state_combos().len()
     }
 
-    pub fn get_dimensions(&self) -> Vec<usize> {
-        vec![self.get_outcome_count()]
-    }
-
-    pub fn get_state_combos(&self) -> &Vec<Vec<usize>> {
-        &self.state_combos
-    }
-
     pub fn get_valid_state_combos(&self) -> Vec<(usize, &Vec<usize>)> {
         self.state_combos
             .iter()
@@ -649,10 +613,6 @@ impl Market {
                 )
             })
             .collect()
-    }
-
-    pub fn get_storage_fee_sats(&self) -> u64 {
-        self.storage_fee_sats
     }
 
     pub fn tradeable_index_for_positions(
@@ -672,17 +632,6 @@ impl Market {
         }
 
         Err(MarketError::InvalidOutcomeCombination)
-    }
-
-    pub fn get_outcome_price(
-        &self,
-        positions: &[usize],
-        beta: f64,
-    ) -> Result<f64, MarketError> {
-        let index = self.tradeable_index_for_positions(positions)?;
-        let prices = self.current_prices(beta);
-
-        Ok(prices[index])
     }
 
     pub fn describe_outcome_by_state(

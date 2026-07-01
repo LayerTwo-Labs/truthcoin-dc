@@ -1,5 +1,8 @@
 use bip300301_enforcer_integration_tests::{
-    setup::{Mode, Network, setup as setup_enforcer},
+    setup::{
+        Mode, Network, PreSetup as EnforcerPreSetup,
+        SetupOpts as EnforcerSetupOpts,
+    },
     util::{AsyncTrial, TestFailureCollector, TestFileRegistry},
 };
 use futures::{FutureExt, channel::mpsc, future::BoxFuture};
@@ -21,17 +24,18 @@ fn deposit_withdraw_roundtrip(
         "deposit_withdraw_roundtrip",
         async move {
             let (res_tx, _) = mpsc::unbounded();
-            let post_setup = setup_enforcer(
-                &bin_paths.others,
-                Network::Regtest,
-                Mode::Mempool,
-                res_tx,
-            )
-            .await?;
+            let enforcer_pre_setup =
+                EnforcerPreSetup::new(&bin_paths.others, Network::Regtest)?;
+            let post_setup = {
+                let setup_opts: EnforcerSetupOpts = Default::default();
+                enforcer_pre_setup
+                    .setup(Mode::Mempool, setup_opts, res_tx)
+                    .await?
+            };
             bip300301_enforcer_integration_tests::integration_test::deposit_withdraw_roundtrip::<PostSetup>(
                 post_setup,
                 Init {
-                    truthcoin_app: bin_paths.truthcoin,
+                    truthcoin_app: bin_paths.truthcoin()?.clone(),
                     data_dir_suffix: None,
                 },
             ).await

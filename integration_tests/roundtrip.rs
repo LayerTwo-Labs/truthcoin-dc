@@ -5,8 +5,9 @@ use bip300301_enforcer_integration_tests::{
         activate_sidechain, deposit, fund_enforcer, propose_sidechain,
     },
     setup::{
-        Mode, Network, PostSetup as EnforcerPostSetup, Sidechain as _,
-        setup as setup_enforcer,
+        Mode, Network, PostSetup as EnforcerPostSetup,
+        PreSetup as EnforcerPreSetup, SetupOpts as EnforcerSetupOpts,
+        Sidechain as _,
     },
     util::{AbortOnDrop, AsyncTrial, TestFailureCollector, TestFileRegistry},
 };
@@ -17,7 +18,9 @@ use tokio::time::sleep;
 use tracing::Instrument as _;
 use truthcoin_dc::{
     authorization::{Dst, Signature},
-    types::{Address, FilledOutputContent, GetAddress as _},
+    types::{
+        Address, FilledOutputContent, GetAddress as _, GetBitcoinValue as _,
+    },
 };
 use truthcoin_dc_app_rpc_api::{
     BallotItem, CreateTradeRequest, DecisionClaimItem, DecisionClaimRequest,
@@ -349,10 +352,11 @@ impl TruthcoinNodes {
         res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
         enforcer_post_setup: &EnforcerPostSetup,
     ) -> anyhow::Result<Self> {
+        let truthcoin_app = bin_paths.truthcoin()?.clone();
         let setup_single = |suffix: &str| {
             PostSetup::setup(
                 Init {
-                    truthcoin_app: bin_paths.truthcoin.clone(),
+                    truthcoin_app: truthcoin_app.clone(),
                     data_dir_suffix: Some(suffix.to_owned()),
                 },
                 enforcer_post_setup,
@@ -411,13 +415,14 @@ async fn setup(
     bin_paths: &BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<(EnforcerPostSetup, TruthcoinNodes)> {
-    let mut enforcer_post_setup = setup_enforcer(
-        &bin_paths.others,
-        Network::Regtest,
-        Mode::Mempool,
-        res_tx.clone(),
-    )
-    .await?;
+    let enforcer_pre_setup =
+        EnforcerPreSetup::new(&bin_paths.others, Network::Regtest)?;
+    let mut enforcer_post_setup = {
+        let setup_opts: EnforcerSetupOpts = Default::default();
+        enforcer_pre_setup
+            .setup(Mode::Mempool, setup_opts, res_tx.clone())
+            .await?
+    };
     let () = propose_sidechain::<PostSetup>(&mut enforcer_post_setup).await?;
     let () = activate_sidechain::<PostSetup>(&mut enforcer_post_setup).await?;
     let () = fund_enforcer::<PostSetup>(&mut enforcer_post_setup).await?;
@@ -1534,6 +1539,45 @@ async fn roundtrip_task_inner(
         "✓ Phase 5: Markets remain Trading while decisions are voting"
     );
 
+    // Capture pre-settlement holdings + treasury to verify fixed-redemption
+    // payouts, the creator refund, and share clearing in Phase 8.
+    let settlement_address_nodes = [
+        &truthcoin_nodes.issuer,
+        &truthcoin_nodes.voter_0,
+        &truthcoin_nodes.voter_1,
+        &truthcoin_nodes.voter_2,
+        &truthcoin_nodes.voter_3,
+        &truthcoin_nodes.voter_4,
+        &truthcoin_nodes.voter_5,
+    ];
+    let mut pre_settlement_positions: Vec<(String, Address, usize, i64)> =
+        Vec::new();
+    for market in &markets_during_voting {
+        for node in settlement_address_nodes {
+            let addrs = node.rpc_client.get_wallet_addresses().await?;
+            for addr in &addrs {
+                let holdings = truthcoin_nodes
+                    .issuer
+                    .rpc_client
+                    .market_positions(*addr, Some(market.market_id.clone()))
+                    .await?;
+                for pos in &holdings.positions {
+                    if pos.shares > 0 {
+                        pre_settlement_positions.push((
+                            market.market_id.clone(),
+                            *addr,
+                            pos.outcome_index,
+                            pos.shares,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let pre_settlement_treasury = utxo_verification::get_market_treasury_utxos(
+        &truthcoin_nodes.issuer.rpc_client.list_utxos().await?,
+    );
+
     let voting_decision_ids: Vec<String> = decisions_at_voting
         .iter()
         .map(|entry| entry.decision_id_hex.clone())
@@ -2008,6 +2052,111 @@ async fn roundtrip_task_inner(
              consensus_post={expected_rep:.6}, post_payout={rep:.6}",
         );
     }
+
+    // Verify the new fixed-redemption payout behavior end-to-end.
+    let post_settlement_utxos =
+        truthcoin_nodes.issuer.rpc_client.list_utxos().await?;
+    let payout_exists = |address: Option<&Address>, amount: u64| -> bool {
+        post_settlement_utxos.iter().any(|p| {
+            matches!(p.outpoint, truthcoin_dc::types::OutPoint::Payout { .. })
+                && address.map(|a| p.output.address == *a).unwrap_or(true)
+                && p.output.get_bitcoin_value().to_sat() == amount
+        })
+    };
+
+    let mut market_winning_prices: HashMap<String, HashMap<usize, f64>> =
+        HashMap::new();
+    for market_summary in &settled_markets {
+        let market_data = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .market_get(market_summary.market_id.clone())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Market not found"))?;
+        if let Some(resolution) = &market_data.resolution {
+            let entry = market_winning_prices
+                .entry(market_summary.market_id.clone())
+                .or_default();
+            for wo in &resolution.winning_outcomes {
+                entry.insert(wo.outcome_index, wo.final_price);
+            }
+        }
+    }
+
+    // Every captured share position is cleared at settlement (winners redeemed,
+    // losers removed).
+    for (market_id, addr, outcome_index, _shares) in &pre_settlement_positions {
+        let holdings = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .market_positions(*addr, Some(market_id.clone()))
+            .await?;
+        let still_held: i64 = holdings
+            .positions
+            .iter()
+            .filter(|p| p.outcome_index == *outcome_index)
+            .map(|p| p.shares)
+            .sum();
+        anyhow::ensure!(
+            still_held == 0,
+            "Settlement should clear position: market {market_id} \
+             outcome {outcome_index} still holds {still_held}"
+        );
+    }
+
+    // On clean-binary markets (single winner at final_price 1.0): each winning
+    // share redeems for exactly its share count, independent of other holders
+    // (no parimutuel dilution), and the creator is refunded the unused subsidy.
+    let mut verified_redemption = false;
+    for market_summary in &settled_markets {
+        let market_id = &market_summary.market_id;
+        let Some(winning) = market_winning_prices.get(market_id) else {
+            continue;
+        };
+        let clean_binary = winning.len() == 1
+            && winning
+                .values()
+                .next()
+                .map(|p| (*p - 1.0).abs() < 0.01)
+                .unwrap_or(false);
+        if !clean_binary {
+            continue;
+        }
+        let winning_outcome = *winning.keys().next().unwrap();
+
+        let mut total_redeemed: u64 = 0;
+        for (m_id, addr, outcome_index, shares) in &pre_settlement_positions {
+            if m_id == market_id
+                && *outcome_index == winning_outcome
+                && *shares > 0
+            {
+                let expected = *shares as u64;
+                anyhow::ensure!(
+                    payout_exists(Some(addr), expected),
+                    "Fixed-redemption payout of {expected} sats missing for \
+                     {addr} in market {market_id}"
+                );
+                total_redeemed += expected;
+                verified_redemption = true;
+            }
+        }
+
+        if let Some((_, treasury_amount)) =
+            pre_settlement_treasury.get(market_id)
+            && *treasury_amount > total_redeemed
+        {
+            let refund = treasury_amount - total_redeemed;
+            anyhow::ensure!(
+                payout_exists(None, refund),
+                "Creator refund UTXO of {refund} sats missing for \
+                 market {market_id}"
+            );
+        }
+    }
+    anyhow::ensure!(
+        verified_redemption,
+        "Expected a clean-binary winning position to verify fixed redemption"
+    );
 
     tracing::info!("✓ Phase 8: Period resolution completed");
 
