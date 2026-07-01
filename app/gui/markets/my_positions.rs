@@ -68,7 +68,7 @@ impl MyPositions {
                             {
                                 let beta = app
                                     .node
-                                    .get_market_beta(&market_id, market)
+                                    .get_market_beta(market)
                                     .unwrap_or(0.0);
                                 let prices = market.current_prices(beta);
                                 let valid_combos =

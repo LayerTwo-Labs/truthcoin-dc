@@ -289,11 +289,8 @@ impl RpcServerImpl {
             .node
             .get_mempool_shares(&market_id_struct)
             .map_err(custom_err)?;
-        let effective_b = self
-            .app
-            .node
-            .get_market_beta(&market_id_struct, &market)
-            .map_err(custom_err)?;
+        let effective_b =
+            self.app.node.get_market_beta(&market).map_err(custom_err)?;
         let shares_for_pricing =
             mempool_shares_opt.as_ref().unwrap_or(market.shares());
         let prices: Vec<f64> =
@@ -454,9 +451,7 @@ impl RpcServerImpl {
 
         let mut prices_cache = std::collections::HashMap::new();
         for (market_id, market) in &markets_map {
-            let beta = node
-                .get_market_beta(market_id, market)
-                .map_err(custom_err)?;
+            let beta = node.get_market_beta(market).map_err(custom_err)?;
             prices_cache.insert(*market_id, market.current_prices(beta));
         }
 
@@ -527,9 +522,7 @@ impl RpcServerImpl {
         let mut positions = Vec::new();
 
         if let Ok(Some(market)) = node.get_market_by_id(&market_id_struct) {
-            let beta = node
-                .get_market_beta(&market_id_struct, &market)
-                .map_err(custom_err)?;
+            let beta = node.get_market_beta(&market).map_err(custom_err)?;
             let current_prices = market.current_prices(beta);
 
             for (outcome_index, position_data) in positions_data {
@@ -1770,11 +1763,8 @@ impl RpcServer for RpcServerImpl {
             .get_mempool_shares(&market_id_struct)
             .map_err(custom_err)?
             .unwrap_or_else(|| market.shares().clone());
-        let effective_b = self
-            .app
-            .node
-            .get_market_beta(&market_id_struct, &market)
-            .map_err(custom_err)?;
+        let effective_b =
+            self.app.node.get_market_beta(&market).map_err(custom_err)?;
 
         let mut new_shares = current_shares.clone();
         new_shares[request.outcome_index] += request.shares_amount;
@@ -1901,11 +1891,8 @@ impl RpcServer for RpcServerImpl {
             .get_mempool_shares(&market_id_struct)
             .map_err(custom_err)?
             .unwrap_or_else(|| market.shares().clone());
-        let effective_b = self
-            .app
-            .node
-            .get_market_beta(&market_id_struct, &market)
-            .map_err(custom_err)?;
+        let effective_b =
+            self.app.node.get_market_beta(&market).map_err(custom_err)?;
 
         // Calculate proceeds: C(current_shares) - C(new_shares)
         let mut new_shares = current_shares.clone();

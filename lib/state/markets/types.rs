@@ -214,8 +214,6 @@ impl utoipa::ToSchema for MarketId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ShareAccount {
     pub positions: BTreeMap<(MarketId, u32), i64>,
-    pub nonce: u64,
-    pub trade_nonce: u64,
     pub last_updated_height: u32,
 }
 
@@ -271,15 +269,6 @@ impl ShareAccount {
 
         self.last_updated_height = height;
         Ok(())
-    }
-
-    pub fn increment_nonce(&mut self) {
-        self.nonce += 1;
-    }
-
-    pub fn increment_trade_nonce(&mut self) {
-        self.trade_nonce += 1;
-        self.increment_nonce();
     }
 
     pub fn get_all_positions(&self) -> &BTreeMap<(MarketId, u32), i64> {

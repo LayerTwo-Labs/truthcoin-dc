@@ -440,7 +440,7 @@ where
         let mut new_shares = current_shares.clone();
         new_shares[outcome_index as usize] += shares_to_buy;
 
-        let beta = self.derive_market_beta(rwtxn, &market_id, &market)?;
+        let beta = self.derive_market_beta(&market)?;
         trading::validate_lmsr_parameters(beta, &new_shares).map_err(|e| {
             Error::State(Box::new(state::Error::InvalidDecisionId {
                 reason: format!(
@@ -509,7 +509,7 @@ where
         let mut new_shares = current_shares.clone();
         new_shares[outcome_index as usize] -= shares_to_sell;
 
-        let beta = self.derive_market_beta(rwtxn, &market_id, &market)?;
+        let beta = self.derive_market_beta(&market)?;
         trading::validate_lmsr_parameters(beta, &new_shares).map_err(|e| {
             Error::State(Box::new(state::Error::InvalidDecisionId {
                 reason: format!(
@@ -545,32 +545,24 @@ where
     }
 
     /// Derive the current effective LMSR beta for a market.
-    /// `beta = confirmed_treasury / ln(num_outcomes)`. Pending mempool
-    /// `AmplifyBeta` deposits are not counted until they confirm.
+    /// `beta = liquidity_base_sats / ln(num_outcomes)`, i.e. the creation seed
+    /// plus confirmed `AmplifyBeta` deposits (trade proceeds excluded). Pending
+    /// mempool deposits are not counted until they confirm.
     fn derive_market_beta(
         &self,
-        rotxn: &sneed::RoTxn,
-        market_id: &crate::state::markets::MarketId,
         market: &crate::state::Market,
     ) -> Result<f64, Error> {
-        let confirmed = self
-            .state
-            .markets()
-            .get_market_funds_sats(rotxn, &self.state, market_id, false)
-            .map_err(|e| Error::State(Box::new(e)))?;
         Ok(trading::derive_beta_from_liquidity(
-            confirmed,
+            market.liquidity_base_sats,
             market.shares().len(),
         ))
     }
 
     pub fn get_market_beta(
         &self,
-        market_id: &crate::state::markets::MarketId,
         market: &crate::state::Market,
     ) -> Result<f64, Error> {
-        let rotxn = self.env.read_txn()?;
-        self.derive_market_beta(&rotxn, market_id, market)
+        self.derive_market_beta(market)
     }
 
     pub fn get_all_utxos(
@@ -946,8 +938,7 @@ where
                         }
                     };
 
-                let beta =
-                    self.derive_market_beta(rotxn, market_id, &market)?;
+                let beta = self.derive_market_beta(&market)?;
                 tracing::debug!(
                     "check_trade_slippage: found market with {} outcomes, beta={}",
                     market.shares().len(),

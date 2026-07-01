@@ -797,49 +797,6 @@ impl MarketsDatabase {
         Ok(result)
     }
 
-    pub fn revert_share_trade(
-        &self,
-        txn: &mut RwTxn,
-        address: &Address,
-        market_id: MarketId,
-        outcome_index: u32,
-        shares_traded: i64,
-        height: u32,
-    ) -> Result<(), Error> {
-        self.remove_shares_from_account(
-            txn,
-            address,
-            &market_id,
-            outcome_index,
-            shares_traded,
-            height,
-        )
-    }
-
-    pub fn get_account_nonce(
-        &self,
-        txn: &RoTxn,
-        address: &Address,
-    ) -> Result<u64, Error> {
-        if let Some(account) = self.share_accounts.try_get(txn, address)? {
-            Ok(account.nonce)
-        } else {
-            Ok(0)
-        }
-    }
-
-    pub fn get_account_nonces(
-        &self,
-        txn: &RoTxn,
-        address: &Address,
-    ) -> Result<(u64, u64), Error> {
-        if let Some(account) = self.share_accounts.try_get(txn, address)? {
-            Ok((account.nonce, account.trade_nonce))
-        } else {
-            Ok((0, 0))
-        }
-    }
-
     pub fn verify_share_invariant(
         &self,
         txn: &RoTxn,
@@ -913,7 +870,10 @@ impl MarketsDatabase {
         Ok(shareholders)
     }
 
-    /// Payout formula: payout_i = (shares_i * final_price_i / total_weighted_shares) * treasury
+    /// Fixed redemption: each share of outcome `i` redeems for `final_price_i`
+    /// sats, independent of other holders. The unused subsidy (treasury minus
+    /// total redeemed) is refunded to the market author. Strict conservation:
+    /// `treasury == Σ payouts + refund`.
     pub fn calculate_share_payouts(
         &self,
         txn: &RoTxn,
@@ -929,67 +889,13 @@ impl MarketsDatabase {
 
         let shareholders = self.get_shareholders_for_market(txn, &market.id)?;
 
-        // Calculate total weighted shares for normalization
-        let total_weighted_shares: f64 = shareholders
-            .iter()
-            .flat_map(|(_, positions)| positions.iter())
-            .map(|(outcome_index, shares)| {
-                let final_price = final_prices[*outcome_index as usize];
-                *shares as f64 * final_price
-            })
-            .sum();
-
-        // If no winning positions, refund treasury to the market creator
-        // rather than burning it.
-        if total_weighted_shares <= 0.0 {
-            let creator_refund =
-                (treasury_sats > 0).then_some(super::types::CreatorRefund {
-                    address: market.creator_address,
-                    amount_sats: treasury_sats,
-                });
-            return Ok(MarketPayoutSummary {
-                market_id: market.id,
-                treasury_distributed: 0,
-                total_fees_distributed: 0,
-                shareholder_count: 0,
-                payouts: Vec::new(),
-                fee_payouts: Vec::new(),
-                creator_refund,
-                block_height,
-            });
-        }
-
-        let participants: Vec<((Address, u32, i64, f64), f64)> = shareholders
+        let mut payouts: Vec<super::types::SharePayoutRecord> = shareholders
             .into_iter()
             .flat_map(|(address, positions)| {
                 positions.into_iter().map(move |(outcome_index, shares)| {
                     let final_price = final_prices[outcome_index as usize];
-                    let weighted_shares = shares as f64 * final_price;
-                    (
-                        (address, outcome_index, shares, final_price),
-                        weighted_shares,
-                    )
-                })
-            })
-            .collect();
-
-        let alloc_result =
-            crate::math::allocation::allocate_proportionally_u64(
-                participants,
-                treasury_sats,
-            )
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Payout allocation failed: {e}"),
-            })?;
-
-        let payouts: Vec<super::types::SharePayoutRecord> = alloc_result
-            .allocations
-            .into_iter()
-            .map(
-                |(
-                    (address, outcome_index, shares, final_price),
-                    payout_sats,
-                )| {
+                    let payout_sats =
+                        (shares as f64 * final_price).round().max(0.0) as u64;
                     super::types::SharePayoutRecord {
                         market_id: market.id,
                         address,
@@ -998,11 +904,40 @@ impl MarketsDatabase {
                         final_price,
                         payout_sats,
                     }
-                },
-            )
+                })
+            })
             .collect();
 
-        let total_distributed = alloc_result.total_allocated;
+        let mut total_redeemed: u64 =
+            payouts.iter().map(|p| p.payout_sats).sum();
+
+        if total_redeemed > treasury_sats {
+            reclaim_payout_roundups(
+                &mut payouts,
+                total_redeemed - treasury_sats,
+            );
+            total_redeemed = payouts.iter().map(|p| p.payout_sats).sum();
+        }
+
+        let refund =
+            treasury_sats.checked_sub(total_redeemed).ok_or_else(|| {
+                Error::InvalidTransaction {
+                    reason: format!(
+                        "Market payout obligation {total_redeemed} exceeds \
+                     treasury {treasury_sats} for market {:?}",
+                        market.id
+                    ),
+                }
+            })?;
+
+        let creator_refund =
+            (refund > 0).then_some(super::types::CreatorRefund {
+                address: market.creator_address,
+                amount_sats: refund,
+            });
+
+        let shareholder_count =
+            payouts.iter().filter(|p| p.payout_sats > 0).count() as u32;
 
         let fee_sats =
             self.get_market_funds_sats(txn, state, &market.id, true)?;
@@ -1019,12 +954,12 @@ impl MarketsDatabase {
 
         Ok(MarketPayoutSummary {
             market_id: market.id,
-            treasury_distributed: total_distributed,
+            treasury_distributed: total_redeemed,
             total_fees_distributed,
-            shareholder_count: payouts.len() as u32,
+            shareholder_count,
             payouts,
             fee_payouts,
-            creator_refund: None,
+            creator_refund,
             block_height,
         })
     }
@@ -1043,22 +978,26 @@ impl MarketsDatabase {
         let mut sequence = 0u32;
 
         for payout in &payout_summary.payouts {
-            let outpoint = generate_share_payout_outpoint(
-                &payout.market_id,
-                &payout.address,
-                block_height,
-                sequence,
-            );
+            if payout.payout_sats > 0 {
+                let outpoint = generate_share_payout_outpoint(
+                    &payout.market_id,
+                    &payout.address,
+                    block_height,
+                    sequence,
+                );
 
-            let output = FilledOutput {
-                address: payout.address,
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(payout.payout_sats),
-                )),
-                memo: vec![],
-            };
+                let output = FilledOutput {
+                    address: payout.address,
+                    content: FilledOutputContent::Bitcoin(
+                        BitcoinOutputContent(bitcoin::Amount::from_sat(
+                            payout.payout_sats,
+                        )),
+                    ),
+                    memo: vec![],
+                };
 
-            state.insert_utxo(txn, &outpoint, &output)?;
+                state.insert_utxo(txn, &outpoint, &output)?;
+            }
 
             self.remove_shares_from_account(
                 txn,
@@ -1142,16 +1081,17 @@ impl MarketsDatabase {
         let mut sequence = 0u32;
 
         for payout in &payout_summary.payouts {
-            let outpoint = generate_share_payout_outpoint(
-                &payout.market_id,
-                &payout.address,
-                block_height,
-                sequence,
-            );
+            if payout.payout_sats > 0 {
+                let outpoint = generate_share_payout_outpoint(
+                    &payout.market_id,
+                    &payout.address,
+                    block_height,
+                    sequence,
+                );
 
-            state.delete_utxo(txn, &outpoint)?;
+                state.delete_utxo(txn, &outpoint)?;
+            }
 
-            // Restore shares to account
             self.add_shares_to_account(
                 txn,
                 &payout.address,
@@ -1250,5 +1190,78 @@ impl MarketsDatabase {
             }
             None => Ok(0),
         }
+    }
+}
+
+fn reclaim_payout_roundups(
+    payouts: &mut [super::types::SharePayoutRecord],
+    mut excess: u64,
+) {
+    let frac = |p: &super::types::SharePayoutRecord| {
+        let value = (p.shares_redeemed as f64 * p.final_price).max(0.0);
+        value - value.floor()
+    };
+    let mut order: Vec<usize> = (0..payouts.len()).collect();
+    order.sort_by(|&a, &b| {
+        frac(&payouts[b])
+            .partial_cmp(&frac(&payouts[a]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for i in order {
+        if excess == 0 {
+            break;
+        }
+        let value = (payouts[i].shares_redeemed as f64
+            * payouts[i].final_price)
+            .max(0.0);
+        let floor = value.floor() as u64;
+        if payouts[i].payout_sats > floor {
+            payouts[i].payout_sats -= 1;
+            excess -= 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod payout_reclaim_tests {
+    use super::super::types::{MarketId, SharePayoutRecord};
+    use super::reclaim_payout_roundups;
+    use crate::types::Address;
+
+    fn rec(
+        shares: i64,
+        final_price: f64,
+        payout_sats: u64,
+    ) -> SharePayoutRecord {
+        SharePayoutRecord {
+            market_id: MarketId::new([0u8; 6]),
+            address: Address::ALL_ZEROS,
+            outcome_index: 0,
+            shares_redeemed: shares,
+            final_price,
+            payout_sats,
+        }
+    }
+
+    #[test]
+    fn reclaim_takes_roundups_never_below_floor() {
+        let mut payouts =
+            vec![rec(3, 0.5, 2), rec(3, 0.6, 2), rec(10, 1.0, 10)];
+        reclaim_payout_roundups(&mut payouts, 2);
+
+        assert_eq!(payouts[0].payout_sats, 1);
+        assert_eq!(payouts[1].payout_sats, 1);
+        assert_eq!(payouts[2].payout_sats, 10);
+        let total: u64 = payouts.iter().map(|p| p.payout_sats).sum();
+        assert_eq!(total, 12);
+    }
+
+    #[test]
+    fn reclaim_prefers_largest_fraction_first() {
+        let mut payouts = vec![rec(3, 0.5, 2), rec(3, 0.6, 2)];
+        reclaim_payout_roundups(&mut payouts, 1);
+
+        assert_eq!(payouts[1].payout_sats, 1);
+        assert_eq!(payouts[0].payout_sats, 2);
     }
 }

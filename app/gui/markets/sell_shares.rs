@@ -122,10 +122,7 @@ impl SellShares {
             return;
         }
 
-        let beta = app
-            .node
-            .get_market_beta(&self.market_id, &market)
-            .unwrap_or(0.0);
+        let beta = app.node.get_market_beta(&market).unwrap_or(0.0);
 
         let old_cost = match trading::calculate_treasury(&market.shares, beta) {
             Ok(c) => c,

@@ -496,11 +496,11 @@ impl Browse {
             .get_effective_market_treasury_sats(&market.id)
             .unwrap_or(0);
         let effective_b =
-            if effective_treasury == 0 || market.shares().len() < 2 {
+            if market.liquidity_base_sats == 0 || market.shares().len() < 2 {
                 truthcoin_dc::state::markets::DEFAULT_MARKET_BETA
             } else {
                 trading::derive_beta_from_liquidity(
-                    effective_treasury,
+                    market.liquidity_base_sats,
                     market.shares().len(),
                 )
             };
@@ -1098,8 +1098,7 @@ impl Browse {
         let valid_combos = market.get_valid_state_combos();
         let mempool_shares_opt =
             app.node.get_mempool_shares(&market.id).ok().flatten();
-        let effective_b =
-            app.node.get_market_beta(&market.id, market).unwrap_or(0.0);
+        let effective_b = app.node.get_market_beta(market).unwrap_or(0.0);
         let shares_for_pricing =
             mempool_shares_opt.as_ref().unwrap_or(market.shares());
         let prices: Vec<f64> =
@@ -1546,10 +1545,7 @@ impl Browse {
 
                 ui.add_space(8.0);
                 if let Ok(idx) = market.tradeable_index_for_positions(&combo) {
-                    let beta = app
-                        .node
-                        .get_market_beta(&market.id, market)
-                        .unwrap_or(0.0);
+                    let beta = app.node.get_market_beta(market).unwrap_or(0.0);
                     let prices = market.current_prices(beta).to_vec();
                     if let Some(p) = prices.get(idx) {
                         ui.horizontal(|ui| {
@@ -1863,7 +1859,7 @@ impl Browse {
                     &valid_combos,
                 );
                 let detail_beta =
-                    app.node.get_market_beta(&market.id, market).unwrap_or(0.0);
+                    app.node.get_market_beta(market).unwrap_or(0.0);
                 let prices: Vec<f64> =
                     market.current_prices(detail_beta).to_vec();
                 let current_price =
@@ -2165,8 +2161,7 @@ impl Browse {
             return;
         }
 
-        let preview_beta =
-            app.node.get_market_beta(&market.id, market).unwrap_or(0.0);
+        let preview_beta = app.node.get_market_beta(market).unwrap_or(0.0);
         let prices: Vec<f64> = market.current_prices(preview_beta).to_vec();
         let current_price = prices.get(outcome_idx).copied().unwrap_or(0.0);
 
@@ -2189,7 +2184,7 @@ impl Browse {
         actual_idx: usize,
         current_price: f64,
     ) {
-        let beta = app.node.get_market_beta(&market.id, market).unwrap_or(0.0);
+        let beta = app.node.get_market_beta(market).unwrap_or(0.0);
         let calc_cost = |shares: u64| -> Option<trading::BuyCost> {
             let mut new_shares = market.shares.clone();
             new_shares[actual_idx] += shares as i64;
@@ -2325,7 +2320,7 @@ impl Browse {
             return;
         }
 
-        let beta = app.node.get_market_beta(&market.id, market).unwrap_or(0.0);
+        let beta = app.node.get_market_beta(market).unwrap_or(0.0);
 
         let old_cost = match trading::calculate_treasury(&market.shares, beta) {
             Ok(c) => c,

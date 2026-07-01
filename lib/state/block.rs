@@ -25,7 +25,6 @@ struct StateUpdate {
 struct MarketStateUpdate {
     market_id: MarketId,
     share_delta: Option<(usize, i64)>,
-    new_beta: Option<f64>,
     transaction_id: Option<[u8; 32]>,
     volume_sats: Option<u64>,
     fee_sats: Option<u64>,
@@ -55,6 +54,7 @@ pub struct PendingBuySettlement {
     pub lmsr_cost_sats: u64,
     pub market_fee_sats: u64,
     pub transaction_id: [u8; 32],
+    pub is_amplify: bool,
 }
 
 enum TradeApplyResult {
@@ -110,14 +110,6 @@ impl StateUpdate {
         self.verify_internal_consistency()?;
 
         for update in &self.market_updates {
-            if let Some(beta) = update.new_beta
-                && beta <= 0.0
-            {
-                return Err(Error::InvalidTransaction {
-                    reason: "Beta must be positive".to_string(),
-                });
-            }
-
             if state
                 .markets()
                 .get_market(rotxn, &update.market_id)?
@@ -217,6 +209,32 @@ impl StateUpdate {
 
             state.markets().update_market(rwtxn, &market)?;
             state.clear_mempool_shares(rwtxn, &market_id)?;
+        }
+
+        let mut amplify_by_market: std::collections::HashMap<MarketId, u64> =
+            std::collections::HashMap::new();
+        for settlement in &self.pending_buy_settlements {
+            if settlement.is_amplify {
+                *amplify_by_market.entry(settlement.market_id).or_default() +=
+                    settlement.lmsr_cost_sats;
+            }
+        }
+        for (market_id, amount) in amplify_by_market {
+            let mut market = state
+                .markets()
+                .get_market(rwtxn, &market_id)?
+                .ok_or_else(|| Error::InvalidTransaction {
+                    reason: format!("Market {market_id:?} not found"),
+                })?;
+            market.liquidity_base_sats = market
+                .liquidity_base_sats
+                .checked_add(amount)
+                .ok_or_else(|| Error::InvalidTransaction {
+                    reason: format!(
+                        "Liquidity base overflow for market {market_id:?}"
+                    ),
+                })?;
+            state.markets().update_market(rwtxn, &market)?;
         }
 
         for ((address, market_id), outcome_changes) in
@@ -1092,7 +1110,9 @@ pub fn disconnect_tip(
                 let () = revert_submit_ballot(state, rwtxn, &filled_tx)?;
             }
             Some(TxData::TransferReputation { .. }) => {}
-            Some(TxData::AmplifyBeta { .. }) => {}
+            Some(TxData::AmplifyBeta { .. }) => {
+                let () = revert_amplify_beta(state, rwtxn, &filled_tx)?;
+            }
         }
 
         tx.outputs.iter().enumerate().rev().try_for_each(
@@ -1534,33 +1554,27 @@ fn configure_market_builder(
 }
 
 /// Derive the current effective beta for a market.
-/// `beta = confirmed_treasury / ln(num_outcomes)`. Mempool-pending
-/// `AmplifyBeta` deposits are not counted until they confirm.
-fn market_beta(
-    state: &State,
-    rotxn: &RoTxn,
-    market_id: &MarketId,
-    market: &crate::state::Market,
-) -> Result<f64, Error> {
-    let confirmed = state
-        .markets()
-        .get_market_funds_sats(rotxn, state, market_id, false)?;
-    Ok(trading::derive_beta_from_liquidity(
-        confirmed,
+/// `beta = liquidity_base_sats / ln(num_outcomes)`, where the liquidity base is
+/// the creation seed plus confirmed `AmplifyBeta` deposits (ordinary trade
+/// proceeds are excluded). Mempool-pending deposits are not counted until they
+/// confirm.
+fn market_beta(market: &crate::state::Market) -> f64 {
+    trading::derive_beta_from_liquidity(
+        market.liquidity_base_sats,
         market.shares().len(),
-    ))
+    )
 }
 
 /// Effective shares and beta for a market, folding in the trades already
 /// applied to `state_update` earlier in this block. Lets same-block trades
 /// price sequentially against running state instead of stale pre-block state.
+/// Beta tracks the liquidity base (seed + confirmed and same-block `AmplifyBeta`
+/// deposits), never ordinary trade proceeds.
 fn running_market_state(
-    state: &State,
-    rotxn: &RoTxn,
     market_id: &MarketId,
     market: &crate::state::Market,
     state_update: &StateUpdate,
-) -> Result<(ndarray::Array1<i64>, f64), Error> {
+) -> (ndarray::Array1<i64>, f64) {
     let mut effective_shares = market.shares().clone();
     for update in &state_update.market_updates {
         if update.market_id == *market_id
@@ -1570,30 +1584,20 @@ fn running_market_state(
         }
     }
 
-    let committed = state
-        .markets()
-        .get_market_funds_sats(rotxn, state, market_id, false)?;
-    let pending_buys: u64 = state_update
+    let pending_amplify: u64 = state_update
         .pending_buy_settlements
         .iter()
-        .filter(|s| s.market_id == *market_id)
+        .filter(|s| s.market_id == *market_id && s.is_amplify)
         .map(|s| s.lmsr_cost_sats)
         .sum();
-    let pending_sells: u64 = state_update
-        .pending_sell_payouts
-        .iter()
-        .filter(|p| p.market_id == *market_id)
-        .map(|p| p.payout_sats + p.fee_sats)
-        .sum();
-    let running_treasury = committed
-        .saturating_add(pending_buys)
-        .saturating_sub(pending_sells);
+    let running_base =
+        market.liquidity_base_sats.saturating_add(pending_amplify);
 
     let beta = trading::derive_beta_from_liquidity(
-        running_treasury,
+        running_base,
         effective_shares.len(),
     );
-    Ok((effective_shares, beta))
+    (effective_shares, beta)
 }
 
 pub fn compute_market_tags(
@@ -1676,7 +1680,7 @@ fn revert_trade_market_state(
     let shares_delta = trade.shares_abs() as i64;
     let outcome = trade.outcome_index as usize;
 
-    let beta = market_beta(state, rwtxn, &trade.market_id, &market)?;
+    let beta = market_beta(&market);
 
     if is_buy {
         let mut pre_trade_shares = market.shares().clone();
@@ -1869,13 +1873,8 @@ fn apply_trade(
         });
     }
 
-    let (effective_shares, beta) = running_market_state(
-        state,
-        rwtxn,
-        &trade.market_id,
-        &market,
-        state_update,
-    )?;
+    let (effective_shares, beta) =
+        running_market_state(&trade.market_id, &market, state_update);
 
     let mut new_shares = effective_shares.clone();
     new_shares[outcome_index] += trade.shares;
@@ -1931,6 +1930,7 @@ fn apply_trade(
             lmsr_cost_sats: buy_cost.base_cost_sats,
             market_fee_sats: buy_cost.trading_fee_sats,
             transaction_id: filled_tx.transaction.txid().0,
+            is_amplify: false,
         });
 
         (buy_cost.total_cost_sats, buy_cost.trading_fee_sats)
@@ -2025,7 +2025,6 @@ fn apply_trade(
     state_update.add_market_update(MarketStateUpdate {
         market_id: trade.market_id,
         share_delta: Some((outcome_index, trade.shares)),
-        new_beta: None,
         transaction_id: Some(filled_tx.transaction.txid().0),
         volume_sats: Some(volume_sats),
         fee_sats: Some(fee_sats),
@@ -2128,7 +2127,7 @@ fn apply_market_creation(
             view.tx_pow_difficulty.unwrap_or(0),
         );
 
-    let market = builder.build(height, None, &decisions).map_err(|e| {
+    let mut market = builder.build(height, None, &decisions).map_err(|e| {
         tracing::warn!("Market creation failed for '{}': {e}", view.title);
         Error::InvalidTransaction {
             reason: format!("Market creation failed: {e}"),
@@ -2160,6 +2159,8 @@ fn apply_market_creation(
             state
                 .markets()
                 .set_market_funds_utxo(rwtxn, &market_id, false, &outpoint)?;
+
+            market.liquidity_base_sats = amount.0.to_sat();
 
             tracing::debug!(
                 "Registered MarketFunds (treasury) UTXO for market {:?} with {} sats at {:?}",
@@ -2203,7 +2204,38 @@ fn apply_amplify_beta(
         lmsr_cost_sats: amplify.amount,
         market_fee_sats: 0,
         transaction_id: filled_tx.transaction.txid().0,
+        is_amplify: true,
     });
+
+    Ok(())
+}
+
+fn revert_amplify_beta(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    filled_tx: &FilledTransaction,
+) -> Result<(), Error> {
+    let amplify =
+        filled_tx
+            .amplify_beta()
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: "Not an amplify_beta transaction".to_string(),
+            })?;
+
+    let mut market = state
+        .markets()
+        .get_market(rwtxn, &amplify.market_id)?
+        .ok_or_else(|| Error::InvalidTransaction {
+            reason: "Market not found during amplify_beta revert".to_string(),
+        })?;
+    market.liquidity_base_sats = market
+        .liquidity_base_sats
+        .checked_sub(amplify.amount)
+        .ok_or_else(|| Error::InvalidTransaction {
+            reason: "Liquidity base underflow during amplify_beta revert"
+                .to_string(),
+        })?;
+    state.markets().update_market(rwtxn, &market)?;
 
     Ok(())
 }
@@ -2645,32 +2677,26 @@ mod tests {
     }
 
     #[test]
-    fn same_block_buys_fold_into_running_state() {
+    fn same_block_buys_fold_shares_not_beta() {
         use crate::math::trading;
         use ndarray::array;
 
         let outcomes = 2usize;
-        let t0 = trading::calculate_lmsr_liquidity(10_000_000.0, outcomes)
-            .round() as u64;
-        let beta0 = trading::derive_beta_from_liquidity(t0, outcomes);
+        let liquidity_base =
+            trading::calculate_lmsr_liquidity(10_000_000.0, outcomes).round()
+                as u64;
+        let beta =
+            trading::derive_beta_from_liquidity(liquidity_base, outcomes);
 
         let s0 = array![0i64, 0i64];
         let after_one = array![100_000i64, 0i64];
         let after_two = array![200_000i64, 0i64];
-
-        let base1 = trading::calculate_buy_cost(
-            trading::calculate_update_cost(&s0, &after_one, beta0).unwrap(),
-            0.0,
-        )
-        .unwrap()
-        .base_cost_sats;
 
         let market_id = MarketId::new([7u8; 6]);
         let mut state_update = StateUpdate::new();
         state_update.add_market_update(MarketStateUpdate {
             market_id,
             share_delta: Some((0, 100_000)),
-            new_beta: None,
             transaction_id: None,
             volume_sats: None,
             fee_sats: None,
@@ -2679,9 +2705,10 @@ mod tests {
             market_id,
             trader_address: Address::ALL_ZEROS,
             input_value_sats: 0,
-            lmsr_cost_sats: base1,
+            lmsr_cost_sats: 12_345,
             market_fee_sats: 0,
             transaction_id: [0u8; 32],
+            is_amplify: false,
         });
 
         let mut effective = s0.clone();
@@ -2694,17 +2721,15 @@ mod tests {
         }
         assert_eq!(effective, after_one);
 
-        let pending_buys: u64 = state_update
-            .pending_buy_settlements
-            .iter()
-            .filter(|s| s.market_id == market_id)
-            .map(|s| s.lmsr_cost_sats)
-            .sum();
-        let beta1 =
-            trading::derive_beta_from_liquidity(t0 + pending_buys, outcomes);
+        let base1 = trading::calculate_buy_cost(
+            trading::calculate_update_cost(&s0, &after_one, beta).unwrap(),
+            0.0,
+        )
+        .unwrap()
+        .base_cost_sats;
 
         let base2_sequential = trading::calculate_buy_cost(
-            trading::calculate_update_cost(&after_one, &after_two, beta1)
+            trading::calculate_update_cost(&after_one, &after_two, beta)
                 .unwrap(),
             0.0,
         )
