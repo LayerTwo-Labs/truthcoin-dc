@@ -156,6 +156,8 @@ impl BlockValidator {
     ) -> Result<bitcoin::Amount, Error> {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
 
+        Self::validate_spent_output_contents(&tx.spent_utxos)?;
+
         if tx.is_claim_decision() {
             DecisionValidator::validate_complete_decision_claim(
                 state,
@@ -259,6 +261,27 @@ impl BlockValidator {
         Ok(fee)
     }
 
+    /// Reject transactions that spend `MarketFunds` UTXOs (LMSR treasury /
+    /// author-fee collateral). These are managed exclusively by consensus at
+    /// the state level (settlement consolidation) and must never be spendable
+    /// as ordinary transaction inputs, otherwise a market's treasury could be
+    /// drained and its treasury pointer left stale. Mirrors the MarketFunds
+    /// rejection in `validate_coinbase_outputs`.
+    pub fn validate_spent_output_contents(
+        spent_utxos: &[crate::types::FilledOutput],
+    ) -> Result<(), Error> {
+        for spent_utxo in spent_utxos {
+            if spent_utxo.content.is_market_funds() {
+                return Err(Error::InvalidTransaction {
+                    reason:
+                        "MarketFunds UTXOs cannot be spent as transaction inputs"
+                            .to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_coinbase_outputs(
         coinbase: &[crate::types::Output],
         _height: u32,
@@ -307,7 +330,10 @@ impl BlockValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Address, BitcoinOutputContent, Output, OutputContent};
+    use crate::types::{
+        Address, BitcoinOutputContent, FilledOutput, FilledOutputContent,
+        Output, OutputContent,
+    };
 
     fn bitcoin_output(sats: u64) -> Output {
         Output {
@@ -341,6 +367,49 @@ mod tests {
         }];
         assert!(
             BlockValidator::validate_coinbase_outputs(&outputs, 0).is_err()
+        );
+    }
+
+    fn bitcoin_filled_output(sats: u64) -> FilledOutput {
+        FilledOutput {
+            address: Address::ALL_ZEROS,
+            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                bitcoin::Amount::from_sat(sats),
+            )),
+            memo: vec![],
+        }
+    }
+
+    fn market_funds_filled_output(sats: u64) -> FilledOutput {
+        FilledOutput {
+            address: Address::ALL_ZEROS,
+            content: FilledOutputContent::MarketFunds {
+                market_id: [0u8; 6],
+                amount: BitcoinOutputContent(bitcoin::Amount::from_sat(sats)),
+                is_fee: false,
+            },
+            memo: vec![],
+        }
+    }
+
+    #[test]
+    fn spending_bitcoin_input_allowed() {
+        let inputs = vec![bitcoin_filled_output(5000)];
+        assert!(
+            BlockValidator::validate_spent_output_contents(&inputs).is_ok()
+        );
+    }
+
+    #[test]
+    fn spending_market_funds_input_rejected() {
+        // A MarketFunds (treasury) UTXO must not be spendable as an ordinary
+        // transaction input, even mixed with a normal bitcoin input.
+        let inputs = vec![
+            bitcoin_filled_output(5000),
+            market_funds_filled_output(1000),
+        ];
+        assert!(
+            BlockValidator::validate_spent_output_contents(&inputs).is_err()
         );
     }
 

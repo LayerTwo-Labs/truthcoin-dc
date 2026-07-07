@@ -2050,7 +2050,7 @@ fn apply_market_creation(
     use crate::state::{
         MarketBuilder,
         decisions::{Decision, DecisionId},
-        markets::DimensionSpec,
+        markets::{DimensionSpec, generate_market_treasury_address},
     };
     use std::collections::HashMap;
 
@@ -2144,6 +2144,7 @@ fn apply_market_creation(
     let market_id_bytes = *market_id.as_bytes();
     let txid = filled_tx.txid();
 
+    let treasury_address = generate_market_treasury_address(&market_id);
     for (vout, output) in filled_tx.outputs().iter().enumerate() {
         if let OutputContent::MarketFunds {
             market_id: output_market_id,
@@ -2151,6 +2152,7 @@ fn apply_market_creation(
             is_fee: false,
         } = &output.content
             && output_market_id == &market_id_bytes
+            && output.address == treasury_address
         {
             let outpoint = OutPoint::Regular {
                 txid,
