@@ -206,7 +206,9 @@ impl MarketValidator {
             }
         }
 
-        use crate::state::markets::compute_market_id;
+        use crate::state::markets::{
+            compute_market_id, generate_market_treasury_address,
+        };
         let expected_market_id = compute_market_id(
             view.title,
             view.description,
@@ -214,6 +216,8 @@ impl MarketValidator {
             dimension_specs,
         );
         let expected_market_id_bytes = *expected_market_id.as_bytes();
+        let expected_treasury_address =
+            generate_market_treasury_address(&expected_market_id);
 
         let treasury_amount_sats = tx
             .outputs()
@@ -223,15 +227,19 @@ impl MarketValidator {
                     market_id,
                     amount,
                     is_fee: false,
-                } if market_id == &expected_market_id_bytes => {
+                } if market_id == &expected_market_id_bytes
+                    && output.address == expected_treasury_address =>
+                {
                     Some(amount.0.to_sat())
                 }
                 _ => None,
             })
             .ok_or_else(|| Error::InvalidTransaction {
                 reason: format!(
-                    "CreateMarket tx must have MarketFunds (treasury) output with market_id {}",
-                    hex::encode(expected_market_id_bytes)
+                    "CreateMarket tx must have MarketFunds (treasury) output \
+                     with market_id {} at treasury address {}",
+                    hex::encode(expected_market_id_bytes),
+                    expected_treasury_address
                 ),
             })?;
 

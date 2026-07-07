@@ -1264,4 +1264,71 @@ mod payout_reclaim_tests {
         assert_eq!(payouts[1].payout_sats, 1);
         assert_eq!(payouts[0].payout_sats, 2);
     }
+
+    // Mirrors the `calculate_share_payouts` obligation math to pin the
+    // fixed-redemption semantics: each share of the winning outcome redeems for
+    // its raw share count (× final_price), independent of other holders, and the
+    // unused subsidy is refunded to the creator (`treasury == Σ payouts +
+    // refund`). Regression guard for the historical bug where payouts used
+    // *normalized* shares — `payout_i = shares_i * price_i /
+    // total_weighted_shares * treasury` — which diluted redemptions across
+    // holders and always paid out the ENTIRE treasury, leaving no refund.
+    #[test]
+    fn fixed_redemption_uses_raw_shares_and_refunds_remainder() {
+        // Clean-binary resolution: outcome 1 wins (final_price 1.0); shares held
+        // on the losing outcome redeem for 0. The treasury was subsidised well
+        // above the winning obligation.
+        let treasury_sats: u64 = 100;
+        let positions = [
+            (30i64, 1.0f64), // winner A
+            (20i64, 1.0f64), // winner B
+            (40i64, 0.0f64), // loser C
+        ];
+
+        let mut payouts: Vec<SharePayoutRecord> = positions
+            .iter()
+            .map(|&(shares, final_price)| {
+                let payout_sats =
+                    (shares as f64 * final_price).round().max(0.0) as u64;
+                rec(shares, final_price, payout_sats)
+            })
+            .collect();
+
+        let mut total_redeemed: u64 =
+            payouts.iter().map(|p| p.payout_sats).sum();
+        if total_redeemed > treasury_sats {
+            reclaim_payout_roundups(
+                &mut payouts,
+                total_redeemed - treasury_sats,
+            );
+            total_redeemed = payouts.iter().map(|p| p.payout_sats).sum();
+        }
+        let refund = treasury_sats.checked_sub(total_redeemed).unwrap();
+
+        // Raw redemption: winners get exactly their share count, loser gets 0.
+        assert_eq!(payouts[0].payout_sats, 30);
+        assert_eq!(payouts[1].payout_sats, 20);
+        assert_eq!(payouts[2].payout_sats, 0);
+
+        // Only the obligation leaves the treasury; the rest is refunded.
+        assert_eq!(total_redeemed, 50);
+        assert_eq!(refund, 50);
+        assert_eq!(total_redeemed + refund, treasury_sats);
+
+        // The old normalized formula would have paid out the entire treasury.
+        let total_weighted: f64 = positions
+            .iter()
+            .map(|&(shares, price)| shares as f64 * price)
+            .sum();
+        let normalized_total: u64 = positions
+            .iter()
+            .map(|&(shares, price)| {
+                ((shares as f64 * price / total_weighted)
+                    * treasury_sats as f64)
+                    .round() as u64
+            })
+            .sum();
+        assert_eq!(normalized_total, treasury_sats);
+        assert!(total_redeemed < normalized_total);
+    }
 }
