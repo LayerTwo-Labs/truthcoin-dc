@@ -914,7 +914,9 @@ fn disconnect_event(
             if !state.delete_utxo(rwtxn, &outpoint)? {
                 return Err(Error::NoUtxo { outpoint });
             }
-            *latest_deposit_block_hash = Some(event_block_hash);
+            if latest_deposit_block_hash.is_none() {
+                *latest_deposit_block_hash = Some(event_block_hash);
+            }
         }
         BlockEvent::WithdrawalBundle(withdrawal_bundle_event) => {
             let () = disconnect_withdrawal_bundle_event(
@@ -923,7 +925,10 @@ fn disconnect_event(
                 block_height,
                 withdrawal_bundle_event,
             )?;
-            *latest_withdrawal_bundle_event_block_hash = Some(event_block_hash);
+            if latest_withdrawal_bundle_event_block_hash.is_none() {
+                *latest_withdrawal_bundle_event_block_hash =
+                    Some(event_block_hash);
+            }
         }
     }
     Ok(())
@@ -1119,5 +1124,30 @@ mod tests {
         let () = disconnect(&state, &mut rwtxn, &tdp).unwrap();
         assert_eq!(state.utxos.len(&rwtxn).unwrap(), 0);
         assert!(state.deposit_blocks.last(&rwtxn).unwrap().is_none());
+    }
+
+    #[test]
+    fn disconnect_two_deposit_blocks_restores_state() {
+        let (_dir, env, state) = fresh_state();
+        let mut rwtxn = env.write_txn().unwrap();
+        state.height.put(&mut rwtxn, &(), &10).unwrap();
+
+        let (h1, b1) = deposit_block(1);
+        let (h2, b2) = deposit_block(2);
+        let mut block_info = LinkedHashMap::new();
+        block_info.insert(h1, b1);
+        block_info.insert(h2, b2);
+        let tdp = TwoWayPegData { block_info };
+
+        let () = connect(&state, &mut rwtxn, &tdp).unwrap();
+        assert_eq!(state.utxos.len(&rwtxn).unwrap(), 2);
+        assert_eq!(
+            state.deposit_blocks.last(&rwtxn).unwrap(),
+            Some((0, (h2, 10)))
+        );
+
+        let () = disconnect(&state, &mut rwtxn, &tdp).unwrap();
+        assert_eq!(state.utxos.len(&rwtxn).unwrap(), 0);
+        assert_eq!(state.deposit_blocks.len(&rwtxn).unwrap(), 0);
     }
 }
