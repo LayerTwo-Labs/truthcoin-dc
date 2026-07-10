@@ -135,6 +135,9 @@ pub enum Error {
     #[error(transparent)]
     SignatureError(#[from] ed25519_dalek::SignatureError),
 
+    #[error("withdrawal output {outpoint} cannot be spent by a transaction")]
+    SpendWithdrawalOutput { outpoint: OutPoint },
+
     #[error("Unknown withdrawal bundle: {m6id}")]
     UnknownWithdrawalBundle { m6id: M6id },
     #[error(
