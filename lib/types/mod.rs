@@ -431,7 +431,7 @@ pub struct TwoWayPegData {
     pub bundle_statuses: HashMap<M6id, WithdrawalBundleEvent>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct Body {
     pub coinbase: Vec<Output>,
     pub transactions: Vec<Transaction>,
@@ -441,6 +441,9 @@ pub struct Body {
 }
 
 impl Body {
+    /// Size limit in bytes
+    pub const MAX_SIZE: usize = 8 * 1024 * 1024;
+
     pub fn new(
         authorized_transactions: Vec<AuthorizedTransaction>,
         coinbase: Vec<Output>,

@@ -97,6 +97,8 @@ pub enum Error {
 
     #[error("bundle too heavy {weight} > {max_weight}")]
     BundleTooHeavy { weight: u64, max_weight: u64 },
+    #[error("body too large")]
+    BodyTooLarge,
     #[error(transparent)]
     BorshSerialize(borsh::io::Error),
     #[error("Database consistency error: {0}")]

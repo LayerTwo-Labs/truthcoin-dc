@@ -24,6 +24,12 @@ impl BlockValidator {
     ) -> Result<PrevalidatedBlock, Error> {
         use crate::state::error;
 
+        let body_size =
+            borsh::object_length(&body).map_err(Error::BorshSerialize)?;
+        if body_size > Body::MAX_SIZE {
+            return Err(Error::BodyTooLarge);
+        }
+
         let tip_hash = state.try_get_tip(rotxn)?;
         if header.prev_side_hash != tip_hash {
             let err = error::InvalidHeader::PrevSideHash {
@@ -404,6 +410,52 @@ mod tests {
     fn distinct_decision_claims_ok() {
         let txs = vec![claim_tx(&[[1, 2, 3]]), claim_tx(&[[4, 5, 6]])];
         assert!(BlockValidator::check_duplicate_decision_claims(&txs).is_ok());
+    }
+
+    #[test]
+    fn oversized_body_rejected() {
+        use bitcoin::hashes::Hash as _;
+        use sneed::Env;
+
+        use crate::{archive::Archive, state::State};
+
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("data.mdb");
+        std::fs::create_dir_all(&env_path).unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
+        let env = unsafe { Env::open(&opts, &env_path) }.unwrap();
+        let state = State::new(&env, None).unwrap();
+        let archive = Archive::new(&env).unwrap();
+        let rotxn = env.read_txn().unwrap();
+
+        let body = Body {
+            coinbase: vec![Output {
+                address: Address::ALL_ZEROS,
+                content: OutputContent::Bitcoin(BitcoinOutputContent(
+                    bitcoin::Amount::ZERO,
+                )),
+                memo: vec![0u8; Body::MAX_SIZE + 1],
+            }],
+            transactions: Vec::new(),
+            authorizations: Vec::new(),
+            actor_proofs: Vec::new(),
+        };
+        let header = Header {
+            merkle_root: Body::compute_merkle_root(
+                &body.coinbase,
+                &body.transactions,
+            ),
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::from_byte_array([0; 32]),
+        };
+        assert!(matches!(
+            BlockValidator::prevalidate(
+                &state, &archive, &rotxn, &header, &body,
+            ),
+            Err(Error::BodyTooLarge)
+        ));
     }
 
     #[test]
