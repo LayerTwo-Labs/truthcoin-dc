@@ -974,11 +974,11 @@ pub fn disconnect(
                  {last_withdrawal_bundle_event_block_hash}"
             )));
         }
-        if block_height - 1 != last_withdrawal_bundle_event_block_height {
+        if block_height != last_withdrawal_bundle_event_block_height {
             return Err(Error::DatabaseError(format!(
                 "withdrawal bundle event block height mismatch: \
-                 {} != {last_withdrawal_bundle_event_block_height}",
-                block_height - 1,
+                 {block_height} != \
+                 {last_withdrawal_bundle_event_block_height}"
             )));
         }
         if !state
@@ -993,7 +993,7 @@ pub fn disconnect(
         .map(|(height, _bundle)| height)
         .unwrap_or_default();
     if block_height - last_withdrawal_bundle_failure_height
-        > WITHDRAWAL_BUNDLE_FAILURE_GAP
+        >= WITHDRAWAL_BUNDLE_FAILURE_GAP
         && let Some(bundle_m6id) =
             state.pending_withdrawal_bundle.try_get(rwtxn, &())?
         && let (bundle, bundle_status) = state
@@ -1005,7 +1005,7 @@ pub fn disconnect(
                      unknown in withdrawal_bundles"
                 ))
             })?
-        && bundle_status.latest().height == block_height - 1
+        && bundle_status.latest().height == block_height
     {
         state.pending_withdrawal_bundle.delete(rwtxn, &())?;
         if let (Some(bundle_status), _latest_bundle_status) =
@@ -1035,11 +1035,10 @@ pub fn disconnect(
                  {last_deposit_block_hash}"
             )));
         }
-        if block_height - 1 != last_deposit_block_height {
+        if block_height != last_deposit_block_height {
             return Err(Error::DatabaseError(format!(
-                "deposit block height mismatch: {} != \
-                 {last_deposit_block_height}",
-                block_height - 1,
+                "deposit block height mismatch: {block_height} != \
+                 {last_deposit_block_height}"
             )));
         }
         if !state
@@ -1050,4 +1049,75 @@ pub fn disconnect(
         };
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::hashes::Hash as _;
+    use hashlink::LinkedHashMap;
+    use sneed::Env;
+
+    use super::*;
+    use crate::types::{
+        Address, BitcoinOutputContent,
+        proto::mainchain::{BlockInfo, Deposit},
+    };
+
+    fn fresh_state() -> (tempfile::TempDir, Env, State) {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("data.mdb");
+        std::fs::create_dir_all(&env_path).unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { Env::open(&opts, &env_path) }.unwrap();
+        let state = State::new(&env, None).unwrap();
+        (dir, env, state)
+    }
+
+    fn deposit_block(salt: u8) -> (bitcoin::BlockHash, BlockInfo) {
+        let deposit = Deposit {
+            tx_index: 0,
+            outpoint: bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([salt; 32]),
+                vout: 0,
+            },
+            output: FilledOutput {
+                address: Address([salt; 20]),
+                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                    bitcoin::Amount::from_sat(1000),
+                )),
+                memo: Vec::new(),
+            },
+        };
+        (
+            bitcoin::BlockHash::from_byte_array([salt; 32]),
+            BlockInfo {
+                bmm_commitment: None,
+                events: vec![BlockEvent::Deposit(deposit)],
+            },
+        )
+    }
+
+    #[test]
+    fn deposit_reorg_round_trips() {
+        let (_dir, env, state) = fresh_state();
+        let mut rwtxn = env.write_txn().unwrap();
+        state.height.put(&mut rwtxn, &(), &10).unwrap();
+
+        let (h1, b1) = deposit_block(1);
+        let mut block_info = LinkedHashMap::new();
+        block_info.insert(h1, b1);
+        let tdp = TwoWayPegData { block_info };
+
+        let () = connect(&state, &mut rwtxn, &tdp).unwrap();
+        assert_eq!(state.utxos.len(&rwtxn).unwrap(), 1);
+        assert_eq!(
+            state.deposit_blocks.last(&rwtxn).unwrap(),
+            Some((0, (h1, 10)))
+        );
+
+        let () = disconnect(&state, &mut rwtxn, &tdp).unwrap();
+        assert_eq!(state.utxos.len(&rwtxn).unwrap(), 0);
+        assert!(state.deposit_blocks.last(&rwtxn).unwrap().is_none());
+    }
 }
