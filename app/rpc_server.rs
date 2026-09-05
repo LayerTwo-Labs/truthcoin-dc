@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{collections::HashMap, net::SocketAddr};
 
 use bitcoin::Amount;
 use jsonrpsee::{
@@ -33,9 +33,10 @@ use truthcoin_dc::{
 use truthcoin_dc_app_rpc_api::{
     ConsensusResults, CreateTradeRequest, CreateTradeResponse, DecisionFilter,
     DecisionListItem, DecisionState, DecisionSummary, MarketAmplifyBetaRequest,
-    MarketBuyRequest, MarketBuyResponse, MarketSellRequest, MarketSellResponse,
-    ParticipationStats, PeriodStats, RpcServer, SubmitBallotRequest, TxInfo,
-    VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
+    MarketBuyRequest, MarketBuyResponse, MarketDimension, MarketDimensionKind,
+    MarketOutcome, MarketSellRequest, MarketSellResponse, ParticipationStats,
+    PeriodStats, RpcServer, SubmitBallotRequest, TxInfo, VoteFilter, VoteInfo,
+    VoterInfo, VoterInfoFull, VotingPeriodFull,
 };
 
 use crate::app::App;
@@ -50,6 +51,118 @@ where
 {
     let error = anyhow::Error::from(error);
     custom_err_msg(format!("{error:#}"))
+}
+
+fn market_dimension_data(
+    market: &truthcoin_dc::state::markets::Market,
+    decisions: &HashMap<
+        truthcoin_dc::state::decisions::DecisionId,
+        truthcoin_dc::state::decisions::Decision,
+    >,
+) -> Result<Vec<MarketDimension>, truthcoin_dc::state::Error> {
+    market
+        .dimension_specs
+        .iter()
+        .enumerate()
+        .map(|(dimension_index, dimension_spec)| {
+            let decision_id = match dimension_spec {
+                truthcoin_dc::state::markets::DimensionSpec::Single(id)
+                | truthcoin_dc::state::markets::DimensionSpec::Categorical(
+                    id,
+                ) => *id,
+            };
+            let decision = decisions.get(&decision_id).ok_or_else(|| {
+                truthcoin_dc::state::markets::MarketError::DecisionNotFound {
+                    decision_id,
+                }
+            })?;
+
+            let kind = match &decision.decision_type {
+                truthcoin_dc::state::decisions::DecisionType::Binary => {
+                    let (lower, upper) = decision.get_binary_labels();
+                    MarketDimensionKind::Binary {
+                        lower_label: lower,
+                        upper_label: upper,
+                    }
+                }
+                truthcoin_dc::state::decisions::DecisionType::Scaled {
+                    min,
+                    max,
+                    increment,
+                } => {
+                    let lower = decision
+                        .option_0_label
+                        .clone()
+                        .unwrap_or_else(|| "Lower basis".to_string());
+                    let upper = decision
+                        .option_1_label
+                        .clone()
+                        .unwrap_or_else(|| "Upper basis".to_string());
+                    MarketDimensionKind::Scaled {
+                        min: *min,
+                        max: *max,
+                        increment: *increment,
+                        // Decision definitions currently have no unit field.
+                        unit: None,
+                        lower_label: lower,
+                        upper_label: upper,
+                    }
+                }
+                truthcoin_dc::state::decisions::DecisionType::Category {
+                    options,
+                } => MarketDimensionKind::Category {
+                    options: options.clone(),
+                },
+            };
+
+            Ok(MarketDimension {
+                dimension_index,
+                decision_id: decision_id.to_hex(),
+                name: decision.header.clone(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn market_outcomes(
+    market: &truthcoin_dc::state::markets::Market,
+    decisions: &HashMap<
+        truthcoin_dc::state::decisions::DecisionId,
+        truthcoin_dc::state::decisions::Decision,
+    >,
+    prices: &[f64],
+) -> Vec<MarketOutcome> {
+    market
+        .get_valid_state_combos()
+        .iter()
+        .enumerate()
+        .map(|(display_index, (full_state_index, coordinates))| {
+            let name = match market
+                .describe_outcome_by_state(*full_state_index, decisions)
+            {
+                Ok(description) => description,
+                Err(_) => format!("Outcome {full_state_index}"),
+            };
+            let current_price =
+                prices.get(display_index).copied().unwrap_or(0.0);
+
+            MarketOutcome {
+                name,
+                current_price,
+                probability: current_price,
+                volume_sats: market
+                    .outcome_volumes_sats
+                    .get(display_index)
+                    .copied()
+                    .unwrap_or(0),
+                index: display_index,
+                display_index,
+                full_state_index: *full_state_index,
+                coordinates: (*coordinates).clone(),
+            }
+        })
+        .collect()
 }
 
 /// Per-decision slot allocation request.
@@ -281,7 +394,6 @@ impl RpcServerImpl {
             .get_market_decisions(&market)
             .map_err(custom_err)?;
 
-        let mut outcomes = Vec::new();
         let valid_state_combos = market.get_valid_state_combos();
 
         let mempool_shares_opt = self
@@ -306,29 +418,9 @@ impl RpcServerImpl {
                 });
 
         let total_volume_sats = market.total_volume_sats;
-
-        for (i, (state_idx, _combo)) in valid_state_combos.iter().enumerate() {
-            let name = match market
-                .describe_outcome_by_state(*state_idx, &decisions)
-            {
-                Ok(description) => description,
-                Err(_) => format!("Outcome {state_idx}"),
-            };
-
-            let current_price = prices.get(i).copied().unwrap_or(0.0);
-            let probability = current_price;
-            let volume_sats =
-                market.outcome_volumes_sats.get(i).copied().unwrap_or(0);
-
-            outcomes.push(truthcoin_dc_app_rpc_api::MarketOutcome {
-                name,
-                current_price,
-                probability,
-                volume_sats,
-                index: i,
-                display_index: i,
-            });
-        }
+        let dimensions =
+            market_dimension_data(&market, &decisions).map_err(custom_err)?;
+        let outcomes = market_outcomes(&market, &decisions, &prices);
 
         let decision_ids: Vec<String> = market
             .decision_ids
@@ -416,6 +508,10 @@ impl RpcServerImpl {
             tx_pow_hash_selector: market.tx_pow_hash_selector,
             tx_pow_ordering: market.tx_pow_ordering,
             tx_pow_difficulty: market.tx_pow_difficulty,
+            dimensions,
+            liquidity_base_sats: market.liquidity_base_sats,
+            treasury_sats,
+            trading_fee_rate: market.trading_fee(),
         };
 
         Ok(Some(market_data))
@@ -2788,4 +2884,126 @@ pub async fn run_server(
     tokio::spawn(handle.stopped());
 
     Ok(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{market_dimension_data, market_outcomes};
+    use std::collections::HashMap;
+
+    use truthcoin_dc::state::{
+        MarketBuilder,
+        decisions::{Decision, DecisionId, DecisionType},
+        markets::DimensionSpec,
+    };
+    use truthcoin_dc::types::Address;
+    use truthcoin_dc_app_rpc_api::MarketDimensionKind;
+
+    #[test]
+    fn multidimensional_market_exposes_ordered_categorical_and_scaled_axes() {
+        let category_id = DecisionId::new(true, 1, 0).unwrap();
+        let scaled_id = DecisionId::new(true, 1, 1).unwrap();
+        let mut decisions = HashMap::new();
+        decisions.insert(
+            category_id,
+            Decision::new(
+                [0; 20],
+                DecisionType::Category {
+                    options: vec![
+                        "North, East".to_string(),
+                        "Central [C]".to_string(),
+                        "South × West".to_string(),
+                    ],
+                },
+                "Region".to_string(),
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        decisions.insert(
+            scaled_id,
+            Decision::new(
+                [0; 20],
+                DecisionType::Scaled {
+                    min: 10.0,
+                    max: 50.0,
+                    increment: 5.0,
+                },
+                "Estimate".to_string(),
+                String::new(),
+                Some("Low basis".to_string()),
+                Some("High basis".to_string()),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+
+        let market = MarketBuilder::new(
+            "Categorical × scaled".to_string(),
+            Address::ALL_ZEROS,
+        )
+        .with_dimensions(vec![
+            DimensionSpec::Categorical(category_id),
+            DimensionSpec::Single(scaled_id),
+        ])
+        .build(42, None, &decisions)
+        .unwrap();
+
+        let dimensions = market_dimension_data(&market, &decisions).unwrap();
+        assert_eq!(dimensions.len(), 2);
+        assert_eq!(dimensions[0].dimension_index, 0);
+        assert_eq!(dimensions[0].decision_id, category_id.to_hex());
+        assert!(matches!(
+            &dimensions[0].kind,
+            MarketDimensionKind::Category { options }
+                if options == &vec![
+                    "North, East".to_string(),
+                    "Central [C]".to_string(),
+                    "South × West".to_string(),
+                ]
+        ));
+        assert_eq!(dimensions[1].dimension_index, 1);
+        assert_eq!(dimensions[1].decision_id, scaled_id.to_hex());
+        assert!(matches!(
+            &dimensions[1].kind,
+            MarketDimensionKind::Scaled {
+                min,
+                max,
+                increment,
+                unit,
+                lower_label,
+                upper_label,
+            } if *min == 10.0
+                && *max == 50.0
+                && *increment == 5.0
+                && unit.is_none()
+                && lower_label == "Low basis"
+                && upper_label == "High basis"
+        ));
+
+        let prices = vec![
+            1.0 / market.get_outcome_count() as f64;
+            market.get_outcome_count()
+        ];
+        let outcomes = market_outcomes(&market, &decisions, &prices);
+        let valid_combos = market.get_valid_state_combos();
+        assert_eq!(outcomes.len(), valid_combos.len());
+
+        for (display_index, (outcome, (full_state_index, coordinates))) in
+            outcomes.iter().zip(valid_combos.iter()).enumerate()
+        {
+            assert_eq!(outcome.index, display_index);
+            assert_eq!(outcome.display_index, display_index);
+            assert_eq!(outcome.full_state_index, *full_state_index);
+            assert_eq!(outcome.coordinates.as_slice(), coordinates.as_slice());
+            assert_eq!(outcome.current_price, outcome.probability);
+            assert!(
+                outcome.name.contains("Region")
+                    || outcome.name.contains("Estimate")
+            );
+        }
+    }
 }
