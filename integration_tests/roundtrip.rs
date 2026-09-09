@@ -25,8 +25,8 @@ use truthcoin_dc::{
 use truthcoin_dc_app_rpc_api::{
     BallotItem, CreateTradeRequest, DecisionClaimItem, DecisionClaimRequest,
     DecisionContentInfo, DecisionFilter, DecisionState, DimensionInput,
-    MarketBuyRequest, MarketCreateRequest, MarketSellRequest, RpcClient as _,
-    VoteFilter,
+    MarketBuyRequest, MarketCreateRequest, MarketSellRequest, MarketStatus,
+    RpcClient as _, VoteFilter,
 };
 
 use crate::{
@@ -183,7 +183,7 @@ mod expected_phase2 {
 
 /// Assertion helpers for test verification
 mod debug_helpers {
-    use truthcoin_dc_app_rpc_api::MarketData;
+    use truthcoin_dc_app_rpc_api::{MarketData, MarketStatus};
 
     /// Log detailed market state for debugging (only called on assertion failures)
     fn log_market_detail(market: &MarketData, label: &str) {
@@ -192,11 +192,10 @@ mod debug_helpers {
         tracing::error!(
             "  State: {}, Treasury: {}",
             market.state,
-            market.treasury
+            market.treasury_sats
         );
         tracing::error!("  Outcome count: {}", market.outcomes.len());
-        let price_sum: f64 =
-            market.outcomes.iter().map(|o| o.current_price).sum();
+        let price_sum: f64 = market.outcomes.iter().map(|o| o.price).sum();
         tracing::error!("  Price sum: {:.10}", price_sum);
     }
 
@@ -246,8 +245,7 @@ mod debug_helpers {
         market: &MarketData,
         market_label: &str,
     ) -> anyhow::Result<()> {
-        let price_sum: f64 =
-            market.outcomes.iter().map(|o| o.current_price).sum();
+        let price_sum: f64 = market.outcomes.iter().map(|o| o.price).sum();
         let tolerance = super::expected_phase2::lmsr::PRICE_SUM_TOLERANCE;
 
         if (price_sum - 1.0).abs() >= tolerance {
@@ -265,13 +263,13 @@ mod debug_helpers {
         market: &MarketData,
         market_id: &str,
     ) -> anyhow::Result<()> {
-        if market.state == "Settled" && market.treasury != 0.0 {
+        if market.state == MarketStatus::Settled && market.treasury_sats != 0 {
             tracing::error!("=== TREASURY NOT ZERO FOR SETTLED MARKET ===");
             log_market_detail(market, &format!("Market {market_id}"));
             anyhow::bail!(
                 "Settled market {} should have zero treasury, got {}",
                 market_id,
-                market.treasury
+                market.treasury_sats
             );
         }
         Ok(())
@@ -1016,7 +1014,7 @@ async fn roundtrip_task_inner(
     anyhow::ensure!(markets.len() == 4);
 
     for market in &markets {
-        anyhow::ensure!(market.state == "Trading");
+        anyhow::ensure!(market.state == MarketStatus::Trading);
         anyhow::ensure!(market.outcome_count == 2 || market.outcome_count == 3);
     }
 
@@ -1037,8 +1035,7 @@ async fn roundtrip_task_inner(
             .await?
             .ok_or_else(|| anyhow::anyhow!("Market not found: {market_id}"))?;
 
-        let price_sum: f64 =
-            market_data.outcomes.iter().map(|o| o.current_price).sum();
+        let price_sum: f64 = market_data.outcomes.iter().map(|o| o.price).sum();
         anyhow::ensure!(
             (price_sum - 1.0).abs() < expected::PRICE_SUM_TOLERANCE,
             "LMSR invariant violated: prices sum to {price_sum} (expected 1.0) for market {market_id}"
@@ -1047,10 +1044,10 @@ async fn roundtrip_task_inner(
         if market_data.outcomes.len() == 2 {
             for outcome in &market_data.outcomes {
                 anyhow::ensure!(
-                    (outcome.current_price - 0.5).abs() < 0.01,
+                    (outcome.price - 0.5).abs() < 0.01,
                     "Initial binary market price should be 0.5, got {} for outcome {}",
-                    outcome.current_price,
-                    outcome.name
+                    outcome.price,
+                    outcome.label
                 );
             }
         }
@@ -1374,7 +1371,7 @@ async fn roundtrip_task_inner(
             .market_get(market.market_id.clone())
             .await?;
         if let Some(market_data) = market_detail {
-            anyhow::ensure!(market_data.treasury > 0.0);
+            anyhow::ensure!(market_data.treasury_sats > 0);
         } else {
             anyhow::bail!("Market not found");
         }
@@ -1389,8 +1386,7 @@ async fn roundtrip_task_inner(
             .await?
             .ok_or_else(|| anyhow::anyhow!("Market not found: {market_id}"))?;
 
-        let price_sum: f64 =
-            market_data.outcomes.iter().map(|o| o.current_price).sum();
+        let price_sum: f64 = market_data.outcomes.iter().map(|o| o.price).sum();
         anyhow::ensure!(
             (price_sum - 1.0).abs() < expected::PRICE_SUM_TOLERANCE,
             "LMSR invariant violated after trading: prices sum to {price_sum} for market {market_id}"
@@ -1398,16 +1394,16 @@ async fn roundtrip_task_inner(
 
         for outcome in &market_data.outcomes {
             anyhow::ensure!(
-                outcome.current_price > 0.0 && outcome.current_price < 1.0,
+                outcome.price > 0.0 && outcome.price < 1.0,
                 "LMSR price out of bounds: {} for outcome {} in market {}",
-                outcome.current_price,
-                outcome.name,
+                outcome.price,
+                outcome.label,
                 market_id
             );
         }
 
         anyhow::ensure!(
-            market_data.treasury > 0.0,
+            market_data.treasury_sats > 0,
             "Market treasury should be positive after trades: {market_id}"
         );
     }
@@ -1523,7 +1519,7 @@ async fn roundtrip_task_inner(
     anyhow::ensure!(markets_during_voting.len() == 4);
 
     for market in markets_during_voting.iter() {
-        anyhow::ensure!(market.state == "Trading");
+        anyhow::ensure!(market.state == MarketStatus::Trading);
     }
 
     for market in &markets_during_voting {
@@ -1906,16 +1902,16 @@ async fn roundtrip_task_inner(
 
         let market = market_data.unwrap();
         anyhow::ensure!(
-            market.state == "Settled",
+            market.state == MarketStatus::Settled,
             "Expected market {} to be Settled, got {}",
             market_summary.market_id,
             market.state
         );
         anyhow::ensure!(
-            market.treasury == 0.0,
+            market.treasury_sats == 0,
             "Expected market {} treasury to be 0, got {}",
             market_summary.market_id,
-            market.treasury
+            market.treasury_sats
         );
         anyhow::ensure!(
             market.resolution.is_some(),
@@ -1939,11 +1935,11 @@ async fn roundtrip_task_inner(
             .ok_or_else(|| anyhow::anyhow!("No resolution for market"))?;
 
         anyhow::ensure!(
-            !market_data.decision_ids.is_empty(),
+            !market_data.dimensions.is_empty(),
             "Market {} has no decisions",
             market_summary.market_id
         );
-        let market_decision_id = &market_data.decision_ids[0];
+        let market_decision_id = &market_data.dimensions[0].decision_id;
         let expected_outcome = consensus_results
             .outcomes
             .get(market_decision_id)
@@ -1970,8 +1966,8 @@ async fn roundtrip_task_inner(
                 "Expected Yes (index 1) to be a winning outcome"
             );
             anyhow::ensure!(
-                (yes_outcome.unwrap().final_price - 1.0).abs() < tolerance,
-                "Yes outcome final_price should be 1.0"
+                (yes_outcome.unwrap().price - 1.0).abs() < tolerance,
+                "Yes outcome price should be 1.0"
             );
         } else if expected_outcome.abs() < tolerance {
             anyhow::ensure!(
@@ -1988,8 +1984,8 @@ async fn roundtrip_task_inner(
                 "Expected No (index 0) to be a winning outcome"
             );
             anyhow::ensure!(
-                (no_outcome.unwrap().final_price - 1.0).abs() < tolerance,
-                "No outcome final_price should be 1.0"
+                (no_outcome.unwrap().price - 1.0).abs() < tolerance,
+                "No outcome price should be 1.0"
             );
         } else {
             anyhow::ensure!(
@@ -1998,14 +1994,14 @@ async fn roundtrip_task_inner(
             );
             for winning in &resolution.winning_outcomes {
                 anyhow::ensure!(
-                    (winning.final_price - 0.5).abs() < tolerance,
-                    "ABSTAIN outcome should have final_price ~0.5"
+                    (winning.price - 0.5).abs() < tolerance,
+                    "ABSTAIN outcome should have price ~0.5"
                 );
             }
         }
 
         anyhow::ensure!(
-            market_data.treasury == 0.0,
+            market_data.treasury_sats == 0,
             "Market treasury should be 0 after payout distribution"
         );
     }
@@ -2078,7 +2074,7 @@ async fn roundtrip_task_inner(
                 .entry(market_summary.market_id.clone())
                 .or_default();
             for wo in &resolution.winning_outcomes {
-                entry.insert(wo.outcome_index, wo.final_price);
+                entry.insert(wo.outcome_index, wo.price);
             }
         }
     }
@@ -2759,7 +2755,7 @@ async fn roundtrip_task_inner(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Market not found"))?;
             let price_sum: f64 =
-                market_detail.outcomes.iter().map(|o| o.current_price).sum();
+                market_detail.outcomes.iter().map(|o| o.price).sum();
             anyhow::ensure!(
                 (price_sum - 1.0).abs() < expected::PRICE_SUM_TOLERANCE,
                 "LMSR invariant violated for market {}: prices sum to {}",
@@ -3613,8 +3609,7 @@ async fn roundtrip_task_inner(
             .await?
             .ok_or_else(|| anyhow::anyhow!("Market {market_name} not found"))?;
 
-        let price_sum: f64 =
-            market_data.outcomes.iter().map(|o| o.current_price).sum();
+        let price_sum: f64 = market_data.outcomes.iter().map(|o| o.price).sum();
 
         anyhow::ensure!(
             (price_sum - 1.0).abs() < expected::PRICE_SUM_TOLERANCE,
@@ -4213,7 +4208,7 @@ async fn roundtrip_task_inner(
             .await?
             .ok_or_else(|| anyhow::anyhow!("Market not found"))?;
 
-        if market_data.state == "Settled" {
+        if market_data.state == MarketStatus::Settled {
             anyhow::ensure!(
                 !remaining_treasury.contains_key(market_id),
                 "Settled market {market_id} should not have remaining treasury UTXO"

@@ -34,9 +34,9 @@ use truthcoin_dc_app_rpc_api::{
     ConsensusResults, CreateTradeRequest, CreateTradeResponse, DecisionFilter,
     DecisionListItem, DecisionState, DecisionSummary, MarketAmplifyBetaRequest,
     MarketBuyRequest, MarketBuyResponse, MarketDimension, MarketDimensionKind,
-    MarketOutcome, MarketSellRequest, MarketSellResponse, ParticipationStats,
-    PeriodStats, RpcServer, SubmitBallotRequest, TxInfo, VoteFilter, VoteInfo,
-    VoterInfo, VoterInfoFull, VotingPeriodFull,
+    MarketOutcome, MarketSellRequest, MarketSellResponse, MarketStatus,
+    ParticipationStats, PeriodStats, RpcServer, SubmitBallotRequest, TxInfo,
+    VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
 };
 
 use crate::app::App;
@@ -148,16 +148,14 @@ fn market_outcomes(
                 prices.get(display_index).copied().unwrap_or(0.0);
 
             MarketOutcome {
-                name,
-                current_price,
-                probability: current_price,
+                outcome_index: display_index,
+                label: name,
+                price: current_price,
                 volume_sats: market
                     .outcome_volumes_sats
                     .get(display_index)
                     .copied()
                     .unwrap_or(0),
-                index: display_index,
-                display_index,
                 full_state_index: *full_state_index,
                 coordinates: (*coordinates).clone(),
             }
@@ -422,12 +420,6 @@ impl RpcServerImpl {
             market_dimension_data(&market, &decisions).map_err(custom_err)?;
         let outcomes = market_outcomes(&market, &decisions, &prices);
 
-        let decision_ids: Vec<String> = market
-            .decision_ids
-            .iter()
-            .map(|decision_id| decision_id.to_hex())
-            .collect();
-
         let resolution = if computed_state
             == truthcoin_dc::state::markets::MarketState::Settled
         {
@@ -448,27 +440,21 @@ impl RpcServerImpl {
                     winning_outcomes.push(
                         truthcoin_dc_app_rpc_api::WinningOutcome {
                             outcome_index: i,
-                            outcome_name: name,
-                            final_price,
+                            label: name,
+                            price: final_price,
                         },
                     );
                 }
             }
 
             let summary = if winning_outcomes.len() == 1 {
-                format!("Resolved: {}", winning_outcomes[0].outcome_name)
+                format!("Resolved: {}", winning_outcomes[0].label)
             } else if winning_outcomes.is_empty() {
                 "No winning outcome".to_string()
             } else {
                 let names: Vec<String> = winning_outcomes
                     .iter()
-                    .map(|w| {
-                        format!(
-                            "{} ({:.1}%)",
-                            w.outcome_name,
-                            w.final_price * 100.0
-                        )
-                    })
+                    .map(|w| format!("{} ({:.1}%)", w.label, w.price * 100.0))
                     .collect();
                 format!("Resolved: {}", names.join(", "))
             };
@@ -486,32 +472,26 @@ impl RpcServerImpl {
             .node
             .get_market_treasury_sats(&market_id_struct)
             .map_err(custom_err)?;
-        let treasury_btc = (treasury_sats as f64) / 100_000_000.0;
-
         let market_data = truthcoin_dc_app_rpc_api::MarketData {
             market_id,
             title: market.title.clone(),
             description: market.description.clone(),
-            outcomes,
-            state: format!("{computed_state:?}"),
-            market_maker: market.creator_address.to_string(),
-            expires_at: market.expires_at_height,
-            beta: effective_b,
-            trading_fee: market.trading_fee(),
             tags: market.tags.clone(),
+            creator_address: market.creator_address.to_string(),
             created_at_height: market.created_at_height,
-            treasury: treasury_btc,
+            expires_at_height: market.expires_at_height,
+            dimensions,
+            outcomes,
+            state: MarketStatus::from(computed_state),
+            beta: effective_b,
+            liquidity_base_sats: market.liquidity_base_sats,
+            treasury_sats,
             total_volume_sats,
-            liquidity: treasury_btc,
-            decision_ids,
+            trading_fee_rate: market.trading_fee(),
             resolution,
             tx_pow_hash_selector: market.tx_pow_hash_selector,
             tx_pow_ordering: market.tx_pow_ordering,
             tx_pow_difficulty: market.tx_pow_difficulty,
-            dimensions,
-            liquidity_base_sats: market.liquidity_base_sats,
-            treasury_sats,
-            trading_fee_rate: market.trading_fee(),
         };
 
         Ok(Some(market_data))
@@ -1820,7 +1800,7 @@ impl RpcServer for RpcServerImpl {
                         market.description.clone()
                     },
                     outcome_count: market.get_outcome_count(),
-                    state: format!("{computed_state:?}"),
+                    state: MarketStatus::from(computed_state),
                     volume_sats: market.total_volume_sats,
                     created_at_height: market.created_at_height,
                 }
@@ -2995,14 +2975,13 @@ mod tests {
         for (display_index, (outcome, (full_state_index, coordinates))) in
             outcomes.iter().zip(valid_combos.iter()).enumerate()
         {
-            assert_eq!(outcome.index, display_index);
-            assert_eq!(outcome.display_index, display_index);
+            assert_eq!(outcome.outcome_index, display_index);
             assert_eq!(outcome.full_state_index, *full_state_index);
             assert_eq!(outcome.coordinates.as_slice(), coordinates.as_slice());
-            assert_eq!(outcome.current_price, outcome.probability);
+            assert_eq!(outcome.price, prices[display_index]);
             assert!(
-                outcome.name.contains("Region")
-                    || outcome.name.contains("Estimate")
+                outcome.label.contains("Region")
+                    || outcome.label.contains("Estimate")
             );
         }
     }
