@@ -11,7 +11,9 @@ pub enum Error {
     CusfMainchain(#[from] proto::Error),
     #[error("merkle root mismatch: header and body are inconsistent")]
     MerkleRootMismatch,
-    #[error("BMM candidate is stale; rebuild it against the current parent tip")]
+    #[error(
+        "BMM candidate is stale; rebuild it against the current parent tip"
+    )]
     StaleCandidate,
 }
 
@@ -51,11 +53,15 @@ where
         header: Header,
         body: Body,
     ) -> Result<bitcoin::Txid, Error> {
-        if header.merkle_root != Body::compute_merkle_root(&body.coinbase, &body.transactions) {
+        if header.merkle_root
+            != Body::compute_merkle_root(&body.coinbase, &body.transactions)
+        {
             return Err(Error::MerkleRootMismatch);
         }
         let tip = self.cusf_mainchain.get_chain_tip().await?;
-        if tip.block_hash != header.prev_main_hash || (height != 0 && height != tip.height) {
+        if tip.block_hash != header.prev_main_hash
+            || (height != 0 && height != tip.height)
+        {
             return Err(Error::StaleCandidate);
         }
         let critical_hash = header.hash().0;
@@ -90,10 +96,16 @@ where
         if tip.block_hash != header.prev_main_hash {
             let distance = tip.height.saturating_sub(parent_height);
             if distance > 0 && distance <= 10_000 {
-                if let Some(infos) = self.cusf_mainchain.get_block_infos(tip.block_hash, distance - 1).await? {
+                if let Some(infos) = self
+                    .cusf_mainchain
+                    .get_block_infos(tip.block_hash, distance - 1)
+                    .await?
+                {
                     for (info, block) in infos {
                         if info.prev_block_hash == header.prev_main_hash {
-                            return Ok((block.bmm_commitment == Some(header.hash())).then_some((info.block_hash, header, body)));
+                            return Ok((block.bmm_commitment
+                                == Some(header.hash()))
+                            .then_some((info.block_hash, header, body)));
                         }
                     }
                 }
@@ -102,17 +114,25 @@ where
         }
         while let Some(event) = events.try_next().await? {
             match event {
-                Event::ConnectBlock { header_info, block_info } => {
+                Event::ConnectBlock {
+                    header_info,
+                    block_info,
+                } => {
                     if header_info.prev_block_hash == header.prev_main_hash {
-                        return Ok((block_info.bmm_commitment == Some(header.hash()))
-                            .then_some((header_info.block_hash, header, body)));
+                        return Ok((block_info.bmm_commitment
+                            == Some(header.hash()))
+                        .then_some((header_info.block_hash, header, body)));
                     }
                     // A different branch or an advanced tip requires a fresh
                     // candidate, with fresh deadline and execution validation.
-                    if header_info.height > parent_height { return Ok(None); }
+                    if header_info.height > parent_height {
+                        return Ok(None);
+                    }
                 }
                 Event::DisconnectBlock { block_hash } => {
-                    if block_hash == header.prev_main_hash { return Ok(None); }
+                    if block_hash == header.prev_main_hash {
+                        return Ok(None);
+                    }
                 }
             }
         }

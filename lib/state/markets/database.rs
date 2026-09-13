@@ -474,6 +474,23 @@ impl MarketsDatabase {
                     &decisions,
                 )?;
 
+                let mut payout_addresses = std::collections::BTreeSet::new();
+                let mut pre_settlement_share_accounts = Vec::new();
+                for payout in &payout_summary.payouts {
+                    if payout_addresses.insert(payout.address) {
+                        let account = self
+                            .get_user_share_account(txn, &payout.address)?
+                            .ok_or_else(|| Error::InvalidTransaction {
+                                reason: format!(
+                                    "missing share account for payout address {}",
+                                    payout.address
+                                ),
+                            })?;
+                        pre_settlement_share_accounts
+                            .push((payout.address, account));
+                    }
+                }
+
                 // Apply payouts
                 self.apply_automatic_share_payouts(
                     state,
@@ -502,6 +519,7 @@ impl MarketsDatabase {
                     payout_summary: payout_summary.clone(),
                     treasury_utxo,
                     fee_utxo,
+                    pre_settlement_share_accounts,
                 });
 
                 results.push((market_id, payout_summary));
@@ -711,18 +729,27 @@ impl MarketsDatabase {
         Ok(())
     }
 
-    pub(crate) fn restore_share_account(&self, txn: &mut RwTxn, address: Address, account: Option<&ShareAccount>) -> Result<(), Error> {
-        if let Some(account) = account { self.share_accounts.put(txn, &address, account)?; }
-        else { self.share_accounts.delete(txn, &address)?; }
-        Ok(())
-    }
-
     pub fn get_user_share_account(
         &self,
         txn: &RoTxn,
         address: &Address,
     ) -> Result<Option<ShareAccount>, Error> {
         Ok(self.share_accounts.try_get(txn, address)?)
+    }
+
+    pub fn restore_share_account(
+        &self,
+        txn: &mut RwTxn,
+        address: &Address,
+        account: Option<&ShareAccount>,
+    ) -> Result<(), Error> {
+        match account {
+            Some(account) => self.share_accounts.put(txn, address, account)?,
+            None => {
+                self.share_accounts.delete(txn, address)?;
+            }
+        }
+        Ok(())
     }
 
     /// Get all share accounts from the database (for debugging)
@@ -984,7 +1011,12 @@ impl MarketsDatabase {
         let mut sequence = 0u32;
 
         for payout in &payout_summary.payouts {
-            let ordinary_payout = state.native().settle_payout(state, txn, payout, block_height)?;
+            let ordinary_payout = state.native().settle_payout(
+                state,
+                txn,
+                payout,
+                block_height,
+            )?;
             if ordinary_payout > 0 {
                 let outpoint = generate_share_payout_outpoint(
                     &payout.market_id,

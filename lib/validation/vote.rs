@@ -5,6 +5,15 @@ use sneed::RoTxn;
 pub struct VoteValidator;
 
 impl VoteValidator {
+    /// Canonical finite transaction encoding for an explicit abstention.
+    /// Borsh rejects NaN, so NaN can only exist in internal math APIs and
+    /// cannot be used as a signed wire value.
+    pub const ABSTAIN_WIRE_VALUE: f64 = -1.0;
+
+    fn is_abstain(vote_value: f64) -> bool {
+        vote_value.is_nan() || vote_value == Self::ABSTAIN_WIRE_VALUE
+    }
+
     pub fn convert_vote_value(
         vote_value: f64,
     ) -> crate::state::voting::types::VoteValue {
@@ -17,7 +26,7 @@ impl VoteValidator {
     ) -> crate::state::voting::types::VoteValue {
         use crate::state::voting::types::VoteValue;
 
-        if vote_value.is_nan() {
+        if Self::is_abstain(vote_value) {
             return VoteValue::Abstain;
         }
 
@@ -75,7 +84,7 @@ impl VoteValidator {
         decision: &crate::state::decisions::Decision,
         vote_value: f64,
     ) -> Result<(), Error> {
-        if vote_value.is_nan() {
+        if Self::is_abstain(vote_value) {
             return Ok(());
         }
 
@@ -408,6 +417,18 @@ mod tests {
     }
 
     #[test]
+    fn convert_finite_wire_sentinel_returns_abstain() {
+        assert_eq!(
+            VoteValidator::convert_vote_value(
+                VoteValidator::ABSTAIN_WIRE_VALUE
+            ),
+            VoteValue::Abstain
+        );
+        assert!(VoteValidator::ABSTAIN_WIRE_VALUE.is_finite());
+        assert!(borsh::to_vec(&VoteValidator::ABSTAIN_WIRE_VALUE).is_ok());
+    }
+
+    #[test]
     fn convert_zero_returns_binary_false() {
         assert_eq!(
             VoteValidator::convert_vote_value(0.0),
@@ -476,6 +497,13 @@ mod tests {
         assert!(VoteValidator::validate_vote_value(&d, 0.5).is_ok());
         assert!(VoteValidator::validate_vote_value(&d, 1.0).is_ok());
         assert!(VoteValidator::validate_vote_value(&d, f64::NAN).is_ok());
+        assert!(
+            VoteValidator::validate_vote_value(
+                &d,
+                VoteValidator::ABSTAIN_WIRE_VALUE
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -518,6 +546,13 @@ mod tests {
         assert!(VoteValidator::validate_vote_value(&d, 2.0).is_ok());
         assert!(VoteValidator::validate_vote_value(&d, 3.0).is_ok());
         assert!(VoteValidator::validate_vote_value(&d, f64::NAN).is_ok());
+        assert!(
+            VoteValidator::validate_vote_value(
+                &d,
+                VoteValidator::ABSTAIN_WIRE_VALUE
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -538,7 +573,7 @@ mod tests {
         .unwrap();
 
         assert!(VoteValidator::validate_vote_value(&d, 4.0).is_err());
-        assert!(VoteValidator::validate_vote_value(&d, -1.0).is_err());
+        assert!(VoteValidator::validate_vote_value(&d, -0.5).is_err());
         assert!(VoteValidator::validate_vote_value(&d, 1.5).is_err());
     }
 

@@ -196,7 +196,11 @@ impl MemPool {
     }
 
     fn is_trade_tx(transaction: &AuthorizedTransaction) -> bool {
-        transaction.transaction.data.as_ref().is_some_and(|data| data.is_trade())
+        transaction
+            .transaction
+            .data
+            .as_ref()
+            .is_some_and(|data| data.is_trade())
     }
 
     /// Extract decision IDs being claimed by this transaction

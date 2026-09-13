@@ -155,7 +155,7 @@ where
         <MainchainTransport as tonic::client::GrpcService<
             tonic::body::Body,
         >>::Future: Send,
-    {
+{
         let env_path = datadir.join("data.mdb");
         std::fs::create_dir_all(&env_path)?;
         let env = {
@@ -345,8 +345,18 @@ where
                             )?;
                         }
                     }
-                    crate::types::TxData::NativeOperation(crate::types::native::NativeOperationV1::BuyForIntent { intent, .. }) => {
-                        self.update_mempool_buy(&mut rwtxn, intent.market_id, intent.outcome_index, intent.shares)?;
+                    crate::types::TxData::NativeOperation(
+                        crate::types::native::NativeOperationV1::BuyForIntent {
+                            intent,
+                            ..
+                        },
+                    ) => {
+                        self.update_mempool_buy(
+                            &mut rwtxn,
+                            intent.market_id,
+                            intent.outcome_index,
+                            intent.shares,
+                        )?;
                     }
                     crate::types::TxData::NativeOperation(_) => {}
                     crate::types::TxData::ClaimDecision(_)
@@ -911,10 +921,29 @@ where
 
         // Reuse the same LMSR path for sponsored recipient-authorized buys.
         let sponsored_trade;
-        let tx_data = if let TxData::NativeOperation(crate::types::native::NativeOperationV1::BuyForIntent { intent, limit_sats, tx_pow_nonce, prev_block_hash, .. }) = tx_data {
-            sponsored_trade = TxData::Trade { market_id: intent.market_id, outcome_index: intent.outcome_index, shares: intent.shares, trader: intent.recipient, limit_sats: *limit_sats, tx_pow_nonce: *tx_pow_nonce, prev_block_hash: *prev_block_hash };
+        let tx_data = if let TxData::NativeOperation(
+            crate::types::native::NativeOperationV1::BuyForIntent {
+                intent,
+                limit_sats,
+                tx_pow_nonce,
+                prev_block_hash,
+                ..
+            },
+        ) = tx_data
+        {
+            sponsored_trade = TxData::Trade {
+                market_id: intent.market_id,
+                outcome_index: intent.outcome_index,
+                shares: intent.shares,
+                trader: intent.recipient,
+                limit_sats: *limit_sats,
+                tx_pow_nonce: *tx_pow_nonce,
+                prev_block_hash: *prev_block_hash,
+            };
             &sponsored_trade
-        } else { tx_data };
+        } else {
+            tx_data
+        };
         match tx_data {
             TxData::Trade {
                 market_id,
@@ -1484,58 +1513,137 @@ where
 
     /// Build against the supplied current parent and execute in an aborted
     /// transaction. Required native operations must apply, not soft-skip.
-    pub fn create_bmm_candidate(&self, parent: bitcoin::BlockHash, transactions: Vec<AuthorizedTransaction>, coinbase_address: Address) -> Result<crate::types::native::NativeBmmCandidateV1, Error> {
+    pub fn create_bmm_candidate(
+        &self,
+        parent: bitcoin::BlockHash,
+        transactions: Vec<AuthorizedTransaction>,
+        coinbase_address: Address,
+    ) -> Result<crate::types::native::NativeBmmCandidateV1, Error> {
         let txn = self.env.read_txn()?;
         let mut fees = bitcoin::Amount::ZERO;
         for tx in &transactions {
-            let filled = self.state.fill_authorized_transaction(&txn, tx.clone())?;
-            let fee = if filled.transaction.transaction.data.as_ref().is_some_and(|data| data.is_trade()) {
-                bitcoin::Amount::from_sat(crate::math::trading::TRADE_MINER_FEE_SATS)
+            let filled =
+                self.state.fill_authorized_transaction(&txn, tx.clone())?;
+            let fee = if filled
+                .transaction
+                .transaction
+                .data
+                .as_ref()
+                .is_some_and(|data| data.is_trade())
+            {
+                bitcoin::Amount::from_sat(
+                    crate::math::trading::TRADE_MINER_FEE_SATS,
+                )
             } else {
                 let inputs = filled.transaction.spent_bitcoin_value()?;
-                let outputs = filled.transaction.transaction.outputs.iter().map(GetBitcoinValue::get_bitcoin_value).checked_sum().ok_or(AmountOverflowError)?;
+                let outputs = filled
+                    .transaction
+                    .transaction
+                    .outputs
+                    .iter()
+                    .map(GetBitcoinValue::get_bitcoin_value)
+                    .checked_sum()
+                    .ok_or(AmountOverflowError)?;
                 inputs.checked_sub(outputs).ok_or(AmountUnderflowError)?
             };
             fees = fees.checked_add(fee).ok_or(AmountOverflowError)?;
         }
         let tip = self.state.try_get_tip(&txn)?;
         let coinbase = if fees > bitcoin::Amount::ZERO || tip.is_none() {
-            vec![crate::types::Output::new(coinbase_address, crate::types::OutputContent::Bitcoin(crate::types::BitcoinOutputContent(fees)))]
-        } else { Vec::new() };
+            vec![crate::types::Output::new(
+                coinbase_address,
+                crate::types::OutputContent::Bitcoin(
+                    crate::types::BitcoinOutputContent(fees),
+                ),
+            )]
+        } else {
+            Vec::new()
+        };
         let body = Body::new(transactions, coinbase);
-        let header = Header { prev_side_hash:tip, prev_main_hash:parent, merkle_root:Body::compute_merkle_root(&body.coinbase,&body.transactions) };
+        let header = Header {
+            prev_side_hash: tip,
+            prev_main_hash: parent,
+            merkle_root: Body::compute_merkle_root(
+                &body.coinbase,
+                &body.transactions,
+            ),
+        };
         drop(txn);
         self.preview_bmm_candidate(header, body)
     }
 
-    pub fn preview_bmm_candidate(&self, header: Header, body: Body) -> Result<crate::types::native::NativeBmmCandidateV1, Error> {
+    pub fn preview_bmm_candidate(
+        &self,
+        header: Header,
+        body: Body,
+    ) -> Result<crate::types::native::NativeBmmCandidateV1, Error> {
         let mut txn = self.env.write_txn()?;
-        let parent_height = self.archive.get_main_height(&txn, header.prev_main_hash)?.checked_add(1).ok_or(AmountOverflowError)?;
-        let timestamp = self.archive.get_main_header_info(&txn, &header.prev_main_hash)?.timestamp;
-        self.state.apply_block(&self.archive, &mut txn, &header, &body, timestamp)?;
+        let parent_height = self
+            .archive
+            .get_main_height(&txn, header.prev_main_hash)?
+            .checked_add(1)
+            .ok_or(AmountOverflowError)?;
+        let timestamp = self
+            .archive
+            .get_main_header_info(&txn, &header.prev_main_hash)?
+            .timestamp;
+        self.state.apply_block(
+            &self.archive,
+            &mut txn,
+            &header,
+            &body,
+            timestamp,
+        )?;
         let mut preview_effects = Vec::new();
         for tx in &body.transactions {
             if matches!(tx.data, Some(TxData::NativeOperation(_))) {
-                preview_effects.push(self.state.native().get_effect(&txn, tx.txid().0)?.ok_or_else(|| state::Error::InvalidTransaction {reason:"required native operation soft-skipped".into()})?);
+                preview_effects.push(
+                    self.state
+                        .native()
+                        .get_effect(&txn, tx.txid().0)?
+                        .ok_or_else(|| state::Error::InvalidTransaction {
+                            reason: "required native operation soft-skipped"
+                                .into(),
+                        })?,
+                );
             }
         }
         // Dropping the transaction removes every preview state mutation.
-        Ok(crate::types::native::NativeBmmCandidateV1 {header,body,parent_height,preview_effects})
+        Ok(crate::types::native::NativeBmmCandidateV1 {
+            header,
+            body,
+            parent_height,
+            preview_effects,
+        })
     }
 
-    pub fn get_native_escrow(&self, id: [u8; 32]) -> Result<Option<crate::types::native::ShareEscrowV1>, Error> {
+    pub fn get_native_escrow(
+        &self,
+        id: [u8; 32],
+    ) -> Result<Option<crate::types::native::ShareEscrowV1>, Error> {
         let txn = self.env.read_txn()?;
         Ok(self.state.native().get_escrow(&txn, id)?)
     }
 
-    pub fn get_native_effect(&self, id: [u8; 32]) -> Result<Option<crate::types::native::NativeEffectV1>, Error> {
+    pub fn get_native_effect(
+        &self,
+        id: [u8; 32],
+    ) -> Result<Option<crate::types::native::NativeEffectV1>, Error> {
         let txn = self.env.read_txn()?;
         Ok(self.state.native().get_effect(&txn, id)?)
     }
 
-    pub fn get_native_reserved_shares(&self, owner: Address, market: crate::state::markets::MarketId, outcome: u32) -> Result<i64, Error> {
+    pub fn get_native_reserved_shares(
+        &self,
+        owner: Address,
+        market: crate::state::markets::MarketId,
+        outcome: u32,
+    ) -> Result<i64, Error> {
         let txn = self.env.read_txn()?;
-        Ok(self.state.native().reserved_shares(&txn, owner, market, outcome)?)
+        Ok(self
+            .state
+            .native()
+            .reserved_shares(&txn, owner, market, outcome)?)
     }
 
     pub fn get_listing_fee_info(
