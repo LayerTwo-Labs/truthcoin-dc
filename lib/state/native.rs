@@ -285,6 +285,8 @@ impl NativeDbs {
                 let kind = NativeEffectKindV1::Assigned {
                     previous_claim_address: escrow.claim_address,
                     previous_refund_address: escrow.refund_address,
+                    valid_from_parent: intent.valid_from_parent,
+                    valid_before_parent: intent.valid_before_parent,
                 };
                 self.capture_escrow(txn, height, escrow.escrow_id)?;
                 escrow.claim_address = *new_claim_address;
@@ -733,6 +735,10 @@ pub fn validate(
             claim_authorization,
             refund_authorization,
         } => {
+            validate_window(
+                intent.valid_from_parent,
+                intent.valid_before_parent,
+            )?;
             // Ownership is checked against ordered execution state, so a child
             // created or assigned earlier in this block can be mutated safely.
             if !intent.verify(claim_authorization)
@@ -799,6 +805,9 @@ pub fn check_deadline(
 ) -> Result<(), Error> {
     let window = match operation {
         NativeOperationV1::BuyForIntent { intent, .. } => {
+            Some((intent.valid_from_parent, intent.valid_before_parent))
+        }
+        NativeOperationV1::MutateEscrow { intent, .. } => {
             Some((intent.valid_from_parent, intent.valid_before_parent))
         }
         NativeOperationV1::TransferShares {

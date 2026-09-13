@@ -91,6 +91,9 @@ pub struct EscrowMutationIntentV1 {
     #[schema(value_type = Vec<u8>)]
     pub nonce: NativeId,
     pub mutation: EscrowMutationV1,
+    /// Inclusive/exclusive heights of the parent block accepting this candidate.
+    pub valid_from_parent: u32,
+    pub valid_before_parent: u32,
 }
 
 impl EscrowMutationIntentV1 {
@@ -293,6 +296,8 @@ pub enum NativeEffectKindV1 {
     Assigned {
         previous_claim_address: Address,
         previous_refund_address: Address,
+        valid_from_parent: u32,
+        valid_before_parent: u32,
     },
     Split {
         first_child: ShareEscrowV1,
@@ -370,6 +375,8 @@ mod tests {
                 new_refund_address: Address([5; 20]),
                 reference: [6; 32],
             },
+            valid_from_parent: 10,
+            valid_before_parent: 20,
         };
         let auth = Authorization {
             verifying_key: key.verifying_key().into(),
@@ -386,6 +393,15 @@ mod tests {
         let mut changed = intent.clone();
         changed.nonce[0] ^= 1;
         assert!(!changed.verify(&auth));
+        for change_from in [true, false] {
+            let mut changed = intent.clone();
+            if change_from {
+                changed.valid_from_parent += 1;
+            } else {
+                changed.valid_before_parent += 1;
+            }
+            assert!(!changed.verify(&auth));
+        }
         for field in 0..4 {
             let mut changed = intent.clone();
             if let EscrowMutationV1::Assign {

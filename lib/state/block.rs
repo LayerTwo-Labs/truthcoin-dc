@@ -3368,6 +3368,8 @@ mod native_integration_tests {
             genesis_hash: [1; 32].into(),
             nonce: [nonce; 32],
             mutation,
+            valid_from_parent: 0,
+            valid_before_parent: 1000,
         };
         let sign =
             |key: &ed25519_dalek::SigningKey| crate::types::Authorization {
@@ -3489,6 +3491,114 @@ mod native_integration_tests {
     }
 
     #[test]
+    fn mutation_expiry_is_signed_and_atomic_at_accepting_parent_boundary() {
+        for accepted_parent in [5, 6, 9, 10, 11] {
+            let (env, state, _dir, market, owner) = fixture();
+            let a = rights_key(11);
+            let b = rights_key(12);
+            let c = rights_key(13);
+            let mut lock_tx = lock(owner, market, 1, 70);
+            if let Some(TxData::NativeOperation(
+                NativeOperationV1::LockShares {
+                    claim_address,
+                    refund_address,
+                    ..
+                },
+            )) = &mut lock_tx.transaction.data
+            {
+                *claim_address = rights_address(&a);
+                *refund_address = rights_address(&b);
+            }
+            let id = escrow_id(lock_tx.txid().0);
+            let mut txn = env.write_txn().unwrap();
+            let mut update = StateUpdate::new();
+            execute(&state, &mut txn, &mut update, &lock_tx, 1, 5).unwrap();
+            let prior = state.native().get_escrow(&txn, id).unwrap();
+            let mut tx = mutation(
+                EscrowMutationV1::Assign {
+                    escrow_id: id,
+                    new_claim_address: rights_address(&c),
+                    new_refund_address: rights_address(&c),
+                    reference: [23; 32],
+                },
+                2,
+                &a,
+                Some(&b),
+            );
+            if let Some(TxData::NativeOperation(
+                NativeOperationV1::MutateEscrow {
+                    intent,
+                    claim_authorization,
+                    refund_authorization,
+                },
+            )) = &mut tx.transaction.data
+            {
+                intent.valid_from_parent = 6;
+                intent.valid_before_parent = 10;
+                assert!(!intent.verify(claim_authorization));
+                let sign = |key: &ed25519_dalek::SigningKey| {
+                    crate::types::Authorization {
+                        verifying_key: key.verifying_key().into(),
+                        signature: crate::authorization::sign(
+                            key,
+                            crate::authorization::Dst::NativeEscrowMutation,
+                            &intent.signing_bytes().unwrap(),
+                        ),
+                    }
+                };
+                *claim_authorization = sign(&a);
+                *refund_authorization = Some(sign(&b));
+            }
+            let result =
+                execute(&state, &mut txn, &mut update, &tx, 2, accepted_parent);
+            if (6..10).contains(&accepted_parent) {
+                result.unwrap();
+                let effect = state
+                    .native()
+                    .get_effect(&txn, tx.txid().0)
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    effect.kind,
+                    NativeEffectKindV1::Assigned {
+                        valid_from_parent: 6,
+                        valid_before_parent: 10,
+                        ..
+                    }
+                ));
+                assert_eq!(effect.parent_height, accepted_parent);
+                state.native().restore(&state, &mut txn, 2).unwrap();
+                assert_eq!(state.native().get_escrow(&txn, id).unwrap(), prior);
+                assert!(
+                    state
+                        .native()
+                        .get_effect(&txn, tx.txid().0)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert!(result.is_err());
+                assert_eq!(state.native().get_escrow(&txn, id).unwrap(), prior);
+                assert!(
+                    state
+                        .native()
+                        .get_effect(&txn, tx.txid().0)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    state
+                        .native()
+                        .nonces
+                        .try_get(&txn, &(rights_address(&a), [2; 32]))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn native_split_assign_and_claim_ordered_atomic_rights_and_undo() {
         let (env, state, _dir, market, owner) = fixture();
         let a = rights_key(11);
@@ -3588,7 +3698,9 @@ mod native_integration_tests {
             receipt.kind,
             NativeEffectKindV1::Assigned {
                 previous_claim_address: rights_address(&a),
-                previous_refund_address: rights_address(&b)
+                previous_refund_address: rights_address(&b),
+                valid_from_parent: 0,
+                valid_before_parent: 1000,
             }
         );
         let stale = mutation(
