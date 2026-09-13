@@ -940,6 +940,26 @@ impl Wallet {
         })
     }
 
+    pub fn sign_native_escrow_mutation(
+        &self,
+        intent: &crate::types::native::EscrowMutationIntentV1,
+        signer: Address,
+    ) -> Result<Authorization, Error> {
+        let txn = self.env.read_txn()?;
+        let key = self.get_tx_signing_key_for_addr(&txn, &signer)?;
+        let bytes = intent
+            .signing_bytes()
+            .map_err(crate::authorization::Error::from)?;
+        Ok(Authorization {
+            verifying_key: key.verifying_key().into(),
+            signature: authorization::sign(
+                &key,
+                authorization::Dst::NativeEscrowMutation,
+                &bytes,
+            ),
+        })
+    }
+
     /// Build an `AmplifyBeta` transaction that adds `amount` sats to the
     /// market's treasury, increasing its LMSR beta (liquidity depth).
     /// The wallet must own a UTXO belonging to `market_author` so the

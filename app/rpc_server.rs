@@ -2808,6 +2808,17 @@ impl RpcServer for RpcServerImpl {
             .map_err(custom_err)
     }
 
+    async fn sign_native_escrow_mutation(
+        &self,
+        intent: truthcoin_dc::types::native::EscrowMutationIntentV1,
+        signer: Address,
+    ) -> RpcResult<Authorization> {
+        self.app
+            .wallet
+            .sign_native_escrow_mutation(&intent, signer)
+            .map_err(custom_err)
+    }
+
     async fn create_native_operation(
         &self,
         operation: truthcoin_dc::types::native::NativeOperationV1,

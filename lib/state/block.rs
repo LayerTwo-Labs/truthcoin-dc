@@ -2038,6 +2038,7 @@ fn apply_native_operation(
                 outcome_index: intent.outcome_index,
                 shares: intent.shares,
                 asset: EscrowAssetV1::Shares,
+                escrow_snapshot: None,
             }
         }
         NativeOperationV1::TransferShares {
@@ -2082,6 +2083,7 @@ fn apply_native_operation(
                 outcome_index: *outcome_index,
                 shares: *shares,
                 asset: EscrowAssetV1::Shares,
+                escrow_snapshot: None,
             }
         }
         NativeOperationV1::LockShares {
@@ -2134,8 +2136,12 @@ fn apply_native_operation(
                 outcome_index: *outcome_index,
                 shares: *shares,
                 asset: EscrowAssetV1::Shares,
+                escrow_snapshot: Some(escrow),
             }
         }
+        NativeOperationV1::MutateEscrow { .. } => state
+            .native()
+            .mutate_escrow(txn, height, parent_height, txid, operation)?,
         NativeOperationV1::ClaimEscrow { escrow_id, .. }
         | NativeOperationV1::RefundEscrow { escrow_id } => {
             let mut escrow = state
@@ -2194,7 +2200,8 @@ fn apply_native_operation(
                 market_id: escrow.market_id,
                 outcome_index: escrow.outcome_index,
                 shares: escrow.shares,
-                asset: escrow.asset,
+                asset: escrow.asset.clone(),
+                escrow_snapshot: Some(escrow),
             }
         }
     };
@@ -3342,6 +3349,299 @@ mod native_integration_tests {
             .and_then(|a| a.positions.get(&(market, 0)).copied())
             .unwrap_or(0)
     }
+    fn rights_key(n: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[n; 32])
+    }
+    fn rights_address(key: &ed25519_dalek::SigningKey) -> Address {
+        crate::authorization::get_address(&key.verifying_key().into())
+    }
+    fn mutation(
+        mutation: EscrowMutationV1,
+        nonce: u8,
+        claim: &ed25519_dalek::SigningKey,
+        refund: Option<&ed25519_dalek::SigningKey>,
+    ) -> FilledTransaction {
+        let intent = EscrowMutationIntentV1 {
+            genesis_hash: [1; 32].into(),
+            nonce: [nonce; 32],
+            mutation,
+        };
+        let sign =
+            |key: &ed25519_dalek::SigningKey| crate::types::Authorization {
+                verifying_key: key.verifying_key().into(),
+                signature: crate::authorization::sign(
+                    key,
+                    crate::authorization::Dst::NativeEscrowMutation,
+                    &intent.signing_bytes().unwrap(),
+                ),
+            };
+        let claim_authorization = sign(claim);
+        let refund_authorization = refund.map(sign);
+        filled(NativeOperationV1::MutateEscrow {
+            intent,
+            claim_authorization,
+            refund_authorization,
+        })
+    }
+    #[test]
+    fn native_split_assign_and_claim_ordered_atomic_rights_and_undo() {
+        let (env, state, _dir, market, owner) = fixture();
+        let a = rights_key(11);
+        let b = rights_key(12);
+        let c = rights_key(13);
+        let mut lock_tx = lock(owner, market, 1, 70);
+        if let Some(TxData::NativeOperation(NativeOperationV1::LockShares {
+            claim_address,
+            refund_address,
+            ..
+        })) = &mut lock_tx.transaction.data
+        {
+            *claim_address = rights_address(&a);
+            *refund_address = rights_address(&b);
+        }
+        let id = escrow_id(lock_tx.txid().0);
+        let mut txn = env.write_txn().unwrap();
+        let mut update = StateUpdate::new();
+        execute(&state, &mut txn, &mut update, &lock_tx, 1, 5).unwrap();
+        let split_spec = EscrowMutationV1::Split {
+            escrow_id: id,
+            split_shares: 21,
+            first_reference: [21; 32],
+            second_reference: [22; 32],
+        };
+        let missing = mutation(split_spec.clone(), 2, &a, None);
+        assert!(
+            execute(&state, &mut txn, &mut update, &missing, 1, 5).is_err()
+        );
+        let wrong = mutation(split_spec.clone(), 2, &a, Some(&c));
+        assert!(execute(&state, &mut txn, &mut update, &wrong, 1, 5).is_err());
+        let split = mutation(split_spec, 2, &a, Some(&b));
+        execute(&state, &mut txn, &mut update, &split, 1, 5).unwrap();
+        let first = child_escrow_id(split.txid().0, 0);
+        let second = child_escrow_id(split.txid().0, 1);
+        assert_eq!(
+            state
+                .native()
+                .reserved_shares(&txn, owner, market, 0)
+                .unwrap(),
+            70
+        );
+        assert_eq!(
+            state
+                .native()
+                .get_escrow(&txn, first)
+                .unwrap()
+                .unwrap()
+                .shares,
+            21
+        );
+        assert_eq!(
+            state
+                .native()
+                .get_escrow(&txn, second)
+                .unwrap()
+                .unwrap()
+                .shares,
+            49
+        );
+        assert!(
+            execute(
+                &state,
+                &mut txn,
+                &mut update,
+                &filled(NativeOperationV1::ClaimEscrow {
+                    escrow_id: id,
+                    preimage: [9; 32]
+                }),
+                1,
+                5
+            )
+            .is_err()
+        );
+        let assign = mutation(
+            EscrowMutationV1::Assign {
+                escrow_id: first,
+                new_claim_address: rights_address(&c),
+                new_refund_address: rights_address(&c),
+                reference: [23; 32],
+            },
+            3,
+            &a,
+            Some(&b),
+        );
+        execute(&state, &mut txn, &mut update, &assign, 1, 5).unwrap();
+        let receipt = state
+            .native()
+            .get_effect(&txn, assign.txid().0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.escrow_snapshot.as_ref().unwrap().status,
+            EscrowStatusV1::Locked
+        );
+        assert_eq!(
+            receipt.kind,
+            NativeEffectKindV1::Assigned {
+                previous_claim_address: rights_address(&a),
+                previous_refund_address: rights_address(&b)
+            }
+        );
+        let stale = mutation(
+            EscrowMutationV1::Assign {
+                escrow_id: first,
+                new_claim_address: rights_address(&a),
+                new_refund_address: rights_address(&b),
+                reference: [24; 32],
+            },
+            4,
+            &a,
+            Some(&b),
+        );
+        assert!(execute(&state, &mut txn, &mut update, &stale, 1, 5).is_err());
+        let back = mutation(
+            EscrowMutationV1::Assign {
+                escrow_id: first,
+                new_claim_address: rights_address(&a),
+                new_refund_address: rights_address(&b),
+                reference: [24; 32],
+            },
+            4,
+            &c,
+            None,
+        );
+        execute(&state, &mut txn, &mut update, &back, 1, 5).unwrap();
+        assert!(execute(&state, &mut txn, &mut update, &assign, 1, 5).is_err()); // consumed nonce even after rights return
+        let claim = filled(NativeOperationV1::ClaimEscrow {
+            escrow_id: first,
+            preimage: [9; 32],
+        });
+        execute(&state, &mut txn, &mut update, &claim, 1, 5).unwrap();
+        let terminal = mutation(
+            EscrowMutationV1::Assign {
+                escrow_id: first,
+                new_claim_address: rights_address(&c),
+                new_refund_address: rights_address(&c),
+                reference: [25; 32],
+            },
+            5,
+            &a,
+            Some(&b),
+        );
+        assert!(
+            execute(&state, &mut txn, &mut update, &terminal, 1, 5).is_err()
+        );
+        assert_eq!(
+            state
+                .native()
+                .reserved_shares(&txn, owner, market, 0)
+                .unwrap(),
+            49
+        );
+        // Historical assignment still describes exactly what was delivered.
+        assert_eq!(
+            state
+                .native()
+                .get_effect(&txn, assign.txid().0)
+                .unwrap()
+                .unwrap(),
+            receipt
+        );
+        update.apply_all_changes(&state, &mut txn, 1).unwrap();
+        assert_eq!(balance(&state, &txn, rights_address(&a), market), 21);
+        state.native().restore(&state, &mut txn, 1).unwrap();
+        for eid in [id, first, second] {
+            assert!(state.native().get_escrow(&txn, eid).unwrap().is_none());
+        }
+        assert_eq!(balance(&state, &txn, owner, market), 100);
+        assert_eq!(
+            state
+                .native()
+                .reserved_shares(&txn, owner, market, 0)
+                .unwrap(),
+            0
+        );
+        assert!(
+            state
+                .native()
+                .get_effect(&txn, assign.txid().0)
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn native_cash_split_preserves_zero_remainder_deadline_and_undo() {
+        for total in [0, 1, u64::MAX] {
+            let (env, state, _dir, market, owner) = fixture();
+            let key = rights_key(20);
+            let address = rights_address(&key);
+            let escrow = ShareEscrowV1 {
+                escrow_id: [31; 32],
+                owner,
+                claim_address: address,
+                refund_address: address,
+                market_id: market,
+                outcome_index: 0,
+                shares: 7,
+                hashlock: Sha256::digest([9; 32]).into(),
+                claim_before_parent: 10,
+                reference: [32; 32],
+                asset: EscrowAssetV1::NativeCash(total),
+                status: EscrowStatusV1::Locked,
+            };
+            let mut txn = env.write_txn().unwrap();
+            state.native().create_escrow(&mut txn, 1, &escrow).unwrap();
+            let split = mutation(
+                EscrowMutationV1::Split {
+                    escrow_id: escrow.escrow_id,
+                    split_shares: 2,
+                    first_reference: [33; 32],
+                    second_reference: [34; 32],
+                },
+                6,
+                &key,
+                None,
+            );
+            let mut update = StateUpdate::new();
+            execute(&state, &mut txn, &mut update, &split, 2, 20).unwrap(); // elapsed deadline preserved, no extension
+            let a = state
+                .native()
+                .get_escrow(&txn, child_escrow_id(split.txid().0, 0))
+                .unwrap()
+                .unwrap();
+            let b = state
+                .native()
+                .get_escrow(&txn, child_escrow_id(split.txid().0, 1))
+                .unwrap()
+                .unwrap();
+            let first = ((total as u128) * 2 / 7) as u64;
+            assert_eq!(a.asset, EscrowAssetV1::NativeCash(first));
+            assert_eq!(b.asset, EscrowAssetV1::NativeCash(total - first));
+            assert_eq!(a.claim_before_parent, escrow.claim_before_parent);
+            assert_eq!(a.hashlock, escrow.hashlock);
+            assert_eq!(state.native().cash_liability(&txn).unwrap(), total);
+            assert_eq!(
+                state
+                    .native()
+                    .reserved_shares(&txn, owner, market, 0)
+                    .unwrap(),
+                0
+            );
+            state.native().restore(&state, &mut txn, 2).unwrap();
+            assert_eq!(
+                state.native().get_escrow(&txn, escrow.escrow_id).unwrap(),
+                Some(escrow)
+            );
+            assert!(
+                state
+                    .native()
+                    .get_escrow(&txn, a.escrow_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(state.native().cash_liability(&txn).unwrap(), total);
+        }
+    }
+
     #[test]
     fn native_lock_blocks_sell_double_lock_and_transfer_then_claim_is_final() {
         let (env, state, _dir, market, owner) = fixture();

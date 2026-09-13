@@ -1011,6 +1011,15 @@ pub trait Rpc {
         intent: BuyIntentV1,
     ) -> RpcResult<Authorization>;
 
+    /// Sign a chain-bound assignment or split as one current rights holder.
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "sign_native_escrow_mutation")]
+    async fn sign_native_escrow_mutation(
+        &self,
+        intent: truthcoin_dc::types::native::EscrowMutationIntentV1,
+        signer: Address,
+    ) -> RpcResult<Authorization>;
+
     /// Build/sign a native operation. Submit the returned bincode hex with push_tx.
     /// BuyForIntent always pays the protocol trade fee; fee_sats funds other operations.
     #[open_api_method(output_schema(ToSchema))]

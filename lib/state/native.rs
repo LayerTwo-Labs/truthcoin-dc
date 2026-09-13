@@ -11,10 +11,11 @@ use sneed::{DatabaseUnique, RoTxn, RwTxn};
 use super::{Error, ShareAccount, State, UtxoManager, markets::MarketId};
 use crate::types::{
     Address, BitcoinOutputContent, FilledOutput, FilledOutputContent,
-    FilledTransaction, OutPoint, TransactionData,
+    FilledTransaction, GetAddress, OutPoint, TransactionData,
     native::{
-        EscrowAssetV1, EscrowStatusV1, NativeEffectV1, NativeId,
-        NativeOperationV1, ShareEscrowV1,
+        EscrowAssetV1, EscrowMutationV1, EscrowStatusV1, NativeEffectKindV1,
+        NativeEffectV1, NativeId, NativeOperationV1, ShareEscrowV1,
+        child_escrow_id,
     },
 };
 
@@ -235,6 +236,124 @@ impl NativeDbs {
         Ok(())
     }
 
+    pub(crate) fn mutate_escrow(
+        &self,
+        txn: &mut RwTxn,
+        height: u32,
+        parent_height: u32,
+        txid: NativeId,
+        operation: &NativeOperationV1,
+    ) -> Result<NativeEffectV1, Error> {
+        let NativeOperationV1::MutateEscrow {
+            intent,
+            claim_authorization,
+            refund_authorization,
+        } = operation
+        else {
+            return Err(invalid("not an escrow mutation"));
+        };
+        let mut escrow = self
+            .get_escrow(txn, intent.mutation.escrow_id())?
+            .ok_or_else(|| invalid("unknown native escrow"))?;
+        if escrow.status != EscrowStatusV1::Locked || escrow.shares <= 0 {
+            return Err(invalid("escrow is not live"));
+        }
+        if claim_authorization.get_address() != escrow.claim_address
+            || !intent.verify(claim_authorization)
+        {
+            return Err(invalid("invalid current claim authorization"));
+        }
+        if escrow.claim_address == escrow.refund_address {
+            if refund_authorization.is_some() {
+                return Err(invalid("redundant refund authorization"));
+            }
+        } else if !refund_authorization.as_ref().is_some_and(|auth| {
+            auth.get_address() == escrow.refund_address && intent.verify(auth)
+        }) {
+            return Err(invalid("invalid current refund authorization"));
+        }
+        let kind = match &intent.mutation {
+            EscrowMutationV1::Assign {
+                new_claim_address,
+                new_refund_address,
+                reference,
+                ..
+            } => {
+                let kind = NativeEffectKindV1::Assigned {
+                    previous_claim_address: escrow.claim_address,
+                    previous_refund_address: escrow.refund_address,
+                };
+                self.capture_escrow(txn, height, escrow.escrow_id)?;
+                escrow.claim_address = *new_claim_address;
+                escrow.refund_address = *new_refund_address;
+                escrow.reference = *reference;
+                self.write_escrow(txn, escrow.escrow_id, Some(&escrow))?;
+                kind
+            }
+            EscrowMutationV1::Split {
+                split_shares,
+                first_reference,
+                second_reference,
+                ..
+            } => {
+                if *split_shares <= 0 || *split_shares >= escrow.shares {
+                    return Err(invalid(
+                        "split must leave two positive share quantities",
+                    ));
+                }
+                let mut first = escrow.clone();
+                first.escrow_id = child_escrow_id(txid, 0);
+                first.shares = *split_shares;
+                first.reference = *first_reference;
+                let mut second = escrow.clone();
+                second.escrow_id = child_escrow_id(txid, 1);
+                second.shares -= *split_shares;
+                second.reference = *second_reference;
+                if let EscrowAssetV1::NativeCash(total) = escrow.asset {
+                    let amount = (u128::from(total) * (*split_shares as u128)
+                        / (escrow.shares as u128))
+                        as u64;
+                    first.asset = EscrowAssetV1::NativeCash(amount);
+                    second.asset = EscrowAssetV1::NativeCash(total - amount);
+                }
+                // All checks precede writes; the surrounding block transaction is atomic.
+                if self.get_escrow(txn, first.escrow_id)?.is_some()
+                    || self.get_escrow(txn, second.escrow_id)?.is_some()
+                {
+                    return Err(invalid("split child already exists"));
+                }
+                self.capture_escrow(txn, height, escrow.escrow_id)?;
+                escrow.status = EscrowStatusV1::Split {
+                    transaction_id: txid,
+                    first_child_id: first.escrow_id,
+                    second_child_id: second.escrow_id,
+                };
+                self.write_escrow(txn, escrow.escrow_id, Some(&escrow))?;
+                self.create_escrow(txn, height, &first)?;
+                self.create_escrow(txn, height, &second)?;
+                NativeEffectKindV1::Split {
+                    first_child: first,
+                    second_child: second,
+                }
+            }
+        };
+        Ok(NativeEffectV1 {
+            transaction_id: txid,
+            sidechain_height: height,
+            parent_height,
+            reference: escrow.reference,
+            kind,
+            escrow_id: Some(escrow.escrow_id),
+            owner: escrow.owner,
+            recipient: escrow.claim_address,
+            market_id: escrow.market_id,
+            outcome_index: escrow.outcome_index,
+            shares: escrow.shares,
+            asset: escrow.asset.clone(),
+            escrow_snapshot: Some(escrow),
+        })
+    }
+
     pub(crate) fn terminate(
         &self,
         state: &State,
@@ -314,10 +433,29 @@ impl NativeDbs {
             .iter()
             .map(|(id, escrow)| (*id, escrow.shares))
             .collect();
-        let (ordinary, allocations) = allocate_settlement(
+        let mut splits = BTreeMap::new();
+        let mut records = self.escrows.iter(txn)?;
+        while let Some((id, escrow)) = records.next()? {
+            if escrow.owner == payout.address
+                && escrow.market_id == payout.market_id
+                && escrow.outcome_index == payout.outcome_index
+            {
+                if let EscrowStatusV1::Split {
+                    first_child_id,
+                    second_child_id,
+                    ..
+                } = escrow.status
+                {
+                    splits.insert(id, (first_child_id, second_child_id));
+                }
+            }
+        }
+        drop(records);
+        let (ordinary, allocations) = allocate_with_splits(
             payout.shares_redeemed,
             payout.payout_sats,
             &quantities,
+            &splits,
         )?;
         for ((id, mut escrow), (_, amount)) in
             locks.into_iter().zip(allocations)
@@ -408,6 +546,88 @@ pub fn allocate_settlement(
             .map(|(index, (id, _))| (*id, amounts[index + 1]))
             .collect(),
     ))
+}
+
+/// Apportion to original roots first, then down their immutable split trees.
+/// This prevents subdivision from changing any unrelated rounding entitlement.
+fn allocate_with_splits(
+    total: i64,
+    payout: u64,
+    locks: &[(NativeId, i64)],
+    splits: &BTreeMap<NativeId, (NativeId, NativeId)>,
+) -> Result<(u64, Vec<(NativeId, u64)>), Error> {
+    if splits.is_empty() {
+        return allocate_settlement(total, payout, locks);
+    }
+    let mut parents = BTreeMap::new();
+    for (parent, (first, second)) in splits {
+        if first == second
+            || parents.insert(*first, *parent).is_some()
+            || parents.insert(*second, *parent).is_some()
+        {
+            return Err(invalid("invalid escrow split ancestry"));
+        }
+    }
+    let mut quantities = BTreeMap::<NativeId, i64>::new();
+    let mut roots = BTreeMap::<NativeId, i64>::new();
+    for (leaf, quantity) in locks {
+        if *quantity <= 0 || splits.contains_key(leaf) {
+            return Err(invalid("invalid escrow split ancestry"));
+        }
+        let mut id = *leaf;
+        for depth in 0..=parents.len() {
+            let value = quantities.entry(id).or_default();
+            *value = value
+                .checked_add(*quantity)
+                .ok_or_else(|| invalid("invalid escrow split ancestry"))?;
+            if let Some(parent) = parents.get(&id) {
+                if depth == parents.len() {
+                    return Err(invalid("invalid escrow split ancestry"));
+                }
+                id = *parent;
+            } else {
+                let value = roots.entry(id).or_default();
+                *value = value
+                    .checked_add(*quantity)
+                    .ok_or_else(|| invalid("invalid escrow split ancestry"))?;
+                break;
+            }
+        }
+    }
+    let roots: Vec<_> = roots.into_iter().collect();
+    let (ordinary, mut pending) = allocate_settlement(total, payout, &roots)?;
+    let mut amounts = BTreeMap::new();
+    while let Some((id, amount)) = pending.pop() {
+        if let Some((first, second)) = splits.get(&id) {
+            let children: Vec<_> = [*first, *second]
+                .into_iter()
+                .filter_map(|child| {
+                    quantities.get(&child).map(|quantity| (child, *quantity))
+                })
+                .collect();
+            let (unallocated, allocations) =
+                allocate_settlement(quantities[&id], amount, &children)?;
+            if unallocated != 0 {
+                return Err(invalid("invalid escrow split ancestry"));
+            }
+            pending.extend(allocations);
+        } else if amounts.insert(id, amount).is_some() {
+            return Err(invalid("invalid escrow split ancestry"));
+        }
+    }
+    let allocations = locks
+        .iter()
+        .map(|(id, _)| {
+            amounts
+                .remove(id)
+                .map(|amount| (*id, amount))
+                .ok_or_else(|| invalid("invalid escrow split ancestry"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !amounts.is_empty() {
+        return Err(invalid("invalid escrow split ancestry"));
+    }
+    Ok((ordinary, allocations))
 }
 
 pub fn cash_outpoint(txid: NativeId) -> OutPoint {
@@ -505,6 +725,34 @@ pub fn validate(
             }
             validate_shares(state, txn, *market_id, *outcome_index, *shares)?;
         }
+        NativeOperationV1::MutateEscrow {
+            intent,
+            claim_authorization,
+            refund_authorization,
+        } => {
+            // Ownership is checked against ordered execution state, so a child
+            // created or assigned earlier in this block can be mutated safely.
+            if !intent.verify(claim_authorization)
+                || refund_authorization
+                    .as_ref()
+                    .is_some_and(|auth| !intent.verify(auth))
+            {
+                return Err(invalid("invalid escrow mutation signature"));
+            }
+            let tip = state
+                .try_get_tip(txn)?
+                .ok_or_else(|| invalid("mutation requires native genesis"))?;
+            let height = state
+                .try_get_height(txn)?
+                .ok_or_else(|| invalid("missing native height"))?;
+            if archive.get_nth_ancestor(txn, tip, height)?
+                != intent.genesis_hash
+            {
+                return Err(invalid(
+                    "mutation belongs to another native chain",
+                ));
+            }
+        }
         NativeOperationV1::ClaimEscrow { .. }
         | NativeOperationV1::RefundEscrow { .. } => {}
     }
@@ -600,6 +848,46 @@ pub fn validate_terminal(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_tree_preserves_other_rounding_entitlements() {
+        let root = [1; 32];
+        let a = [2; 32];
+        let b = [3; 32];
+        let c = [4; 32];
+        let d = [5; 32];
+        let splits = BTreeMap::from([(root, (a, b)), (a, (c, d))]);
+        // Without tree grouping, ordinary gets the only satoshi merely because
+        // a two-share lock was represented by two one-share children.
+        let (ordinary, children) = allocate_with_splits(
+            3,
+            1,
+            &[(a, 1), (b, 1)],
+            &BTreeMap::from([(root, (a, b))]),
+        )
+        .unwrap();
+        assert_eq!(ordinary, 0);
+        assert_eq!(children.iter().map(|(_, a)| a).sum::<u64>(), 1);
+        for total in 4..30 {
+            for payout in 0..total {
+                let baseline =
+                    allocate_settlement(total, payout as u64, &[(root, 3)])
+                        .unwrap();
+                let divided = allocate_with_splits(
+                    total,
+                    payout as u64,
+                    &[(c, 1), (d, 1), (b, 1)],
+                    &splits,
+                )
+                .unwrap();
+                assert_eq!(baseline.0, divided.0);
+                assert_eq!(
+                    baseline.1[0].1,
+                    divided.1.iter().map(|(_, a)| a).sum::<u64>()
+                );
+            }
+        }
+    }
+
     use super::*;
     #[test]
     fn apportionment_conserves_integer_payout_and_zero_successors() {
