@@ -255,7 +255,10 @@ impl NativeDbs {
         let mut escrow = self
             .get_escrow(txn, intent.mutation.escrow_id())?
             .ok_or_else(|| invalid("unknown native escrow"))?;
-        if escrow.status != EscrowStatusV1::Locked || escrow.shares <= 0 {
+        if escrow.status != EscrowStatusV1::Locked
+            || escrow.shares <= 0
+            || !escrow.mutable_rights
+        {
             return Err(invalid("escrow is not live"));
         }
         if claim_authorization.get_address() != escrow.claim_address

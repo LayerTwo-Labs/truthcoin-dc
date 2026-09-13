@@ -2096,6 +2096,7 @@ fn apply_native_operation(
             hashlock,
             claim_before_parent,
             reference,
+            mutable_rights,
             ..
         } => {
             require_available(
@@ -2121,6 +2122,7 @@ fn apply_native_operation(
                 reference: *reference,
                 asset: EscrowAssetV1::Shares,
                 status: EscrowStatusV1::Locked,
+                mutable_rights: *mutable_rights,
             };
             state.native().create_escrow(txn, height, &escrow)?;
             NativeEffectV1 {
@@ -3334,6 +3336,7 @@ mod native_integration_tests {
             claim_before_parent: 10,
             nonce: [nonce; 32],
             reference: [7; 32],
+            mutable_rights: true,
         })
     }
     fn balance(
@@ -3383,6 +3386,108 @@ mod native_integration_tests {
             refund_authorization,
         })
     }
+    #[test]
+    fn sealed_escrow_rejects_jointly_signed_mutation_and_keeps_claim_refund() {
+        for cash in [None, Some(0), Some(19)] {
+            let (env, state, _dir, market, owner) = fixture();
+            let a = rights_key(11);
+            let b = rights_key(12);
+            let c = rights_key(13);
+            let mut tx = lock(owner, market, 1, 70);
+            if let Some(TxData::NativeOperation(
+                NativeOperationV1::LockShares {
+                    claim_address,
+                    refund_address,
+                    mutable_rights,
+                    ..
+                },
+            )) = &mut tx.transaction.data
+            {
+                *claim_address = rights_address(&a);
+                *refund_address = rights_address(&b);
+                *mutable_rights = false;
+            }
+            let mut json = serde_json::to_value(&tx.transaction.data).unwrap();
+            json["NativeOperation"]["LockShares"]
+                .as_object_mut()
+                .unwrap()
+                .remove("mutable_rights");
+            let decoded: Option<TxData> = serde_json::from_value(json).unwrap();
+            assert!(matches!(
+                decoded,
+                Some(TxData::NativeOperation(NativeOperationV1::LockShares {
+                    mutable_rights: false,
+                    ..
+                }))
+            ));
+            let id = escrow_id(tx.txid().0);
+            let mut txn = env.write_txn().unwrap();
+            let mut update = StateUpdate::new();
+            execute(&state, &mut txn, &mut update, &tx, 1, 5).unwrap();
+            if let Some(value) = cash {
+                state
+                    .native()
+                    .settle_payout(
+                        &state,
+                        &mut txn,
+                        &SharePayoutRecord {
+                            market_id: market,
+                            address: owner,
+                            outcome_index: 0,
+                            shares_redeemed: 100,
+                            final_price: 0.19,
+                            payout_sats: value,
+                        },
+                        1,
+                    )
+                    .unwrap();
+            }
+            let original =
+                state.native().get_escrow(&txn, id).unwrap().unwrap();
+            for spec in [
+                EscrowMutationV1::Split {
+                    escrow_id: id,
+                    split_shares: 20,
+                    first_reference: [21; 32],
+                    second_reference: [22; 32],
+                },
+                EscrowMutationV1::Assign {
+                    escrow_id: id,
+                    new_claim_address: rights_address(&c),
+                    new_refund_address: rights_address(&c),
+                    reference: [23; 32],
+                },
+            ] {
+                let mutate = mutation(spec, 2, &a, Some(&b));
+                assert!(
+                    execute(&state, &mut txn, &mut update, &mutate, 1, 5)
+                        .is_err()
+                );
+                assert_eq!(
+                    state.native().get_escrow(&txn, id).unwrap(),
+                    Some(original.clone())
+                );
+                assert!(
+                    state
+                        .native()
+                        .get_effect(&txn, mutate.txid().0)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let refund =
+                filled(NativeOperationV1::RefundEscrow { escrow_id: id });
+            assert!(
+                execute(&state, &mut txn, &mut update, &refund, 1, 9).is_err()
+            );
+            execute(&state, &mut txn, &mut update, &refund, 1, 10).unwrap();
+            let terminal =
+                state.native().get_escrow(&txn, id).unwrap().unwrap();
+            assert!(!terminal.mutable_rights);
+            assert_eq!(terminal.refund_address, rights_address(&b));
+        }
+    }
+
     #[test]
     fn native_split_assign_and_claim_ordered_atomic_rights_and_undo() {
         let (env, state, _dir, market, owner) = fixture();
@@ -3587,6 +3692,7 @@ mod native_integration_tests {
                 reference: [32; 32],
                 asset: EscrowAssetV1::NativeCash(total),
                 status: EscrowStatusV1::Locked,
+                mutable_rights: true,
             };
             let mut txn = env.write_txn().unwrap();
             state.native().create_escrow(&mut txn, 1, &escrow).unwrap();

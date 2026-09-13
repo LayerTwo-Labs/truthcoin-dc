@@ -149,6 +149,9 @@ pub enum NativeOperationV1 {
         nonce: NativeId,
         #[schema(value_type = Vec<u8>)]
         reference: NativeId,
+        /// False permanently fixes both destinations and prohibits subdivision.
+        #[serde(default)]
+        mutable_rights: bool,
     },
     /// Anyone may relay a claim to the current jointly authorized destination.
     ClaimEscrow {
@@ -267,6 +270,8 @@ pub struct ShareEscrowV1 {
     pub reference: NativeId,
     pub asset: EscrowAssetV1,
     pub status: EscrowStatusV1,
+    /// Set only at creation; assignment and splitting cannot change this value.
+    pub mutable_rights: bool,
 }
 
 #[derive(
