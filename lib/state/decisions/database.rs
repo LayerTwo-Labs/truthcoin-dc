@@ -961,13 +961,48 @@ impl Dbs {
             period_decisions.remove(&decision_to_remove);
 
             if period_decisions.is_empty() {
-                self.period_decisions.delete(rwtxn, &period_index)?;
+                // Genesis and period transitions pre-create empty entries for
+                // every priced period. Preserve that minted-period marker on
+                // rollback; deleting it changes both the canonical state and
+                // the next period-pricing transition. Non-priced ad-hoc
+                // periods did not have a pre-existing marker and are deleted.
+                if self.period_pricing.try_get(rwtxn, &period_index)?.is_some()
+                {
+                    self.period_decisions.put(
+                        rwtxn,
+                        &period_index,
+                        &period_decisions,
+                    )?;
+                } else {
+                    self.period_decisions.delete(rwtxn, &period_index)?;
+                }
             } else {
                 self.period_decisions.put(
                     rwtxn,
                     &period_index,
                     &period_decisions,
                 )?;
+            }
+
+            self.decision_state_histories.delete(rwtxn, &decision_id)?;
+
+            if decision_id.is_standard() {
+                let mut pricing = self
+                    .period_pricing
+                    .try_get(rwtxn, &period_index)?
+                    .ok_or_else(|| Error::InvalidTransaction {
+                        reason: format!(
+                            "no pricing record for period {period_index}"
+                        ),
+                    })?;
+                pricing.claimed = pricing.claimed.checked_sub(1).ok_or_else(|| {
+                    Error::InvalidTransaction {
+                        reason: format!(
+                            "pricing claim count underflow for period {period_index}"
+                        ),
+                    }
+                })?;
+                self.period_pricing.put(rwtxn, &period_index, &pricing)?;
             }
         } else {
             tracing::debug!(

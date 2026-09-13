@@ -6,6 +6,9 @@ use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use l2l_openapi::open_api;
 
 use serde::{Deserialize, Serialize};
+use truthcoin_dc::types::native::{
+    BuyIntentV1, NativeEffectV1, NativeOperationV1, ShareEscrowV1,
+};
 use truthcoin_dc::{
     authorization::{Dst, Signature},
     net::{Peer, PeerConnectionStatus},
@@ -455,6 +458,10 @@ pub struct InitialLiquidityCalculation {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct BallotItem {
     pub decision_id: String,
+    /// Explicit abstention. When true, `vote_value` is ignored and the node
+    /// emits the canonical finite abstain wire sentinel.
+    #[serde(default)]
+    pub abstain: bool,
     /// The vote value in real units (e.g., 270 for electoral votes).
     /// For scaled decisions, the value must equal `min + k * increment`
     /// for some non-negative integer `k`, with `vote_value <= max`.
@@ -980,4 +987,69 @@ pub trait Rpc {
         &self,
         request: CreateTradeRequest,
     ) -> RpcResult<CreateTradeResponse>;
+    /// Construct and dry-run a fresh parent-bound candidate from signed transactions.
+    #[method(name = "create_bmm_candidate")]
+    async fn create_bmm_candidate(
+        &self,
+        signed_transactions: Vec<String>,
+        coinbase_address: Address,
+    ) -> RpcResult<truthcoin_dc::types::native::NativeBmmCandidateV1>;
+
+    /// Fund one validated attempt; a losing/expired candidate must be rebuilt.
+    #[method(name = "bid_bmm_candidate")]
+    async fn bid_bmm_candidate(
+        &self,
+        candidate: truthcoin_dc::types::native::NativeBmmCandidateV1,
+        bid_sats: u64,
+    ) -> RpcResult<Option<String>>;
+
+    /// Sign a recipient's chain-bound, fill-once buy permission.
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "sign_native_buy_intent")]
+    async fn sign_native_buy_intent(
+        &self,
+        intent: BuyIntentV1,
+    ) -> RpcResult<Authorization>;
+
+    /// Sign a chain-bound assignment or split as one current rights holder.
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "sign_native_escrow_mutation")]
+    async fn sign_native_escrow_mutation(
+        &self,
+        intent: truthcoin_dc::types::native::EscrowMutationIntentV1,
+        signer: Address,
+    ) -> RpcResult<Authorization>;
+
+    /// Build/sign a native operation. Submit the returned bincode hex with push_tx.
+    /// BuyForIntent always pays the protocol trade fee; fee_sats funds other operations.
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "create_native_operation")]
+    async fn create_native_operation(
+        &self,
+        operation: NativeOperationV1,
+        fee_sats: u64,
+    ) -> RpcResult<CreateTradeResponse>;
+
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "get_native_escrow")]
+    async fn get_native_escrow(
+        &self,
+        escrow_id: String,
+    ) -> RpcResult<Option<ShareEscrowV1>>;
+
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "get_native_effect")]
+    async fn get_native_effect(
+        &self,
+        transaction_id: String,
+    ) -> RpcResult<Option<NativeEffectV1>>;
+
+    #[open_api_method(output_schema(ToSchema))]
+    #[method(name = "get_native_reserved_shares")]
+    async fn get_native_reserved_shares(
+        &self,
+        owner: Address,
+        market_id: String,
+        outcome_index: u32,
+    ) -> RpcResult<i64>;
 }

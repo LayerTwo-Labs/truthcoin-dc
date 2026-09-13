@@ -196,10 +196,11 @@ impl MemPool {
     }
 
     fn is_trade_tx(transaction: &AuthorizedTransaction) -> bool {
-        matches!(
-            &transaction.transaction.data,
-            Some(crate::types::TransactionData::Trade { .. })
-        )
+        transaction
+            .transaction
+            .data
+            .as_ref()
+            .is_some_and(|data| data.is_trade())
     }
 
     /// Extract decision IDs being claimed by this transaction

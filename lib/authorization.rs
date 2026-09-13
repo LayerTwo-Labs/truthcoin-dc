@@ -87,6 +87,10 @@ impl Serialize for Signature {
 #[serde(rename_all = "lowercase")]
 pub enum Dst {
     Transaction = 0,
+    /// Chain-local, recipient-signed fill-once buy intent.
+    NativeIntent = 1,
+    /// Joint authorization to split or assign native conditional rights.
+    NativeEscrowMutation = 2,
     /// Arbitrary, non-protocol messages
     Arbitrary = u8::MAX,
 }

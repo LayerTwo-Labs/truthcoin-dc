@@ -10,6 +10,18 @@ use crate::types::{Address, FilledOutput, OutPoint};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Exact pre-block snapshots for every existing market mutated by trades or
+/// liquidity amplification. Derived reversal is insufficient because market
+/// version and last-updated metadata cannot be reconstructed from a height.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MarketTransitionUndoData {
+    pub entries: Vec<Market>,
+    /// Exact pre-block share accounts touched by trades. Reversing quantities
+    /// alone cannot recover `last_updated_height`, including after a sell.
+    pub share_accounts:
+        Vec<(Address, Option<crate::state::markets::ShareAccount>)>,
+}
+
 /// Undo data for market settlement and automatic payouts (C1).
 ///
 /// Captured before `transition_and_payout_resolved_markets` during connect.
@@ -29,6 +41,9 @@ pub struct SettlementUndoEntry {
     pub treasury_utxo: Option<(OutPoint, FilledOutput)>,
     /// Fee UTXO that existed before payouts consumed it
     pub fee_utxo: Option<(OutPoint, FilledOutput)>,
+    /// Exact pre-settlement accounts for every shareholder touched by payout.
+    pub pre_settlement_share_accounts:
+        Vec<(Address, crate::state::markets::ShareAccount)>,
 }
 
 /// Undo data for consensus voting state commit (C2).

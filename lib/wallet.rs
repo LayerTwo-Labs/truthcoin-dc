@@ -867,6 +867,99 @@ impl Wallet {
         Ok(tx)
     }
 
+    /// Build a general native operation without submitting it. Escrow principal
+    /// is never used to pay fees; normal wallet UTXOs fund fees and change.
+    pub fn native_operation(
+        &self,
+        mut operation: crate::types::native::NativeOperationV1,
+        fee_sats: u64,
+        tx_pow_config: Option<crate::types::tx_pow::TxPowConfig>,
+    ) -> Result<Transaction, Error> {
+        use crate::types::native::NativeOperationV1;
+        if let NativeOperationV1::BuyForIntent {
+            intent,
+            limit_sats,
+            tx_pow_nonce,
+            prev_block_hash,
+            ..
+        } = &mut operation
+        {
+            let mut tx = self.trade(
+                intent.market_id,
+                intent.outcome_index as usize,
+                intent.shares,
+                intent.recipient,
+                *limit_sats,
+                tx_pow_config,
+                *prev_block_hash,
+            )?;
+            if let Some(TxData::Trade {
+                tx_pow_nonce: mined,
+                ..
+            }) = &tx.data
+            {
+                *tx_pow_nonce = *mined;
+            }
+            tx.data = Some(TxData::NativeOperation(operation));
+            return Ok(tx);
+        }
+        let (total, coins) =
+            self.select_bitcoins(bitcoin::Amount::from_sat(fee_sats))?;
+        let mut outputs = Vec::new();
+        if total.to_sat() > fee_sats {
+            outputs.push(crate::types::Output::new(
+                self.get_new_address()?,
+                crate::types::OutputContent::Bitcoin(
+                    crate::types::BitcoinOutputContent(
+                        bitcoin::Amount::from_sat(total.to_sat() - fee_sats),
+                    ),
+                ),
+            ));
+        }
+        let mut tx = Transaction::new(sorted_outpoints(coins), outputs);
+        tx.data = Some(TxData::NativeOperation(operation));
+        Ok(tx)
+    }
+
+    pub fn sign_native_buy_intent(
+        &self,
+        intent: &crate::types::native::BuyIntentV1,
+    ) -> Result<Authorization, Error> {
+        let txn = self.env.read_txn()?;
+        let key = self.get_tx_signing_key_for_addr(&txn, &intent.recipient)?;
+        let bytes = intent
+            .signing_bytes()
+            .map_err(crate::authorization::Error::from)?;
+        Ok(Authorization {
+            verifying_key: key.verifying_key().into(),
+            signature: authorization::sign(
+                &key,
+                authorization::Dst::NativeIntent,
+                &bytes,
+            ),
+        })
+    }
+
+    pub fn sign_native_escrow_mutation(
+        &self,
+        intent: &crate::types::native::EscrowMutationIntentV1,
+        signer: Address,
+    ) -> Result<Authorization, Error> {
+        let txn = self.env.read_txn()?;
+        let key = self.get_tx_signing_key_for_addr(&txn, &signer)?;
+        let bytes = intent
+            .signing_bytes()
+            .map_err(crate::authorization::Error::from)?;
+        Ok(Authorization {
+            verifying_key: key.verifying_key().into(),
+            signature: authorization::sign(
+                &key,
+                authorization::Dst::NativeEscrowMutation,
+                &bytes,
+            ),
+        })
+    }
+
     /// Build an `AmplifyBeta` transaction that adds `amount` sats to the
     /// market's treasury, increasing its LMSR beta (liquidity depth).
     /// The wallet must own a UTXO belonging to `market_author` so the
@@ -1117,6 +1210,9 @@ impl Wallet {
                     None
                 }
             }
+            Some(TransactionData::NativeOperation(operation)) => operation
+                .actor()
+                .filter(|actor| !input_addresses.contains(actor)),
             Some(TransactionData::TransferReputation { sender, .. }) => {
                 if !input_addresses.contains(sender) {
                     Some(*sender)

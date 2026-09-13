@@ -38,6 +38,7 @@ pub mod block;
 pub mod decisions;
 pub mod error;
 pub mod markets;
+pub mod native;
 mod rollback;
 pub mod type_aliases;
 pub mod undo;
@@ -63,6 +64,7 @@ pub struct PrevalidatedBlock {
     pub computed_merkle_root: MerkleRoot,
     pub coinbase_value: bitcoin::Amount,
     pub next_height: u32,
+    pub parent_height: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -91,6 +93,7 @@ pub struct State {
     reputation: reputation::ReputationDbs,
     decisions: decisions::Dbs,
     markets: MarketsDatabase,
+    native: native::NativeDbs,
     voting: VotingSystem,
     utxos: DatabaseUnique<OutPointKey, SerdeBincode<FilledOutput>>,
     utxos_by_address:
@@ -123,6 +126,10 @@ pub struct State {
         SerdeBincode<u32>,
         SerdeBincode<undo::ConsolidationUndoData>,
     >,
+    market_transition_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::MarketTransitionUndoData>,
+    >,
     pub(crate) minting_undo:
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<u32>>,
     reputation_transfer_undo: DatabaseUnique<
@@ -131,6 +138,8 @@ pub struct State {
     >,
     pub(crate) skipped_tx_indices_undo:
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Vec<u32>>>,
+    pub(crate) mainchain_timestamp_undo:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Option<u64>>>,
 }
 
 impl DecisionValidationInterface for State {
@@ -212,14 +221,15 @@ impl DecisionValidationInterface for State {
 
 impl State {
     const BASE_DBS: u32 = 13;
-    const UNDO_DBS: u32 = 6;
+    const UNDO_DBS: u32 = 8;
 
     pub const NUM_DBS: u32 = reputation::ReputationDbs::NUM_DBS
         + decisions::Dbs::NUM_DBS
         + MarketsDatabase::NUM_DBS
         + VotingSystem::NUM_DBS
         + Self::BASE_DBS
-        + Self::UNDO_DBS;
+        + Self::UNDO_DBS
+        + native::NativeDbs::NUM_DBS;
 
     pub fn new(
         env: &sneed::Env,
@@ -248,9 +258,14 @@ impl State {
                 decisions::DecisionConfig::testing(nz),
             )?
         } else {
-            decisions::Dbs::new(env, &mut rwtxn)?
+            decisions::Dbs::new_with_config(
+                env,
+                &mut rwtxn,
+                decisions::DecisionConfig::production(),
+            )?
         };
         let markets = MarketsDatabase::new(env, &mut rwtxn)?;
+        let native = native::NativeDbs::new(env, &mut rwtxn)?;
         let voting = VotingSystem::new(env, &mut rwtxn)?;
         let utxos = DatabaseUnique::create(env, &mut rwtxn, "utxos")?;
         let utxos_by_address =
@@ -285,6 +300,8 @@ impl State {
             DatabaseUnique::create(env, &mut rwtxn, "consensus_undo")?;
         let consolidation_undo =
             DatabaseUnique::create(env, &mut rwtxn, "consolidation_undo")?;
+        let market_transition_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "market_transition_undo")?;
         let minting_undo =
             DatabaseUnique::create(env, &mut rwtxn, "minting_undo")?;
         let reputation_transfer_undo = DatabaseUnique::create(
@@ -294,6 +311,11 @@ impl State {
         )?;
         let skipped_tx_indices_undo =
             DatabaseUnique::create(env, &mut rwtxn, "skipped_tx_indices_undo")?;
+        let mainchain_timestamp_undo = DatabaseUnique::create(
+            env,
+            &mut rwtxn,
+            "mainchain_timestamp_undo",
+        )?;
         rwtxn.commit()?;
         Ok(Self {
             tip,
@@ -303,6 +325,7 @@ impl State {
             reputation,
             decisions,
             markets,
+            native,
             voting,
             utxos,
             utxos_by_address,
@@ -316,9 +339,11 @@ impl State {
             settlement_undo,
             consensus_undo,
             consolidation_undo,
+            market_transition_undo,
             minting_undo,
             reputation_transfer_undo,
             skipped_tx_indices_undo,
+            mainchain_timestamp_undo,
         })
     }
 
@@ -328,6 +353,10 @@ impl State {
 
     pub fn decisions(&self) -> &decisions::Dbs {
         &self.decisions
+    }
+
+    pub fn native(&self) -> &native::NativeDbs {
+        &self.native
     }
 
     pub fn markets(&self) -> &MarketsDatabase {

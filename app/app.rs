@@ -495,6 +495,17 @@ impl App {
             let bribe = Self::EMPTY_BLOCK_BMM_BRIBE;
             (bribe, header, body)
         };
+        // Full dry-run catches expired or conflicting native operations before
+        // funding this parent-bound attempt.
+        if body.transactions.iter().any(|tx| {
+            matches!(
+                tx.data,
+                Some(types::TransactionData::NativeOperation(_))
+            )
+        }) {
+            self.node
+                .preview_bmm_candidate(header.clone(), body.clone())?;
+        }
         let mut miner_write = miner.write().await;
         miner_write
             .attempt_bmm(bribe.to_sat(), 0, header, body)
