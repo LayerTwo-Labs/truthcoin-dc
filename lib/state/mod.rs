@@ -38,6 +38,7 @@ pub mod block;
 pub mod decisions;
 pub mod error;
 pub mod markets;
+pub mod native;
 mod rollback;
 pub mod type_aliases;
 pub mod undo;
@@ -63,6 +64,7 @@ pub struct PrevalidatedBlock {
     pub computed_merkle_root: MerkleRoot,
     pub coinbase_value: bitcoin::Amount,
     pub next_height: u32,
+    pub parent_height: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -91,6 +93,7 @@ pub struct State {
     reputation: reputation::ReputationDbs,
     decisions: decisions::Dbs,
     markets: MarketsDatabase,
+    native: native::NativeDbs,
     voting: VotingSystem,
     utxos: DatabaseUnique<OutPointKey, SerdeBincode<FilledOutput>>,
     utxos_by_address:
@@ -219,7 +222,8 @@ impl State {
         + MarketsDatabase::NUM_DBS
         + VotingSystem::NUM_DBS
         + Self::BASE_DBS
-        + Self::UNDO_DBS;
+        + Self::UNDO_DBS
+        + native::NativeDbs::NUM_DBS;
 
     pub fn new(
         env: &sneed::Env,
@@ -251,6 +255,7 @@ impl State {
             decisions::Dbs::new(env, &mut rwtxn)?
         };
         let markets = MarketsDatabase::new(env, &mut rwtxn)?;
+        let native = native::NativeDbs::new(env, &mut rwtxn)?;
         let voting = VotingSystem::new(env, &mut rwtxn)?;
         let utxos = DatabaseUnique::create(env, &mut rwtxn, "utxos")?;
         let utxos_by_address =
@@ -303,6 +308,7 @@ impl State {
             reputation,
             decisions,
             markets,
+            native,
             voting,
             utxos,
             utxos_by_address,
@@ -329,6 +335,8 @@ impl State {
     pub fn decisions(&self) -> &decisions::Dbs {
         &self.decisions
     }
+
+    pub fn native(&self) -> &native::NativeDbs { &self.native }
 
     pub fn markets(&self) -> &MarketsDatabase {
         &self.markets

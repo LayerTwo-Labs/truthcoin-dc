@@ -711,6 +711,12 @@ impl MarketsDatabase {
         Ok(())
     }
 
+    pub(crate) fn restore_share_account(&self, txn: &mut RwTxn, address: Address, account: Option<&ShareAccount>) -> Result<(), Error> {
+        if let Some(account) = account { self.share_accounts.put(txn, &address, account)?; }
+        else { self.share_accounts.delete(txn, &address)?; }
+        Ok(())
+    }
+
     pub fn get_user_share_account(
         &self,
         txn: &RoTxn,
@@ -978,7 +984,8 @@ impl MarketsDatabase {
         let mut sequence = 0u32;
 
         for payout in &payout_summary.payouts {
-            if payout.payout_sats > 0 {
+            let ordinary_payout = state.native().settle_payout(state, txn, payout, block_height)?;
+            if ordinary_payout > 0 {
                 let outpoint = generate_share_payout_outpoint(
                     &payout.market_id,
                     &payout.address,
@@ -990,7 +997,7 @@ impl MarketsDatabase {
                     address: payout.address,
                     content: FilledOutputContent::Bitcoin(
                         BitcoinOutputContent(bitcoin::Amount::from_sat(
-                            payout.payout_sats,
+                            ordinary_payout,
                         )),
                     ),
                     memo: vec![],

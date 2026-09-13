@@ -486,6 +486,8 @@ pub enum TransactionData {
         amount: u64,
         market_author: Address,
     },
+    /// Versioned, general native share delivery and hash/time escrow.
+    NativeOperation(crate::types::native::NativeOperationV1),
 }
 
 pub type TxData = TransactionData;
@@ -500,7 +502,7 @@ impl TxData {
     }
 
     pub fn is_trade(&self) -> bool {
-        matches!(self, Self::Trade { .. })
+        matches!(self, Self::Trade { .. } | Self::NativeOperation(crate::types::native::NativeOperationV1::BuyForIntent { .. }))
     }
 
     pub fn is_submit_vote(&self) -> bool {
@@ -737,6 +739,15 @@ impl FilledTransaction {
     /// If the tx is a trade, returns the corresponding [`Trade`].
     pub fn trade(&self) -> Option<Trade> {
         match &self.transaction.data {
+            Some(TransactionData::NativeOperation(crate::types::native::NativeOperationV1::BuyForIntent { intent, limit_sats, tx_pow_nonce, prev_block_hash, .. })) => Some(Trade {
+                market_id: intent.market_id,
+                outcome_index: intent.outcome_index,
+                shares: intent.shares,
+                trader: intent.recipient,
+                limit_sats: *limit_sats,
+                tx_pow_nonce: *tx_pow_nonce,
+                prev_block_hash: *prev_block_hash,
+            }),
             Some(TransactionData::Trade {
                 market_id,
                 outcome_index,
@@ -1004,7 +1015,13 @@ impl AuthorizedTransaction {
             self.actor_proof.iter().map(|auth| auth.get_address());
         let output_addrs =
             self.transaction.outputs.iter().map(|output| output.address);
-        input_addrs.chain(actor_addrs).chain(output_addrs).collect()
+        let native_addrs = match &self.transaction.data {
+            Some(TransactionData::NativeOperation(crate::types::native::NativeOperationV1::BuyForIntent {intent,change_address,..})) => vec![intent.recipient,*change_address],
+            Some(TransactionData::NativeOperation(crate::types::native::NativeOperationV1::TransferShares {owner,recipient,..})) => vec![*owner,*recipient],
+            Some(TransactionData::NativeOperation(crate::types::native::NativeOperationV1::LockShares {owner,claim_address,refund_address,..})) => vec![*owner,*claim_address,*refund_address],
+            _ => Vec::new(),
+        };
+        input_addrs.chain(actor_addrs).chain(output_addrs).chain(native_addrs).collect()
     }
 }
 

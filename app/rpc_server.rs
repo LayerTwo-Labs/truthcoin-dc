@@ -2708,6 +2708,67 @@ impl RpcServer for RpcServerImpl {
             txid: txid.to_string(),
         })
     }
+    async fn create_bmm_candidate(&self, signed_transactions: Vec<String>, coinbase_address: Address) -> RpcResult<truthcoin_dc::types::native::NativeBmmCandidateV1> {
+        if signed_transactions.len() > 1000 { return Err(custom_err_msg("too many candidate transactions")); }
+        let mut transactions = Vec::with_capacity(signed_transactions.len());
+        for encoded in signed_transactions {
+            transactions.push(bincode::deserialize::<truthcoin_dc::types::AuthorizedTransaction>(&hex::decode(encoded).map_err(custom_err)?).map_err(custom_err)?);
+        }
+        let miner = self.app.miner.as_ref().ok_or_else(|| custom_err_msg("BMM wallet unavailable"))?;
+        let parent = miner.write().await.cusf_mainchain.get_chain_tip().await.map_err(custom_err)?.block_hash;
+        if !self.node().request_mainchain_ancestor_infos(parent).await.map_err(custom_err)? {
+            return Err(custom_err_msg("parent ancestry unavailable"));
+        }
+        self.node().create_bmm_candidate(parent, transactions, coinbase_address).map_err(custom_err)
+    }
+
+    async fn bid_bmm_candidate(&self, candidate: truthcoin_dc::types::native::NativeBmmCandidateV1, bid_sats: u64) -> RpcResult<Option<String>> {
+        let candidate = self.node().preview_bmm_candidate(candidate.header, candidate.body).map_err(custom_err)?;
+        let miner = self.app.miner.as_ref().ok_or_else(|| custom_err_msg("BMM wallet unavailable"))?;
+        let mut miner = miner.write().await;
+        miner.attempt_bmm(bid_sats, candidate.parent_height - 1, candidate.header, candidate.body).await.map_err(custom_err)?;
+        let Some((main_hash, header, body)) = miner.confirm_bmm().await.map_err(custom_err)? else {return Ok(None)};
+        drop(miner);
+        if self.node().submit_block(main_hash, &header, &body).await.map_err(custom_err)? {
+            self.app.update().map_err(custom_err)?;
+            Ok(Some(header.hash().to_string()))
+        } else { Ok(None) }
+    }
+
+    async fn sign_native_buy_intent(&self, intent: truthcoin_dc::types::native::BuyIntentV1) -> RpcResult<Authorization> {
+        self.app.wallet.sign_native_buy_intent(&intent).map_err(custom_err)
+    }
+
+    async fn create_native_operation(&self, operation: truthcoin_dc::types::native::NativeOperationV1, fee_sats: u64) -> RpcResult<CreateTradeResponse> {
+        use truthcoin_dc::types::native::NativeOperationV1;
+        let config = if let NativeOperationV1::BuyForIntent { intent, .. } = &operation {
+            Some(self.node().get_market_by_id(&intent.market_id).map_err(custom_err)?
+                .ok_or_else(|| custom_err_msg("Market not found"))?.tx_pow_config())
+        } else { None };
+        let tx = self.app.wallet.native_operation(operation, fee_sats, config).map_err(custom_err)?;
+        let authorized = self.app.wallet.authorize(tx).map_err(custom_err)?;
+        Ok(CreateTradeResponse {
+            txid: authorized.transaction.txid().to_string(),
+            signed_tx_hex: hex::encode(bincode::serialize(&authorized).map_err(custom_err)?),
+        })
+    }
+
+    async fn get_native_escrow(&self, escrow_id: String) -> RpcResult<Option<truthcoin_dc::types::native::ShareEscrowV1>> {
+        let mut id = [0u8; 32];
+        hex::decode_to_slice(escrow_id, &mut id).map_err(custom_err)?;
+        self.node().get_native_escrow(id).map_err(custom_err)
+    }
+
+    async fn get_native_effect(&self, transaction_id: String) -> RpcResult<Option<truthcoin_dc::types::native::NativeEffectV1>> {
+        let mut id = [0u8; 32];
+        hex::decode_to_slice(transaction_id, &mut id).map_err(custom_err)?;
+        self.node().get_native_effect(id).map_err(custom_err)
+    }
+
+    async fn get_native_reserved_shares(&self, owner: Address, market_id: String, outcome_index: u32) -> RpcResult<i64> {
+        self.node().get_native_reserved_shares(owner, parse_market_id(&market_id)?, outcome_index).map_err(custom_err)
+    }
+
 }
 
 #[derive(Clone, Debug)]
