@@ -155,7 +155,7 @@ where
         <MainchainTransport as tonic::client::GrpcService<
             tonic::body::Body,
         >>::Future: Send,
-    {
+{
         let env_path = datadir.join("data.mdb");
         std::fs::create_dir_all(&env_path)?;
         let env = {

@@ -82,6 +82,11 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "Transitive dependency from heed, awaiting upstream update to use alternative"},
     # ttf-parser is unmaintained (transitive via egui/eframe -> ab_glyph); no safe upgrade
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, transitive via egui/eframe, no safe upgrade" },
+    # quick-xml 0.30 (transitive via eframe -> accesskit_unix -> zbus_xml); fixed in 0.41, needs eframe bump
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 pinned by zbus_xml under eframe 0.31, no upgrade without eframe bump" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.30 pinned by zbus_xml under eframe 0.31, no upgrade without eframe bump" },
+    # bitmaps is unmaintained (transitive via cusf-enforcer-mempool -> imbl); dev-dependency only
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained, transitive via cusf-enforcer-mempool/imbl, no safe upgrade" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
