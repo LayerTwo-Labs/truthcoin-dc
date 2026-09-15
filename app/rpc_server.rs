@@ -71,11 +71,11 @@ fn market_dimension_data(
                     id,
                 ) => *id,
             };
-            let decision = decisions.get(&decision_id).ok_or_else(|| {
+            let decision = decisions.get(&decision_id).ok_or(
                 truthcoin_dc::state::markets::MarketError::DecisionNotFound {
                     decision_id,
-                }
-            })?;
+                },
+            )?;
 
             let kind = match &decision.decision_type {
                 truthcoin_dc::state::decisions::DecisionType::Binary => {
