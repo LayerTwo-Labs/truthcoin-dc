@@ -29,12 +29,24 @@ where
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    const COMMON_PROTO: &str = "../proto/proto/cusf/common/v1/common.proto";
+    const BLOCK_PRODUCER_PROTO: &str =
+        "../bip300301_enforcer/proto/cusf/mainchain/v1/block_producer.proto";
+    const COMMON_PROTO: &str =
+        "../bip300301_enforcer/proto/cusf/common/v1/common.proto";
+    const MINING_PROTO: &str =
+        "../bip300301_enforcer/proto/cusf/mainchain/v1/mining.proto";
     const VALIDATOR_PROTO: &str =
-        "../proto/proto/cusf/mainchain/v1/validator.proto";
-    const WALLET_PROTO: &str = "../proto/proto/cusf/mainchain/v1/wallet.proto";
-    const ALL_PROTOS: &[&str] = &[COMMON_PROTO, VALIDATOR_PROTO, WALLET_PROTO];
-    const INCLUDES: &[&str] = &["../proto/proto"];
+        "../bip300301_enforcer/proto/cusf/mainchain/v1/validator.proto";
+    const WALLET_PROTO: &str =
+        "../bip300301_enforcer/proto/cusf/mainchain/v1/wallet.proto";
+    const ALL_PROTOS: &[&str] = &[
+        BLOCK_PRODUCER_PROTO,
+        COMMON_PROTO,
+        MINING_PROTO,
+        VALIDATOR_PROTO,
+        WALLET_PROTO,
+    ];
+    const INCLUDES: &[&str] = &["../bip300301_enforcer/proto"];
     let file_descriptors = protox::compile(ALL_PROTOS, INCLUDES)?;
     let file_descriptor_path = PathBuf::from(
         env::var("OUT_DIR").expect("OUT_DIR environment variable not set"),
@@ -50,7 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let () = compile_protos_with_config(
         &file_descriptor_path,
-        &[VALIDATOR_PROTO, WALLET_PROTO],
+        &[
+            VALIDATOR_PROTO,
+            MINING_PROTO,
+            WALLET_PROTO,
+            BLOCK_PRODUCER_PROTO,
+        ],
         INCLUDES,
         |config| {
             config

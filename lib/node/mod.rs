@@ -76,8 +76,6 @@ pub enum Error {
     Net(#[source] Box<net::Error>),
     #[error("net task error")]
     NetTask(#[source] Box<net_task::Error>),
-    #[error("No CUSF mainchain wallet client")]
-    NoCusfMainchainWalletClient,
     #[error("peer info stream closed")]
     PeerInfoRxClosed,
     #[error("Receive mainchain task response cancelled")]
@@ -120,8 +118,8 @@ pub type FilledTransactionWithPosition =
 pub struct Node<MainchainTransport = Channel> {
     archive: Archive,
     cusf_mainchain: Arc<Mutex<mainchain::ValidatorClient<MainchainTransport>>>,
-    cusf_mainchain_wallet:
-        Option<Arc<Mutex<mainchain::WalletClient<MainchainTransport>>>>,
+    cusf_mainchain_block_producer:
+        Option<Arc<Mutex<mainchain::BlockProducerClient<MainchainTransport>>>>,
     env: sneed::Env,
     mainchain_task: MainchainTaskHandle,
     mempool: MemPool,
@@ -142,8 +140,8 @@ where
         datadir: &Path,
         network: Network,
         cusf_mainchain: mainchain::ValidatorClient<MainchainTransport>,
-        cusf_mainchain_wallet: Option<
-            mainchain::WalletClient<MainchainTransport>,
+        cusf_mainchain_block_producer: Option<
+            mainchain::BlockProducerClient<MainchainTransport>,
         >,
         runtime: &tokio::runtime::Runtime,
         decision_config_testing: Option<u32>,
@@ -215,8 +213,8 @@ where
             );
         let (net, peer_info_rx) =
             Net::new(&env, archive.clone(), network, state.clone(), bind_addr)?;
-        let cusf_mainchain_wallet =
-            cusf_mainchain_wallet.map(|wallet| Arc::new(Mutex::new(wallet)));
+        let cusf_mainchain_block_producer = cusf_mainchain_block_producer
+            .map(|block_producer| Arc::new(Mutex::new(block_producer)));
         let net_task = NetTaskHandle::new(
             runtime,
             env.clone(),
@@ -233,7 +231,7 @@ where
         Ok(Self {
             archive,
             cusf_mainchain: Arc::new(Mutex::new(cusf_mainchain)),
-            cusf_mainchain_wallet,
+            cusf_mainchain_block_producer,
             env,
             mainchain_task,
             mempool,
@@ -1267,10 +1265,6 @@ where
         header: &Header,
         body: &Body,
     ) -> Result<bool, Error> {
-        let Some(cusf_mainchain_wallet) = self.cusf_mainchain_wallet.as_ref()
-        else {
-            return Err(Error::NoCusfMainchainWalletClient);
-        };
         let block_hash = header.hash();
         if let Some(parent) = header.prev_side_hash
             && self.try_get_header(parent)?.is_none()
@@ -1371,13 +1365,25 @@ where
         }
         if let Some((bundle, _bundle_h)) = bundle {
             let m6id = bundle.compute_m6id();
-            let mut cusf_mainchain_wallet_lock =
-                cusf_mainchain_wallet.lock().await;
-            let () = cusf_mainchain_wallet_lock
-                .broadcast_withdrawal_bundle(bundle.tx())
-                .await?;
-            drop(cusf_mainchain_wallet_lock);
-            tracing::trace!(%m6id, "Broadcast withdrawal bundle");
+            if let Some(cusf_mainchain_block_producer) =
+                self.cusf_mainchain_block_producer.as_ref()
+            {
+                {
+                    let mut cusf_mainchain_block_producer_lock =
+                        cusf_mainchain_block_producer.lock().await;
+                    let () = cusf_mainchain_block_producer_lock
+                        .propose_withdrawal_bundle(bundle.tx())
+                        .await?;
+                }
+                tracing::trace!(%m6id, "Proposed withdrawal bundle");
+            } else {
+                tracing::warn!(
+                    %m6id,
+                    "Withdrawal bundle is pending, but the mainchain node \
+                     does not serve BlockProducerService, so the bundle \
+                     cannot be proposed and the withdrawal cannot complete",
+                );
+            }
         }
         Ok(true)
     }
