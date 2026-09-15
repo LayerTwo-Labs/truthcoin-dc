@@ -212,7 +212,7 @@ fn disconnect_tip_(
             .rev_iter(rwtxn)
             .map_err(DbError::from)?
             .find_map(|(_, (block_hash, applied_height))| {
-                if applied_height < height - 1 {
+                if applied_height < height {
                     Ok(Some((block_hash, applied_height)))
                 } else {
                     Ok(None)
@@ -222,7 +222,7 @@ fn disconnect_tip_(
             .withdrawal_bundle_event_blocks()
             .rev_iter(rwtxn)?
             .find_map(|(_, (block_hash, applied_height))| {
-                if applied_height < height - 1 {
+                if applied_height < height {
                     Ok(Some((block_hash, applied_height)))
                 } else {
                     Ok(None)

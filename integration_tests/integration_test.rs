@@ -8,7 +8,7 @@ use bip300301_enforcer_integration_tests::{
 use futures::{FutureExt, channel::mpsc, future::BoxFuture};
 
 use crate::{
-    ibd::ibd_trial,
+    ibd::{ibd_trial, reorg_across_deposit_trial},
     roundtrip::roundtrip_trial,
     setup::{Init, PostSetup},
     unknown_withdrawal::unknown_withdrawal_trial,
@@ -58,6 +58,11 @@ pub fn tests(
             failure_collector.clone(),
         ),
         ibd_trial(
+            bin_paths.clone(),
+            file_registry.clone(),
+            failure_collector.clone(),
+        ),
+        reorg_across_deposit_trial(
             bin_paths.clone(),
             file_registry.clone(),
             failure_collector.clone(),
