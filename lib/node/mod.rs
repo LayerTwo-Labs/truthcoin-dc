@@ -798,6 +798,7 @@ where
         let mut spent_utxos = HashSet::new();
         let mut cumulative_market_states: HashMap<MarketId, Array1<i64>> =
             HashMap::new();
+        let mut cumulative_amplify: HashMap<MarketId, u64> = HashMap::new();
 
         for transaction in combined_txs {
             let txid = transaction.transaction.txid();
@@ -833,6 +834,7 @@ where
                 &rwtxn,
                 &filled_transaction,
                 &mut cumulative_market_states,
+                &mut cumulative_amplify,
             ) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -892,12 +894,18 @@ where
     /// For Trade transactions, this checks the cost/proceeds against
     /// the cumulative market state (accounting for prior txs in this block) and updates
     /// the cumulative state if the check passes.
+    ///
+    /// `cumulative_amplify` tracks the `AmplifyBeta` deposits already selected
+    /// for this block, per market, so that beta matches connect time.
     fn check_trade_slippage(
         &self,
         rotxn: &sneed::RoTxn,
         filled_tx: &Authorized<FilledTransaction>,
         cumulative_states: &mut HashMap<MarketId, Array1<i64>>,
+        cumulative_amplify: &mut HashMap<MarketId, u64>,
     ) -> Result<bool, Error> {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
         let tx_data = match &filled_tx.transaction.transaction.data {
             Some(data) => data,
             None => return Ok(true), // Non-data txs always pass
@@ -936,7 +944,18 @@ where
                         }
                     };
 
-                let beta = self.derive_market_beta(&market)?;
+                // Must mirror `state::block::running_market_state`, which folds
+                // the `AmplifyBeta` deposits already applied in this block into
+                // the liquidity base before deriving beta. Pricing against the
+                // confirmed-only base here would let the miner credit
+                // TRADE_MINER_FEE_SATS for a tx that connect then skips, and
+                // self-reject its own block with NotEnoughFees.
+                let pending_amplify =
+                    cumulative_amplify.get(market_id).copied().unwrap_or(0);
+                let beta = trading::derive_beta_from_liquidity(
+                    market.liquidity_base_sats.saturating_add(pending_amplify),
+                    market.shares().len(),
+                );
                 tracing::debug!(
                     "check_trade_slippage: found market with {} outcomes, beta={}",
                     market.shares().len(),
@@ -1036,10 +1055,19 @@ where
                         limit_sats
                     );
 
-                    if buy_cost.total_cost_sats > *limit_sats {
+                    // Must mirror the connect-time check in
+                    // `state::block::apply_trade` exactly, otherwise the miner
+                    // credits TRADE_MINER_FEE_SATS for a tx that connect skips
+                    // and self-rejects its own block with NotEnoughFees.
+                    if buy_cost
+                        .total_cost_sats
+                        .saturating_add(TRADE_MINER_FEE_SATS)
+                        > *limit_sats
+                    {
                         tracing::info!(
-                            "Slippage exceeded for buy tx: cost {} sats > max {} sats",
+                            "Slippage exceeded for buy tx: cost {} sats + miner fee {} sats > max {} sats",
                             buy_cost.total_cost_sats,
+                            TRADE_MINER_FEE_SATS,
                             limit_sats
                         );
                         return Ok(false);
@@ -1102,12 +1130,20 @@ where
                 tracing::debug!("check_trade_slippage: Trade passed");
                 Ok(true)
             }
+            TxData::AmplifyBeta {
+                market_id, amount, ..
+            } => {
+                // Track the deposit so later trades on this market in the same
+                // block are priced at the amplified beta connect will use.
+                let pending = cumulative_amplify.entry(*market_id).or_insert(0);
+                *pending = pending.saturating_add(*amount);
+                Ok(true)
+            }
             TxData::ClaimDecision(_)
             | TxData::CreateMarket { .. }
             | TxData::SubmitVote { .. }
             | TxData::SubmitBallot { .. }
-            | TxData::TransferReputation { .. }
-            | TxData::AmplifyBeta { .. } => Ok(true),
+            | TxData::TransferReputation { .. } => Ok(true),
         }
     }
 
