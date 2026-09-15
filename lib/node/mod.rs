@@ -898,6 +898,8 @@ where
         filled_tx: &Authorized<FilledTransaction>,
         cumulative_states: &mut HashMap<MarketId, Array1<i64>>,
     ) -> Result<bool, Error> {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
         let tx_data = match &filled_tx.transaction.transaction.data {
             Some(data) => data,
             None => return Ok(true), // Non-data txs always pass
@@ -1036,10 +1038,19 @@ where
                         limit_sats
                     );
 
-                    if buy_cost.total_cost_sats > *limit_sats {
+                    // Must mirror the connect-time check in
+                    // `state::block::apply_trade` exactly, otherwise the miner
+                    // credits TRADE_MINER_FEE_SATS for a tx that connect skips
+                    // and self-rejects its own block with NotEnoughFees.
+                    if buy_cost
+                        .total_cost_sats
+                        .saturating_add(TRADE_MINER_FEE_SATS)
+                        > *limit_sats
+                    {
                         tracing::info!(
-                            "Slippage exceeded for buy tx: cost {} sats > max {} sats",
+                            "Slippage exceeded for buy tx: cost {} sats + miner fee {} sats > max {} sats",
                             buy_cost.total_cost_sats,
+                            TRADE_MINER_FEE_SATS,
                             limit_sats
                         );
                         return Ok(false);
