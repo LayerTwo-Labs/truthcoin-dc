@@ -853,7 +853,7 @@ impl RpcServer for RpcServerImpl {
     ) -> RpcResult<Signature> {
         self.app
             .wallet
-            .sign_arbitrary_msg(&verifying_key, &msg)
+            .sign_arbitrary_msg(rand::rng(), &verifying_key, &msg)
             .map_err(custom_err)
     }
 
@@ -864,7 +864,7 @@ impl RpcServer for RpcServerImpl {
     ) -> RpcResult<Authorization> {
         self.app
             .wallet
-            .sign_arbitrary_msg_as_addr(&address, &msg)
+            .sign_arbitrary_msg_as_addr(rand::rng(), &address, &msg)
             .map_err(custom_err)
     }
 
@@ -2772,7 +2772,11 @@ impl RpcServer for RpcServerImpl {
             )
             .map_err(custom_err)?;
 
-        let authorized = self.app.wallet.authorize(tx).map_err(custom_err)?;
+        let authorized = self
+            .app
+            .wallet
+            .authorize(rand::rng(), tx)
+            .map_err(custom_err)?;
         let txid = authorized.transaction.txid();
         let bytes = bincode::serialize(&authorized).map_err(|e| {
             custom_err_msg(format!(

@@ -15,6 +15,7 @@ use tracing::instrument;
 
 use crate::{
     archive::Archive,
+    authorization::BatchVerificationContext,
     state::State,
     types::{AuthorizedTransaction, Network, THIS_SIDECHAIN, VERSION, Version},
 };
@@ -184,6 +185,7 @@ const fn seed_node_addrs(network: Network) -> &'static [SocketAddr] {
 pub struct Net {
     pub server: Endpoint,
     archive: Archive,
+    pub(crate) batch_verification_ctxt: BatchVerificationContext,
     network: Network,
     state: State,
     active_peers: Arc<RwLock<HashMap<SocketAddr, PeerConnectionHandle>>>,
@@ -278,6 +280,7 @@ impl Net {
         let connection_ctxt = PeerConnectionCtxt {
             env,
             archive: self.archive.clone(),
+            batch_verification_ctxt: self.batch_verification_ctxt,
             network: self.network,
             state: self.state.clone(),
         };
@@ -314,6 +317,7 @@ impl Net {
     pub fn new(
         env: &sneed::Env,
         archive: Archive,
+        batch_verification_ctxt: BatchVerificationContext,
         network: Network,
         state: State,
         bind_addr: SocketAddr,
@@ -342,6 +346,7 @@ impl Net {
         let net = Net {
             server,
             archive,
+            batch_verification_ctxt,
             network,
             state,
             active_peers,
@@ -441,6 +446,7 @@ impl Net {
         let connection_ctxt = PeerConnectionCtxt {
             env,
             archive: self.archive.clone(),
+            batch_verification_ctxt: self.batch_verification_ctxt,
             network: self.network,
             state: self.state.clone(),
         };

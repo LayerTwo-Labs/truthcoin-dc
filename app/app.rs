@@ -305,6 +305,7 @@ impl App {
             config.network,
             cusf_mainchain,
             cusf_mainchain_block_producer,
+            &mut rand::rng(),
             &runtime,
             config.decision_config_testing,
             #[cfg(feature = "zmq")]
@@ -355,7 +356,7 @@ impl App {
     }
 
     pub fn sign_and_send(&self, tx: Transaction) -> Result<(), Error> {
-        let authorized_transaction = self.wallet.authorize(tx)?;
+        let authorized_transaction = self.wallet.authorize(rand::rng(), tx)?;
         self.node.submit_transaction(authorized_transaction)?;
         let () = self.update()?;
         Ok(())

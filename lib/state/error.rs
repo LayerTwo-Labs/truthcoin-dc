@@ -135,7 +135,7 @@ pub enum Error {
     NoWithdrawalBundleEventBlock,
 
     #[error(transparent)]
-    SignatureError(#[from] ed25519_dalek::SignatureError),
+    SignatureError(#[from] frost_ristretto255::Error),
 
     #[error("withdrawal output {outpoint} cannot be spent by a transaction")]
     SpendWithdrawalOutput { outpoint: OutPoint },

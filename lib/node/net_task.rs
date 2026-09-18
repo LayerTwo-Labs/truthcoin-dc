@@ -28,6 +28,7 @@ use tokio_stream::StreamNotifyClose;
 use super::mainchain_task::{self, MainchainTaskHandle};
 use crate::{
     archive::{self, Archive},
+    authorization::BatchVerificationContext,
     mempool::{self, MemPool},
     net::{
         self, Net, PeerConnectionError, PeerConnectionInfo,
@@ -137,9 +138,11 @@ impl From<net::Error> for Error {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect_tip_(
     rwtxn: &mut RwTxn<'_>,
     archive: &Archive,
+    batch_verification_ctxt: &BatchVerificationContext,
     mempool: &MemPool,
     state: &State,
     header: &Header,
@@ -148,7 +151,13 @@ fn connect_tip_(
 ) -> Result<(), Error> {
     let block_hash = header.hash();
     let prevalidated = state
-        .prevalidate_block(archive, rwtxn, header, body)
+        .prevalidate_block(
+            archive,
+            rwtxn,
+            batch_verification_ctxt,
+            header,
+            body,
+        )
         .inspect_err(|e| {
             tracing::error!(
                 %block_hash,
@@ -314,9 +323,11 @@ fn is_fatal_reorg_error(err: &Error) -> bool {
     !matches!(err, Error::State(_))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reorg_to_tip(
     env: &sneed::Env,
     archive: &Archive,
+    batch_verification_ctxt: &BatchVerificationContext,
     mempool: &MemPool,
     state: &State,
     #[cfg(feature = "zmq")] zmq_pub_handler: &ZmqPubHandler,
@@ -454,6 +465,7 @@ fn reorg_to_tip(
         let () = match connect_tip_(
             &mut rwtxn,
             archive,
+            batch_verification_ctxt,
             mempool,
             state,
             header,
@@ -1149,6 +1161,7 @@ impl NetTask {
                         reorg_to_tip(
                             &self.ctxt.env,
                             &self.ctxt.archive,
+                            &self.ctxt.net.batch_verification_ctxt,
                             &self.ctxt.mempool,
                             &self.ctxt.state,
                             #[cfg(feature = "zmq")]
