@@ -1809,4 +1809,94 @@ mod test {
             Ok(())
         })
     }
+
+    // A stored body that fails validation must leave the archive, so that the
+    // block is requested again. `zmq` only adds a notification to the reorg,
+    // so this needs no ZMQ socket.
+    #[cfg(not(feature = "zmq"))]
+    #[test]
+    fn a_body_that_fails_validation_is_discarded() {
+        use bitcoin::hashes::Hash as _;
+
+        use super::reorg_to_tip;
+        use crate::{
+            archive::Archive,
+            authorization::BatchVerificationContext,
+            mempool::MemPool,
+            state::State,
+            types::{Body, Header, MerkleRoot, Tip, proto::mainchain},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("data.mdb");
+        std::fs::create_dir_all(&env_path).unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS + MemPool::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, &env_path) }.unwrap();
+        let archive = Archive::new(&env).unwrap();
+        let state = State::new(&env, None).unwrap();
+        let mempool = MemPool::new(&env).unwrap();
+
+        let main_hash = bitcoin::BlockHash::from_byte_array([1; 32]);
+        let body = Body {
+            coinbase: Vec::new(),
+            transactions: Vec::new(),
+            authorizations: Vec::new(),
+            actor_proofs: Vec::new(),
+        };
+        // The merkle root does not commit to `body`.
+        let header = Header {
+            merkle_root: MerkleRoot::from([0xab; 32]),
+            prev_side_hash: None,
+            prev_main_hash: main_hash,
+        };
+        let block_hash = header.hash();
+        {
+            let mut rwtxn = env.write_txn().unwrap();
+            archive
+                .put_main_header_info(
+                    &mut rwtxn,
+                    &mainchain::BlockHeaderInfo {
+                        block_hash: main_hash,
+                        prev_block_hash: bitcoin::BlockHash::all_zeros(),
+                        height: 1,
+                        work: bitcoin::Work::from_le_bytes([0; 32]),
+                        timestamp: 0,
+                    },
+                )
+                .unwrap();
+            archive
+                .put_main_block_info(
+                    &mut rwtxn,
+                    main_hash,
+                    &mainchain::BlockInfo {
+                        bmm_commitment: None,
+                        events: Vec::new(),
+                    },
+                )
+                .unwrap();
+            archive.put_header(&mut rwtxn, &header).unwrap();
+            archive.put_body(&mut rwtxn, block_hash, &body).unwrap();
+            rwtxn.commit().unwrap();
+        }
+
+        let result = reorg_to_tip(
+            &env,
+            &archive,
+            &BatchVerificationContext::new(&mut rand::rng()),
+            &mempool,
+            &state,
+            Tip {
+                block_hash,
+                main_block_hash: main_hash,
+            },
+        );
+        assert!(matches!(result, Err(Error::State(_))), "{result:?}");
+        let rotxn = env.read_txn().unwrap();
+        assert!(
+            archive.try_get_body(&rotxn, block_hash).unwrap().is_none(),
+            "a body that failed validation is still in the archive"
+        );
+    }
 }
