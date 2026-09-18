@@ -16,19 +16,22 @@ pub const MAGIC_BYTES_LEN: usize = 4;
 
 pub type MagicBytes = [u8; MAGIC_BYTES_LEN];
 
+// First 25 bits are the US-TTY Baudot–Murray code for "TRUTH".
+// The least significant bits of the 4th byte encode the network
+// identifier.
 pub const fn magic_bytes(network: Network) -> MagicBytes {
-    // First 4 bytes are the US-TTY (LSB Right) Baudot–Murray code for "BITS8".
-    // Rightmost bits of the 4th byte is the network identifier.
-    let b0 = 0b1100_1001;
-    let b1 = 0b1010_0000;
-    let b2 = 0b0101_1101;
-    let mut b3 = 0b1001_1000;
-    match network {
-        Network::Regtest => (),
-        Network::Signet => b3 |= 0b0000_0110,
-        Network::Forknet => b3 |= 0b0000_0010,
+    const PREFIX: [u8; 4] =
+        [0b1000_0010, 0b1000_1111, 0b0000_1010, 0b0000_0000];
+    const fn network_identifier(network: Network) -> u8 {
+        match network {
+            Network::Regtest => 0b0000_0000,
+            Network::Signet => 0b0000_0001,
+            Network::Forknet => 0b0000_0010,
+        }
     }
-    [b0, b1, b2, b3]
+    let mut res = PREFIX;
+    *res.last_mut().unwrap() |= network_identifier(network);
+    res
 }
 
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize)]
@@ -301,5 +304,36 @@ impl ResponseMessage {
         } else {
             std::fmt::Debug::fmt(headers, f)
         }
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use std::collections::HashSet;
+
+    use super::{MagicBytes, Network, magic_bytes};
+
+    const EXPECTED: [(Network, MagicBytes); 3] = [
+        (Network::Regtest, [0x82, 0x8f, 0x0a, 0x00]),
+        (Network::Signet, [0x82, 0x8f, 0x0a, 0x01]),
+        (Network::Forknet, [0x82, 0x8f, 0x0a, 0x02]),
+    ];
+
+    /// The old prefix encoded "BITS8", which is the plain-bitassets name, so
+    /// the two chains returned the same bytes on regtest and forknet.
+    #[test]
+    fn network_magic_matches_the_baudot_encoding() {
+        for (network, expected) in EXPECTED {
+            assert_eq!(magic_bytes(network), expected, "{network:?}");
+        }
+    }
+
+    #[test]
+    fn network_magic_keeps_each_network_separate() {
+        let magics: HashSet<MagicBytes> = EXPECTED
+            .iter()
+            .map(|(network, _)| magic_bytes(*network))
+            .collect();
+        assert_eq!(magics.len(), EXPECTED.len());
     }
 }
