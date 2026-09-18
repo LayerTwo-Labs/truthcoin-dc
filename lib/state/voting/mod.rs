@@ -93,7 +93,10 @@ pub struct VotingSystem {
 impl VotingSystem {
     pub const NUM_DBS: u32 = VotingDatabases::NUM_DBS;
 
-    pub fn new(env: &Env, rwtxn: &mut RwTxn<'_>) -> Result<Self, Error> {
+    pub fn new<Tls>(
+        env: &Env<Tls>,
+        rwtxn: &mut RwTxn<'_>,
+    ) -> Result<Self, Error> {
         let databases = VotingDatabases::new(env, rwtxn)?;
         Ok(Self { databases })
     }
@@ -156,7 +159,7 @@ impl VotingSystem {
 
                 tracing::info!(
                     "Decision {} no votes — using default {:.4}",
-                    hex::encode(decision_id.as_bytes()),
+                    const_hex::encode(decision_id.as_bytes()),
                     default_value
                 );
 
@@ -280,7 +283,7 @@ impl VotingSystem {
                     tracing::info!(
                         "Decision {} has unanimous abstention \
                          — using default {:.4}",
-                        hex::encode(decision_id.as_bytes()),
+                        const_hex::encode(decision_id.as_bytes()),
                         default_value
                     );
                     default_value
@@ -325,7 +328,7 @@ impl VotingSystem {
 
                 tracing::info!(
                     "Decision {} had no votes — using default {:.4}",
-                    hex::encode(decision_id.as_bytes()),
+                    const_hex::encode(decision_id.as_bytes()),
                     default_value
                 );
 

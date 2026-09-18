@@ -2,14 +2,42 @@
 
 use thiserror::Error;
 
-/// Convenience alias to avoid writing out a lengthy trait bound
-pub trait Transport = where
-    Self: tonic::client::GrpcService<tonic::body::Body>,
-    Self::Error: Into<tonic::codegen::StdError>,
-    Self::ResponseBody:
+/// Convenience trait for a lengthy trait bound. A blanket impl covers every
+/// type that satisfies the bounds.
+///
+/// The associated types restate the `GrpcService` bounds, so that
+/// `T: Transport` alone gives all of them.
+pub trait Transport:
+    tonic::client::GrpcService<
+        tonic::body::Body,
+        Error = <Self as Transport>::TransportError,
+        ResponseBody = <Self as Transport>::TransportResponseBody,
+    >
+{
+    type TransportError: Into<tonic::codegen::StdError>;
+
+    type TransportResponseBody: tonic::codegen::Body<
+            Data = tonic::codegen::Bytes,
+            Error = <Self as Transport>::TransportBodyError,
+        > + Send
+        + 'static;
+
+    type TransportBodyError: Into<tonic::codegen::StdError> + Send;
+}
+
+impl<T> Transport for T
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody:
         tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
-    <Self::ResponseBody as tonic::codegen::Body>::Error:
-        Into<tonic::codegen::StdError> + Send;
+    <T::ResponseBody as tonic::codegen::Body>::Error:
+        Into<tonic::codegen::StdError> + Send,
+{
+    type TransportError = T::Error;
+    type TransportResponseBody = T::ResponseBody;
+    type TransportBodyError = <T::ResponseBody as tonic::codegen::Body>::Error;
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -170,7 +198,7 @@ pub mod common {
             let Self { hex } = self;
             let hex =
                 hex.ok_or_else(|| super::Error::missing_field::<Self>("hex"))?;
-            hex::decode(&hex).map_err(|_err| {
+            const_hex::decode(&hex).map_err(|_err| {
                 super::Error::invalid_field_value::<Message>(field_name, &hex)
             })
         }
@@ -186,7 +214,7 @@ pub mod common {
             let Self { hex } = self;
             let hex =
                 hex.ok_or_else(|| super::Error::missing_field::<Self>("hex"))?;
-            let bytes = hex::decode(&hex).map_err(|_err| {
+            let bytes = const_hex::decode(&hex).map_err(|_err| {
                 super::Error::invalid_field_value::<Message>(field_name, &hex)
             })?;
             T::try_from_slice(&bytes).map_err(|_err| {
@@ -196,7 +224,7 @@ pub mod common {
 
         pub fn encode<T>(value: &T) -> Self
         where
-            T: hex::ToHex,
+            T: const_hex::ToHexExt,
         {
             let hex = value.encode_hex();
             Self { hex: Some(hex) }
@@ -216,7 +244,7 @@ pub mod common {
             let hex = hex
                 .as_ref()
                 .ok_or_else(|| super::Error::missing_field::<Self>("hex"))?;
-            let mut bytes = hex::decode(hex).map_err(|_| {
+            let mut bytes = const_hex::decode(hex).map_err(|_| {
                 super::Error::invalid_field_value::<Message>(field_name, hex)
             })?;
             bytes.reverse();
@@ -246,7 +274,7 @@ pub mod common {
             let mut bytes = bitcoin::consensus::encode::serialize(value);
             bytes.reverse();
             Self {
-                hex: Some(hex::encode(bytes)),
+                hex: Some(const_hex::encode(bytes)),
             }
         }
     }
@@ -269,6 +297,7 @@ pub mod mainchain {
         THIS_SIDECHAIN,
     };
 
+    #[allow(clippy::double_must_use)]
     pub mod generated {
         tonic::include_proto!("cusf.mainchain.v1");
     }
@@ -445,7 +474,8 @@ pub mod mainchain {
                         Ok(address_str) => address_str,
                         Err(_) => {
                             tracing::warn!(
-                                address_bytes = hex::encode(address_bytes),
+                                address_bytes =
+                                    const_hex::encode(address_bytes),
                                 "Ignoring invalid deposit address"
                             );
                             break 'address Address::ALL_ZEROS;
@@ -479,7 +509,7 @@ pub mod mainchain {
         }
     }
 
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
     pub struct BlockHeaderInfo {
         pub block_hash: BlockHash,
         pub prev_block_hash: BlockHash,
@@ -1226,7 +1256,7 @@ pub mod mainchain {
 
         pub async fn subscribe_events(
             &mut self,
-        ) -> Result<BoxStream<'_, Result<Event, super::Error>>, super::Error>
+        ) -> Result<BoxStream<'static, Result<Event, super::Error>>, super::Error>
         {
             let request = generated::SubscribeEventsRequest {
                 sidechain_id: Some(THIS_SIDECHAIN as u32),

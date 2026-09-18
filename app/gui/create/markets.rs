@@ -255,7 +255,7 @@ impl CreateMarket {
                     for entry in entries {
                         if let Some(decision) = &entry.decision {
                             self.claimed_decisions.push(ClaimedDecisionInfo {
-                                decision_id_hex: hex::encode(
+                                decision_id_hex: const_hex::encode(
                                     entry.decision_id.as_bytes(),
                                 ),
                                 header: decision.header.clone(),

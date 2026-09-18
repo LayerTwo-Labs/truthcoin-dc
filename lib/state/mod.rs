@@ -1,8 +1,9 @@
+//! Sidechain state as of the current sidechain tip
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU32;
 
 use fallible_iterator::FallibleIterator;
-use futures::Stream;
 use heed::types::SerdeBincode;
 use serde::{Deserialize, Serialize};
 use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
@@ -10,10 +11,11 @@ use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
 use crate::{
     types::{
         Address, AmountOverflowError, Authorized, AuthorizedTransaction,
-        BlockHash, Body, FilledOutput, FilledTransaction, GetBitcoinValue as _,
-        Header, InPoint, M6id, MerkleRoot, OutPoint, OutPointKey, SpentOutput,
-        Transaction, VERSION, Version, WithdrawalBundle,
-        WithdrawalBundleStatus, proto::mainchain::TwoWayPegData,
+        BlockHash, BlockIndexEvents, Body, FilledOutput, FilledTransaction,
+        GetBitcoinValue as _, Header, InPoint, M6id, MerkleRoot, OutPoint,
+        OutPointKey, SpentOutput, Transaction, VERSION, Version,
+        WithdrawalBundle, WithdrawalBundleStatus,
+        proto::mainchain::TwoWayPegData,
     },
     util::Watchable,
     validation::DecisionValidationInterface,
@@ -101,6 +103,10 @@ pub struct State {
     latest_failed_withdrawal_bundle:
         DatabaseUnique<UnitKey, SerdeBincode<RollBack<HeightStamped<M6id>>>>,
     withdrawal_bundles: WithdrawalBundlesDb,
+    /// Coin movements that no block body carries, keyed by the height that
+    /// applied them
+    block_index_events:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<BlockIndexEvents>>,
     deposit_blocks: DatabaseUnique<
         SerdeBincode<u32>,
         SerdeBincode<(bitcoin::BlockHash, u32)>,
@@ -211,7 +217,7 @@ impl DecisionValidationInterface for State {
 }
 
 impl State {
-    const BASE_DBS: u32 = 13;
+    const BASE_DBS: u32 = 14;
     const UNDO_DBS: u32 = 6;
 
     pub const NUM_DBS: u32 = reputation::ReputationDbs::NUM_DBS
@@ -221,8 +227,8 @@ impl State {
         + Self::BASE_DBS
         + Self::UNDO_DBS;
 
-    pub fn new(
-        env: &sneed::Env,
+    pub fn new<Tls>(
+        env: &sneed::Env<Tls>,
         decision_config_testing: Option<u32>,
     ) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
@@ -268,6 +274,8 @@ impl State {
         )?;
         let withdrawal_bundles =
             DatabaseUnique::create(env, &mut rwtxn, "withdrawal_bundles")?;
+        let block_index_events =
+            DatabaseUnique::create(env, &mut rwtxn, "block_index_events")?;
         let deposit_blocks =
             DatabaseUnique::create(env, &mut rwtxn, "deposit_blocks")?;
         let withdrawal_bundle_event_blocks = DatabaseUnique::create(
@@ -310,6 +318,7 @@ impl State {
             pending_withdrawal_bundle,
             latest_failed_withdrawal_bundle,
             withdrawal_bundles,
+            block_index_events,
             withdrawal_bundle_event_blocks,
             deposit_blocks,
             _version: version,
@@ -362,6 +371,19 @@ impl State {
         &self.withdrawal_bundle_event_blocks
     }
 
+    /// Coin movements that the block at this height applied outside its body.
+    pub fn get_block_index_events(
+        &self,
+        rotxn: &RoTxn,
+        height: u32,
+    ) -> Result<BlockIndexEvents, Error> {
+        let events = self
+            .block_index_events
+            .try_get(rotxn, &height)?
+            .unwrap_or_default();
+        Ok(events)
+    }
+
     pub fn try_get_tip(
         &self,
         rotxn: &RoTxn,
@@ -401,6 +423,20 @@ impl State {
             .map(|(key, output)| Ok((key.to_outpoint(), output)))
             .collect()?;
         Ok(utxos)
+    }
+
+    pub fn get_stxos_by_addresses(
+        &self,
+        rotxn: &RoTxn,
+        addresses: &HashSet<Address>,
+    ) -> Result<HashMap<OutPoint, SpentOutput>, Error> {
+        let stxos: HashMap<OutPoint, SpentOutput> = self
+            .stxos
+            .iter(rotxn)?
+            .filter(|(_, stxo)| Ok(addresses.contains(&stxo.output.address)))
+            .map(|(key, stxo)| Ok((key.to_outpoint(), stxo)))
+            .collect()?;
+        Ok(stxos)
     }
 
     pub fn get_utxos_by_addresses(
@@ -954,7 +990,7 @@ impl State {
 }
 
 impl Watchable<()> for State {
-    type WatchStream = impl Stream<Item = ()>;
+    type WatchStream = tokio_stream::wrappers::WatchStream<()>;
     fn watch(&self) -> Self::WatchStream {
         tokio_stream::wrappers::WatchStream::new(self.tip.watch().clone())
     }

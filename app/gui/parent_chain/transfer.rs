@@ -2,15 +2,50 @@ use eframe::egui::{self, Button, Color32};
 
 use crate::app::App;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Deposit {
     amount: String,
     fee: String,
     error: Option<String>,
+    promise: Option<poll_promise::Promise<Result<bitcoin::Txid, String>>>,
+}
+
+impl std::fmt::Debug for Deposit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deposit")
+            .field("amount", &self.amount)
+            .field("fee", &self.fee)
+            .field("error", &self.error)
+            .field("promise_active", &self.promise.is_some())
+            .finish()
+    }
 }
 
 impl Deposit {
     pub fn show(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
+        if let Some(promise) = &self.promise {
+            match promise.ready() {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            "Creating deposit transaction on parent chain...",
+                        );
+                    });
+                    return;
+                }
+                Some(Ok(txid)) => {
+                    tracing::info!("Deposit transaction created: {}", txid);
+                    *self = Self::default();
+                }
+                Some(Err(err)) => {
+                    tracing::error!("{err}");
+                    self.error = Some(err.clone());
+                    self.promise = None;
+                }
+            }
+        }
+
         ui.add_sized((110., 10.), |ui: &mut egui::Ui| {
             ui.horizontal(|ui| {
                 let amount_edit = egui::TextEdit::singleline(&mut self.amount)
@@ -47,16 +82,24 @@ impl Deposit {
             )
             .clicked()
         {
-            let app = app.unwrap();
-            if let Err(err) = app.deposit(
-                app.wallet.get_new_address().expect("should not happen"),
-                amount.expect("should not happen"),
-                fee.expect("should not happen"),
-            ) {
-                tracing::error!("{err}");
-                self.error = Some(format!("{err:#}"));
-            } else {
-                *self = Self::default();
+            let app = app.unwrap().clone();
+            let amount = amount.expect("should not happen");
+            let fee = fee.expect("should not happen");
+
+            match app.wallet.get_new_address() {
+                Ok(address) => {
+                    self.error = None;
+                    self.promise =
+                        Some(poll_promise::Promise::spawn_async(async move {
+                            app.deposit(address, amount, fee)
+                                .await
+                                .map_err(|e| format!("{e:#}"))
+                        }));
+                }
+                Err(err) => {
+                    tracing::error!("Failed to get new address: {err}");
+                    self.error = Some(format!("{err:#}"));
+                }
             }
         }
 
@@ -67,13 +110,31 @@ impl Deposit {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Withdrawal {
     mainchain_address: String,
     amount: String,
     fee: String,
     mainchain_fee: String,
     error: Option<String>,
+    generate_promise: Option<
+        poll_promise::Promise<
+            Result<bitcoin::Address<bitcoin::address::NetworkChecked>, String>,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for Withdrawal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Withdrawal")
+            .field("mainchain_address", &self.mainchain_address)
+            .field("amount", &self.amount)
+            .field("fee", &self.fee)
+            .field("mainchain_fee", &self.mainchain_fee)
+            .field("error", &self.error)
+            .field("generate_active", &self.generate_promise.is_some())
+            .finish()
+    }
 }
 
 fn create_withdrawal(
@@ -95,6 +156,23 @@ fn create_withdrawal(
 
 impl Withdrawal {
     pub fn show(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
+        if let Some(promise) = &self.generate_promise {
+            match promise.ready() {
+                None => {}
+                Some(Ok(address)) => {
+                    self.mainchain_address = address.to_string();
+                    self.generate_promise = None;
+                }
+                Some(Err(err)) => {
+                    tracing::error!(
+                        "Failed to generate mainchain address: {err}"
+                    );
+                    self.error = Some(err.clone());
+                    self.generate_promise = None;
+                }
+            }
+        }
+
         ui.add_sized((250., 10.), |ui: &mut egui::Ui| {
             ui.horizontal(|ui| {
                 let mainchain_address_edit =
@@ -102,20 +180,24 @@ impl Withdrawal {
                         .hint_text("mainchain address")
                         .desired_width(150.);
                 ui.add(mainchain_address_edit);
+
+                let is_generating = self.generate_promise.is_some();
+                let generate_btn = if is_generating {
+                    Button::new("generating...")
+                } else {
+                    Button::new("generate")
+                };
                 if ui
-                    .add_enabled(app.is_some(), Button::new("generate"))
+                    .add_enabled(app.is_some() && !is_generating, generate_btn)
                     .clicked()
                 {
-                    match app.unwrap().get_new_main_address() {
-                        Ok(main_address) => {
-                            self.mainchain_address = main_address.to_string();
-                        }
-                        Err(err) => {
-                            let err = anyhow::Error::new(err);
-                            tracing::error!("{err:#}");
-                            self.error = Some(format!("{err:#}"));
-                        }
-                    };
+                    let app = app.unwrap().clone();
+                    self.generate_promise =
+                        Some(poll_promise::Promise::spawn_async(async move {
+                            app.get_new_main_address()
+                                .await
+                                .map_err(|e| format!("{e:#}"))
+                        }));
                 }
             })
             .response
@@ -188,7 +270,16 @@ impl Withdrawal {
                 tracing::error!("{err:#}");
                 self.error = Some(format!("{err:#}"));
             } else {
+                let is_generating = self.generate_promise.is_some();
                 *self = Self::default();
+                if is_generating {
+                    // Keep the generation promise active if it was running
+                    // (though unlikely to happen during a withdrawal)
+                    self.generate_promise =
+                        Some(poll_promise::Promise::spawn_async(async move {
+                            unreachable!()
+                        }));
+                }
             }
         }
 

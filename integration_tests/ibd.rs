@@ -16,7 +16,7 @@ use bip300301_enforcer_integration_tests::{
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::BoxFuture};
 use tokio::time::sleep;
 use tracing::Instrument as _;
-use truthcoin_dc_app_rpc_api::RpcClient as _;
+use truthcoin_dc_app_rpc_api::node::{PrivateRpcClient as _, RpcClient as _};
 
 use crate::{
     setup::{Init, PostSetup},
@@ -98,15 +98,19 @@ async fn check_peer_connection(
     }
 }
 
+/// What the syncer holds before it meets the sender.
 #[derive(Clone, Copy, Debug)]
 enum SyncerStart {
+    /// Fresh node: plain IBD.
     Empty,
-    /// Syncer holds its own three-block chain with a deposit applied in the
-    /// second block, so adopting the sender's chain must disconnect a tip
-    /// whose parent is the latest deposit block.
+    /// The syncer already BMM'd its own chain of three blocks, with a deposit
+    /// that lands in the second one and nothing in the third. Adopting the
+    /// sender's chain then has to disconnect a tip whose parent is the most
+    /// recent deposit block.
     OwnChainWithDeposit,
 }
 
+/// Number of blocks the syncer holds under [`SyncerStart::OwnChainWithDeposit`]
 const OWN_CHAIN_BLOCKS: u32 = 3;
 
 async fn initial_block_download_task(
@@ -130,6 +134,8 @@ async fn initial_block_download_task(
                 .await?;
             let deposit_address =
                 truthcoin_nodes.syncer.get_deposit_address().await?;
+            // `deposit` mines the mainchain deposit block, then
+            // `confirm_deposit` BMMs syncer block 2 to apply it.
             tracing::info!("Syncer: deposit, applied by BMM block 2");
             let () = deposit(
                 &mut enforcer_post_setup,
@@ -279,6 +285,8 @@ pub fn ibd_trial(
     )
 }
 
+/// IBD onto a node that must first reorg its own chain away, disconnecting a
+/// tip whose parent carries the latest deposit.
 pub fn reorg_across_deposit_trial(
     bin_paths: BinPaths,
     file_registry: TestFileRegistry,

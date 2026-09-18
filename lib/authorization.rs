@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use borsh::BorshSerialize;
-use hex::FromHex;
+use const_hex::FromHex;
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -33,7 +33,7 @@ impl<'de> Deserialize<'de> for Signature {
         D: serde::Deserializer<'de>,
     {
         if deserializer.is_human_readable() {
-            hex::serde::deserialize(deserializer)
+            const_hex::serde::deserialize(deserializer)
         } else {
             ed25519_dalek::Signature::deserialize(deserializer).map(Self)
         }
@@ -72,7 +72,7 @@ impl Serialize for Signature {
         S: serde::Serializer,
     {
         if serializer.is_human_readable() {
-            hex::serde::serialize(self.0.to_bytes(), serializer)
+            const_hex::serde::serialize(self.0.to_bytes(), serializer)
         } else {
             self.0.serialize(serializer)
         }

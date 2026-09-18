@@ -80,6 +80,9 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "Temporary ignore until aws-lc-rs and rustls-webpki get updated"},
     # bincode is unmaintained (transitive via heed)
     { id = "RUSTSEC-2025-0141", reason = "Transitive dependency from heed, awaiting upstream update to use alternative"},
+    { id = "RUSTSEC-2026-0247", reason = "The pinned enforcer integration harness uses cusf-enforcer-mempool -> imbl -> bitmaps. No patched bitmaps version exists." },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 via atspi-common -> zbus-lockstep(-macros) -> zbus_xml parses fixed crate XML in macros and dependency tests." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.30 via atspi-common -> zbus-lockstep(-macros) -> zbus_xml parses fixed crate XML in macros and dependency tests." },
     # ttf-parser is unmaintained (transitive via egui/eframe -> ab_glyph); no safe upgrade
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, transitive via egui/eframe, no safe upgrade" },
     # quick-xml 0.30 (transitive via eframe -> accesskit_unix -> zbus_xml); fixed in 0.41, needs eframe bump

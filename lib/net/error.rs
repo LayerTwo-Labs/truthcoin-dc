@@ -71,6 +71,22 @@ pub(in crate::net) mod configure_client {
 }
 pub use configure_client::Error as ConfigureClient;
 
+#[derive(Debug, Error)]
+pub enum ResolveSeedAddress {
+    #[error(transparent)]
+    Net(Box<hickory_resolver::net::NetError>),
+    #[error("the domain ({domain}) resolved to no IP address")]
+    NoIpAddrs { domain: String },
+}
+
+#[derive(Debug, Error)]
+pub enum DialSeed {
+    #[error("cannot connect to the seed peer")]
+    Connect(#[source] Box<Error>),
+    #[error("cannot resolve the seed host name")]
+    DnsResolve(#[from] ResolveSeedAddress),
+}
+
 #[allow(clippy::duplicated_attributes)]
 #[derive(Debug, Error, Transitive)]
 #[transitive(from(db::error::Put, db::Error))]
@@ -86,6 +102,8 @@ pub enum Error {
     AlreadyConnected(#[from] AlreadyConnected),
     #[error("bincode error")]
     Bincode(#[from] bincode::Error),
+    #[error("cannot build the DNS resolver")]
+    BuildDnsResolver(#[source] hickory_resolver::net::NetError),
     #[error(transparent)]
     ConfigureClient(#[from] ConfigureClient),
     #[error("connect error")]

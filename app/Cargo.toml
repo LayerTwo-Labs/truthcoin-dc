@@ -21,11 +21,10 @@ either = "1.13.0"
 fallible-iterator = { workspace = true }
 fraction = { workspace = true, features = ["with-serde-support"] }
 futures = { workspace = true }
-hex = { workspace = true }
+const-hex = { workspace = true }
 http = { workspace = true }
 human-size = "0.4.3"
 itertools = { workspace = true }
-include_path = "0.1.1"
 jsonrpsee = { workspace = true, features = ["server"] }
 mimalloc = { version = "0.1.48", features = ["v3"] }
 parking_lot = { workspace = true }
@@ -44,7 +43,7 @@ tonic = { workspace = true }
 tonic-health = "0.14.3"
 # needs to line up with jsonrpsee tower version...
 tower = "0.5.2"
-tower-http = { version = "0.6.2", features = ["request-id", "trace"] }
+tower-http = { version = "0.6.2", features = ["cors", "request-id", "trace"] }
 tracing = { workspace = true }
 tracing-appender = "0.2.3"
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
@@ -55,6 +54,9 @@ uuid = { workspace = true, features = ["v4"] }
 [dependencies.libes]
 version = "0.9.1"
 features = ["AES256-GCM", "ECIES-MAC", "HMAC-SHA256", "x25519"]
+
+[dev-dependencies]
+reserve-port = "2.0.1"
 
 [features]
 default = ["zmq"]

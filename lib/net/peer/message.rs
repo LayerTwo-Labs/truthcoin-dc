@@ -27,6 +27,7 @@ pub const fn magic_bytes(network: Network) -> MagicBytes {
         Network::Regtest => (),
         Network::Signet => b3 |= 0b0000_0110,
         Network::Forknet => b3 |= 0b0000_0010,
+        Network::Alphanet => b3 |= 0b0000_0011,
     }
     [b0, b1, b2, b3]
 }
@@ -301,5 +302,18 @@ impl ResponseMessage {
         } else {
             std::fmt::Debug::fmt(headers, f)
         }
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::{Network, magic_bytes};
+
+    #[test]
+    fn network_magic_keeps_each_network_separate() {
+        assert_eq!(magic_bytes(Network::Regtest), [0xc9, 0xa0, 0x5d, 0x98]);
+        assert_eq!(magic_bytes(Network::Signet), [0xc9, 0xa0, 0x5d, 0x9e]);
+        assert_eq!(magic_bytes(Network::Forknet), [0xc9, 0xa0, 0x5d, 0x9a]);
+        assert_eq!(magic_bytes(Network::Alphanet), [0xc9, 0xa0, 0x5d, 0x9b]);
     }
 }

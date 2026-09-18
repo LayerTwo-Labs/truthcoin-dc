@@ -695,7 +695,7 @@ pub fn run_consensus(
                 tracing::warn!(
                     "Decision {} has no votes cast \
                      - marking as unanimous abstention",
-                    hex::encode(decision_id.as_bytes())
+                    const_hex::encode(decision_id.as_bytes())
                 );
                 None
             };

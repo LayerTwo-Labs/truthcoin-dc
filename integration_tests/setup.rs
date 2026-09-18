@@ -15,7 +15,7 @@ use reserve_port::ReservedPort;
 use thiserror::Error;
 use tokio::time::sleep;
 use truthcoin_dc::types::{FilledOutputContent, PointedOutput};
-use truthcoin_dc_app_rpc_api::RpcClient as _;
+use truthcoin_dc_app_rpc_api::{node::RpcClient as _, wallet::RpcClient as _};
 
 use crate::util::TruthcoinApp;
 

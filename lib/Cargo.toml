@@ -14,7 +14,6 @@ tonic-prost-build = "0.14.3"
 
 [dependencies]
 addr = "0.15.6"
-anyhow = { workspace = true, features = ["backtrace"] }
 async-lock = "3.4.0"
 bech32 = "0.11.0"
 bincode = { workspace = true }
@@ -31,8 +30,9 @@ fallible-iterator = { workspace = true }
 error-fatality = "0.1.2"
 futures = { workspace = true, features = ["alloc"] }
 hashlink = { version = "0.10.0", features = ["serde_impl"] }
-heed = { version = "0.21.0", features = ["read-txn-no-tls"] }
-hex = { workspace = true, features = ["serde"] }
+heed = "0.22.0"
+hickory-resolver = { workspace = true, features = ["system-config", "tokio"] }
+const-hex = { workspace = true, features = ["serde"] }
 hex-literal = "0.4.1"
 itertools = { workspace = true }
 jsonrpsee = { workspace = true }
@@ -55,18 +55,19 @@ sha2 = "0.10"
 sha3 = "0.10"
 serde_json = { workspace = true }
 serde_with = { workspace = true, features = ["alloc", "macros"] }
-smallvec = { version = "1.13.2", features = ["write"] }
-sneed = { version = "0.0.19", features = ["observe"] }
+smallvec = { version = "1.13.2", features = ["const_generics", "write"] }
+sneed = { version = "0.0.22", features = ["observe"] }
 strum = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 tiny-bip39 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 tokio-stream = { version = "0.1.15", features = ["sync"] }
-tokio-util = { workspace = true, features = ["rt"] }
+tokio-util = { workspace = true, features = ["join-map", "rt"] }
 tonic = { workspace = true }
 tonic-prost = "0.14.3"
 tracing = { workspace = true }
 transitive = "1.2.0"
+url = { workspace = true }
 utoipa = { workspace = true, features = ["macros", "non_strict_integers"] }
 x25519-dalek = { version = "2.0.0", features = ["serde", "static_secrets"] }
 zeromq = { version = "0.4.1", optional = true }
@@ -87,6 +88,7 @@ default-features = false
 features = ["quanta", "std"]
 
 [dev-dependencies]
+anyhow = { workspace = true }
 tempfile = "3.10.1"
 approx = "0.5.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }

@@ -4,10 +4,14 @@ use bip300301_enforcer_integration_tests::util::{
 use clap::Parser;
 use tracing_subscriber::{filter as tracing_filter, layer::SubscriberExt};
 
+mod block_template;
 mod ibd;
 mod integration_test;
+mod list_mempool;
+mod receive_address;
 mod roundtrip;
 mod setup;
+mod transfer_many;
 mod unknown_withdrawal;
 mod util;
 
@@ -98,19 +102,46 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
     runtime.block_on(async_main())
 }
 
-async fn async_main() -> anyhow::Result<std::process::ExitCode> {
-    // Parse command line arguments
-    let args = Cli::parse();
-    let () = set_tracing_subscriber(tracing::Level::DEBUG)?;
-    let rt_handle = tokio::runtime::Handle::current();
-    // Read env vars
+/// Env file in the repo root. dotenvy looks for it in the working directory,
+/// and then in each parent directory.
+const DEFAULT_ENV_FILE: &str = "integrationtests.env";
+
+/// Variables that are already set take precedence over [`DEFAULT_ENV_FILE`].
+///
+/// `TRUTHCOIN_INTEGRATION_TEST_ENV` names an env file to load instead. That
+/// file must exist, and its values override the environment.
+fn load_env_file() -> anyhow::Result<()> {
     if let Some(env_filepath) =
         std::env::var_os("TRUTHCOIN_INTEGRATION_TEST_ENV")
     {
         let env_filepath: &std::path::Path = env_filepath.as_ref();
         tracing::info!("Adding env vars from `{}`", env_filepath.display());
         dotenvy::from_filename_override(env_filepath)?;
+        return Ok(());
     }
+    match dotenvy::from_filename(DEFAULT_ENV_FILE) {
+        Ok(path) => {
+            tracing::info!("Adding env vars from `{}`", path.display());
+            Ok(())
+        }
+        Err(err) if err.not_found() => {
+            tracing::debug!(
+                "No `{DEFAULT_ENV_FILE}`; \
+                 expecting the environment to be set by other means"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn async_main() -> anyhow::Result<std::process::ExitCode> {
+    // Parse command line arguments
+    let args = Cli::parse();
+    let () = set_tracing_subscriber(tracing::Level::DEBUG)?;
+    let rt_handle = tokio::runtime::Handle::current();
+    // Read env vars
+    let () = load_env_file()?;
 
     // Create a list of tests
     let mut tests = Vec::<libtest_mimic::Trial>::new();

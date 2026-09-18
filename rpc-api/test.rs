@@ -274,10 +274,10 @@ impl ComponentRefs for openapi::OpenApi {
     }
 }
 
-#[test]
-fn check_schema() -> anyhow::Result<()> {
-    let schema: openapi::OpenApi =
-        <crate::RpcDoc as utoipa::OpenApi>::openapi();
+/// Find the errors within a schema: a ref to a missing component, or a
+/// component that no ref names
+fn check_schema(schema: &openapi::OpenApi) -> Vec<String> {
+    let mut errors = Vec::new();
     let component_ref_locations = BTreeSet::<&str>::from_iter(
         schema
             .component_refs()
@@ -289,17 +289,47 @@ fn check_schema() -> anyhow::Result<()> {
         ));
     for ref_loc in &component_ref_locations {
         let Some(loc) = ref_loc.strip_prefix("#/components/schemas/") else {
-            anyhow::bail!("Unexpected prefix in ref location: `{ref_loc}`");
+            errors.push(format!("Unexpected ref location: `{ref_loc}`"));
+            continue;
         };
         if !component_schemas.contains(loc) {
-            anyhow::bail!("Missing schema referenced as `{ref_loc}`")
+            errors.push(format!("Missing schema referenced as `{ref_loc}`"));
         }
     }
     for component in component_schemas {
         let component_ref = format!("#/components/schemas/{component}");
         if !component_ref_locations.contains(component_ref.as_str()) {
-            anyhow::bail!("No references to {component_ref}")
+            errors.push(format!("No references to {component_ref}"));
         }
     }
+    errors
+}
+
+fn check_schemas_inner() -> anyhow::Result<()> {
+    use utoipa::OpenApi as _;
+    let docs = [
+        ("node::PrivateRpcDoc", crate::node::PrivateRpcDoc::openapi()),
+        ("node::RpcDoc", crate::node::RpcDoc::openapi()),
+        ("wallet::RpcDoc", crate::wallet::RpcDoc::openapi()),
+    ];
+    let errors: Vec<String> = docs
+        .iter()
+        .flat_map(|(name, doc)| {
+            check_schema(doc)
+                .into_iter()
+                .map(move |err| format!("{name}: {err}"))
+        })
+        .collect();
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("\n"));
     Ok(())
+}
+
+#[test]
+fn check_schemas() -> anyhow::Result<()> {
+    // The schemas nest deep enough to overflow the default test thread stack.
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(check_schemas_inner)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the schema check panicked"))?
 }

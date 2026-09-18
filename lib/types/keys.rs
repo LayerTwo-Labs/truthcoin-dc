@@ -16,7 +16,7 @@ pub struct WrongHrpError {
 pub enum Bech32mDecodeError {
     #[error(transparent)]
     Bech32m(#[from] bech32::DecodeError),
-    #[error("Invalid bytes: {}", hex::encode(.bytes))]
+    #[error("Invalid bytes: {}", const_hex::encode(.bytes))]
     InvalidBytes {
         bytes: [u8; 32],
         source: Box<ed25519_dalek::SignatureError>,

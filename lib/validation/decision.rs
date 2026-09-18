@@ -137,7 +137,7 @@ impl DecisionValidator {
                         Error::InvalidDecisionId {
                             reason: format!(
                                 "Decision {} already claimed",
-                                hex::encode(entry.decision_id_bytes)
+                                const_hex::encode(entry.decision_id_bytes)
                             ),
                         }
                     }

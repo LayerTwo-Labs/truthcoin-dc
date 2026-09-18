@@ -44,7 +44,10 @@ pub struct VotingDatabases {
 impl VotingDatabases {
     pub const NUM_DBS: u32 = 4;
 
-    pub fn new(env: &Env, rwtxn: &mut RwTxn<'_>) -> Result<Self, Error> {
+    pub fn new<Tls>(
+        env: &Env<Tls>,
+        rwtxn: &mut RwTxn<'_>,
+    ) -> Result<Self, Error> {
         Ok(Self {
             votes: DatabaseUnique::create(env, rwtxn, "votes")?,
             ballots: DatabaseUnique::create(env, rwtxn, "ballots")?,
