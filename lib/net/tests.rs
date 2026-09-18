@@ -10,7 +10,7 @@ use futures::StreamExt as _;
 use heed::types::{SerdeBincode, Unit};
 
 use super::{
-    ALPHANET_SEED_NODE_ADDRS, Archive, DatabaseUnique, DialSeedsHandle, Net,
+    Archive, BETANET_SEED_NODE_ADDRS, DatabaseUnique, DialSeedsHandle, Net,
     Network, PeerConnectionInfo, PeerInfoRx, State,
 };
 use crate::{
@@ -28,11 +28,11 @@ pub(crate) fn set_crypto_provider() {
 }
 
 #[test]
-fn alphanet_names_the_seed_port() {
+fn betanet_names_the_seed_port() {
     assert_eq!(
-        ALPHANET_SEED_NODE_ADDRS,
+        BETANET_SEED_NODE_ADDRS,
         [SeedAddress {
-            host: url::Host::Domain("seed.alpha.ecash.eu.com"),
+            host: url::Host::Domain("seed.beta.ecash.eu.com"),
             port: 4013,
         }]
     );
