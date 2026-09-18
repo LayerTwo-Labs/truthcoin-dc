@@ -18,6 +18,7 @@ use ndarray::Array1;
 
 use crate::{
     archive::{self, Archive},
+    authorization::{BatchVerificationContext, rand_core::CryptoRng},
     math::trading,
     mempool::{self, MemPool},
     net::{self, Net, Peer},
@@ -117,6 +118,7 @@ pub type FilledTransactionWithPosition =
 #[derive(Clone)]
 pub struct Node<MainchainTransport = Channel> {
     archive: Archive,
+    batch_verification_ctxt: BatchVerificationContext,
     cusf_mainchain: Arc<Mutex<mainchain::ValidatorClient<MainchainTransport>>>,
     cusf_mainchain_block_producer:
         Option<Arc<Mutex<mainchain::BlockProducerClient<MainchainTransport>>>>,
@@ -135,7 +137,7 @@ where
     MainchainTransport: proto::Transport,
 {
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
+    pub async fn new<R>(
         bind_addr: SocketAddr,
         datadir: &Path,
         network: Network,
@@ -143,6 +145,7 @@ where
         cusf_mainchain_block_producer: Option<
             mainchain::BlockProducerClient<MainchainTransport>,
         >,
+        rng: &mut R,
         runtime: &tokio::runtime::Runtime,
         decision_config_testing: Option<u32>,
         #[cfg(feature = "zmq")] zmq_addr: SocketAddr,
@@ -153,6 +156,7 @@ where
         <MainchainTransport as tonic::client::GrpcService<
             tonic::body::Body,
         >>::Future: Send,
+        R: CryptoRng,
 {
         let env_path = datadir.join("data.mdb");
         std::fs::create_dir_all(&env_path)?;
@@ -211,8 +215,15 @@ where
                 archive.clone(),
                 cusf_mainchain.clone(),
             );
-        let (net, peer_info_rx) =
-            Net::new(&env, archive.clone(), network, state.clone(), bind_addr)?;
+        let batch_verification_ctxt = BatchVerificationContext::new(rng);
+        let (net, peer_info_rx) = Net::new(
+            &env,
+            archive.clone(),
+            batch_verification_ctxt,
+            network,
+            state.clone(),
+            bind_addr,
+        )?;
         let cusf_mainchain_block_producer = cusf_mainchain_block_producer
             .map(|block_producer| Arc::new(Mutex::new(block_producer)));
         let net_task = NetTaskHandle::new(
@@ -230,6 +241,7 @@ where
         );
         Ok(Self {
             archive,
+            batch_verification_ctxt,
             cusf_mainchain: Arc::new(Mutex::new(cusf_mainchain)),
             cusf_mainchain_block_producer,
             env,
@@ -315,6 +327,7 @@ where
             self.state.validate_transaction(
                 &self.archive,
                 &rwtxn,
+                &self.batch_verification_ctxt,
                 &transaction,
             )?;
             self.mempool.put(&mut rwtxn, &transaction)?;
