@@ -27,7 +27,8 @@ pub const fn magic_bytes(network: Network) -> MagicBytes {
             Network::Regtest => 0b0000_0000,
             Network::Signet => 0b0000_0001,
             Network::Forknet => 0b0000_0010,
-            Network::Alphanet => 0b0000_0011,
+            // Network::Alphanet => 0b0000_0011,
+            Network::Betanet => 0b0000_0100,
         }
     }
     let mut res = PREFIX;
@@ -318,7 +319,7 @@ mod network_tests {
         (Network::Regtest, [0x82, 0x8f, 0x0a, 0x00]),
         (Network::Signet, [0x82, 0x8f, 0x0a, 0x01]),
         (Network::Forknet, [0x82, 0x8f, 0x0a, 0x02]),
-        (Network::Alphanet, [0x82, 0x8f, 0x0a, 0x03]),
+        (Network::Betanet, [0x82, 0x8f, 0x0a, 0x04]),
     ];
 
     /// The old prefix encoded "BITS8", which is the plain-bitassets name, so

@@ -725,10 +725,10 @@ pub struct Tip {
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum, strum::Display))]
 pub enum Network {
     #[default]
-    Signet,
-    Regtest,
+    Betanet,
     Forknet,
-    Alphanet,
+    Regtest,
+    Signet,
 }
 
 /// Semver-compatible version
