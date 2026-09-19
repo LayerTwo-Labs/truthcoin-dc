@@ -124,7 +124,7 @@ impl DecisionId {
     }
 
     pub fn to_hex(self) -> String {
-        hex::encode(self.0)
+        const_hex::encode(self.0)
     }
 
     #[inline(always)]

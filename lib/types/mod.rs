@@ -16,6 +16,7 @@ pub use crate::authorization::Authorization;
 mod address;
 pub mod hashes;
 pub mod keys;
+pub mod net;
 pub mod proto;
 pub mod schema;
 mod transaction;
@@ -83,17 +84,17 @@ mod serde_display_fromstr_human_readable {
 /// Optimized (de)serialize as hex strings for human-readable forms like json,
 /// and default serialization for non human-readable formats like bincode
 mod serde_hexstr_human_readable {
-    use hex::{FromHex, ToHex};
+    use const_hex::{FromHex, ToHexExt};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[inline]
     pub fn serialize<S, T>(data: T, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
-        T: Serialize + ToHex,
+        T: Serialize + ToHexExt,
     {
         if serializer.is_human_readable() {
-            hex::serde::serialize(data, serializer)
+            data.encode_hex().serialize(serializer)
         } else {
             data.serialize(serializer)
         }
@@ -107,7 +108,7 @@ mod serde_hexstr_human_readable {
         <T as FromHex>::Error: std::fmt::Display,
     {
         if deserializer.is_human_readable() {
-            hex::serde::deserialize(deserializer)
+            const_hex::serde::deserialize(deserializer)
         } else {
             T::deserialize(deserializer)
         }
@@ -194,6 +195,61 @@ pub enum WithdrawalBundleStatus {
 pub struct WithdrawalBundleEvent {
     pub m6id: M6id,
     pub status: WithdrawalBundleEventStatus,
+}
+
+/// Coin movements that a block body does not carry: a mainchain deposit, and
+/// the outputs a withdrawal bundle removed
+#[derive(
+    Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
+)]
+pub struct BlockIndexEvents {
+    /// Outputs that mainchain deposits created
+    pub deposits: Vec<(OutPoint, FilledOutput)>,
+    /// Outputs that a withdrawal bundle removed, with the bundle that took them
+    pub bundle_spends: Vec<(OutPoint, M6id)>,
+}
+
+impl BlockIndexEvents {
+    /// True when the block moved no coins outside its body
+    pub fn is_empty(&self) -> bool {
+        self.deposits.is_empty() && self.bundle_spends.is_empty()
+    }
+}
+
+/// One transaction of a block, with the fields its body omits
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndexTx {
+    pub txid: Txid,
+    /// Borsh size in bytes
+    pub size: u64,
+    /// Borsh encoding, as hex
+    pub raw: String,
+}
+
+/// One output a mainchain deposit created
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndexDeposit {
+    pub outpoint: OutPoint,
+    pub output: FilledOutput,
+}
+
+/// One output a withdrawal bundle removed, with the bundle that took it
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndexSpend {
+    pub outpoint: OutPoint,
+    pub m6id: M6id,
+}
+
+/// Everything about a block that its body does not carry
+//  Each pair is a named struct: a tuple of ref schemas does not compose.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndex {
+    /// Transactions in body order
+    pub txs: Vec<BlockIndexTx>,
+    /// Outputs that mainchain deposits created
+    pub deposits: Vec<BlockIndexDeposit>,
+    /// Outputs that a withdrawal bundle removed
+    pub bundle_spends: Vec<BlockIndexSpend>,
 }
 
 pub static OP_DRIVECHAIN_SCRIPT: LazyLock<bitcoin::ScriptBuf> =
@@ -614,6 +670,32 @@ pub struct TxIn {
     pub idx: u32,
 }
 
+/// Step of the sync with the mainchain
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MainchainSyncPhase {
+    #[default]
+    Idle,
+    /// Fetch mainchain headers from the enforcer
+    Headers,
+    /// Write the fetched mainchain headers to the archive
+    Writing,
+}
+
+/// Progress of the sync with the mainchain
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
+)]
+pub struct MainchainSyncProgress {
+    pub phase: MainchainSyncPhase,
+    pub done: u32,
+    pub total: u32,
+    /// Height of the mainchain block that the sync moves to
+    pub tip_height: u32,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BmmResult {
     Verified,
@@ -646,6 +728,7 @@ pub enum Network {
     Signet,
     Regtest,
     Forknet,
+    Alphanet,
 }
 
 /// Semver-compatible version

@@ -164,8 +164,10 @@ impl BlockValidator {
     ) -> Result<bitcoin::Amount, Error> {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
 
-        for (outpoint, utxo) in tx.spent_inputs() {
-            if utxo.content.is_withdrawal() {
+        for (outpoint, output) in tx.spent_inputs() {
+            // a withdrawal output is committed to a bundle and can only be
+            // spent by the bundle, never by a transaction
+            if output.is_withdrawal() {
                 return Err(Error::SpendWithdrawalOutput {
                     outpoint: *outpoint,
                 });

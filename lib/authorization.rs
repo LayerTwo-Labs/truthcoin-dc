@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use borsh::BorshSerialize;
-use hex::FromHex;
+use const_hex::FromHex;
 use rayon::{
     iter::{IntoParallelRefIterator as _, ParallelIterator as _},
     slice::ParallelSlice as _,
@@ -50,7 +50,7 @@ impl<'de> Deserialize<'de> for Signature {
         D: serde::Deserializer<'de>,
     {
         if deserializer.is_human_readable() {
-            hex::serde::deserialize(deserializer)
+            const_hex::serde::deserialize(deserializer)
         } else {
             <frost_ristretto255::Signature as Deserialize>::deserialize(
                 deserializer,
@@ -62,18 +62,18 @@ impl<'de> Deserialize<'de> for Signature {
 
 impl std::fmt::Display for Signature {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        hex::encode(self.to_bytes()).fmt(f)
+        const_hex::encode(self.to_bytes()).fmt(f)
     }
 }
 
 impl FromHex for Signature {
-    type Error = hex::FromHexError;
+    type Error = const_hex::FromHexError;
 
     fn from_hex<T: AsRef<[u8]>>(hex: T) -> Result<Self, Self::Error> {
         let bytes = <[u8; Self::BYTE_SIZE] as FromHex>::from_hex(hex)?;
         frost_ristretto255::Signature::deserialize(&bytes)
             .map(Self)
-            .map_err(|_| hex::FromHexError::InvalidStringLength)
+            .map_err(|_| const_hex::FromHexError::InvalidStringLength)
     }
 }
 
@@ -91,7 +91,7 @@ impl Serialize for Signature {
         S: serde::Serializer,
     {
         if serializer.is_human_readable() {
-            hex::serde::serialize(self.to_bytes(), serializer)
+            const_hex::serde::serialize(self.to_bytes(), serializer)
         } else {
             Serialize::serialize(&self.0, serializer)
         }
@@ -461,7 +461,7 @@ mod tests {
         Address, AuthorizedTransaction, GetAddress as _, Transaction,
         VerifyingKey,
     };
-    use hex::FromHex as _;
+    use const_hex::FromHex as _;
 
     fn signing_key(seed: u8) -> SigningKey {
         let scalar = curve25519_dalek::Scalar::from_bytes_mod_order([seed; 32]);

@@ -143,7 +143,7 @@ pub fn parse_dimensions(
 fn parse_single_decision(
     decision_str: &str,
 ) -> Result<DecisionId, MarketError> {
-    let decision_bytes = hex::decode(decision_str)
+    let decision_bytes = const_hex::decode(decision_str)
         .map_err(|_| MarketError::InvalidDimensions)?;
 
     if decision_bytes.len() != 3 {
@@ -185,7 +185,7 @@ impl MarketId {
 
 impl std::fmt::Display for MarketId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
+        write!(f, "{}", const_hex::encode(self.0))
     }
 }
 

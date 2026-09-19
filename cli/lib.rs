@@ -1,4 +1,5 @@
 use std::{
+    marker::PhantomData,
     net::{Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -12,11 +13,15 @@ use truthcoin_dc::{
     authorization::{Dst, Signature},
     math::trading,
     types::{
-        Address, BlockHash, EncryptionPubKey, THIS_SIDECHAIN, Txid,
-        VerifyingKey,
+        Address, AuthorizedTransaction, BlockHash, EncryptionPubKey,
+        THIS_SIDECHAIN, Transaction, Txid, VerifyingKey,
     },
+    wallet::TransferDests,
 };
-use truthcoin_dc_app_rpc_api::RpcClient;
+use truthcoin_dc_app_rpc_api::{
+    node::{PrivateRpcClient as _, RpcClient as _},
+    wallet::RpcClient as _,
+};
 use url::{Host, Url};
 
 /// Format transaction success messages consistently
@@ -38,6 +43,20 @@ where
     T: Serialize,
 {
     Ok(serde_json::to_string_pretty(data)?)
+}
+
+struct JsonParser<T>(PhantomData<T>);
+
+impl<T> JsonParser<T> {
+    fn parse(
+        s: &str,
+    ) -> Result<T, serde_path_to_error::Error<serde_json::Error>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let mut deserializer = serde_json::Deserializer::from_str(s);
+        serde_path_to_error::deserialize(&mut deserializer)
+    }
 }
 
 fn render_period_slot_grid(
@@ -113,6 +132,10 @@ fn format_with_commas(n: u64) -> String {
     out
 }
 
+fn parse_transfer_dests(s: &str) -> Result<TransferDests, serde_json::Error> {
+    serde_json::from_str(s)
+}
+
 #[derive(Clone, Debug, Subcommand)]
 #[command(arg_required_else_help(true))]
 pub enum Command {
@@ -123,6 +146,20 @@ pub enum Command {
     /// Stop the node
     #[command(name = "stop", alias = "shutdown")]
     Stop,
+
+    /// Sign a transaction, and optionally broadcast it.
+    SignTransaction {
+        #[arg(value_parser = JsonParser::<Transaction>::parse)]
+        transaction: Transaction,
+        #[arg(default_value_t = false)]
+        broadcast: bool,
+    },
+
+    /// Verify and broadcast a transaction
+    SubmitTransaction {
+        #[arg(value_parser = JsonParser::<AuthorizedTransaction>::parse)]
+        transaction: AuthorizedTransaction,
+    },
 
     /// Attempt to mine a sidechain block
     #[command(name = "mine", alias = "m")]
@@ -166,6 +203,10 @@ pub enum Command {
     /// List all UTXOs
     #[command(name = "list-utxos")]
     ListUtxos,
+
+    /// Get the progress of the sync with the mainchain
+    #[command(name = "mainchain-sync-progress")]
+    MainchainSyncProgress,
 
     /// Transfer funds to address
     #[command(name = "transfer", alias = "send")]
@@ -223,6 +264,18 @@ pub enum Command {
     #[command(name = "get-block")]
     GetBlock { block_hash: BlockHash },
 
+    /// Get the block hash at the specified height, if it exists
+    #[command(name = "get-block-hash")]
+    GetBlockHash { height: u32 },
+
+    /// Get everything about a block that its body does not carry
+    #[command(name = "get-block-index")]
+    GetBlockIndex { block_hash: BlockHash },
+
+    /// Assemble a block to blind merge mine, without requesting BMM for it
+    #[command(name = "get-block-template")]
+    GetBlockTemplate,
+
     /// Get best mainchain block hash
     #[command(name = "get-best-mainchain-block-hash")]
     GetBestMainchainBlockHash,
@@ -237,6 +290,12 @@ pub enum Command {
         block_hash: truthcoin_dc::types::BlockHash,
     },
 
+    /// Get stxos for addresses
+    GetStxos {
+        #[arg(required = true)]
+        addresses: Vec<Address>,
+    },
+
     /// Get transaction by txid
     #[command(name = "get-transaction", alias = "get-tx")]
     GetTransaction { txid: Txid },
@@ -244,6 +303,12 @@ pub enum Command {
     /// Get transaction info
     #[command(name = "get-transaction-info")]
     GetTransactionInfo { txid: Txid },
+
+    /// Get utxos for addresses
+    GetUtxos {
+        #[arg(required = true)]
+        addresses: Vec<Address>,
+    },
 
     /// Get pending withdrawal bundle
     #[command(name = "pending-withdrawal-bundle")]
@@ -253,13 +318,30 @@ pub enum Command {
     #[command(name = "latest-failed-withdrawal-bundle-height")]
     LatestFailedWithdrawalBundleHeight,
 
+    /// Invalidate a block and its descendants. If the tip descends from the
+    /// block, re-org to the parent of the block.
+    #[command(name = "invalidate-block")]
+    InvalidateBlock { block_hash: BlockHash },
+
     /// Remove transaction from mempool
     #[command(name = "remove-from-mempool")]
     RemoveFromMempool { txid: Txid },
 
+    /// Connect a block for which a BMM request was included in the specified
+    /// mainchain block. The block is the JSON returned by `get-block-template`.
+    #[command(name = "connect-block")]
+    ConnectBlock {
+        block: String,
+        main_block_hash: bitcoin::BlockHash,
+    },
+
     /// Connect to a peer
     #[command(name = "connect-peer", alias = "connect")]
     ConnectPeer { addr: SocketAddr },
+
+    /// List the transactions the mempool holds
+    #[command(name = "list-mempool")]
+    ListMempool,
 
     /// List connected peers
     #[command(name = "list-peers", alias = "peers")]
@@ -312,6 +394,16 @@ pub enum Command {
         address: Address,
         #[arg(long)]
         msg: String,
+    },
+
+    /// Transfer funds to each address in a JSON map of address to value in
+    /// sats, such as `{"<address>": 1000}`
+    #[command(name = "transfer-many")]
+    TransferMany {
+        #[arg(value_parser = parse_transfer_dests)]
+        dests: TransferDests,
+        #[arg(long)]
+        fee_sats: u64,
     },
 
     /// Verify signature
@@ -679,14 +771,25 @@ where
             let () = rpc_client.stop().await?;
             "Node stopping...".to_string()
         }
+        Command::SignTransaction {
+            transaction,
+            broadcast,
+        } => {
+            let authorized = rpc_client
+                .sign_transaction(transaction, Some(broadcast))
+                .await?;
+            serde_json::to_string_pretty(&authorized)?
+        }
+        Command::SubmitTransaction { transaction } => {
+            let txid = rpc_client.submit_transaction(transaction).await?;
+            format!("{txid}")
+        }
         Command::Mine { fee_sats } => {
             let () = rpc_client.mine(Some(fee_sats)).await?;
             format!("Mining block with fee {fee_sats} sats")
         }
         Command::OpenApiSchema => {
-            let openapi =
-                <truthcoin_dc_app_rpc_api::RpcDoc as utoipa::OpenApi>::openapi(
-                );
+            let openapi = truthcoin_dc_app_rpc_api::openapi()?;
             openapi.to_pretty_json()?
         }
 
@@ -722,6 +825,10 @@ where
             let utxos = rpc_client.list_utxos().await?;
             json_response(&utxos)?
         }
+        Command::MainchainSyncProgress => {
+            let progress = rpc_client.mainchain_sync_progress().await?;
+            json_response(&progress)?
+        }
         Command::Transfer {
             dest,
             value_sats,
@@ -730,6 +837,10 @@ where
             let txid = rpc_client
                 .transfer(dest, value_sats, fee_sats, None)
                 .await?;
+            format_tx_success("Transfer", None, &txid.to_string())
+        }
+        Command::TransferMany { dests, fee_sats } => {
+            let txid = rpc_client.transfer_many(dests, fee_sats).await?;
             format_tx_success("Transfer", None, &txid.to_string())
         }
         Command::Withdraw {
@@ -779,6 +890,18 @@ where
             let block = rpc_client.get_block(block_hash).await?;
             json_response(&block)?
         }
+        Command::GetBlockHash { height } => {
+            let block_hash = rpc_client.get_block_hash(height).await?;
+            json_response(&block_hash)?
+        }
+        Command::GetBlockIndex { block_hash } => {
+            let block_index = rpc_client.get_block_index(block_hash).await?;
+            json_response(&block_index)?
+        }
+        Command::GetBlockTemplate => {
+            let template = rpc_client.get_block_template().await?;
+            json_response(&template)?
+        }
         Command::GetBestMainchainBlockHash => {
             let block_hash = rpc_client.get_best_mainchain_block_hash().await?;
             json_response(&block_hash)?
@@ -792,6 +915,11 @@ where
                 rpc_client.get_bmm_inclusions(block_hash).await?;
             json_response(&bmm_inclusions)?
         }
+        Command::GetStxos { addresses } => {
+            let addresses = addresses.into_iter().collect();
+            let stxos = rpc_client.get_stxos(addresses).await?;
+            json_response(&stxos)?
+        }
         Command::GetTransaction { txid } => {
             let tx = rpc_client.get_transaction(txid).await?;
             json_response(&tx)?
@@ -799,6 +927,11 @@ where
         Command::GetTransactionInfo { txid } => {
             let tx_info = rpc_client.get_transaction_info(txid).await?;
             json_response(&tx_info)?
+        }
+        Command::GetUtxos { addresses } => {
+            let addresses = addresses.into_iter().collect();
+            let utxos = rpc_client.get_utxos(addresses).await?;
+            json_response(&utxos)?
         }
         Command::PendingWithdrawalBundle => {
             let withdrawal_bundle =
@@ -810,14 +943,31 @@ where
                 rpc_client.latest_failed_withdrawal_bundle_height().await?;
             json_response(&height)?
         }
+        Command::InvalidateBlock { block_hash } => {
+            let () = rpc_client.invalidate_block(block_hash).await?;
+            format!("Block {block_hash} invalidated")
+        }
         Command::RemoveFromMempool { txid } => {
             let () = rpc_client.remove_from_mempool(txid).await?;
             format!("Transaction {txid} removed from mempool")
         }
 
+        Command::ConnectBlock {
+            block,
+            main_block_hash,
+        } => {
+            let block = serde_json::from_str(&block)?;
+            let accepted =
+                rpc_client.connect_block(block, main_block_hash).await?;
+            format!("{accepted}")
+        }
         Command::ConnectPeer { addr } => {
             let () = rpc_client.connect_peer(addr).await?;
             format!("Connected to peer: {addr}")
+        }
+        Command::ListMempool => {
+            let txs = rpc_client.list_mempool().await?;
+            json_response(&txs)?
         }
         Command::ListPeers => {
             let peers = rpc_client.list_peers().await?;
@@ -844,7 +994,7 @@ where
             let msg_hex =
                 rpc_client.decrypt_msg(encryption_pubkey, msg).await?;
             if utf8 {
-                let msg_bytes: Vec<u8> = hex::decode(msg_hex)?;
+                let msg_bytes: Vec<u8> = const_hex::decode(msg_hex)?;
                 String::from_utf8(msg_bytes)?
             } else {
                 msg_hex
@@ -1397,5 +1547,43 @@ impl Cli {
 
         let result = handle_command(&client, self.command).await?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn parse_transfer_many() {
+        let address = Address([1u8; 20]);
+        let cli = Cli::parse_from([
+            "truthcoin_dc_app_cli",
+            "transfer-many",
+            &format!("{{\"{address}\": 1000}}"),
+            "--fee-sats",
+            "500",
+        ]);
+        let Command::TransferMany { dests, fee_sats } = cli.command else {
+            panic!("expected transfer-many");
+        };
+        assert_eq!(dests.0, BTreeMap::from([(address, 1000)]));
+        assert_eq!(fee_sats, 500);
+    }
+
+    // A repeated address must not silently drop one of the two payments.
+    #[test]
+    fn refuse_a_repeated_address() {
+        let address = Address([1u8; 20]);
+        let result = Cli::try_parse_from([
+            "truthcoin_dc_app_cli",
+            "transfer-many",
+            &format!("{{\"{address}\": 1000, \"{address}\": 5000}}"),
+            "--fee-sats",
+            "500",
+        ]);
+        assert!(result.is_err());
     }
 }

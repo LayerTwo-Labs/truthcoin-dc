@@ -1,8 +1,9 @@
 use std::str::FromStr;
 
 use bitcoin::hashes::Hash as _;
+use blake3::Hasher;
 use borsh::{BorshDeserialize, BorshSerialize};
-use hex::FromHex;
+use const_hex::FromHex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -60,13 +61,13 @@ impl FromHex for BlockHash {
 
 impl std::fmt::Display for BlockHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
+        write!(f, "{}", const_hex::encode(self.0))
     }
 }
 
 impl std::fmt::Debug for BlockHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
+        write!(f, "{}", const_hex::encode(self.0))
     }
 }
 
@@ -123,13 +124,13 @@ impl From<MerkleRoot> for Hash {
 
 impl std::fmt::Display for MerkleRoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
+        write!(f, "{}", const_hex::encode(self.0))
     }
 }
 
 impl std::fmt::Debug for MerkleRoot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
+        write!(f, "{}", const_hex::encode(self.0))
     }
 }
 
@@ -191,13 +192,13 @@ impl<'a> From<&'a Txid> for &'a Hash {
 
 impl std::fmt::Display for Txid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
+        write!(f, "{}", const_hex::encode(self.0))
     }
 }
 
 impl std::fmt::Debug for Txid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
+        write!(f, "{}", const_hex::encode(self.0))
     }
 }
 
@@ -235,7 +236,7 @@ pub enum ParseAssetIdError {
     #[error(transparent)]
     Borsh(#[from] borsh::io::Error),
     #[error(transparent)]
-    FromHex(#[from] hex::FromHexError),
+    FromHex(#[from] const_hex::FromHexError),
 }
 
 /// Identifier for an asset type
@@ -280,14 +281,14 @@ impl std::fmt::Display for AssetId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let bytes = borsh::to_vec(self)
             .expect("AssetId borsh serialization is infallible");
-        hex::encode(bytes).fmt(f)
+        const_hex::encode(bytes).fmt(f)
     }
 }
 
 impl FromStr for AssetId {
     type Err = ParseAssetIdError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes: Vec<u8> = hex::decode(s)?;
+        let bytes: Vec<u8> = const_hex::decode(s)?;
         borsh::from_slice(&bytes).map_err(Self::Err::from)
     }
 }
@@ -318,13 +319,28 @@ impl std::fmt::Display for M6id {
     }
 }
 
+impl utoipa::PartialSchema for M6id {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        let obj =
+            utoipa::openapi::Object::with_type(utoipa::openapi::Type::String);
+        utoipa::openapi::RefOr::T(utoipa::openapi::Schema::Object(obj))
+    }
+}
+
+impl utoipa::ToSchema for M6id {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("M6id")
+    }
+}
+
 pub fn hash<T>(data: &T) -> Hash
 where
     T: BorshSerialize + ?Sized,
 {
-    let data_serialized = borsh::to_vec(data)
+    let mut hasher = blake3::Hasher::new();
+    let () = borsh::to_writer(&mut hasher, data)
         .expect("failed to serialize with borsh to compute a hash");
-    blake3::hash(&data_serialized).into()
+    hasher.finalize().into()
 }
 
 /// Optimized hash function that reuses a thread-local scratch buffer
@@ -334,23 +350,16 @@ pub fn hash_with_scratch_buffer<T>(data: &T) -> Hash
 where
     T: BorshSerialize + ?Sized,
 {
-    use smallvec::SmallVec;
-
     thread_local! {
-        // Thread-local scratch buffer that starts with 256 bytes on the stack
-        // and grows as needed. This avoids heap allocations for most transactions.
-        static SCRATCH_BUFFER: std::cell::RefCell<SmallVec<[u8; 256]>> =
-            std::cell::RefCell::new(SmallVec::new());
+        static HASHER: std::cell::RefCell<blake3::Hasher> =
+            std::cell::RefCell::new(Hasher::new());
     }
 
-    SCRATCH_BUFFER.with(|buffer| {
-        let mut buffer = buffer.borrow_mut();
-        buffer.clear(); // Reuse the buffer
-
-        // Serialize directly into the reused buffer
-        borsh::to_writer(&mut *buffer, data)
+    HASHER.with(|hasher| {
+        let mut hasher = hasher.borrow_mut();
+        hasher.reset();
+        borsh::to_writer(&mut *hasher, data)
             .expect("failed to serialize with borsh to compute a hash");
-
-        blake3::hash(&buffer).into()
+        hasher.finalize().into()
     })
 }

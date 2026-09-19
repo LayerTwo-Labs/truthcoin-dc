@@ -10,16 +10,20 @@ cargo run --example integration_tests
 
 ## Setup
 
-The integration tests require at least one environment variable to be set.
-Environment variables can also be set via an env file, where the path to the env
-file is set via environment variable. An example env file is provided
-[here](/integration_tests/example.env). The path to the env file can be provided
-by setting the `TRUTHCOIN_INTEGRATION_TEST_ENV` variable, eg.
+The tests drive a real enforcer, bitcoind and electrs. They read the paths to
+these binaries from environment variables. An example env file is provided
+[here](/integration_tests/example.env).
+
+Copy it to `integrationtests.env` in the repo root, and set the paths. The
+tests read that file from the working directory or from a parent directory.
 
 ```sh
-TRUTHCOIN_INTEGRATON_TEST_ENV='integration_tests/example.env'
+cargo run --example integration_tests
 ```
 
-Variables set in an env file have higher precedence than environment variables.
-If multiple declarations for the same environment variable exist in an env file,
-the last one has highest precedence.
+Pass a test name after `--` to run a single test.
+
+An env file is optional. Variables that are already set in the environment
+take precedence over `integrationtests.env`. To load a different env file, set
+`TRUTHCOIN_INTEGRATION_TEST_ENV` to its path. The values in that file override
+the environment.

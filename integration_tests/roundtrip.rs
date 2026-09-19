@@ -26,7 +26,9 @@ use truthcoin_dc_app_rpc_api::{
     BallotItem, CreateTradeRequest, DecisionClaimItem, DecisionClaimRequest,
     DecisionContentInfo, DecisionFilter, DecisionState, DimensionInput,
     MarketBuyRequest, MarketCreateRequest, MarketSellRequest, MarketStatus,
-    RpcClient as _, VoteFilter,
+    VoteFilter,
+    node::{PrivateRpcClient as _, RpcClient as _},
+    wallet::RpcClient as _,
 };
 
 use crate::{
@@ -296,7 +298,7 @@ mod utxo_verification {
                 } = &pointed.output.content
                 {
                     Some((
-                        hex::encode(market_id),
+                        const_hex::encode(market_id),
                         (pointed.outpoint, amount.0.to_sat()),
                     ))
                 } else {
@@ -321,7 +323,7 @@ mod utxo_verification {
                 } = &pointed.output.content
                 {
                     Some((
-                        hex::encode(market_id),
+                        const_hex::encode(market_id),
                         (pointed.outpoint, amount.0.to_sat()),
                     ))
                 } else {
@@ -1080,7 +1082,7 @@ async fn roundtrip_task_inner(
         .get_best_sidechain_block_hash()
         .await?
         .expect("Issuer should have a tip before trading starts");
-    let pre_trade_tip_hex = hex::encode(pre_trade_tip.0);
+    let pre_trade_tip_hex = const_hex::encode(pre_trade_tip.0);
 
     for (i, market_id) in market_ids.iter().enumerate() {
         let voter = match i {

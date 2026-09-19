@@ -1494,7 +1494,7 @@ fn apply_decision_claim(
 
         tracing::debug!(
             "Claimed decision {} (type: {:?})",
-            hex::encode(decision_id.as_bytes()),
+            const_hex::encode(decision_id.as_bytes()),
             claim.decision_type
         );
     }
@@ -2271,7 +2271,7 @@ fn apply_submit_vote(
         return Err(Error::InvalidTransaction {
             reason: format!(
                 "Vote period mismatch: decision {} was claimed in period {} and must be voted on in period {}, but transaction specifies period {}",
-                hex::encode(vote_data.decision_id_bytes),
+                const_hex::encode(vote_data.decision_id_bytes),
                 decision_claim_period,
                 voting_period,
                 vote_data.voting_period
@@ -2383,7 +2383,7 @@ fn apply_submit_ballot(
                 return Err(Error::InvalidTransaction {
                     reason: format!(
                         "Ballot period mismatch: decision {} requires period {} but ballot expects period {}",
-                        hex::encode(vote_item.decision_id_bytes),
+                        const_hex::encode(vote_item.decision_id_bytes),
                         voting_period,
                         expected
                     ),
