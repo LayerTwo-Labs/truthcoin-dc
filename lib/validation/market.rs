@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::state::Error;
 use crate::state::decisions::{DecisionId, DecisionType};
@@ -30,6 +30,30 @@ impl MarketValidator {
         let market_maker_address = first_utxo.address;
 
         Ok(market_maker_address)
+    }
+
+    /// Reject dimension specs that reference the same decision more than
+    /// once. Mirrors the connect-time check in `generate_state_combos`.
+    fn validate_no_duplicate_dimensions(
+        dimension_specs: &[DimensionSpec],
+    ) -> Result<(), Error> {
+        let mut seen_decisions = HashSet::new();
+        for spec in dimension_specs {
+            let decision_id = match spec {
+                DimensionSpec::Single(id) | DimensionSpec::Categorical(id) => {
+                    *id
+                }
+            };
+            if !seen_decisions.insert(decision_id) {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Duplicate decision in market dimensions: \
+                         {decision_id:?}"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_market_creation(
@@ -107,6 +131,8 @@ impl MarketValidator {
                 reason: "Market must have at least one dimension".to_string(),
             });
         }
+
+        Self::validate_no_duplicate_dimensions(dimension_specs)?;
 
         for spec in dimension_specs {
             let decision_id = match spec {
@@ -625,6 +651,38 @@ mod tests {
     fn market_fewer_than_two_outcomes_rejected() {
         let shares = Array1::from_vec(vec![100]);
         assert!(MarketValidator::validate_market_shares(&shares).is_err());
+    }
+
+    #[test]
+    fn duplicate_dimensions_rejected() {
+        let a = DecisionId::new(true, 1, 0).unwrap();
+        let b = DecisionId::new(true, 1, 1).unwrap();
+
+        assert!(
+            MarketValidator::validate_no_duplicate_dimensions(&[
+                DimensionSpec::Single(a),
+                DimensionSpec::Single(b),
+            ])
+            .is_ok()
+        );
+
+        assert!(
+            MarketValidator::validate_no_duplicate_dimensions(&[
+                DimensionSpec::Single(a),
+                DimensionSpec::Single(a),
+            ])
+            .is_err()
+        );
+
+        // Same decision referenced through different spec kinds is still a
+        // duplicate, matching `generate_state_combos`.
+        assert!(
+            MarketValidator::validate_no_duplicate_dimensions(&[
+                DimensionSpec::Single(a),
+                DimensionSpec::Categorical(a),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
