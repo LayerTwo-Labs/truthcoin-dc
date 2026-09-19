@@ -125,6 +125,28 @@ impl VoteValidator {
         Ok(())
     }
 
+    /// Reject a transaction whose declared `voting_period` disagrees with the
+    /// period deterministically derived from the decision id. Mirrors the
+    /// connect-time check in `apply_submit_vote`.
+    fn validate_declared_vote_period(
+        decision_id: crate::state::decisions::DecisionId,
+        declared_period: u32,
+    ) -> Result<(), Error> {
+        let voting_period = decision_id.voting_period();
+        if declared_period != voting_period {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Vote period mismatch: decision {} was claimed in period {} and must be voted on in period {}, but transaction specifies period {}",
+                    decision_id.to_hex(),
+                    decision_id.period_index(),
+                    voting_period,
+                    declared_period
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_no_duplicate_vote(
         state: &crate::state::State,
         rotxn: &RoTxn,
@@ -178,6 +200,13 @@ impl VoteValidator {
         Self::validate_voter_eligibility(state, rotxn, &voter_address)?;
 
         let decision_id = DecisionId::from_bytes(vote_data.decision_id_bytes)?;
+
+        // Voting period is deterministically derived from decision: voting_period = period_index + 1
+        Self::validate_declared_vote_period(
+            decision_id,
+            vote_data.voting_period,
+        )?;
+
         let decision =
             Self::validate_decision_entry(state, rotxn, decision_id)?;
 
@@ -185,7 +214,6 @@ impl VoteValidator {
 
         Self::validate_voting_period(state, rotxn, decision_id)?;
 
-        // Voting period is deterministically derived from decision: voting_period = period_index + 1
         let period_id = VotingPeriodId::new(decision_id.voting_period());
         Self::validate_no_duplicate_vote(
             state,
@@ -307,12 +335,39 @@ impl VoteValidator {
 
         let mut seen_votes =
             std::collections::HashSet::<(VotingPeriodId, DecisionId)>::new();
+        let mut expected_voting_period: Option<u32> = None;
         for (idx, vote_item) in ballot_data.votes.iter().enumerate() {
             let decision_id =
                 DecisionId::from_bytes(vote_item.decision_id_bytes)?;
 
             // Voting period is deterministically derived from decision: voting_period = period_index + 1
-            let period_id = VotingPeriodId::new(decision_id.voting_period());
+            let voting_period = decision_id.voting_period();
+
+            if let Some(expected) = expected_voting_period {
+                if voting_period != expected {
+                    return Err(Error::InvalidTransaction {
+                        reason: format!(
+                            "Ballot period mismatch: decision {} requires period {} but ballot expects period {}",
+                            decision_id.to_hex(),
+                            voting_period,
+                            expected
+                        ),
+                    });
+                }
+            } else {
+                expected_voting_period = Some(voting_period);
+
+                if ballot_data.voting_period != voting_period {
+                    return Err(Error::InvalidTransaction {
+                        reason: format!(
+                            "Ballot period mismatch: decisions require period {} but transaction specifies period {}",
+                            voting_period, ballot_data.voting_period
+                        ),
+                    });
+                }
+            }
+
+            let period_id = VotingPeriodId::new(voting_period);
 
             if !seen_votes.insert((period_id, decision_id)) {
                 return Err(Error::InvalidTransaction {
@@ -540,6 +595,29 @@ mod tests {
         assert!(VoteValidator::validate_vote_value(&d, 4.0).is_err());
         assert!(VoteValidator::validate_vote_value(&d, -1.0).is_err());
         assert!(VoteValidator::validate_vote_value(&d, 1.5).is_err());
+    }
+
+    #[test]
+    fn declared_vote_period_matching_derived_is_accepted() {
+        use crate::state::decisions::DecisionId;
+
+        let decision_id = DecisionId::new(true, 1, 0).unwrap();
+        assert_eq!(decision_id.voting_period(), 2);
+        assert!(
+            VoteValidator::validate_declared_vote_period(decision_id, 2)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn declared_vote_period_mismatch_is_rejected() {
+        use crate::state::decisions::DecisionId;
+
+        let decision_id = DecisionId::new(true, 1, 0).unwrap();
+        assert!(
+            VoteValidator::validate_declared_vote_period(decision_id, 999)
+                .is_err()
+        );
     }
 
     #[test]
