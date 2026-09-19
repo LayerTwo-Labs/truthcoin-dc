@@ -25,7 +25,9 @@ bytes = "1.9.0"
 dashmap = "5.5"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { workspace = true, features = ["derive"], optional = true }
-ed25519-dalek = { version = "2.1.1", features = ["batch", "serde"] }
+curve25519-dalek = { workspace = true, features = ["group", "serde"] }
+frost-core = { workspace = true, features = ["internals"] }
+frost-ristretto255 = { workspace = true, features = ["serde"] }
 fallible-iterator = { workspace = true }
 error-fatality = "0.1.2"
 futures = { workspace = true, features = ["alloc"] }
@@ -46,6 +48,7 @@ parking_lot = { workspace = true }
 prost = { workspace = true }
 prost-types = "0.14.3"
 quinn = "0.11.6"
+rand = { workspace = true, features = ["chacha"] }
 rayon = "1.7.0"
 rcgen = "0.13.2"
 rustls = { version = "0.23.21", default-features = false, features = ["ring"] }
@@ -89,6 +92,7 @@ features = ["quanta", "std"]
 
 [dev-dependencies]
 anyhow = { workspace = true }
+rand = { workspace = true, features = ["thread_rng"] }
 tempfile = "3.10.1"
 approx = "0.5.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }

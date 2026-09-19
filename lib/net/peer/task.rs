@@ -690,7 +690,12 @@ impl ConnectionTask {
         let txid = tx.transaction.txid();
         let validate_tx_result = {
             let rotxn = ctxt.env.read_txn().map_err(EnvError::from)?;
-            ctxt.state.validate_transaction(&ctxt.archive, &rotxn, &tx)
+            ctxt.state.validate_transaction(
+                &ctxt.archive,
+                &rotxn,
+                &ctxt.batch_verification_ctxt,
+                &tx,
+            )
         };
         match validate_tx_result {
             Err(err) => {

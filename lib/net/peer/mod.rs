@@ -17,6 +17,7 @@ use tokio::{spawn, task::JoinHandle, time::Duration};
 
 use crate::{
     archive::Archive,
+    authorization::BatchVerificationContext,
     state::State,
     types::{
         AuthorizedTransaction, Hash, Tip, Version, hashes::hash,
@@ -356,6 +357,7 @@ impl Connection {
 pub struct ConnectionContext {
     pub env: sneed::Env<heed::WithoutTls>,
     pub archive: Archive,
+    pub batch_verification_ctxt: BatchVerificationContext,
     pub magic_bytes: message::MagicBytes,
     pub resolved_address: ResolvedSeedAddress,
     pub state: State,

@@ -1102,6 +1102,7 @@ mod tests {
 
     use crate::{
         archive::Archive,
+        authorization::BatchVerificationContext,
         state::{
             State, UtxoManager as _, WithdrawalBundleInfo,
             rollback::{HeightStamped, RollBack},
@@ -1372,6 +1373,8 @@ mod tests {
         let (env, _dir) = temp_env();
         let archive = Archive::new(&env).unwrap();
         let state = State::new(&env, None).unwrap();
+        let batch_verification_ctxt =
+            BatchVerificationContext::new(&mut rand::rng());
 
         let empty_body = Body {
             coinbase: Vec::new(),
@@ -1394,7 +1397,14 @@ mod tests {
         {
             let mut rwtxn = env.write_txn().unwrap();
             state
-                .apply_block(&archive, &mut rwtxn, &genesis, &empty_body, 0)
+                .apply_block(
+                    &archive,
+                    &mut rwtxn,
+                    &batch_verification_ctxt,
+                    &genesis,
+                    &empty_body,
+                    0,
+                )
                 .unwrap();
             state
                 .connect_two_way_peg_data(&mut rwtxn, &TwoWayPegData::default())
@@ -1439,7 +1449,14 @@ mod tests {
         {
             let mut rwtxn = env.write_txn().unwrap();
             state
-                .apply_block(&archive, &mut rwtxn, &block1, &empty_body, 0)
+                .apply_block(
+                    &archive,
+                    &mut rwtxn,
+                    &batch_verification_ctxt,
+                    &block1,
+                    &empty_body,
+                    0,
+                )
                 .unwrap();
             state
                 .connect_two_way_peg_data(&mut rwtxn, &deposit_twpd)

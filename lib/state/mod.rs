@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
 
 use crate::{
+    authorization::BatchVerificationContext,
     types::{
         Address, AmountOverflowError, Authorized, AuthorizedTransaction,
         BlockHash, BlockIndexEvents, Body, FilledOutput, FilledTransaction,
@@ -696,12 +697,14 @@ impl State {
         &self,
         archive: &crate::archive::Archive,
         rotxn: &RoTxn,
+        batch_verification_ctxt: &BatchVerificationContext,
         transaction: &AuthorizedTransaction,
     ) -> Result<bitcoin::Amount, Error> {
         crate::validation::BlockValidator::validate_transaction(
             self,
             archive,
             rotxn,
+            batch_verification_ctxt,
             transaction,
         )
     }
@@ -804,11 +807,17 @@ impl State {
         &self,
         archive: &crate::archive::Archive,
         rotxn: &RoTxn,
+        batch_verification_ctxt: &BatchVerificationContext,
         header: &Header,
         body: &Body,
     ) -> Result<PrevalidatedBlock, Error> {
         crate::validation::BlockValidator::prevalidate(
-            self, archive, rotxn, header, body,
+            self,
+            archive,
+            rotxn,
+            batch_verification_ctxt,
+            header,
+            body,
         )
     }
 
@@ -834,12 +843,18 @@ impl State {
         &self,
         archive: &crate::archive::Archive,
         rwtxn: &mut RwTxn,
+        batch_verification_ctxt: &BatchVerificationContext,
         header: &Header,
         body: &Body,
         mainchain_timestamp: u64,
     ) -> Result<(), Error> {
-        let prevalidated =
-            self.prevalidate_block(archive, rwtxn, header, body)?;
+        let prevalidated = self.prevalidate_block(
+            archive,
+            rwtxn,
+            batch_verification_ctxt,
+            header,
+            body,
+        )?;
         self.connect_prevalidated_block(
             rwtxn,
             header,

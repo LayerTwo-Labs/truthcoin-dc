@@ -19,6 +19,7 @@ use tracing::instrument;
 
 use crate::{
     archive::Archive,
+    authorization::BatchVerificationContext,
     state::State,
     types::{
         AuthorizedTransaction, Network, VERSION, Version,
@@ -278,6 +279,7 @@ pub struct Net {
     pub server: Endpoint,
     archive: Archive,
     pub dns_resolver: Arc<TokioResolver>,
+    pub(crate) batch_verification_ctxt: BatchVerificationContext,
     magic_bytes: peer_message::MagicBytes,
     state: State,
     active_peers: Arc<RwLock<HashMap<SocketAddr, PeerConnectionHandle>>>,
@@ -417,6 +419,7 @@ impl Net {
         let connection_ctxt = PeerConnectionCtxt {
             env,
             archive: self.archive.clone(),
+            batch_verification_ctxt: self.batch_verification_ctxt,
             magic_bytes: self.magic_bytes,
             resolved_address: resolved_addr,
             state: self.state.clone(),
@@ -552,6 +555,7 @@ impl Net {
         runtime: &tokio::runtime::Handle,
         env: &sneed::Env<heed::WithoutTls>,
         archive: Archive,
+        batch_verification_ctxt: BatchVerificationContext,
         magic_bytes_override: Option<peer_message::MagicBytes>,
         network: Network,
         state: State,
@@ -595,6 +599,7 @@ impl Net {
             server,
             archive,
             dns_resolver,
+            batch_verification_ctxt,
             magic_bytes,
             state,
             active_peers,
@@ -702,6 +707,7 @@ impl Net {
         let connection_ctxt = PeerConnectionCtxt {
             env,
             archive: self.archive.clone(),
+            batch_verification_ctxt: self.batch_verification_ctxt,
             magic_bytes: self.magic_bytes,
             resolved_address: addr.into(),
             state: self.state.clone(),

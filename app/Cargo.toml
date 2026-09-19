@@ -28,6 +28,7 @@ itertools = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server"] }
 mimalloc = { version = "0.1.48", features = ["v3"] }
 parking_lot = { workspace = true }
+rand = { workspace = true, features = ["thread_rng"] }
 truthcoin_dc = { path = "../lib", features = ["clap"] }
 truthcoin_dc_app_cli = { path = "../cli" }
 truthcoin_dc_app_rpc_api = { path = "../rpc-api" }

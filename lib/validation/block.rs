@@ -1,8 +1,9 @@
+use crate::authorization::{self, BatchVerificationContext};
 use crate::state::{Error, PrevalidatedBlock};
 use crate::types::{
-    AmountOverflowError, Authorization, AuthorizedTransaction, Body,
-    FilledTransaction, GetAddress as _, GetBitcoinValue as _, Header,
-    OutPointKey, OutputContent, TransactionData, Verify as _,
+    AmountOverflowError, AuthorizedTransaction, Body, FilledTransaction,
+    GetAddress as _, GetBitcoinValue as _, Header, OutPointKey, OutputContent,
+    TransactionData,
 };
 use rayon::prelude::*;
 use sneed::RoTxn;
@@ -19,6 +20,7 @@ impl BlockValidator {
         state: &crate::state::State,
         archive: &crate::archive::Archive,
         rotxn: &RoTxn,
+        batch_verification_ctxt: &BatchVerificationContext,
         header: &Header,
         body: &Body,
     ) -> Result<PrevalidatedBlock, Error> {
@@ -112,7 +114,7 @@ impl BlockValidator {
                 return Err(Error::WrongPubKeyForAddress);
             }
         }
-        if Authorization::verify_body(body).is_err() {
+        if authorization::verify_body(batch_verification_ctxt, body).is_err() {
             return Err(Error::AuthorizationError);
         }
 
@@ -240,6 +242,7 @@ impl BlockValidator {
         state: &crate::state::State,
         archive: &crate::archive::Archive,
         rotxn: &RoTxn,
+        batch_verification_ctxt: &BatchVerificationContext,
         transaction: &AuthorizedTransaction,
     ) -> Result<bitcoin::Amount, Error> {
         let mut filled_transaction =
@@ -262,7 +265,12 @@ impl BlockValidator {
                 return Err(Error::WrongPubKeyForAddress);
             }
         }
-        if Authorization::verify_transaction(transaction).is_err() {
+        if authorization::verify_transaction(
+            batch_verification_ctxt,
+            transaction,
+        )
+        .is_err()
+        {
             return Err(Error::AuthorizationError);
         }
         let fee = Self::validate_filled_transaction(
@@ -452,9 +460,16 @@ mod tests {
             prev_side_hash: None,
             prev_main_hash: bitcoin::BlockHash::from_byte_array([0; 32]),
         };
+        let batch_verification_ctxt =
+            BatchVerificationContext::new(&mut rand::rng());
         assert!(matches!(
             BlockValidator::prevalidate(
-                &state, &archive, &rotxn, &header, &body,
+                &state,
+                &archive,
+                &rotxn,
+                &batch_verification_ctxt,
+                &header,
+                &body,
             ),
             Err(Error::BodyTooLarge)
         ));
