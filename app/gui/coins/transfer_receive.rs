@@ -139,7 +139,7 @@ impl Receive {
         };
         let address = app
             .wallet
-            .get_new_address()
+            .get_or_generate_last_address()
             .map_err(anyhow::Error::from)
             .inspect_err(|err| tracing::error!("{err:#}"));
         Self {
@@ -162,7 +162,13 @@ impl Receive {
                 .add_enabled(app.is_some(), Button::new("generate"))
                 .clicked()
             {
-                *self = Self::new(app)
+                let address = app
+                    .unwrap()
+                    .wallet
+                    .get_new_address()
+                    .map_err(anyhow::Error::from)
+                    .inspect_err(|err| tracing::error!("{err:#}"));
+                self.address = Some(address);
             }
 
             let has_valid_address = matches!(&self.address, Some(Ok(_)));

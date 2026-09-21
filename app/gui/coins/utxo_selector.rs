@@ -205,7 +205,7 @@ pub fn show_utxo(
             is_fee,
         } => (
             if *is_fee { "author_fee" } else { "market" },
-            hex::encode(market_id),
+            const_hex::encode(market_id),
             *block_height,
         ),
         OutPoint::Payout { hash, vout } => ("payout", format!("{hash}"), *vout),
@@ -259,7 +259,7 @@ pub fn show_unconfirmed_utxo(
             is_fee,
         } => (
             if *is_fee { "author_fee" } else { "market" },
-            hex::encode(market_id),
+            const_hex::encode(market_id),
             *block_height,
         ),
         OutPoint::Payout { hash, vout } => ("payout", format!("{hash}"), *vout),

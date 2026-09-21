@@ -7,10 +7,9 @@ use std::{
 };
 
 use bitcoin::amount::CheckedSum as _;
-use fallible_iterator::FallibleIterator;
-use futures::future::BoxFuture;
+use fallible_iterator::{FallibleIterator, IteratorExt};
 use heed::EnvFlags;
-use sneed::{DbError, Env, EnvError, RwTxnError, env};
+use sneed::{DbError, Env, EnvError, RoTxn, RwTxnError, env};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
@@ -18,16 +17,18 @@ use ndarray::Array1;
 
 use crate::{
     archive::{self, Archive},
+    authorization::{BatchVerificationContext, rand_core::CryptoRng},
     math::trading,
     mempool::{self, MemPool},
-    net::{self, Net, Peer},
+    net::{self, DialSeedsHandle, Net, Peer},
     state::{self, State, markets::MarketId},
     types::{
         Address, AmountOverflowError, AmountUnderflowError, Authorized,
-        AuthorizedTransaction, Block, BlockHash, BmmResult, Body, FilledOutput,
-        FilledTransaction, GetBitcoinValue, Header, InPoint, Network, OutPoint,
-        OutPointKey, Output, SpentOutput, Tip, Transaction, TxData, TxIn, Txid,
-        WithdrawalBundle,
+        AuthorizedTransaction, Block, BlockHash, BlockIndexEvents, BmmResult,
+        Body, FilledOutput, FilledTransaction, GetBitcoinValue, Header,
+        InPoint, MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
+        SpentOutput, Tip, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
+        net::SeedAddress,
         proto::{self, mainchain},
     },
     util::Watchable,
@@ -36,6 +37,9 @@ use sneed::RwTxn;
 
 mod mainchain_task;
 mod net_task;
+
+pub(crate) use mainchain_task::ResponseError;
+pub(crate) use net_task::MainchainAncestors;
 
 use mainchain_task::MainchainTaskHandle;
 use net_task::NetTaskHandle;
@@ -76,8 +80,8 @@ pub enum Error {
     Net(#[source] Box<net::Error>),
     #[error("net task error")]
     NetTask(#[source] Box<net_task::Error>),
-    #[error("No CUSF mainchain wallet client")]
-    NoCusfMainchainWalletClient,
+    #[error("block {block_hash} is not in the current chain")]
+    NotInCurrentChain { block_hash: BlockHash },
     #[error("peer info stream closed")]
     PeerInfoRxClosed,
     #[error("Receive mainchain task response cancelled")]
@@ -88,8 +92,6 @@ pub enum Error {
     State(#[source] Box<state::Error>),
     #[error("Utreexo error: {0}")]
     Utreexo(String),
-    #[error("Verify BMM error")]
-    VerifyBmm(anyhow::Error),
     #[cfg(feature = "zmq")]
     #[error("ZMQ error")]
     Zmq(#[from] zeromq::ZmqError),
@@ -119,10 +121,12 @@ pub type FilledTransactionWithPosition =
 #[derive(Clone)]
 pub struct Node<MainchainTransport = Channel> {
     archive: Archive,
-    cusf_mainchain: Arc<Mutex<mainchain::ValidatorClient<MainchainTransport>>>,
-    cusf_mainchain_wallet:
-        Option<Arc<Mutex<mainchain::WalletClient<MainchainTransport>>>>,
-    env: sneed::Env,
+    batch_verification_ctxt: BatchVerificationContext,
+    cusf_mainchain: mainchain::ValidatorClient<MainchainTransport>,
+    cusf_mainchain_block_producer:
+        Option<Arc<Mutex<mainchain::BlockProducerClient<MainchainTransport>>>>,
+    _dial_seeds: Arc<DialSeedsHandle>,
+    env: sneed::Env<heed::WithoutTls>,
     mainchain_task: MainchainTaskHandle,
     mempool: MemPool,
     net: Net,
@@ -137,14 +141,18 @@ where
     MainchainTransport: proto::Transport,
 {
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
+    pub async fn new<R>(
         bind_addr: SocketAddr,
         datadir: &Path,
+        magic_bytes_override: Option<crate::net::peer_message::MagicBytes>,
         network: Network,
+        add_peers: HashSet<SeedAddress>,
+        server_names: HashSet<String>,
         cusf_mainchain: mainchain::ValidatorClient<MainchainTransport>,
-        cusf_mainchain_wallet: Option<
-            mainchain::WalletClient<MainchainTransport>,
+        cusf_mainchain_block_producer: Option<
+            mainchain::BlockProducerClient<MainchainTransport>,
         >,
+        rng: &mut R,
         runtime: &tokio::runtime::Runtime,
         decision_config_testing: Option<u32>,
         #[cfg(feature = "zmq")] zmq_addr: SocketAddr,
@@ -155,18 +163,20 @@ where
         <MainchainTransport as tonic::client::GrpcService<
             tonic::body::Body,
         >>::Future: Send,
+        R: CryptoRng,
 {
         let env_path = datadir.join("data.mdb");
         std::fs::create_dir_all(&env_path)?;
         let env = {
-            let mut env_open_opts = heed::EnvOpenOptions::new();
+            let mut env_open_opts =
+                heed::EnvOpenOptions::new().read_txn_without_tls();
             env_open_opts
                 .map_size(128 * 1024 * 1024 * 1024) // 128 GB
                 .max_dbs(
-                    State::NUM_DBS
-                        + Archive::NUM_DBS
+                    Archive::NUM_DBS
                         + MemPool::NUM_DBS
-                        + Net::NUM_DBS,
+                        + Net::NUM_DBS
+                        + State::NUM_DBS,
                 );
             // Apply LMDB "fast" flags consistent with our benchmark setup:
             // - WRITE_MAP lets us write directly into the memory map instead of
@@ -181,24 +191,20 @@ where
             // - NO_READ_AHEAD disables kernel readahead that would otherwise
             //   touch cold pages we immediately overwrite, improving random
             //   access behaviour on SSDs used in testing.
-            // - NO_TLS stops LMDB from relying on thread-local storage for
-            //   reader slots so transactions can be moved across Tokio tasks.
             // WRITE_MAP/MAP_ASYNC/NO_READ_AHEAD are gated off on
             // Windows: LMDB's writable-mmap path returns
             // ERROR_INVALID_HANDLE on commit there, and
             // NO_READ_AHEAD has no effect without posix_madvise.
-            // NO_SYNC/NO_META_SYNC/NO_TLS are kept on every platform
+            // NO_SYNC/NO_META_SYNC are kept on every platform
             // since their tradeoffs are OS-independent.
             #[cfg(not(windows))]
             let fast_flags = EnvFlags::WRITE_MAP
                 | EnvFlags::MAP_ASYNC
                 | EnvFlags::NO_SYNC
                 | EnvFlags::NO_META_SYNC
-                | EnvFlags::NO_READ_AHEAD
-                | EnvFlags::NO_TLS;
+                | EnvFlags::NO_READ_AHEAD;
             #[cfg(windows)]
-            let fast_flags =
-                EnvFlags::NO_SYNC | EnvFlags::NO_META_SYNC | EnvFlags::NO_TLS;
+            let fast_flags = EnvFlags::NO_SYNC | EnvFlags::NO_META_SYNC;
             unsafe { env_open_opts.flags(fast_flags) };
             unsafe { Env::open(&env_open_opts, &env_path) }?
         };
@@ -207,22 +213,33 @@ where
         let zmq_pub_handler = Arc::new(ZmqPubHandler::new(zmq_addr).await?);
         let archive = Archive::new(&env)?;
         let mempool = MemPool::new(&env)?;
-        let (mainchain_task, mainchain_task_response_rx) =
+        let (mainchain_task, mainchain_task_event_rx) =
             MainchainTaskHandle::new(
                 env.clone(),
                 archive.clone(),
                 cusf_mainchain.clone(),
             );
-        let (net, peer_info_rx) =
-            Net::new(&env, archive.clone(), network, state.clone(), bind_addr)?;
-        let cusf_mainchain_wallet =
-            cusf_mainchain_wallet.map(|wallet| Arc::new(Mutex::new(wallet)));
+        let batch_verification_ctxt = BatchVerificationContext::new(rng);
+        let (net, peer_info_rx, dial_seeds) = Net::new(
+            runtime.handle(),
+            &env,
+            archive.clone(),
+            batch_verification_ctxt,
+            magic_bytes_override,
+            network,
+            state.clone(),
+            bind_addr,
+            add_peers,
+            server_names,
+        )?;
+        let cusf_mainchain_block_producer = cusf_mainchain_block_producer
+            .map(|block_producer| Arc::new(Mutex::new(block_producer)));
         let net_task = NetTaskHandle::new(
             runtime,
             env.clone(),
             archive.clone(),
             mainchain_task.clone(),
-            mainchain_task_response_rx,
+            mainchain_task_event_rx,
             mempool.clone(),
             net.clone(),
             peer_info_rx,
@@ -232,8 +249,10 @@ where
         );
         Ok(Self {
             archive,
-            cusf_mainchain: Arc::new(Mutex::new(cusf_mainchain)),
-            cusf_mainchain_wallet,
+            batch_verification_ctxt,
+            cusf_mainchain,
+            cusf_mainchain_block_producer,
+            _dial_seeds: Arc::new(dial_seeds),
             env,
             mainchain_task,
             mempool,
@@ -245,7 +264,7 @@ where
         })
     }
 
-    pub fn env(&self) -> &Env {
+    pub fn env(&self) -> &Env<heed::WithoutTls> {
         &self.env
     }
 
@@ -253,19 +272,13 @@ where
         &self.archive
     }
 
-    /// Borrow the CUSF mainchain client, and execute the provided future.
-    /// The CUSF mainchain client will be locked while the future is running.
-    pub async fn with_cusf_mainchain<F, Output>(&self, f: F) -> Output
+    /// Borrow the CUSF mainchain client
+    #[inline(always)]
+    pub fn with_cusf_mainchain<F, Output>(&self, f: F) -> Output
     where
-        F: for<'cusf_mainchain> FnOnce(
-            &'cusf_mainchain mut mainchain::ValidatorClient<MainchainTransport>,
-        )
-            -> BoxFuture<'cusf_mainchain, Output>,
+        F: FnOnce(&mainchain::ValidatorClient<MainchainTransport>) -> Output,
     {
-        let mut cusf_mainchain_lock = self.cusf_mainchain.lock().await;
-        let res = f(&mut cusf_mainchain_lock).await;
-        drop(cusf_mainchain_lock);
-        res
+        f(&self.cusf_mainchain)
     }
 
     pub fn try_get_tip_height(&self) -> Result<Option<u32>, Error> {
@@ -276,6 +289,35 @@ where
     pub fn try_get_tip(&self) -> Result<Option<BlockHash>, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self.state.try_get_tip(&rotxn)?)
+    }
+
+    /// Invalidate a block and its descendants. If the tip descends from the
+    /// block, disconnect blocks back to the parent of the block.
+    pub fn invalidate_block(&self, block_hash: BlockHash) -> Result<(), Error> {
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        let Some(header) = self.archive.try_get_header(&rwtxn, block_hash)?
+        else {
+            return Ok(());
+        };
+        let tip = self.state.try_get_tip(&rwtxn)?;
+        let in_active_chain = if let Some(tip) = tip {
+            self.archive.is_descendant(&rwtxn, block_hash, tip)?
+        } else {
+            false
+        };
+        if in_active_chain {
+            while self.state.try_get_tip(&rwtxn)? != header.prev_side_hash {
+                net_task::disconnect_tip_(
+                    &mut rwtxn,
+                    &self.archive,
+                    &self.mempool,
+                    &self.state,
+                )?;
+            }
+        }
+        let () = self.archive.invalidate_block(&mut rwtxn, block_hash)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        Ok(())
     }
 
     pub fn try_get_height(
@@ -310,16 +352,17 @@ where
 
     pub fn submit_transaction(
         &self,
-        transaction: AuthorizedTransaction,
+        transaction: &AuthorizedTransaction,
     ) -> Result<(), Error> {
         {
             let mut rwtxn = self.env.write_txn()?;
             self.state.validate_transaction(
                 &self.archive,
                 &rwtxn,
-                &transaction,
+                &self.batch_verification_ctxt,
+                transaction,
             )?;
-            self.mempool.put(&mut rwtxn, &transaction)?;
+            self.mempool.put(&mut rwtxn, transaction)?;
 
             if let Some(data) = transaction.transaction.data.as_ref() {
                 match data {
@@ -345,26 +388,13 @@ where
                             )?;
                         }
                     }
-                    crate::types::TxData::NativeOperation(
-                        crate::types::native::NativeOperationV1::BuyForIntent {
-                            intent,
-                            ..
-                        },
-                    ) => {
-                        self.update_mempool_buy(
-                            &mut rwtxn,
-                            intent.market_id,
-                            intent.outcome_index,
-                            intent.shares,
-                        )?;
-                    }
-                    crate::types::TxData::NativeOperation(_) => {}
                     crate::types::TxData::ClaimDecision(_)
                     | crate::types::TxData::CreateMarket { .. }
                     | crate::types::TxData::SubmitVote { .. }
                     | crate::types::TxData::SubmitBallot { .. }
                     | crate::types::TxData::TransferReputation { .. }
-                    | crate::types::TxData::AmplifyBeta { .. } => {}
+                    | crate::types::TxData::AmplifyBeta { .. }
+                    | crate::types::TxData::NativeOperation(_) => {}
                 }
             }
 
@@ -469,7 +499,7 @@ where
 
         tracing::debug!(
             "Updated mempool shares for market {}: outcome {} increased by {} shares",
-            hex::encode(market_id),
+            const_hex::encode(market_id),
             outcome_index,
             shares_to_buy
         );
@@ -538,7 +568,7 @@ where
 
         tracing::debug!(
             "Updated mempool shares for market {}: outcome {} decreased by {} shares (sell)",
-            hex::encode(market_id),
+            const_hex::encode(market_id),
             outcome_index,
             shares_to_sell
         );
@@ -653,6 +683,15 @@ where
         Ok(res)
     }
 
+    pub fn get_stxos_by_addresses(
+        &self,
+        addresses: &HashSet<Address>,
+    ) -> Result<HashMap<OutPoint, SpentOutput>, Error> {
+        let rotxn = self.env.read_txn()?;
+        let stxos = self.state.get_stxos_by_addresses(&rotxn, addresses)?;
+        Ok(stxos)
+    }
+
     pub fn get_utxos_by_addresses(
         &self,
         addresses: &HashSet<Address>,
@@ -711,20 +750,44 @@ where
         height: u32,
     ) -> Result<Option<BlockHash>, Error> {
         let rotxn = self.env.read_txn()?;
-        let Some(tip) = self.state.try_get_tip(&rotxn)? else {
+        self.try_get_block_hash_read(&rotxn, height)
+    }
+
+    fn try_get_block_hash_read(
+        &self,
+        rotxn: &RoTxn,
+        height: u32,
+    ) -> Result<Option<BlockHash>, Error> {
+        let Some(tip) = self.state.try_get_tip(rotxn)? else {
             return Ok(None);
         };
-        let Some(tip_height) = self.state.try_get_height(&rotxn)? else {
+        let Some(tip_height) = self.state.try_get_height(rotxn)? else {
             return Ok(None);
         };
         if tip_height >= height {
             self.archive
-                .ancestors(&rotxn, tip)
+                .ancestors(rotxn, tip)
                 .nth((tip_height - height) as usize)
                 .map_err(Error::from)
         } else {
             Ok(None)
         }
+    }
+
+    /// Get the coin movements that the block applied outside its body
+    pub fn get_block_index_events(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<BlockIndexEvents, Error> {
+        let rotxn = self.env.read_txn()?;
+        let height = self.archive.get_height(&rotxn, block_hash)?;
+        // The events are keyed by height, so a block off the current chain
+        // would read another block's events.
+        if self.try_get_block_hash_read(&rotxn, height)? != Some(block_hash) {
+            return Err(Error::NotInCurrentChain { block_hash });
+        }
+        let events = self.state.get_block_index_events(&rotxn, height)?;
+        Ok(events)
     }
 
     pub fn try_get_body(
@@ -919,31 +982,6 @@ where
             None => return Ok(true), // Non-data txs always pass
         };
 
-        // Reuse the same LMSR path for sponsored recipient-authorized buys.
-        let sponsored_trade;
-        let tx_data = if let TxData::NativeOperation(
-            crate::types::native::NativeOperationV1::BuyForIntent {
-                intent,
-                limit_sats,
-                tx_pow_nonce,
-                prev_block_hash,
-                ..
-            },
-        ) = tx_data
-        {
-            sponsored_trade = TxData::Trade {
-                market_id: intent.market_id,
-                outcome_index: intent.outcome_index,
-                shares: intent.shares,
-                trader: intent.recipient,
-                limit_sats: *limit_sats,
-                tx_pow_nonce: *tx_pow_nonce,
-                prev_block_hash: *prev_block_hash,
-            };
-            &sponsored_trade
-        } else {
-            tx_data
-        };
         match tx_data {
             TxData::Trade {
                 market_id,
@@ -1196,8 +1234,11 @@ where
         let rotxn = self.env.read_txn()?;
         let tip = self.state.try_get_tip(&rotxn)?;
         let inclusions = self.archive.get_tx_inclusions(&rotxn, txid)?;
-        if let Some((block_hash, idx)) =
-            inclusions.into_iter().try_find(|(block_hash, _)| {
+        if let Some((block_hash, idx)) = inclusions
+            .into_iter()
+            .map(Ok)
+            .transpose_into_fallible()
+            .find(|(block_hash, _)| {
                 if let Some(tip) = tip {
                     self.archive.is_descendant(&rotxn, *block_hash, tip)
                 } else {
@@ -1267,7 +1308,7 @@ where
 
     pub fn connect_peer(&self, addr: SocketAddr) -> Result<(), Error> {
         self.net
-            .connect_peer(self.env.clone(), addr)
+            .connect_peer(self.env.clone(), addr.into())
             .map_err(Error::from)
     }
 
@@ -1280,6 +1321,11 @@ where
 
     pub fn get_active_peers(&self) -> Vec<Peer> {
         self.net.get_active_peers()
+    }
+
+    /// Get the progress of the sync with the mainchain
+    pub fn mainchain_sync_progress(&self) -> MainchainSyncProgress {
+        self.mainchain_task.sync_progress()
     }
 
     pub async fn request_mainchain_ancestor_infos(
@@ -1307,10 +1353,6 @@ where
         header: &Header,
         body: &Body,
     ) -> Result<bool, Error> {
-        let Some(cusf_mainchain_wallet) = self.cusf_mainchain_wallet.as_ref()
-        else {
-            return Err(Error::NoCusfMainchainWalletClient);
-        };
         let block_hash = header.hash();
         if let Some(parent) = header.prev_side_hash
             && self.try_get_header(parent)?.is_none()
@@ -1409,15 +1451,27 @@ where
                 );
             }
         }
-        if let Some((bundle, _bundle_h)) = bundle {
+        if let Some((bundle, _)) = bundle {
             let m6id = bundle.compute_m6id();
-            let mut cusf_mainchain_wallet_lock =
-                cusf_mainchain_wallet.lock().await;
-            let () = cusf_mainchain_wallet_lock
-                .broadcast_withdrawal_bundle(bundle.tx())
-                .await?;
-            drop(cusf_mainchain_wallet_lock);
-            tracing::trace!(%m6id, "Broadcast withdrawal bundle");
+            if let Some(cusf_mainchain_block_producer) =
+                self.cusf_mainchain_block_producer.as_ref()
+            {
+                {
+                    let mut cusf_mainchain_block_producer_lock =
+                        cusf_mainchain_block_producer.lock().await;
+                    let () = cusf_mainchain_block_producer_lock
+                        .propose_withdrawal_bundle(bundle.tx())
+                        .await?;
+                }
+                tracing::trace!(%m6id, "Proposed withdrawal bundle");
+            } else {
+                tracing::warn!(
+                    %m6id,
+                    "Withdrawal bundle is pending, but the mainchain node \
+                     does not serve BlockProducerService, so the bundle \
+                     cannot be proposed and the withdrawal cannot complete",
+                );
+            }
         }
         Ok(true)
     }
@@ -1509,35 +1563,6 @@ where
         Ok(self
             .state
             .claimed_count_in_period(&rotxn, period_id.as_u32())?)
-    }
-
-    pub fn get_native_escrow(
-        &self,
-        id: [u8; 32],
-    ) -> Result<Option<crate::types::native::ShareEscrowV1>, Error> {
-        let txn = self.env.read_txn()?;
-        Ok(self.state.native().get_escrow(&txn, id)?)
-    }
-
-    pub fn get_native_effect(
-        &self,
-        id: [u8; 32],
-    ) -> Result<Option<crate::types::native::NativeEffectV1>, Error> {
-        let txn = self.env.read_txn()?;
-        Ok(self.state.native().get_effect(&txn, id)?)
-    }
-
-    pub fn get_native_reserved_shares(
-        &self,
-        owner: Address,
-        market: crate::state::markets::MarketId,
-        outcome: u32,
-    ) -> Result<i64, Error> {
-        let txn = self.env.read_txn()?;
-        Ok(self
-            .state
-            .native()
-            .reserved_shares(&txn, owner, market, outcome)?)
     }
 
     pub fn get_listing_fee_info(
@@ -1755,7 +1780,9 @@ where
         )?)
     }
 
-    pub fn read_txn(&self) -> Result<sneed::RoTxn<'_>, Error> {
+    pub fn read_txn(
+        &self,
+    ) -> Result<sneed::RoTxn<'_, heed::WithoutTls>, Error> {
         self.env.read_txn().map_err(Into::into)
     }
 

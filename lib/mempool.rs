@@ -65,7 +65,7 @@ const MAX_MEMPOOL_TRANSACTIONS: usize = 5000;
 impl MemPool {
     pub const NUM_DBS: u32 = 7;
 
-    pub fn new(env: &sneed::Env) -> Result<Self, Error> {
+    pub fn new<Tls>(env: &sneed::Env<Tls>) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
         let transactions =
             DatabaseUnique::create(env, &mut rwtxn, "transactions")?;
@@ -196,11 +196,10 @@ impl MemPool {
     }
 
     fn is_trade_tx(transaction: &AuthorizedTransaction) -> bool {
-        transaction
-            .transaction
-            .data
-            .as_ref()
-            .is_some_and(|data| data.is_trade())
+        matches!(
+            &transaction.transaction.data,
+            Some(crate::types::TransactionData::Trade { .. })
+        )
     }
 
     /// Extract decision IDs being claimed by this transaction
@@ -248,7 +247,7 @@ impl MemPool {
                 && existing_txid != txid
             {
                 return Err(Error::DecisionAlreadyClaimedInMempool(
-                    hex::encode(decision_id),
+                    const_hex::encode(decision_id),
                 ));
             }
         }
@@ -386,7 +385,7 @@ impl MemPool {
                 && zombie_txid != confirmed_txid
             {
                 tracing::info!(
-                    decision_id = %hex::encode(decision_id),
+                    decision_id = %const_hex::encode(decision_id),
                     %zombie_txid,
                     %confirmed_txid,
                     "evicting zombie decision-claim conflict"
@@ -541,7 +540,7 @@ impl MemPool {
 }
 
 impl Watchable<()> for MemPool {
-    type WatchStream = impl Stream<Item = ()>;
+    type WatchStream = std::pin::Pin<Box<dyn Stream<Item = ()> + Send>>;
 
     /// Get a signal that notifies whenever the mempool changes
     fn watch(&self) -> Self::WatchStream {
@@ -554,11 +553,11 @@ impl Watchable<()> for MemPool {
             watchables.into_iter().map(WatchStream::new).enumerate(),
         );
         let streams_len = streams.len();
-        streams.ready_chunks(streams_len).map(|signals| {
+        Box::pin(streams.ready_chunks(streams_len).map(|signals| {
             assert_ne!(signals.len(), 0);
             #[allow(clippy::unused_unit)]
             ()
-        })
+        }))
     }
 }
 

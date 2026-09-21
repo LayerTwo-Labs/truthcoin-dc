@@ -1,5 +1,5 @@
 //! Native share operations. All state changes use the enclosing block's LMDB
-//! transaction; receipts describe execution and are removed on disconnect.
+//! transaction. External replay derives receipts from successful transitions.
 use std::collections::BTreeMap;
 
 use fallible_iterator::FallibleIterator;
@@ -11,10 +11,10 @@ use sneed::{DatabaseUnique, RoTxn, RwTxn};
 use super::{Error, ShareAccount, State, UtxoManager, markets::MarketId};
 use crate::types::{
     Address, BitcoinOutputContent, FilledOutput, FilledOutputContent,
-    FilledTransaction, GetAddress, OutPoint, TransactionData,
+    FilledTransaction, OutPoint, TransactionData,
     native::{
-        EscrowAssetV1, EscrowMutationV1, EscrowStatusV1, NativeEffectKindV1,
-        NativeEffectV1, NativeId, NativeOperationV1, ShareEscrowV1,
+        EscrowAssetV1, EscrowStatusV1, NativeActionV2, NativeId,
+        NativeOperationV2, ShareEscrowV1,
     },
 };
 
@@ -36,28 +36,23 @@ pub struct NativeDbs {
     >,
     pub escrows:
         DatabaseUnique<SerdeBincode<NativeId>, SerdeBincode<ShareEscrowV1>>,
-    pub effects:
-        DatabaseUnique<SerdeBincode<NativeId>, SerdeBincode<NativeEffectV1>>,
-    pub nonces: DatabaseUnique<
-        SerdeBincode<(Address, NativeId)>,
-        SerdeBincode<NativeId>,
-    >,
     pub undo: DatabaseUnique<SerdeBincode<u32>, SerdeBincode<NativeUndoV1>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct NativeUndoV1 {
     pub escrows: BTreeMap<NativeId, Option<ShareEscrowV1>>,
-    pub nonces: Vec<(Address, NativeId)>,
-    pub effects: Vec<NativeId>,
     pub accounts: BTreeMap<Address, Option<ShareAccount>>,
     pub cash_outputs: Vec<OutPoint>,
 }
 
 impl NativeDbs {
-    pub const NUM_DBS: u32 = 5;
+    pub const NUM_DBS: u32 = 3;
 
-    pub fn new(env: &sneed::Env, txn: &mut RwTxn) -> Result<Self, Error> {
+    pub fn new<Tls>(
+        env: &sneed::Env<Tls>,
+        txn: &mut RwTxn,
+    ) -> Result<Self, Error> {
         Ok(Self {
             reservations: DatabaseUnique::create(
                 env,
@@ -65,8 +60,6 @@ impl NativeDbs {
                 "native_reservations",
             )?,
             escrows: DatabaseUnique::create(env, txn, "native_escrows")?,
-            effects: DatabaseUnique::create(env, txn, "native_effects")?,
-            nonces: DatabaseUnique::create(env, txn, "native_nonces")?,
             undo: DatabaseUnique::create(env, txn, "native_undo")?,
         })
     }
@@ -77,14 +70,6 @@ impl NativeDbs {
         id: NativeId,
     ) -> Result<Option<ShareEscrowV1>, Error> {
         Ok(self.escrows.try_get(txn, &id)?)
-    }
-
-    pub fn get_effect(
-        &self,
-        txn: &RoTxn,
-        id: NativeId,
-    ) -> Result<Option<NativeEffectV1>, Error> {
-        Ok(self.effects.try_get(txn, &id)?)
     }
 
     pub fn reserved_shares(
@@ -138,6 +123,9 @@ impl NativeDbs {
                     (escrow.owner, escrow.market_id, escrow.outcome_index);
                 let mut reservations =
                     self.reservations.try_get(txn, &key)?.unwrap_or_default();
+                if reservations.len() >= 1024 {
+                    return Err(invalid("too many active native reservations"));
+                }
                 reservations.insert(id, escrow.shares);
                 self.reservations.put(txn, &key, &reservations)?;
             }
@@ -195,32 +183,6 @@ impl NativeDbs {
         Ok(())
     }
 
-    pub(crate) fn record(
-        &self,
-        txn: &mut RwTxn,
-        operation: &NativeOperationV1,
-        effect: &NativeEffectV1,
-    ) -> Result<(), Error> {
-        if self.effects.try_get(txn, &effect.transaction_id)?.is_some() {
-            return Err(invalid("native operation already executed"));
-        }
-        let mut undo = self
-            .undo
-            .try_get(txn, &effect.sidechain_height)?
-            .unwrap_or_default();
-        if let Some(key) = operation.nonce() {
-            if self.nonces.try_get(txn, &key)?.is_some() {
-                return Err(invalid("native operation nonce already consumed"));
-            }
-            self.nonces.put(txn, &key, &effect.transaction_id)?;
-            undo.nonces.push(key);
-        }
-        self.effects.put(txn, &effect.transaction_id, effect)?;
-        undo.effects.push(effect.transaction_id);
-        self.undo.put(txn, &effect.sidechain_height, &undo)?;
-        Ok(())
-    }
-
     pub(crate) fn create_escrow(
         &self,
         txn: &mut RwTxn,
@@ -235,81 +197,29 @@ impl NativeDbs {
         Ok(())
     }
 
-    pub(crate) fn mutate_escrow(
+    pub(crate) fn assign(
         &self,
         txn: &mut RwTxn,
         height: u32,
-        parent_height: u32,
-        txid: NativeId,
-        operation: &NativeOperationV1,
-    ) -> Result<NativeEffectV1, Error> {
-        let NativeOperationV1::MutateEscrow {
-            intent,
-            claim_authorization,
-            refund_authorization,
-        } = operation
-        else {
-            return Err(invalid("not an escrow mutation"));
-        };
+        filled: &FilledTransaction,
+        id: NativeId,
+        claim: crate::types::Address,
+        refund: crate::types::Address,
+        reference: NativeId,
+    ) -> Result<(), Error> {
         let mut escrow = self
-            .get_escrow(txn, intent.mutation.escrow_id())?
+            .get_escrow(txn, id)?
             .ok_or_else(|| invalid("unknown native escrow"))?;
-        if escrow.status != EscrowStatusV1::Locked
-            || escrow.shares <= 0
-            || !escrow.mutable_rights
-        {
-            return Err(invalid("escrow is not live"));
+        if escrow.status != EscrowStatusV1::Locked || !escrow.mutable_rights {
+            return Err(invalid("escrow is terminal or sealed"));
         }
-        if claim_authorization.get_address() != escrow.claim_address
-            || !intent.verify(claim_authorization)
-        {
-            return Err(invalid("invalid current claim authorization"));
-        }
-        if escrow.claim_address == escrow.refund_address {
-            if refund_authorization.is_some() {
-                return Err(invalid("redundant refund authorization"));
-            }
-        } else if !refund_authorization.as_ref().is_some_and(|auth| {
-            auth.get_address() == escrow.refund_address && intent.verify(auth)
-        }) {
-            return Err(invalid("invalid current refund authorization"));
-        }
-        let kind = match &intent.mutation {
-            EscrowMutationV1::Assign {
-                new_claim_address,
-                new_refund_address,
-                reference,
-                ..
-            } => {
-                let kind = NativeEffectKindV1::Assigned {
-                    previous_claim_address: escrow.claim_address,
-                    previous_refund_address: escrow.refund_address,
-                    valid_from_parent: intent.valid_from_parent,
-                    valid_before_parent: intent.valid_before_parent,
-                };
-                self.capture_escrow(txn, height, escrow.escrow_id)?;
-                escrow.claim_address = *new_claim_address;
-                escrow.refund_address = *new_refund_address;
-                escrow.reference = *reference;
-                self.write_escrow(txn, escrow.escrow_id, Some(&escrow))?;
-                kind
-            }
-        };
-        Ok(NativeEffectV1 {
-            transaction_id: txid,
-            sidechain_height: height,
-            parent_height,
-            reference: escrow.reference,
-            kind,
-            escrow_id: Some(escrow.escrow_id),
-            owner: escrow.owner,
-            recipient: escrow.claim_address,
-            market_id: escrow.market_id,
-            outcome_index: escrow.outcome_index,
-            shares: escrow.shares,
-            asset: escrow.asset.clone(),
-            escrow_snapshot: Some(escrow),
-        })
+        require_owner_input(filled, escrow.claim_address)?;
+        require_owner_input(filled, escrow.refund_address)?;
+        self.capture_escrow(txn, height, id)?;
+        escrow.claim_address = claim;
+        escrow.refund_address = refund;
+        escrow.reference = reference;
+        self.write_escrow(txn, id, Some(&escrow))
     }
 
     pub(crate) fn terminate(
@@ -419,12 +329,6 @@ impl NativeDbs {
             for (id, previous) in undo.escrows {
                 self.write_escrow(txn, id, previous.as_ref())?;
             }
-            for id in undo.effects {
-                self.effects.delete(txn, &id)?;
-            }
-            for key in undo.nonces {
-                self.nonces.delete(txn, &key)?;
-            }
             for (address, account) in undo.accounts {
                 state.markets().restore_share_account(
                     txn,
@@ -499,130 +403,74 @@ pub fn cash_outpoint(txid: NativeId) -> OutPoint {
 
 /// Structural/authorization checks are also used by mempool admission. Parent
 /// deadline and ordered share availability checks run in block application.
-pub fn validate(
-    state: &State,
-    archive: &crate::archive::Archive,
-    txn: &RoTxn,
-    filled: &FilledTransaction,
+/// Called only on filled inputs whose full transaction signatures are verified by
+/// normal block authorization. Actor-only proofs never authorize native ownership.
+pub(crate) fn require_owner_input(
+    tx: &FilledTransaction,
+    owner: crate::types::Address,
 ) -> Result<(), Error> {
-    let Some(TransactionData::NativeOperation(operation)) =
-        &filled.transaction.data
-    else {
-        return Ok(());
-    };
-    if let Some(actor) = operation.actor() {
-        if filled.actor_address != Some(actor)
-            && !filled
-                .spent_utxos
-                .iter()
-                .any(|output| output.address == actor)
-        {
-            return Err(invalid("missing native owner authorization"));
-        }
-    }
-    if let Some(key) = operation.nonce() {
-        if state.native().nonces.try_get(txn, &key)?.is_some() {
-            return Err(invalid("native nonce already consumed"));
-        }
-    }
-    match operation {
-        NativeOperationV1::BuyForIntent {
-            intent,
-            authorization,
-            ..
-        } => {
-            validate_window(
-                intent.valid_from_parent,
-                intent.valid_before_parent,
-            )?;
-            validate_shares(
-                state,
-                txn,
-                intent.market_id,
-                intent.outcome_index,
-                intent.shares,
-            )?;
-            if !intent.verify(authorization) {
-                return Err(invalid("invalid recipient buy intent signature"));
-            }
-            let tip = state
-                .try_get_tip(txn)?
-                .ok_or_else(|| invalid("buy intent requires native genesis"))?;
-            let height = state
-                .try_get_height(txn)?
-                .ok_or_else(|| invalid("missing native height"))?;
-            if archive.get_nth_ancestor(txn, tip, height)?
-                != intent.genesis_hash
-            {
-                return Err(invalid(
-                    "buy intent belongs to another native chain",
-                ));
-            }
-        }
-        NativeOperationV1::TransferShares {
-            market_id,
-            outcome_index,
-            shares,
-            valid_from_parent,
-            valid_before_parent,
-            ..
-        } => {
-            validate_window(*valid_from_parent, *valid_before_parent)?;
-            validate_shares(state, txn, *market_id, *outcome_index, *shares)?;
-        }
-        NativeOperationV1::LockShares {
-            market_id,
-            outcome_index,
-            shares,
-            claim_before_parent,
-            ..
-        } => {
-            if *claim_before_parent == 0 {
-                return Err(invalid("zero escrow deadline"));
-            }
-            validate_shares(state, txn, *market_id, *outcome_index, *shares)?;
-        }
-        NativeOperationV1::MutateEscrow {
-            intent,
-            claim_authorization,
-            refund_authorization,
-        } => {
-            validate_window(
-                intent.valid_from_parent,
-                intent.valid_before_parent,
-            )?;
-            // Ownership is checked against ordered execution state, so an escrow
-            // created or assigned earlier in this block can be mutated safely.
-            if !intent.verify(claim_authorization)
-                || refund_authorization
-                    .as_ref()
-                    .is_some_and(|auth| !intent.verify(auth))
-            {
-                return Err(invalid("invalid escrow mutation signature"));
-            }
-            let tip = state
-                .try_get_tip(txn)?
-                .ok_or_else(|| invalid("mutation requires native genesis"))?;
-            let height = state
-                .try_get_height(txn)?
-                .ok_or_else(|| invalid("missing native height"))?;
-            if archive.get_nth_ancestor(txn, tip, height)?
-                != intent.genesis_hash
-            {
-                return Err(invalid(
-                    "mutation belongs to another native chain",
-                ));
-            }
-        }
-        NativeOperationV1::ClaimEscrow { .. }
-        | NativeOperationV1::RefundEscrow { .. } => {}
+    if !tx.spent_utxos.iter().any(|output| {
+        output.address == owner
+            && matches!(output.content, FilledOutputContent::Bitcoin(_))
+    }) {
+        return Err(invalid(
+            "native action requires owner-controlled ordinary input",
+        ));
     }
     Ok(())
 }
 
-fn validate_window(from: u32, before: u32) -> Result<(), Error> {
-    if from >= before {
-        return Err(invalid("empty parent-height validity window"));
+pub fn validate(
+    state: &State,
+    archive: &crate::archive::Archive,
+    txn: &RoTxn,
+    tx: &FilledTransaction,
+) -> Result<(), Error> {
+    let Some(TransactionData::NativeOperation(op)) = &tx.transaction.data
+    else {
+        return Ok(());
+    };
+    if tx.transaction.inputs.is_empty()
+        || tx.transaction.inputs.len() != tx.spent_utxos.len()
+        || !tx
+            .spent_utxos
+            .iter()
+            .any(|o| matches!(o.content, FilledOutputContent::Bitcoin(_)))
+        || op.valid_from_parent >= op.valid_before_parent
+    {
+        return Err(invalid(
+            "native action requires inputs and a valid height interval",
+        ));
+    }
+    let tip = state
+        .try_get_tip(txn)?
+        .ok_or_else(|| invalid("native action requires genesis"))?;
+    let height = state
+        .try_get_height(txn)?
+        .ok_or_else(|| invalid("missing native height"))?;
+    if archive.get_nth_ancestor(txn, tip, height)? != op.genesis_hash {
+        return Err(invalid("native action belongs to another chain"));
+    }
+    match &op.action {
+        NativeActionV2::MoveShares {
+            owner,
+            market_id,
+            outcome_index,
+            shares,
+            ..
+        }
+        | NativeActionV2::LockShares {
+            owner,
+            market_id,
+            outcome_index,
+            shares,
+            ..
+        } => {
+            require_owner_input(tx, *owner)?;
+            validate_shares(state, txn, *market_id, *outcome_index, *shares)?;
+        }
+        // Assignment owners are checked during ordered execution, not at block start.
+        _ => (),
     }
     Ok(())
 }
@@ -652,33 +500,20 @@ fn validate_shares(
 }
 
 pub fn check_deadline(
-    operation: &NativeOperationV1,
-    parent_height: u32,
+    op: &NativeOperationV2,
+    parent: u32,
 ) -> Result<(), Error> {
-    let window = match operation {
-        NativeOperationV1::BuyForIntent { intent, .. } => {
-            Some((intent.valid_from_parent, intent.valid_before_parent))
+    if parent < op.valid_from_parent || parent >= op.valid_before_parent {
+        return Err(invalid("native action outside signed parent interval"));
+    }
+    if let NativeActionV2::LockShares {
+        claim_before_parent,
+        ..
+    } = op.action
+    {
+        if parent >= claim_before_parent {
+            return Err(invalid("expired native lock"));
         }
-        NativeOperationV1::MutateEscrow { intent, .. } => {
-            Some((intent.valid_from_parent, intent.valid_before_parent))
-        }
-        NativeOperationV1::TransferShares {
-            valid_from_parent,
-            valid_before_parent,
-            ..
-        } => Some((*valid_from_parent, *valid_before_parent)),
-        NativeOperationV1::LockShares {
-            claim_before_parent,
-            ..
-        } => Some((0, *claim_before_parent)),
-        _ => None,
-    };
-    if window.is_some_and(|(from, before)| {
-        parent_height < from || parent_height >= before
-    }) {
-        return Err(invalid(
-            "native operation outside parent-height validity window",
-        ));
     }
     Ok(())
 }

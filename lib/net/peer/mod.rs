@@ -17,10 +17,11 @@ use tokio::{spawn, task::JoinHandle, time::Duration};
 
 use crate::{
     archive::Archive,
+    authorization::BatchVerificationContext,
     state::State,
     types::{
-        AuthorizedTransaction, Hash, Network, Tip, Version, hashes::hash,
-        schema,
+        AuthorizedTransaction, Hash, Tip, Version, hashes::hash,
+        net::ResolvedSeedAddress, schema,
     },
 };
 
@@ -87,13 +88,13 @@ impl From<&PeerState> for PeerStateId {
 
 impl std::fmt::Debug for PeerStateId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        hex::encode(self.0).fmt(f)
+        const_hex::encode(self.0).fmt(f)
     }
 }
 
 impl std::fmt::Display for PeerStateId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        hex::encode(self.0).fmt(f)
+        const_hex::encode(self.0).fmt(f)
     }
 }
 
@@ -110,7 +111,10 @@ pub struct PeerResponseItem {
 #[must_use]
 #[derive(Debug)]
 pub enum Info {
-    Error(ConnectionError),
+    Error {
+        err: ConnectionError,
+        resolved_addr: ResolvedSeedAddress,
+    },
     /// Need Mainchain ancestors for the specified tip
     NeedMainchainAncestors {
         main_hash: bitcoin::BlockHash,
@@ -122,29 +126,10 @@ pub enum Info {
     Response(Box<(ResponseMessage, Request)>),
 }
 
-impl From<ConnectionError> for Info {
-    fn from(err: ConnectionError) -> Self {
-        Self::Error(err)
-    }
-}
-
-impl<E, T> From<Result<T, E>> for Info
-where
-    ConnectionError: From<E>,
-    Info: From<T>,
-{
-    fn from(res: Result<T, E>) -> Self {
-        match res {
-            Ok(value) => value.into(),
-            Err(err) => Self::Error(err.into()),
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Connection {
     pub(in crate::net) inner: quinn::Connection,
-    pub network: Network,
+    pub magic_bytes: message::MagicBytes,
 }
 
 impl Connection {
@@ -155,20 +140,47 @@ impl Connection {
 
     pub const HEARTBEAT_TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
 
+    pub const MIN_READ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub fn addr(&self) -> SocketAddr {
         self.inner.remote_address()
     }
 
-    pub fn new(connection: quinn::Connection, network: Network) -> Self {
+    /// Timeout for reading a full response from a peer, scaled to the maximum
+    /// permitted response size.
+    /// Bounds the wait for an unresponsive peer while leaving ample time for a
+    /// large but steadily-progressing response.
+    const fn response_read_timeout(
+        read_response_limit: NonZeroUsize,
+    ) -> Duration {
+        // Minimum sustained throughput, in bytes per second, that a peer
+        // streaming a response body is expected to achieve.
+        // Used to scale the response read timeout to `read_response_limit`, so
+        // a large (up to 10MB) block response is given proportionally more
+        // time. Deliberately conservative so a slow or congested link is not
+        // aborted; a peer that stops making progress entirely still hits the
+        // timeout.
+        const MIN_READ_RESPONSE_THROUGHPUT: u64 = 64 * 1024;
+
+        let body_allowance = Duration::from_secs(
+            read_response_limit.get() as u64 / MIN_READ_RESPONSE_THROUGHPUT,
+        );
+        Self::MIN_READ_RESPONSE_TIMEOUT.saturating_add(body_allowance)
+    }
+
+    pub fn new(
+        connection: quinn::Connection,
+        magic_bytes: message::MagicBytes,
+    ) -> Self {
         Self {
             inner: connection,
-            network,
+            magic_bytes,
         }
     }
 
     pub async fn from_connecting(
         connecting: quinn::Connecting,
-        network: Network,
+        magic_bytes: message::MagicBytes,
     ) -> Result<Self, quinn::ConnectionError> {
         let addr = connecting.remote_address();
         tracing::trace!(%addr, "connecting to peer");
@@ -176,7 +188,7 @@ impl Connection {
         tracing::info!(%addr, "connected successfully to peer");
         Ok(Self {
             inner: connection,
-            network,
+            magic_bytes,
         })
     }
 
@@ -190,7 +202,7 @@ impl Connection {
         rx.read_exact(&mut magic_bytes)
             .await
             .map_err(error::connection::Receive::ReadMagic)?;
-        if magic_bytes != message::magic_bytes(self.network) {
+        if magic_bytes != self.magic_bytes {
             return Err(
                 error::connection::Receive::BadMagic(magic_bytes).into()
             );
@@ -216,7 +228,7 @@ impl Connection {
             "Sending heartbeat"
         );
         let message = RequestMessageRef::from(heartbeat);
-        let mut message_buf = message::magic_bytes(self.network).to_vec();
+        let mut message_buf = self.magic_bytes.to_vec();
         bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &message)?;
         send.write_all(&message_buf).await.map_err(|err| {
             error::connection::Send::Write {
@@ -229,7 +241,7 @@ impl Connection {
     }
 
     async fn receive_response(
-        network: Network,
+        expected_magic_bytes: message::MagicBytes,
         mut recv: RecvStream,
         read_response_limit: NonZeroUsize,
     ) -> ResponseResult {
@@ -238,7 +250,7 @@ impl Connection {
         recv.read_exact(&mut magic_bytes)
             .await
             .map_err(error::connection::Receive::ReadMagic)?;
-        if magic_bytes != message::magic_bytes(network) {
+        if magic_bytes != expected_magic_bytes {
             return Err(
                 error::connection::Receive::BadMagic(magic_bytes).into()
             );
@@ -266,7 +278,7 @@ impl Connection {
             "Sending request"
         );
         let message = RequestMessageRef::from(request);
-        let mut message_buf = message::magic_bytes(self.network).to_vec();
+        let mut message_buf = self.magic_bytes.to_vec();
         bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &message)?;
         send.write_all(&message_buf).await.map_err(|err| {
             error::connection::Send::Write {
@@ -275,16 +287,26 @@ impl Connection {
             }
         })?;
         send.finish()?;
-        Ok(
-            Self::receive_response(self.network, recv, read_response_limit)
-                .await,
+        // Bound the wait for a response so an unresponsive peer that holds the
+        // bi-stream open cannot pin the outbound request channel indefinitely.
+        // The timeout scales with the maximum response size, so a large (up to
+        // 10MB) block response on a slow or congested link is not aborted.
+        let response = match tokio::time::timeout(
+            Self::response_read_timeout(read_response_limit),
+            Self::receive_response(self.magic_bytes, recv, read_response_limit),
         )
+        .await
+        {
+            Ok(response) => response,
+            Err(_elapsed) => Err(error::connection::Receive::Timeout.into()),
+        };
+        Ok(response)
     }
 
     // Send a pre-serialized response, where the response does not include
     // magic bytes
     async fn send_serialized_response(
-        network: Network,
+        magic_bytes: message::MagicBytes,
         mut response_tx: SendStream,
         serialized_response: &[u8],
     ) -> Result<(), error::connection::SendResponse> {
@@ -293,9 +315,7 @@ impl Connection {
             "Sending response"
         );
         async {
-            response_tx
-                .write_all(&message::magic_bytes(network))
-                .await?;
+            response_tx.write_all(&magic_bytes).await?;
             response_tx.write_all(serialized_response).await
         }
         .await
@@ -311,7 +331,7 @@ impl Connection {
     }
 
     async fn send_response(
-        network: Network,
+        magic_bytes: message::MagicBytes,
         mut response_tx: SendStream,
         response: ResponseMessage,
     ) -> Result<(), error::connection::SendResponse> {
@@ -320,7 +340,7 @@ impl Connection {
             send_id = %response_tx.id(),
             "Sending response"
         );
-        let mut message_buf = message::magic_bytes(network).to_vec();
+        let mut message_buf = magic_bytes.to_vec();
         bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &response)?;
         response_tx.write_all(&message_buf).await.map_err(|err| {
             {
@@ -335,9 +355,11 @@ impl Connection {
 }
 
 pub struct ConnectionContext {
-    pub env: sneed::Env,
+    pub env: sneed::Env<heed::WithoutTls>,
     pub archive: Archive,
-    pub network: Network,
+    pub batch_verification_ctxt: BatchVerificationContext,
+    pub magic_bytes: message::MagicBytes,
+    pub resolved_address: ResolvedSeedAddress,
     pub state: State,
 }
 
@@ -420,6 +442,7 @@ pub fn handle(
     let (mailbox_tx, mailbox_rx) = mailbox::new();
     let internal_message_tx = mailbox_tx.internal_message_tx.clone();
     let received_msg_successfully = Arc::new(AtomicBool::new(false));
+    let resolved_addr = ctxt.resolved_address.clone();
     let connection_task = {
         let info_tx = info_tx.clone();
         let received_msg_successfully = received_msg_successfully.clone();
@@ -439,8 +462,9 @@ pub fn handle(
         if let Err(err) = connection_task().await {
             tracing::error!(%addr, "connection task error, sending on info_tx: {err:#}");
 
-            if let Err(send_error) = info_tx.unbounded_send(err.into())
-                && let Info::Error(err) = send_error.into_inner()
+            if let Err(send_error) =
+                info_tx.unbounded_send(Info::Error { err, resolved_addr })
+                && let Info::Error { err, .. } = send_error.into_inner()
             {
                 tracing::warn!("Failed to send error to receiver: {err}")
             }
@@ -466,13 +490,15 @@ pub fn connect(
     let (info_tx, info_rx) = mpsc::unbounded();
     let (mailbox_tx, mailbox_rx) = mailbox::new();
     let internal_message_tx = mailbox_tx.internal_message_tx.clone();
+    let resolved_addr = ctxt.resolved_address.clone();
     let connection_task = {
         let received_msg_successfully = received_msg_successfully.clone();
         let status_repr = status_repr.clone();
         let info_tx = info_tx.clone();
         move || async move {
             let connection =
-                Connection::from_connecting(connecting, ctxt.network).await?;
+                Connection::from_connecting(connecting, ctxt.magic_bytes)
+                    .await?;
             status_repr.store(
                 PeerConnectionStatus::Connected.as_repr(),
                 atomic::Ordering::SeqCst,
@@ -491,8 +517,9 @@ pub fn connect(
     };
     let task = spawn(async move {
         if let Err(err) = connection_task().await
-            && let Err(send_error) = info_tx.unbounded_send(err.into())
-            && let Info::Error(err) = send_error.into_inner()
+            && let Err(send_error) =
+                info_tx.unbounded_send(Info::Error { err, resolved_addr })
+            && let Info::Error { err, .. } = send_error.into_inner()
         {
             tracing::warn!("Failed to send error to receiver: {err}")
         }
@@ -512,4 +539,45 @@ pub struct Peer {
     #[schema(value_type = schema::SocketAddr)]
     pub address: SocketAddr,
     pub status: PeerConnectionStatus,
+}
+
+#[cfg(test)]
+mod test {
+    use std::num::NonZeroUsize;
+
+    use crate::{
+        net::peer::{Connection, message::GetBlockRequest},
+        types::BlockHash,
+    };
+
+    /// A large (up to 10MB) block response must be granted substantially more
+    /// time than the heartbeat timeout, so that a slow but steadily-progressing
+    /// response over a congested link is not spuriously aborted (which would
+    /// stall IBD).
+    #[test]
+    fn large_response_read_timeout_leaves_headroom() {
+        let get_block = GetBlockRequest {
+            block_hash: BlockHash([0u8; 32]),
+            descendant_tip: None,
+            ancestor: None,
+            peer_state_id: None,
+        };
+        let timeout =
+            Connection::response_read_timeout(get_block.read_response_limit());
+        assert!(
+            timeout > Connection::HEARTBEAT_TIMEOUT_INTERVAL,
+            "10MB block response timeout {timeout:?} must exceed the heartbeat \
+             timeout {:?}",
+            Connection::HEARTBEAT_TIMEOUT_INTERVAL,
+        );
+    }
+
+    /// A tiny response is still bounded, but never below the base allowance
+    /// covering round-trip latency.
+    #[test]
+    fn small_response_read_timeout_at_least_base() {
+        let limit = NonZeroUsize::new(256).unwrap();
+        let timeout = Connection::response_read_timeout(limit);
+        assert_eq!(timeout, Connection::MIN_READ_RESPONSE_TIMEOUT);
+    }
 }

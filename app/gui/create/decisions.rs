@@ -942,7 +942,7 @@ impl Decisions {
                 .show(ui, |ui| {
                     for entry in &self.claimed_decisions {
                         let entry_hex =
-                            hex::encode(entry.decision_id.as_bytes());
+                            const_hex::encode(entry.decision_id.as_bytes());
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
                                 ui.monospace(&entry_hex);

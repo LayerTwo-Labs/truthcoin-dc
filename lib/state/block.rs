@@ -1171,44 +1171,8 @@ pub fn disconnect_tip(
             Some(TxData::CreateMarket { .. }) => {
                 let () = revert_create_market(state, rwtxn, &filled_tx)?;
             }
-            Some(TxData::NativeOperation(operation)) => {
-                use crate::types::native::{
-                    EscrowAssetV1, NativeEffectKindV1, NativeOperationV1,
-                };
-                if matches!(operation, NativeOperationV1::BuyForIntent { .. }) {
-                    trade_share_deltas.push(revert_trade_market_state(
-                        state, rwtxn, &filled_tx,
-                    )?);
-                } else if let Some(effect) =
-                    state.native().get_effect(rwtxn, txid.0)?
-                {
-                    if matches!(
-                        effect.kind,
-                        NativeEffectKindV1::Transferred
-                            | NativeEffectKindV1::Claimed
-                            | NativeEffectKindV1::Refunded
-                    ) && effect.asset == EscrowAssetV1::Shares
-                        && effect.owner != effect.recipient
-                    {
-                        trade_share_deltas.push(TradeShareDelta {
-                            address: effect.owner,
-                            market_id: effect.market_id,
-                            outcome_index: effect.outcome_index,
-                            share_delta: effect.shares,
-                        });
-                        trade_share_deltas.push(TradeShareDelta {
-                            address: effect.recipient,
-                            market_id: effect.market_id,
-                            outcome_index: effect.outcome_index,
-                            share_delta: -effect.shares,
-                        });
-                    }
-                } else {
-                    return Err(super::native::invalid(
-                        "missing native effect during disconnect",
-                    ));
-                }
-            }
+            // Native undo restores exact touched accounts and escrow rows below.
+            Some(TxData::NativeOperation(_)) => {}
             Some(TxData::Trade { .. }) => {
                 let delta =
                     revert_trade_market_state(state, rwtxn, &filled_tx)?;
@@ -1650,7 +1614,7 @@ fn apply_decision_claim(
 
         tracing::debug!(
             "Claimed decision {} (type: {:?})",
-            hex::encode(decision_id.as_bytes()),
+            const_hex::encode(decision_id.as_bytes()),
             claim.decision_type
         );
     }
@@ -2000,56 +1964,29 @@ fn apply_native_operation(
     state: &State,
     txn: &mut RwTxn,
     filled: &FilledTransaction,
-    operation: &crate::types::native::NativeOperationV1,
+    operation: &crate::types::native::NativeOperationV2,
     update: &mut StateUpdate,
     height: u32,
     parent_height: u32,
 ) -> Result<bool, Error> {
-    use super::native::{check_deadline, invalid, validate_terminal};
+    use super::native::{
+        check_deadline, invalid, require_owner_input, validate_terminal,
+    };
     use crate::types::native::*;
     check_deadline(operation, parent_height)?;
     if height < super::native::NATIVE_OPERATIONS_ACTIVATION_HEIGHT {
         return Err(invalid("native operations not activated"));
     }
-    if let Some(key) = operation.nonce() {
-        if state.native().nonces.try_get(txn, &key)?.is_some() {
-            return Err(invalid("native operation nonce already consumed"));
-        }
-    }
     let txid = filled.txid().0;
-    let effect = match operation {
-        NativeOperationV1::BuyForIntent { intent, .. } => {
-            if matches!(
-                apply_trade(state, txn, filled, update, height)?,
-                TradeApplyResult::Skipped { .. }
-            ) {
-                return Ok(false);
-            }
-            NativeEffectV1 {
-                transaction_id: txid,
-                sidechain_height: height,
-                parent_height,
-                reference: intent.reference,
-                kind: NativeEffectKindV1::Bought,
-                escrow_id: None,
-                owner: intent.recipient,
-                recipient: intent.recipient,
-                market_id: intent.market_id,
-                outcome_index: intent.outcome_index,
-                shares: intent.shares,
-                asset: EscrowAssetV1::Shares,
-                escrow_snapshot: None,
-            }
-        }
-        NativeOperationV1::TransferShares {
+    match &operation.action {
+        NativeActionV2::MoveShares {
             owner,
             recipient,
             market_id,
             outcome_index,
             shares,
-            reference,
-            ..
         } => {
+            require_owner_input(filled, *owner)?;
             require_available(
                 state,
                 txn,
@@ -2070,23 +2007,8 @@ fn apply_native_operation(
                 *outcome_index,
                 *shares,
             )?;
-            NativeEffectV1 {
-                transaction_id: txid,
-                sidechain_height: height,
-                parent_height,
-                reference: *reference,
-                kind: NativeEffectKindV1::Transferred,
-                escrow_id: None,
-                owner: *owner,
-                recipient: *recipient,
-                market_id: *market_id,
-                outcome_index: *outcome_index,
-                shares: *shares,
-                asset: EscrowAssetV1::Shares,
-                escrow_snapshot: None,
-            }
         }
-        NativeOperationV1::LockShares {
+        NativeActionV2::LockShares {
             owner,
             claim_address,
             refund_address,
@@ -2095,10 +2017,9 @@ fn apply_native_operation(
             shares,
             hashlock,
             claim_before_parent,
-            reference,
             mutable_rights,
-            ..
         } => {
+            require_owner_input(filled, *owner)?;
             require_available(
                 state,
                 txn,
@@ -2108,53 +2029,52 @@ fn apply_native_operation(
                 *outcome_index,
                 *shares,
             )?;
-            let escrow_id = escrow_id(txid);
-            let escrow = ShareEscrowV1 {
-                escrow_id,
-                owner: *owner,
-                claim_address: *claim_address,
-                refund_address: *refund_address,
-                market_id: *market_id,
-                outcome_index: *outcome_index,
-                shares: *shares,
-                hashlock: *hashlock,
-                claim_before_parent: *claim_before_parent,
-                reference: *reference,
-                asset: EscrowAssetV1::Shares,
-                status: EscrowStatusV1::Locked,
-                mutable_rights: *mutable_rights,
-            };
-            state.native().create_escrow(txn, height, &escrow)?;
-            NativeEffectV1 {
-                transaction_id: txid,
-                sidechain_height: height,
-                parent_height,
-                reference: *reference,
-                kind: NativeEffectKindV1::Locked,
-                escrow_id: Some(escrow_id),
-                owner: *owner,
-                recipient: *claim_address,
-                market_id: *market_id,
-                outcome_index: *outcome_index,
-                shares: *shares,
-                asset: EscrowAssetV1::Shares,
-                escrow_snapshot: Some(escrow),
-            }
+            state.native().create_escrow(
+                txn,
+                height,
+                &ShareEscrowV1 {
+                    escrow_id: escrow_id(operation.genesis_hash, txid),
+                    owner: *owner,
+                    claim_address: *claim_address,
+                    refund_address: *refund_address,
+                    market_id: *market_id,
+                    outcome_index: *outcome_index,
+                    shares: *shares,
+                    hashlock: *hashlock,
+                    claim_before_parent: *claim_before_parent,
+                    reference: operation.reference,
+                    mutable_rights: *mutable_rights,
+                    status: EscrowStatusV1::Locked,
+                    asset: EscrowAssetV1::Shares,
+                },
+            )?;
         }
-        NativeOperationV1::MutateEscrow { .. } => state
-            .native()
-            .mutate_escrow(txn, height, parent_height, txid, operation)?,
-        NativeOperationV1::ClaimEscrow { escrow_id, .. }
-        | NativeOperationV1::RefundEscrow { escrow_id } => {
+        NativeActionV2::AssignEscrow {
+            escrow_id,
+            new_claim_address,
+            new_refund_address,
+        } => {
+            state.native().assign(
+                txn,
+                height,
+                filled,
+                *escrow_id,
+                *new_claim_address,
+                *new_refund_address,
+                operation.reference,
+            )?;
+        }
+        NativeActionV2::ResolveEscrow {
+            escrow_id,
+            resolution,
+        } => {
             let mut escrow = state
                 .native()
                 .get_escrow(txn, *escrow_id)?
                 .ok_or_else(|| invalid("unknown native escrow"))?;
-            let preimage = match operation {
-                NativeOperationV1::ClaimEscrow { preimage, .. } => {
-                    Some(preimage)
-                }
-                _ => None,
+            let preimage = match resolution {
+                EscrowResolutionV2::Claim { preimage } => Some(preimage),
+                EscrowResolutionV2::Refund => None,
             };
             validate_terminal(&escrow, parent_height, preimage)?;
             let refund = preimage.is_none();
@@ -2164,7 +2084,6 @@ fn apply_native_operation(
                 escrow.claim_address
             };
             if escrow.asset == EscrowAssetV1::Shares {
-                // This operation spends its own reservation, not the unreserved balance.
                 native_share_transfer(
                     state,
                     txn,
@@ -2186,28 +2105,8 @@ fn apply_native_operation(
                 recipient,
                 refund,
             )?;
-            NativeEffectV1 {
-                transaction_id: txid,
-                sidechain_height: height,
-                parent_height,
-                reference: escrow.reference,
-                kind: if refund {
-                    NativeEffectKindV1::Refunded
-                } else {
-                    NativeEffectKindV1::Claimed
-                },
-                escrow_id: Some(*escrow_id),
-                owner: escrow.owner,
-                recipient,
-                market_id: escrow.market_id,
-                outcome_index: escrow.outcome_index,
-                shares: escrow.shares,
-                asset: escrow.asset.clone(),
-                escrow_snapshot: Some(escrow),
-            }
         }
-    };
-    state.native().record(txn, operation, &effect)?;
+    }
     Ok(true)
 }
 
@@ -2406,15 +2305,7 @@ fn apply_trade(
 
         state_update.add_pending_buy_settlement(PendingBuySettlement {
             market_id: trade.market_id,
-            trader_address: match &filled_tx.transaction.data {
-                Some(TxData::NativeOperation(
-                    crate::types::native::NativeOperationV1::BuyForIntent {
-                        change_address,
-                        ..
-                    },
-                )) => *change_address,
-                _ => trade.trader,
-            },
+            trader_address: trade.trader,
             input_value_sats,
             lmsr_cost_sats: buy_cost.base_cost_sats,
             market_fee_sats: buy_cost.trading_fee_sats,
@@ -2769,7 +2660,7 @@ fn apply_submit_vote(
         return Err(Error::InvalidTransaction {
             reason: format!(
                 "Vote period mismatch: decision {} was claimed in period {} and must be voted on in period {}, but transaction specifies period {}",
-                hex::encode(vote_data.decision_id_bytes),
+                const_hex::encode(vote_data.decision_id_bytes),
                 decision_claim_period,
                 voting_period,
                 vote_data.voting_period
@@ -2881,7 +2772,7 @@ fn apply_submit_ballot(
                 return Err(Error::InvalidTransaction {
                     reason: format!(
                         "Ballot period mismatch: decision {} requires period {} but ballot expects period {}",
-                        hex::encode(vote_item.decision_id_bytes),
+                        const_hex::encode(vote_item.decision_id_bytes),
                         voting_period,
                         expected
                     ),
@@ -3239,1019 +3130,5 @@ mod tests {
 }
 
 #[cfg(test)]
-mod native_integration_tests {
-    use super::*;
-    use crate::state::markets::{
-        Market, MarketState,
-        types::{MarketPayoutSummary, SharePayoutRecord},
-    };
-    use crate::types::{
-        BitcoinOutputContent, FilledOutputContent, Transaction, native::*,
-    };
-    use bitcoin::hashes::Hash;
-    use sha2::{Digest, Sha256};
-
-    fn fixture() -> (sneed::Env, State, tempfile::TempDir, MarketId, Address) {
-        let dir = tempfile::tempdir().unwrap();
-        let mut options = heed::EnvOpenOptions::new();
-        options.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
-        let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
-        let state = State::new(&env, None).unwrap();
-        let owner = Address([1; 20]);
-        let market_id = MarketId::new([1; 6]);
-        let market = Market {
-            id: market_id,
-            title: "native escrow test".into(),
-            description: String::new(),
-            tags: vec![],
-            creator_address: owner,
-            dimension_specs: vec![],
-            decision_ids: vec![],
-            state_combos: vec![vec![0], vec![1]],
-            created_at_height: 0,
-            expires_at_height: None,
-            tau_from_now: 0,
-            storage_fee_sats: 0,
-            market_state: MarketState::Trading,
-            trading_fee: 0.005,
-            liquidity_base_sats: 100,
-            shares: ndarray::array![100, 0],
-            final_prices: ndarray::array![0.0, 0.0],
-            version: 0,
-            last_updated_height: 0,
-            total_volume_sats: 0,
-            outcome_volumes_sats: vec![0, 0],
-            tx_pow_hash_selector: 0,
-            tx_pow_ordering: 0,
-            tx_pow_difficulty: 0,
-        };
-        let mut txn = env.write_txn().unwrap();
-        state.markets().add_market(&mut txn, &market).unwrap();
-        state
-            .markets()
-            .add_shares_to_account(&mut txn, &owner, market_id, 0, 100, 0)
-            .unwrap();
-        txn.commit().unwrap();
-        (env, state, dir, market_id, owner)
-    }
-    fn filled(operation: NativeOperationV1) -> FilledTransaction {
-        FilledTransaction {
-            actor_address: operation.actor(),
-            spent_utxos: vec![],
-            transaction: Transaction {
-                inputs: vec![],
-                outputs: vec![],
-                memo: vec![],
-                data: Some(TxData::NativeOperation(operation)),
-            },
-        }
-    }
-    fn execute(
-        state: &State,
-        txn: &mut RwTxn,
-        update: &mut StateUpdate,
-        tx: &FilledTransaction,
-        height: u32,
-        parent: u32,
-    ) -> Result<bool, Error> {
-        let Some(TxData::NativeOperation(op)) = &tx.transaction.data else {
-            unreachable!()
-        };
-        apply_native_operation(state, txn, tx, op, update, height, parent)
-    }
-    fn lock(
-        owner: Address,
-        market_id: MarketId,
-        nonce: u8,
-        shares: i64,
-    ) -> FilledTransaction {
-        filled(NativeOperationV1::LockShares {
-            owner,
-            claim_address: Address([2; 20]),
-            refund_address: Address([3; 20]),
-            market_id,
-            outcome_index: 0,
-            shares,
-            hashlock: Sha256::digest([9; 32]).into(),
-            claim_before_parent: 10,
-            nonce: [nonce; 32],
-            reference: [7; 32],
-            mutable_rights: true,
-        })
-    }
-    fn balance(
-        state: &State,
-        txn: &sneed::RoTxn,
-        owner: Address,
-        market: MarketId,
-    ) -> i64 {
-        state
-            .markets()
-            .get_user_share_account(txn, &owner)
-            .unwrap()
-            .and_then(|a| a.positions.get(&(market, 0)).copied())
-            .unwrap_or(0)
-    }
-    fn rights_key(n: u8) -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&[n; 32])
-    }
-    fn rights_address(key: &ed25519_dalek::SigningKey) -> Address {
-        crate::authorization::get_address(&key.verifying_key().into())
-    }
-    fn mutation(
-        mutation: EscrowMutationV1,
-        nonce: u8,
-        claim: &ed25519_dalek::SigningKey,
-        refund: Option<&ed25519_dalek::SigningKey>,
-    ) -> FilledTransaction {
-        let intent = EscrowMutationIntentV1 {
-            genesis_hash: [1; 32].into(),
-            nonce: [nonce; 32],
-            mutation,
-            valid_from_parent: 0,
-            valid_before_parent: 1000,
-        };
-        let sign =
-            |key: &ed25519_dalek::SigningKey| crate::types::Authorization {
-                verifying_key: key.verifying_key().into(),
-                signature: crate::authorization::sign(
-                    key,
-                    crate::authorization::Dst::NativeEscrowMutation,
-                    &intent.signing_bytes().unwrap(),
-                ),
-            };
-        let claim_authorization = sign(claim);
-        let refund_authorization = refund.map(sign);
-        filled(NativeOperationV1::MutateEscrow {
-            intent,
-            claim_authorization,
-            refund_authorization,
-        })
-    }
-    #[test]
-    fn sealed_escrow_rejects_jointly_signed_mutation_and_keeps_claim_refund() {
-        for cash in [None, Some(0), Some(19)] {
-            let (env, state, _dir, market, owner) = fixture();
-            let a = rights_key(11);
-            let b = rights_key(12);
-            let c = rights_key(13);
-            let mut tx = lock(owner, market, 1, 70);
-            if let Some(TxData::NativeOperation(
-                NativeOperationV1::LockShares {
-                    claim_address,
-                    refund_address,
-                    mutable_rights,
-                    ..
-                },
-            )) = &mut tx.transaction.data
-            {
-                *claim_address = rights_address(&a);
-                *refund_address = rights_address(&b);
-                *mutable_rights = false;
-            }
-            let mut json = serde_json::to_value(&tx.transaction.data).unwrap();
-            json["NativeOperation"]["LockShares"]
-                .as_object_mut()
-                .unwrap()
-                .remove("mutable_rights");
-            let decoded: Option<TxData> = serde_json::from_value(json).unwrap();
-            assert!(matches!(
-                decoded,
-                Some(TxData::NativeOperation(NativeOperationV1::LockShares {
-                    mutable_rights: false,
-                    ..
-                }))
-            ));
-            let id = escrow_id(tx.txid().0);
-            let mut txn = env.write_txn().unwrap();
-            let mut update = StateUpdate::new();
-            execute(&state, &mut txn, &mut update, &tx, 1, 5).unwrap();
-            if let Some(value) = cash {
-                state
-                    .native()
-                    .settle_payout(
-                        &state,
-                        &mut txn,
-                        &SharePayoutRecord {
-                            market_id: market,
-                            address: owner,
-                            outcome_index: 0,
-                            shares_redeemed: 100,
-                            final_price: 0.19,
-                            payout_sats: value,
-                        },
-                        1,
-                    )
-                    .unwrap();
-            }
-            let original =
-                state.native().get_escrow(&txn, id).unwrap().unwrap();
-            for spec in [EscrowMutationV1::Assign {
-                escrow_id: id,
-                new_claim_address: rights_address(&c),
-                new_refund_address: rights_address(&c),
-                reference: [23; 32],
-            }] {
-                let mutate = mutation(spec, 2, &a, Some(&b));
-                assert!(
-                    execute(&state, &mut txn, &mut update, &mutate, 1, 5)
-                        .is_err()
-                );
-                assert_eq!(
-                    state.native().get_escrow(&txn, id).unwrap(),
-                    Some(original.clone())
-                );
-                assert!(
-                    state
-                        .native()
-                        .get_effect(&txn, mutate.txid().0)
-                        .unwrap()
-                        .is_none()
-                );
-            }
-            let refund =
-                filled(NativeOperationV1::RefundEscrow { escrow_id: id });
-            assert!(
-                execute(&state, &mut txn, &mut update, &refund, 1, 9).is_err()
-            );
-            execute(&state, &mut txn, &mut update, &refund, 1, 10).unwrap();
-            let terminal =
-                state.native().get_escrow(&txn, id).unwrap().unwrap();
-            assert!(!terminal.mutable_rights);
-            assert_eq!(terminal.refund_address, rights_address(&b));
-        }
-    }
-
-    #[test]
-    fn mutation_expiry_is_signed_and_atomic_at_accepting_parent_boundary() {
-        for accepted_parent in [5, 6, 9, 10, 11] {
-            let (env, state, _dir, market, owner) = fixture();
-            let a = rights_key(11);
-            let b = rights_key(12);
-            let c = rights_key(13);
-            let mut lock_tx = lock(owner, market, 1, 70);
-            if let Some(TxData::NativeOperation(
-                NativeOperationV1::LockShares {
-                    claim_address,
-                    refund_address,
-                    ..
-                },
-            )) = &mut lock_tx.transaction.data
-            {
-                *claim_address = rights_address(&a);
-                *refund_address = rights_address(&b);
-            }
-            let id = escrow_id(lock_tx.txid().0);
-            let mut txn = env.write_txn().unwrap();
-            let mut update = StateUpdate::new();
-            execute(&state, &mut txn, &mut update, &lock_tx, 1, 5).unwrap();
-            let prior = state.native().get_escrow(&txn, id).unwrap();
-            let mut tx = mutation(
-                EscrowMutationV1::Assign {
-                    escrow_id: id,
-                    new_claim_address: rights_address(&c),
-                    new_refund_address: rights_address(&c),
-                    reference: [23; 32],
-                },
-                2,
-                &a,
-                Some(&b),
-            );
-            if let Some(TxData::NativeOperation(
-                NativeOperationV1::MutateEscrow {
-                    intent,
-                    claim_authorization,
-                    refund_authorization,
-                },
-            )) = &mut tx.transaction.data
-            {
-                intent.valid_from_parent = 6;
-                intent.valid_before_parent = 10;
-                assert!(!intent.verify(claim_authorization));
-                let sign = |key: &ed25519_dalek::SigningKey| {
-                    crate::types::Authorization {
-                        verifying_key: key.verifying_key().into(),
-                        signature: crate::authorization::sign(
-                            key,
-                            crate::authorization::Dst::NativeEscrowMutation,
-                            &intent.signing_bytes().unwrap(),
-                        ),
-                    }
-                };
-                *claim_authorization = sign(&a);
-                *refund_authorization = Some(sign(&b));
-            }
-            let result =
-                execute(&state, &mut txn, &mut update, &tx, 2, accepted_parent);
-            if (6..10).contains(&accepted_parent) {
-                result.unwrap();
-                let effect = state
-                    .native()
-                    .get_effect(&txn, tx.txid().0)
-                    .unwrap()
-                    .unwrap();
-                assert!(matches!(
-                    effect.kind,
-                    NativeEffectKindV1::Assigned {
-                        valid_from_parent: 6,
-                        valid_before_parent: 10,
-                        ..
-                    }
-                ));
-                assert_eq!(effect.parent_height, accepted_parent);
-                state.native().restore(&state, &mut txn, 2).unwrap();
-                assert_eq!(state.native().get_escrow(&txn, id).unwrap(), prior);
-                assert!(
-                    state
-                        .native()
-                        .get_effect(&txn, tx.txid().0)
-                        .unwrap()
-                        .is_none()
-                );
-            } else {
-                assert!(result.is_err());
-                assert_eq!(state.native().get_escrow(&txn, id).unwrap(), prior);
-                assert!(
-                    state
-                        .native()
-                        .get_effect(&txn, tx.txid().0)
-                        .unwrap()
-                        .is_none()
-                );
-                assert!(
-                    state
-                        .native()
-                        .nonces
-                        .try_get(&txn, &(rights_address(&a), [2; 32]))
-                        .unwrap()
-                        .is_none()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn native_assign_and_claim_ordered_atomic_rights_and_undo() {
-        let (env, state, _dir, market, owner) = fixture();
-        let a = rights_key(11);
-        let b = rights_key(12);
-        let c = rights_key(13);
-        let mut lock_tx = lock(owner, market, 1, 70);
-        if let Some(TxData::NativeOperation(NativeOperationV1::LockShares {
-            claim_address,
-            refund_address,
-            ..
-        })) = &mut lock_tx.transaction.data
-        {
-            *claim_address = rights_address(&a);
-            *refund_address = rights_address(&b);
-        }
-        let id = escrow_id(lock_tx.txid().0);
-        let mut txn = env.write_txn().unwrap();
-        let mut update = StateUpdate::new();
-        execute(&state, &mut txn, &mut update, &lock_tx, 1, 5).unwrap();
-        let assign = mutation(
-            EscrowMutationV1::Assign {
-                escrow_id: id,
-                new_claim_address: rights_address(&c),
-                new_refund_address: rights_address(&c),
-                reference: [23; 32],
-            },
-            3,
-            &a,
-            Some(&b),
-        );
-        let spec = EscrowMutationV1::Assign {
-            escrow_id: id,
-            new_claim_address: rights_address(&c),
-            new_refund_address: rights_address(&c),
-            reference: [23; 32],
-        };
-        for invalid in [
-            mutation(spec.clone(), 3, &a, None),
-            mutation(spec, 3, &a, Some(&c)),
-        ] {
-            assert!(
-                execute(&state, &mut txn, &mut update, &invalid, 1, 5).is_err()
-            );
-        }
-        execute(&state, &mut txn, &mut update, &assign, 1, 5).unwrap();
-        let receipt = state
-            .native()
-            .get_effect(&txn, assign.txid().0)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            receipt.escrow_snapshot.as_ref().unwrap().status,
-            EscrowStatusV1::Locked
-        );
-        assert_eq!(
-            receipt.kind,
-            NativeEffectKindV1::Assigned {
-                previous_claim_address: rights_address(&a),
-                previous_refund_address: rights_address(&b),
-                valid_from_parent: 0,
-                valid_before_parent: 1000,
-            }
-        );
-        let stale = mutation(
-            EscrowMutationV1::Assign {
-                escrow_id: id,
-                new_claim_address: rights_address(&a),
-                new_refund_address: rights_address(&b),
-                reference: [24; 32],
-            },
-            4,
-            &a,
-            Some(&b),
-        );
-        assert!(execute(&state, &mut txn, &mut update, &stale, 1, 5).is_err());
-        let back = mutation(
-            EscrowMutationV1::Assign {
-                escrow_id: id,
-                new_claim_address: rights_address(&a),
-                new_refund_address: rights_address(&b),
-                reference: [24; 32],
-            },
-            4,
-            &c,
-            None,
-        );
-        execute(&state, &mut txn, &mut update, &back, 1, 5).unwrap();
-        assert!(execute(&state, &mut txn, &mut update, &assign, 1, 5).is_err()); // consumed nonce even after rights return
-        let claim = filled(NativeOperationV1::ClaimEscrow {
-            escrow_id: id,
-            preimage: [9; 32],
-        });
-        execute(&state, &mut txn, &mut update, &claim, 1, 5).unwrap();
-        let terminal = mutation(
-            EscrowMutationV1::Assign {
-                escrow_id: id,
-                new_claim_address: rights_address(&c),
-                new_refund_address: rights_address(&c),
-                reference: [25; 32],
-            },
-            5,
-            &a,
-            Some(&b),
-        );
-        assert!(
-            execute(&state, &mut txn, &mut update, &terminal, 1, 5).is_err()
-        );
-        assert_eq!(
-            state
-                .native()
-                .reserved_shares(&txn, owner, market, 0)
-                .unwrap(),
-            0
-        );
-        // Historical assignment still describes exactly what was delivered.
-        assert_eq!(
-            state
-                .native()
-                .get_effect(&txn, assign.txid().0)
-                .unwrap()
-                .unwrap(),
-            receipt
-        );
-        update.apply_all_changes(&state, &mut txn, 1).unwrap();
-        assert_eq!(balance(&state, &txn, rights_address(&a), market), 70);
-        state.native().restore(&state, &mut txn, 1).unwrap();
-        assert!(state.native().get_escrow(&txn, id).unwrap().is_none());
-        assert_eq!(balance(&state, &txn, owner, market), 100);
-        assert_eq!(
-            state
-                .native()
-                .reserved_shares(&txn, owner, market, 0)
-                .unwrap(),
-            0
-        );
-        assert!(
-            state
-                .native()
-                .get_effect(&txn, assign.txid().0)
-                .unwrap()
-                .is_none()
-        );
-    }
-    #[test]
-    fn native_cash_assignment_preserves_value_deadline_and_undo() {
-        for total in [0, 1, u64::MAX] {
-            let (env, state, _dir, market, owner) = fixture();
-            let key = rights_key(20);
-            let address = rights_address(&key);
-            let escrow = ShareEscrowV1 {
-                escrow_id: [31; 32],
-                owner,
-                claim_address: address,
-                refund_address: address,
-                market_id: market,
-                outcome_index: 0,
-                shares: 7,
-                hashlock: Sha256::digest([9; 32]).into(),
-                claim_before_parent: 10,
-                reference: [32; 32],
-                asset: EscrowAssetV1::NativeCash(total),
-                status: EscrowStatusV1::Locked,
-                mutable_rights: true,
-            };
-            let mut txn = env.write_txn().unwrap();
-            state.native().create_escrow(&mut txn, 1, &escrow).unwrap();
-            let destination = rights_address(&rights_key(21));
-            let assign = mutation(
-                EscrowMutationV1::Assign {
-                    escrow_id: escrow.escrow_id,
-                    new_claim_address: destination,
-                    new_refund_address: destination,
-                    reference: [33; 32],
-                },
-                6,
-                &key,
-                None,
-            );
-            let mut update = StateUpdate::new();
-            execute(&state, &mut txn, &mut update, &assign, 2, 20).unwrap();
-            let assigned = state
-                .native()
-                .get_escrow(&txn, escrow.escrow_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(assigned.asset, EscrowAssetV1::NativeCash(total));
-            assert_eq!(assigned.shares, escrow.shares);
-            assert_eq!(
-                assigned.claim_before_parent,
-                escrow.claim_before_parent
-            );
-            assert_eq!(assigned.hashlock, escrow.hashlock);
-            assert_eq!(assigned.claim_address, destination);
-            assert_eq!(assigned.refund_address, destination);
-            assert_eq!(state.native().cash_liability(&txn).unwrap(), total);
-            assert_eq!(
-                state
-                    .native()
-                    .reserved_shares(&txn, owner, market, 0)
-                    .unwrap(),
-                0
-            );
-            state.native().restore(&state, &mut txn, 2).unwrap();
-            assert_eq!(
-                state.native().get_escrow(&txn, escrow.escrow_id).unwrap(),
-                Some(escrow)
-            );
-            assert_eq!(state.native().cash_liability(&txn).unwrap(), total);
-        }
-    }
-
-    #[test]
-    fn native_lock_blocks_sell_double_lock_and_transfer_then_claim_is_final() {
-        let (env, state, _dir, market, owner) = fixture();
-        let mut txn = env.write_txn().unwrap();
-        let mut update = StateUpdate::new();
-        let lock_tx = lock(owner, market, 1, 70);
-        let id = escrow_id(lock_tx.txid().0);
-        assert!(
-            execute(&state, &mut txn, &mut update, &lock_tx, 1, 5).unwrap()
-        );
-        assert_eq!(
-            state
-                .native()
-                .reserved_shares(&txn, owner, market, 0)
-                .unwrap(),
-            70
-        );
-        assert!(
-            execute(
-                &state,
-                &mut txn,
-                &mut update,
-                &lock(owner, market, 2, 31),
-                1,
-                5
-            )
-            .is_err()
-        );
-        let transfer = filled(NativeOperationV1::TransferShares {
-            owner,
-            recipient: Address([4; 20]),
-            market_id: market,
-            outcome_index: 0,
-            shares: 31,
-            nonce: [3; 32],
-            reference: [4; 32],
-            valid_from_parent: 0,
-            valid_before_parent: 10,
-        });
-        assert!(
-            execute(&state, &mut txn, &mut update, &transfer, 1, 5).is_err()
-        );
-        let sell = FilledTransaction {
-            transaction: Transaction {
-                inputs: vec![],
-                outputs: vec![],
-                memo: vec![],
-                data: Some(TxData::Trade {
-                    market_id: market,
-                    outcome_index: 0,
-                    shares: -31,
-                    trader: owner,
-                    limit_sats: 0,
-                    tx_pow_nonce: None,
-                    prev_block_hash: [0; 32].into(),
-                }),
-            },
-            spent_utxos: vec![],
-            actor_address: Some(owner),
-        };
-        assert!(apply_trade(&state, &mut txn, &sell, &mut update, 1).is_err());
-        let early_refund =
-            filled(NativeOperationV1::RefundEscrow { escrow_id: id });
-        assert!(
-            execute(&state, &mut txn, &mut update, &early_refund, 1, 9)
-                .is_err()
-        );
-        let bad_claim = filled(NativeOperationV1::ClaimEscrow {
-            escrow_id: id,
-            preimage: [8; 32],
-        });
-        assert!(
-            execute(&state, &mut txn, &mut update, &bad_claim, 1, 9).is_err()
-        );
-        let claim = filled(NativeOperationV1::ClaimEscrow {
-            escrow_id: id,
-            preimage: [9; 32],
-        });
-        assert!(execute(&state, &mut txn, &mut update, &claim, 1, 9).unwrap());
-        assert!(
-            execute(&state, &mut txn, &mut update, &early_refund, 1, 10)
-                .is_err()
-        );
-        update.apply_all_changes(&state, &mut txn, 1).unwrap();
-        assert_eq!(balance(&state, &txn, owner, market), 30);
-        assert_eq!(balance(&state, &txn, Address([2; 20]), market), 70);
-        assert_eq!(
-            state
-                .native()
-                .reserved_shares(&txn, owner, market, 0)
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            state
-                .native()
-                .get_effect(&txn, claim.txid().0)
-                .unwrap()
-                .unwrap()
-                .kind,
-            NativeEffectKindV1::Claimed
-        );
-        state.native().restore(&state, &mut txn, 1).unwrap();
-        assert_eq!(balance(&state, &txn, owner, market), 100);
-        assert!(
-            state
-                .markets()
-                .get_user_share_account(&txn, &Address([2; 20]))
-                .unwrap()
-                .is_none()
-        );
-        assert!(state.native().get_escrow(&txn, id).unwrap().is_none());
-        assert!(
-            state
-                .native()
-                .get_effect(&txn, claim.txid().0)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            state
-                .native()
-                .nonces
-                .try_get(&txn, &(owner, [1; 32]))
-                .unwrap()
-                .is_none()
-        );
-    }
-    #[test]
-    fn native_settlement_keeps_hashlock_and_cash_refund_and_undo() {
-        for payout in [0, 51] {
-            let (env, state, _dir, market, owner) = fixture();
-            let mut txn = env.write_txn().unwrap();
-            let original = bincode::serialize(
-                &state
-                    .markets()
-                    .get_user_share_account(&txn, &owner)
-                    .unwrap(),
-            )
-            .unwrap();
-            let mut update = StateUpdate::new();
-            let lock_tx = lock(owner, market, 1, 70);
-            let id = escrow_id(lock_tx.txid().0);
-            execute(&state, &mut txn, &mut update, &lock_tx, 1, 5).unwrap();
-            update.apply_all_changes(&state, &mut txn, 1).unwrap();
-            let summary = MarketPayoutSummary {
-                market_id: market,
-                treasury_distributed: payout,
-                total_fees_distributed: 0,
-                shareholder_count: 1,
-                payouts: vec![SharePayoutRecord {
-                    market_id: market,
-                    address: owner,
-                    outcome_index: 0,
-                    shares_redeemed: 100,
-                    final_price: 0.51,
-                    payout_sats: payout,
-                }],
-                fee_payouts: vec![],
-                creator_refund: None,
-                block_height: 2,
-            };
-            state
-                .markets()
-                .apply_automatic_share_payouts(&state, &mut txn, &summary, 2)
-                .unwrap();
-            let settled = state.native().get_escrow(&txn, id).unwrap().unwrap();
-            let EscrowAssetV1::NativeCash(cash) = settled.asset else {
-                panic!("escrow did not settle")
-            };
-            assert_eq!(cash, if payout == 0 { 0 } else { 36 });
-            assert_eq!(settled.hashlock, Sha256::digest([9; 32]).as_slice());
-            assert_eq!(
-                state
-                    .native()
-                    .reserved_shares(&txn, owner, market, 0)
-                    .unwrap(),
-                0
-            );
-            assert_eq!(balance(&state, &txn, owner, market), 0);
-            let claim = filled(NativeOperationV1::ClaimEscrow {
-                escrow_id: id,
-                preimage: [9; 32],
-            });
-            assert!(
-                execute(
-                    &state,
-                    &mut txn,
-                    &mut StateUpdate::new(),
-                    &claim,
-                    3,
-                    10
-                )
-                .is_err()
-            );
-            let refund =
-                filled(NativeOperationV1::RefundEscrow { escrow_id: id });
-            execute(&state, &mut txn, &mut StateUpdate::new(), &refund, 3, 10)
-                .unwrap();
-            let output = state
-                .utxos
-                .try_get(
-                    &txn,
-                    &super::super::native::cash_outpoint(refund.txid().0)
-                        .into(),
-                )
-                .unwrap();
-            assert_eq!(output.is_some(), cash > 0);
-            if let Some(output) = output {
-                assert_eq!(output.address, Address([3; 20]));
-                assert_eq!(output.get_bitcoin_value().to_sat(), cash);
-            }
-            state.native().restore(&state, &mut txn, 3).unwrap();
-            assert_eq!(
-                state.native().get_escrow(&txn, id).unwrap().unwrap(),
-                settled
-            );
-            state
-                .markets()
-                .revert_automatic_share_payouts(&state, &mut txn, &summary, 2)
-                .unwrap();
-            state.native().restore(&state, &mut txn, 2).unwrap();
-            assert_eq!(
-                state.native().get_escrow(&txn, id).unwrap().unwrap().asset,
-                EscrowAssetV1::Shares
-            );
-            assert_eq!(
-                state
-                    .native()
-                    .reserved_shares(&txn, owner, market, 0)
-                    .unwrap(),
-                70
-            );
-            assert_eq!(
-                bincode::serialize(
-                    &state
-                        .markets()
-                        .get_user_share_account(&txn, &owner)
-                        .unwrap()
-                )
-                .unwrap(),
-                original
-            );
-        }
-    }
-    #[test]
-    fn native_connected_blocks_disconnect_and_replay_exactly() {
-        let (env, state, _dir, market, owner) = fixture();
-        let mut txn = env.write_txn().unwrap();
-        let original = bincode::serialize(
-            &state
-                .markets()
-                .get_user_share_account(&txn, &owner)
-                .unwrap(),
-        )
-        .unwrap();
-        let genesis_body = Body::new(
-            vec![],
-            vec![crate::types::Output {
-                address: owner,
-                content: crate::types::OutputContent::Bitcoin(
-                    BitcoinOutputContent(bitcoin::Amount::ZERO),
-                ),
-                memo: vec![],
-            }],
-        );
-        let genesis = Header {
-            merkle_root: Body::compute_merkle_root(
-                &genesis_body.coinbase,
-                &genesis_body.transactions,
-            ),
-            prev_side_hash: None,
-            prev_main_hash: bitcoin::BlockHash::from_byte_array([1; 32]),
-        };
-        connect_prevalidated(
-            &state,
-            &mut txn,
-            &genesis,
-            &genesis_body,
-            100,
-            crate::state::PrevalidatedBlock {
-                filled_transactions: vec![],
-                computed_merkle_root: genesis.merkle_root,
-                coinbase_value: bitcoin::Amount::ZERO,
-                next_height: 0,
-                parent_height: 4,
-            },
-        )
-        .unwrap();
-        let lock_tx = lock(owner, market, 1, 70);
-        let id = escrow_id(lock_tx.txid().0);
-        let body = Body {
-            coinbase: vec![],
-            transactions: vec![lock_tx.transaction.clone()],
-            authorizations: vec![],
-            actor_proofs: vec![None],
-        };
-        let header = Header {
-            merkle_root: Body::compute_merkle_root(
-                &body.coinbase,
-                &body.transactions,
-            ),
-            prev_side_hash: Some(genesis.hash()),
-            prev_main_hash: bitcoin::BlockHash::from_byte_array([2; 32]),
-        };
-        for _ in 0..2 {
-            connect_prevalidated(
-                &state,
-                &mut txn,
-                &header,
-                &body,
-                101,
-                crate::state::PrevalidatedBlock {
-                    filled_transactions: vec![lock_tx.clone()],
-                    computed_merkle_root: header.merkle_root,
-                    coinbase_value: bitcoin::Amount::ZERO,
-                    next_height: 1,
-                    parent_height: 5,
-                },
-            )
-            .unwrap();
-            let claim = filled(NativeOperationV1::ClaimEscrow {
-                escrow_id: id,
-                preimage: [9; 32],
-            });
-            let claim_body = Body {
-                coinbase: vec![],
-                transactions: vec![claim.transaction.clone()],
-                authorizations: vec![],
-                actor_proofs: vec![None],
-            };
-            let claim_header = Header {
-                merkle_root: Body::compute_merkle_root(
-                    &claim_body.coinbase,
-                    &claim_body.transactions,
-                ),
-                prev_side_hash: Some(header.hash()),
-                prev_main_hash: bitcoin::BlockHash::from_byte_array([3; 32]),
-            };
-            connect_prevalidated(
-                &state,
-                &mut txn,
-                &claim_header,
-                &claim_body,
-                102,
-                crate::state::PrevalidatedBlock {
-                    filled_transactions: vec![claim],
-                    computed_merkle_root: claim_header.merkle_root,
-                    coinbase_value: bitcoin::Amount::ZERO,
-                    next_height: 2,
-                    parent_height: 6,
-                },
-            )
-            .unwrap();
-            assert_eq!(balance(&state, &txn, Address([2; 20]), market), 70);
-            disconnect_tip(&state, &mut txn, &claim_header, &claim_body)
-                .unwrap();
-            assert_eq!(
-                state
-                    .native()
-                    .reserved_shares(&txn, owner, market, 0)
-                    .unwrap(),
-                70
-            );
-            assert_eq!(
-                state.native().get_escrow(&txn, id).unwrap().unwrap().status,
-                EscrowStatusV1::Locked
-            );
-            disconnect_tip(&state, &mut txn, &header, &body).unwrap();
-            assert!(state.native().get_escrow(&txn, id).unwrap().is_none());
-            assert_eq!(
-                state.try_get_mainchain_timestamp(&txn).unwrap(),
-                Some(100)
-            );
-            assert_eq!(
-                bincode::serialize(
-                    &state
-                        .markets()
-                        .get_user_share_account(&txn, &owner)
-                        .unwrap()
-                )
-                .unwrap(),
-                original
-            );
-            assert!(
-                state
-                    .markets()
-                    .get_user_share_account(&txn, &Address([2; 20]))
-                    .unwrap()
-                    .is_none()
-            );
-        }
-    }
-    #[test]
-    fn native_sponsored_soft_skip_has_no_receipt_or_nonce() {
-        let (env, state, _dir, market, owner) = fixture();
-        let mut txn = env.write_txn().unwrap();
-        let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
-        let intent = BuyIntentV1 {
-            genesis_hash: [0; 32].into(),
-            recipient: owner,
-            market_id: market,
-            outcome_index: 0,
-            shares: 10,
-            nonce: [5; 32],
-            reference: [6; 32],
-            valid_from_parent: 0,
-            valid_before_parent: 10,
-        };
-        let authorization = crate::authorization::Authorization {
-            verifying_key: key.verifying_key().into(),
-            signature: crate::authorization::sign(
-                &key,
-                crate::authorization::Dst::NativeIntent,
-                &intent.signing_bytes().unwrap(),
-            ),
-        };
-        let mut buy = filled(NativeOperationV1::BuyForIntent {
-            intent,
-            authorization,
-            change_address: Address([4; 20]),
-            limit_sats: 1,
-            tx_pow_nonce: None,
-            prev_block_hash: [0; 32].into(),
-        });
-        buy.spent_utxos.push(FilledOutput {
-            address: Address([4; 20]),
-            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                bitcoin::Amount::from_sat(100),
-            )),
-            memo: vec![],
-        });
-        assert!(
-            !execute(&state, &mut txn, &mut StateUpdate::new(), &buy, 1, 5)
-                .unwrap()
-        );
-        assert!(
-            state
-                .native()
-                .get_effect(&txn, buy.txid().0)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            state
-                .native()
-                .nonces
-                .try_get(&txn, &(owner, [5; 32]))
-                .unwrap()
-                .is_none()
-        );
-    }
-}
+#[path = "native_tests.rs"]
+mod native_integration_tests;

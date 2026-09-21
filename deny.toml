@@ -80,8 +80,16 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "Temporary ignore until aws-lc-rs and rustls-webpki get updated"},
     # bincode is unmaintained (transitive via heed)
     { id = "RUSTSEC-2025-0141", reason = "Transitive dependency from heed, awaiting upstream update to use alternative"},
+    { id = "RUSTSEC-2026-0247", reason = "The pinned enforcer integration harness uses cusf-enforcer-mempool -> imbl -> bitmaps. No patched bitmaps version exists." },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 via atspi-common -> zbus-lockstep(-macros) -> zbus_xml parses fixed crate XML in macros and dependency tests." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.30 via atspi-common -> zbus-lockstep(-macros) -> zbus_xml parses fixed crate XML in macros and dependency tests." },
     # ttf-parser is unmaintained (transitive via egui/eframe -> ab_glyph); no safe upgrade
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, transitive via egui/eframe, no safe upgrade" },
+    # quick-xml 0.30 (transitive via eframe -> accesskit_unix -> zbus_xml); fixed in 0.41, needs eframe bump
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 pinned by zbus_xml under eframe 0.31, no upgrade without eframe bump" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.30 pinned by zbus_xml under eframe 0.31, no upgrade without eframe bump" },
+    # bitmaps is unmaintained (transitive via cusf-enforcer-mempool -> imbl); dev-dependency only
+    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained, transitive via cusf-enforcer-mempool/imbl, no safe upgrade" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
@@ -278,6 +286,7 @@ allow-git = [
     "https://github.com/LayerTwo-Labs/bip300301_enforcer.git",
     "https://github.com/LayerTwo-Labs/cusf-enforcer-mempool.git",
     "https://github.com/torkelrogstad/tokio-tracing.git?branch=log-rotation-size",
+    "https://github.com/ZcashFoundation/frost.git?rev=0966bd1529aa062ad3b621af99e277f976b1c0f0",
 ]
 
 [sources.allow-org]

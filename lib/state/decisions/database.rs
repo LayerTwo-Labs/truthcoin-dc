@@ -58,12 +58,15 @@ impl Dbs {
             .collect())
     }
 
-    pub fn new(env: &Env, rwtxn: &mut RwTxn<'_>) -> Result<Self, Error> {
+    pub fn new<Tls>(
+        env: &Env<Tls>,
+        rwtxn: &mut RwTxn<'_>,
+    ) -> Result<Self, Error> {
         Self::new_with_config(env, rwtxn, DecisionConfig::default())
     }
 
-    pub fn new_with_config(
-        env: &Env,
+    pub fn new_with_config<Tls>(
+        env: &Env<Tls>,
         rwtxn: &mut RwTxn<'_>,
         config: DecisionConfig,
     ) -> Result<Self, Error> {

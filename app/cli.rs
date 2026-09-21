@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Deref,
     path::PathBuf,
@@ -6,7 +7,7 @@ use std::{
 };
 
 use clap::{Arg, Parser};
-use truthcoin_dc::types::{Network, THIS_SIDECHAIN};
+use truthcoin_dc::types::{Network, THIS_SIDECHAIN, net::SeedAddress};
 use url::{Host, Url};
 
 use crate::util::saturating_pred_level;
@@ -90,7 +91,10 @@ impl clap::Args for DatadirArg {
                 .value_parser(clap::builder::PathBufValueParser::new())
                 .long("datadir")
                 .short('d')
-                .help("Data directory for storing blockchain and wallet data");
+                .help(
+                    "Data directory for storing blockchain data. \
+                     Wallet data is stored here by default.",
+                );
             match DEFAULT_DATA_DIR.deref() {
                 None => arg.required(true),
                 Some(datadir) => {
@@ -105,10 +109,21 @@ impl clap::Args for DatadirArg {
     }
 }
 
+#[inline(always)]
+fn parse_network_magic(s: &str) -> Result<[u8; 4], const_hex::FromHexError> {
+    const_hex::decode_to_array(s)
+}
+
 #[derive(Clone, Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 pub(super) struct Cli {
-    /// Data directory for storing blockchain and wallet data
+    /// Peer to dial at startup, as `host:port` or `host`. The host can be a
+    /// host name or an IP address. Use this option one time for each peer.
+    /// The node also dials the seed peers of the network.
+    #[arg(long = "add-peer")]
+    add_peers: Vec<SeedAddress>,
+    /// Data directory for storing blockchain data.
+    /// Wallet data is stored here by default.
     #[command(flatten)]
     datadir: DatadirArg,
     /// Log level for logs that get written to file
@@ -142,6 +157,15 @@ pub(super) struct Cli {
     /// Set the network. Setting this may affect other defaults.
     #[arg(default_value_t, long, value_enum)]
     network: Network,
+    /// Manually provide the network magic bytes
+    #[arg(long, value_parser = parse_network_magic)]
+    network_magic: Option<[u8; 4]>,
+    /// Host for the private RPC server. Defaults to the RPC host.
+    #[arg(long, value_parser = Host::parse)]
+    private_rpc_host: Option<Host>,
+    /// Port for the private RPC server. Defaults to the RPC port.
+    #[arg(long)]
+    private_rpc_port: Option<u16>,
     /// Host for the RPC server
     #[arg(default_value_t = DEFAULT_RPC_HOST, long, value_parser = Host::parse)]
     rpc_host: Host,
@@ -152,10 +176,16 @@ pub(super) struct Cli {
     /// If not set, uses time-based periods (production default).
     #[arg(long)]
     decision_config_testing: Option<u32>,
+    /// Host name of the P2P server. Use this option one time for each name.
+    #[arg(long = "server-name")]
+    server_names: Vec<String>,
     /// ZMQ pub/sub address
     #[cfg(feature = "zmq")]
     #[arg(default_value_t = DEFAULT_ZMQ_ADDR, long, short)]
     pub zmq_addr: SocketAddr,
+    /// Data directory for storing wallet data
+    #[arg(long)]
+    wallet_dir: Option<PathBuf>,
 }
 
 impl Cli {
@@ -169,12 +199,12 @@ impl Cli {
 
     pub fn get_config(self) -> anyhow::Result<Config> {
         let mainchain_grpc_url = self.mainchain_grpc_url();
+        let datadir = self.datadir.0;
         let log_dir = match self.log_dir {
             None => {
                 let version_dir_name =
                     format!("v{}", env!("CARGO_PKG_VERSION"));
-                let log_dir =
-                    self.datadir.0.join("logs").join(version_dir_name);
+                let log_dir = datadir.join("logs").join(version_dir_name);
                 Some(log_dir)
             }
             Some(log_dir) => {
@@ -190,8 +220,14 @@ impl Cli {
         } else {
             saturating_pred_level(self.log_level)
         };
+        let wallet_dir = self.wallet_dir.unwrap_or_else(|| datadir.clone());
+        let private_rpc_host = self
+            .private_rpc_host
+            .unwrap_or_else(|| self.rpc_host.clone());
+        let private_rpc_port = self.private_rpc_port.unwrap_or(self.rpc_port);
         Ok(Config {
-            datadir: self.datadir.0,
+            add_peers: HashSet::from_iter(self.add_peers),
+            datadir,
             file_log_level: self.file_log_level,
             headless: self.headless,
             log_dir,
@@ -200,9 +236,14 @@ impl Cli {
             mnemonic_seed_phrase_path: self.mnemonic_seed_phrase_path,
             net_addr: self.net_addr,
             network: self.network,
+            network_magic_override: self.network_magic,
+            private_rpc_host,
+            private_rpc_port,
             rpc_host: self.rpc_host,
             rpc_port: self.rpc_port,
             decision_config_testing: self.decision_config_testing,
+            server_names: HashSet::from_iter(self.server_names),
+            wallet_dir,
             #[cfg(feature = "zmq")]
             zmq_addr: self.zmq_addr,
         })
@@ -211,6 +252,7 @@ impl Cli {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub add_peers: HashSet<SeedAddress>,
     pub datadir: PathBuf,
     pub file_log_level: tracing::Level,
     pub headless: bool,
@@ -221,16 +263,128 @@ pub struct Config {
     pub mnemonic_seed_phrase_path: Option<PathBuf>,
     pub net_addr: SocketAddr,
     pub network: Network,
+    pub network_magic_override:
+        Option<truthcoin_dc::net::peer_message::MagicBytes>,
+    pub private_rpc_host: Host,
+    pub private_rpc_port: u16,
     pub rpc_host: Host,
     pub rpc_port: u16,
     pub decision_config_testing: Option<u32>,
+    pub server_names: HashSet<String>,
+    pub wallet_dir: PathBuf,
     #[cfg(feature = "zmq")]
     pub zmq_addr: SocketAddr,
 }
 
 impl Config {
+    pub fn private_rpc_url(&self) -> url::Url {
+        Url::parse(&format!(
+            "http://{}:{}",
+            self.private_rpc_host, self.private_rpc_port
+        ))
+        .unwrap()
+    }
+
     pub fn rpc_url(&self) -> url::Url {
         Url::parse(&format!("http://{}:{}", self.rpc_host, self.rpc_port))
             .unwrap()
+    }
+
+    /// Log all fields at info level
+    #[track_caller]
+    pub fn log_all_fields(&self, msg: &str) {
+        let Self {
+            add_peers,
+            datadir,
+            decision_config_testing,
+            file_log_level,
+            headless,
+            log_dir,
+            log_level,
+            mainchain_grpc_url,
+            mnemonic_seed_phrase_path,
+            net_addr,
+            network,
+            network_magic_override,
+            private_rpc_host,
+            private_rpc_port,
+            rpc_host,
+            rpc_port,
+            server_names,
+            wallet_dir,
+            #[cfg(feature = "zmq")]
+            zmq_addr,
+        } = self;
+        #[cfg(feature = "zmq")]
+        let zmq_addr = Some(zmq_addr);
+        #[cfg(not(feature = "zmq"))]
+        let zmq_addr: Option<&SocketAddr> = None;
+        let add_peers = std::fmt::from_fn(|f| {
+            f.debug_set()
+                .entries(add_peers.iter().map(|peer_addr| {
+                    std::fmt::from_fn(|f| std::fmt::Display::fmt(peer_addr, f))
+                }))
+                .finish()
+        });
+        tracing::info!(
+            %add_peers,
+            datadir = %datadir.display(),
+            ?decision_config_testing,
+            %file_log_level,
+            %headless,
+            log_dir = log_dir.as_ref().map(|path|
+                tracing::field::display(path.display())
+            ),
+            %log_level,
+            %mainchain_grpc_url,
+            mnemonic_seed_phrase_path = mnemonic_seed_phrase_path.as_ref()
+                .map(|path| tracing::field::display(path.display())),
+            %net_addr,
+            %network,
+            network_magic_override = network_magic_override.map(|magic|
+                tracing::field::display(const_hex::encode(magic))
+            ),
+            %private_rpc_host,
+            %private_rpc_port,
+            %rpc_host,
+            %rpc_port,
+            ?server_names,
+            wallet_dir = %wallet_dir.display(),
+            zmq_addr = zmq_addr.map(tracing::field::display),
+            msg,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Network};
+    use clap::Parser;
+
+    #[test]
+    fn betanet_uses_the_remote_validator() {
+        let cli = Cli::try_parse_from([
+            "truthcoin",
+            "--datadir=/tmp/truthcoin-cli-test",
+            "--network=betanet",
+            "--mainchain-grpc-host=127.0.0.1",
+            "--mainchain-grpc-port=54321",
+        ])
+        .unwrap();
+        assert_eq!(cli.network, Network::Betanet);
+        assert_eq!(
+            cli.mainchain_grpc_url().as_str(),
+            "http://127.0.0.1:54321/"
+        );
+    }
+
+    #[test]
+    fn the_default_network_stays_signet() {
+        let cli = Cli::try_parse_from([
+            "truthcoin",
+            "--datadir=/tmp/truthcoin-cli-test",
+        ])
+        .unwrap();
+        assert_eq!(cli.network, Network::Signet);
     }
 }

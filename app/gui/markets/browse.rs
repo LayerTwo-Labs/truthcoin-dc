@@ -1182,7 +1182,7 @@ impl Browse {
                     ui.visuals().widgets.noninteractive.bg_fill
                 })
                 .stroke(if is_selected {
-                    egui::Stroke::new(2.0, bar_color)
+                    egui::Stroke::new(2.0_f32, bar_color)
                 } else {
                     ui.visuals().widgets.noninteractive.bg_stroke
                 })
@@ -1416,7 +1416,7 @@ impl Browse {
                     ui.visuals().widgets.noninteractive.bg_fill
                 })
                 .stroke(if is_selected {
-                    egui::Stroke::new(2.0, bar_color)
+                    egui::Stroke::new(2.0_f32, bar_color)
                 } else {
                     ui.visuals().widgets.noninteractive.bg_stroke
                 })
@@ -1704,7 +1704,7 @@ impl Browse {
                 ui.visuals().widgets.noninteractive.bg_fill
             })
             .stroke(if lower_selected {
-                egui::Stroke::new(2.0, RED)
+                egui::Stroke::new(2.0_f32, RED)
             } else {
                 ui.visuals().widgets.noninteractive.bg_stroke
             })
@@ -1752,7 +1752,7 @@ impl Browse {
                 ui.visuals().widgets.noninteractive.bg_fill
             })
             .stroke(if higher_selected {
-                egui::Stroke::new(2.0, GREEN)
+                egui::Stroke::new(2.0_f32, GREEN)
             } else {
                 ui.visuals().widgets.noninteractive.bg_stroke
             })
@@ -1811,7 +1811,7 @@ impl Browse {
                         Color32::TRANSPARENT
                     })
                     .stroke(if buy_selected {
-                        egui::Stroke::new(2.0, GREEN)
+                        egui::Stroke::new(2.0_f32, GREEN)
                     } else {
                         egui::Stroke::NONE
                     })
@@ -1834,7 +1834,7 @@ impl Browse {
                         Color32::TRANSPARENT
                     })
                     .stroke(if sell_selected {
-                        egui::Stroke::new(2.0, RED)
+                        egui::Stroke::new(2.0_f32, RED)
                     } else {
                         egui::Stroke::NONE
                     })

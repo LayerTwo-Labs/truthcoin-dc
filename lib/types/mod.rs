@@ -17,6 +17,7 @@ mod address;
 pub mod hashes;
 pub mod keys;
 pub mod native;
+pub mod net;
 pub mod proto;
 pub mod schema;
 mod transaction;
@@ -84,17 +85,17 @@ mod serde_display_fromstr_human_readable {
 /// Optimized (de)serialize as hex strings for human-readable forms like json,
 /// and default serialization for non human-readable formats like bincode
 mod serde_hexstr_human_readable {
-    use hex::{FromHex, ToHex};
+    use const_hex::{FromHex, ToHexExt};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[inline]
     pub fn serialize<S, T>(data: T, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
-        T: Serialize + ToHex,
+        T: Serialize + ToHexExt,
     {
         if serializer.is_human_readable() {
-            hex::serde::serialize(data, serializer)
+            data.encode_hex().serialize(serializer)
         } else {
             data.serialize(serializer)
         }
@@ -108,7 +109,7 @@ mod serde_hexstr_human_readable {
         <T as FromHex>::Error: std::fmt::Display,
     {
         if deserializer.is_human_readable() {
-            hex::serde::deserialize(deserializer)
+            const_hex::serde::deserialize(deserializer)
         } else {
             T::deserialize(deserializer)
         }
@@ -197,6 +198,61 @@ pub struct WithdrawalBundleEvent {
     pub status: WithdrawalBundleEventStatus,
 }
 
+/// Coin movements that a block body does not carry: a mainchain deposit, and
+/// the outputs a withdrawal bundle removed
+#[derive(
+    Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
+)]
+pub struct BlockIndexEvents {
+    /// Outputs that mainchain deposits created
+    pub deposits: Vec<(OutPoint, FilledOutput)>,
+    /// Outputs that a withdrawal bundle removed, with the bundle that took them
+    pub bundle_spends: Vec<(OutPoint, M6id)>,
+}
+
+impl BlockIndexEvents {
+    /// True when the block moved no coins outside its body
+    pub fn is_empty(&self) -> bool {
+        self.deposits.is_empty() && self.bundle_spends.is_empty()
+    }
+}
+
+/// One transaction of a block, with the fields its body omits
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndexTx {
+    pub txid: Txid,
+    /// Borsh size in bytes
+    pub size: u64,
+    /// Borsh encoding, as hex
+    pub raw: String,
+}
+
+/// One output a mainchain deposit created
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndexDeposit {
+    pub outpoint: OutPoint,
+    pub output: FilledOutput,
+}
+
+/// One output a withdrawal bundle removed, with the bundle that took it
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndexSpend {
+    pub outpoint: OutPoint,
+    pub m6id: M6id,
+}
+
+/// Everything about a block that its body does not carry
+//  Each pair is a named struct: a tuple of ref schemas does not compose.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndex {
+    /// Transactions in body order
+    pub txs: Vec<BlockIndexTx>,
+    /// Outputs that mainchain deposits created
+    pub deposits: Vec<BlockIndexDeposit>,
+    /// Outputs that a withdrawal bundle removed
+    pub bundle_spends: Vec<BlockIndexSpend>,
+}
+
 pub static OP_DRIVECHAIN_SCRIPT: LazyLock<bitcoin::ScriptBuf> =
     LazyLock::new(|| {
         let mut script = bitcoin::ScriptBuf::new();
@@ -232,6 +288,127 @@ pub struct WithdrawalBundle {
 }
 
 impl WithdrawalBundle {
+    /// Compute the size of a single txout
+    pub const fn txout_size(spk_size: u32) -> Option<u32> {
+        let Some(size) = (bitcoin::Amount::SIZE as u32)
+            .checked_add(bitcoin::VarInt(spk_size as u64).size() as u32)
+        else {
+            return None;
+        };
+        size.checked_add(spk_size)
+    }
+
+    /// Predict the weight of a withdrawal bundle, based on the number of
+    /// outputs (not including the commitment/treasury outputs) and the
+    /// sum of sizes of txouts (not including the commitment/treasury outputs).
+    /// Returns None if the predicted weight exceeds the maximum tx weight.
+    pub const fn predict_weight(
+        n_outputs: u32,
+        sum_txout_sizes: u32,
+    ) -> Option<bitcoin::Weight> {
+        use bitcoin::{VarInt, Weight};
+        const fn txin_base_size(script_sig_size: u32) -> Option<u32> {
+            const OUTPOINT_SIZE: u8 = 36;
+            const SEQUENCE_SIZE: u8 = 4;
+            let script_sig_len_size: u8 =
+                VarInt(script_sig_size as u64).size() as u8;
+            let Some(res) = ((OUTPOINT_SIZE + script_sig_len_size) as u32)
+                .checked_add(script_sig_size)
+            else {
+                return None;
+            };
+            res.checked_add(SEQUENCE_SIZE as u32)
+        }
+        const fn tx_base_size(
+            n_inputs: u32,
+            sum_txin_base_sizes: u32,
+            n_outputs: u32,
+            sum_txout_sizes: u32,
+        ) -> Option<u32> {
+            const VERSION_SIZE: u8 = 4;
+            const fn vin_base_size(
+                n_inputs: u32,
+                sum_txin_base_sizes: u32,
+            ) -> Option<u32> {
+                let len_size = VarInt(n_inputs as u64).size() as u8;
+                (len_size as u32).checked_add(sum_txin_base_sizes)
+            }
+            const fn vout_size(
+                n_outputs: u32,
+                sum_txout_sizes: u32,
+            ) -> Option<u32> {
+                let len_size = VarInt(n_outputs as u64).size() as u8;
+                (len_size as u32).checked_add(sum_txout_sizes)
+            }
+            const LOCKTIME_SIZE: u8 = bitcoin::absolute::LockTime::SIZE as u8;
+            let res = VERSION_SIZE as u32;
+            let Some(vin_base_size) =
+                vin_base_size(n_inputs, sum_txin_base_sizes)
+            else {
+                return None;
+            };
+            let Some(res) = res.checked_add(vin_base_size) else {
+                return None;
+            };
+            let Some(vout_size) = vout_size(n_outputs, sum_txout_sizes) else {
+                return None;
+            };
+            let Some(res) = res.checked_add(vout_size) else {
+                return None;
+            };
+            res.checked_add(LOCKTIME_SIZE as u32)
+        }
+        const N_INPUTS: u32 = 1;
+        const SUM_TXIN_BASE_SIZES: u32 = {
+            const TREASURY_TXIN_BASE_SIZE: u32 = {
+                const TREASURY_SCRIPT_SIG_SIZE: u32 = 0;
+                txin_base_size(TREASURY_SCRIPT_SIG_SIZE).unwrap()
+            };
+            TREASURY_TXIN_BASE_SIZE
+        };
+        let Some(n_outputs) = n_outputs.checked_add(2) else {
+            return None;
+        };
+        let Some(sum_txout_sizes) = ({
+            const INPUTS_COMMITMENT_TXOUT_SIZE: u32 = {
+                const INPUTS_COMMITMENT_OUTPUT_SPK_SIZE: u8 = 34;
+                WithdrawalBundle::txout_size(
+                    INPUTS_COMMITMENT_OUTPUT_SPK_SIZE as u32,
+                )
+                .unwrap()
+            };
+            const MAINCHAIN_FEE_COMMITMENT_TXOUT_SIZE: u32 = {
+                const MAINCHAIN_FEE_COMMITMENT_OUTPUT_SPK_SIZE: u8 = 10;
+                WithdrawalBundle::txout_size(
+                    MAINCHAIN_FEE_COMMITMENT_OUTPUT_SPK_SIZE as u32,
+                )
+                .unwrap()
+            };
+            (INPUTS_COMMITMENT_TXOUT_SIZE + MAINCHAIN_FEE_COMMITMENT_TXOUT_SIZE)
+                .checked_add(sum_txout_sizes)
+        }) else {
+            return None;
+        };
+        let Some(tx_base_size) = tx_base_size(
+            N_INPUTS,
+            SUM_TXIN_BASE_SIZES,
+            n_outputs,
+            sum_txout_sizes,
+        ) else {
+            return None;
+        };
+        let Some(tx_weight_wu) =
+            (tx_base_size as u64).checked_mul(Weight::WITNESS_SCALE_FACTOR)
+        else {
+            return None;
+        };
+        if tx_weight_wu <= bitcoin::Transaction::MAX_STANDARD_WEIGHT.to_wu() {
+            Some(Weight::from_wu(tx_weight_wu))
+        } else {
+            None
+        }
+    }
+
     pub fn new(
         block_height: u32,
         fee: bitcoin::Amount,
@@ -311,7 +488,7 @@ pub struct TwoWayPegData {
     pub bundle_statuses: HashMap<M6id, WithdrawalBundleEvent>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct Body {
     pub coinbase: Vec<Output>,
     pub transactions: Vec<Transaction>,
@@ -321,6 +498,9 @@ pub struct Body {
 }
 
 impl Body {
+    /// Size limit in bytes
+    pub const MAX_SIZE: usize = 8 * 1024 * 1024;
+
     pub fn new(
         authorized_transactions: Vec<AuthorizedTransaction>,
         coinbase: Vec<Output>,
@@ -448,9 +628,7 @@ pub trait Verify {
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct Block {
-    #[serde(flatten)]
     pub header: Header,
-    #[serde(flatten)]
     pub body: Body,
     pub height: u32,
 }
@@ -491,6 +669,32 @@ pub struct TxIn {
     pub idx: u32,
 }
 
+/// Step of the sync with the mainchain
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MainchainSyncPhase {
+    #[default]
+    Idle,
+    /// Fetch mainchain headers from the enforcer
+    Headers,
+    /// Write the fetched mainchain headers to the archive
+    Writing,
+}
+
+/// Progress of the sync with the mainchain
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
+)]
+pub struct MainchainSyncProgress {
+    pub phase: MainchainSyncPhase,
+    pub done: u32,
+    pub total: u32,
+    /// Height of the mainchain block that the sync moves to
+    pub tip_height: u32,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BmmResult {
     Verified,
@@ -520,9 +724,10 @@ pub struct Tip {
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum, strum::Display))]
 pub enum Network {
     #[default]
-    Signet,
-    Regtest,
+    Betanet,
     Forknet,
+    Regtest,
+    Signet,
 }
 
 /// Semver-compatible version
@@ -634,5 +839,40 @@ mod withdrawal_bundle_order_regression {
                 "m6id must not depend on aggregation order"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod block_json_tests {
+    use bitcoin::hashes::Hash as _;
+
+    use super::{Block, Body, Header, MerkleRoot};
+
+    #[test]
+    fn block_json_nests_the_header_and_the_body() {
+        let block = Block {
+            header: Header {
+                merkle_root: MerkleRoot::from([1; 32]),
+                prev_side_hash: None,
+                prev_main_hash: bitcoin::BlockHash::from_byte_array([2; 32]),
+            },
+            body: Body {
+                coinbase: Vec::new(),
+                transactions: Vec::new(),
+                authorizations: Vec::new(),
+                actor_proofs: Vec::new(),
+            },
+            height: 7,
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            json["header"]["prev_main_hash"],
+            serde_json::to_value(block.header.prev_main_hash).unwrap()
+        );
+        assert!(json["body"]["transactions"].is_array());
+        assert_eq!(json["height"], 7);
+        assert!(json.get("prev_main_hash").is_none());
+        let decoded: Block = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), json);
     }
 }

@@ -75,7 +75,7 @@ impl MarketValidator {
                     return Err(Error::InvalidTransaction {
                         reason: format!(
                             "Duplicate new claim for decision {}",
-                            hex::encode(entry.decision_id_bytes)
+                            const_hex::encode(entry.decision_id_bytes)
                         ),
                     });
                 }
@@ -89,7 +89,7 @@ impl MarketValidator {
                         reason: format!(
                             "New claim for decision {} collides with \
                              already-claimed decision",
-                            hex::encode(entry.decision_id_bytes)
+                            const_hex::encode(entry.decision_id_bytes)
                         ),
                     });
                 }
@@ -231,7 +231,7 @@ impl MarketValidator {
             .ok_or_else(|| Error::InvalidTransaction {
                 reason: format!(
                     "CreateMarket tx must have MarketFunds (treasury) output with market_id {}",
-                    hex::encode(expected_market_id_bytes)
+                    const_hex::encode(expected_market_id_bytes)
                 ),
             })?;
 
@@ -313,7 +313,7 @@ impl MarketValidator {
                 reason: format!(
                     "Trade prev_block_hash {} does not reference a \
                      known block",
-                    hex::encode(trade.prev_block_hash.0)
+                    const_hex::encode(trade.prev_block_hash.0)
                 ),
             })?;
         if trade.prev_block_hash != tip
@@ -322,7 +322,7 @@ impl MarketValidator {
             return Err(Error::InvalidTransaction {
                 reason: format!(
                     "Trade prev_block_hash {} is not on the active chain",
-                    hex::encode(trade.prev_block_hash.0)
+                    const_hex::encode(trade.prev_block_hash.0)
                 ),
             });
         }

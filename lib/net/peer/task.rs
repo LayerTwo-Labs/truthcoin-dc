@@ -12,6 +12,7 @@ use quinn::SendStream;
 use sneed::EnvError;
 
 use crate::{
+    archive,
     net::peer::{
         BanReason, Connection, ConnectionContext, Info, PeerState, PeerStateId,
         Request, TipInfo,
@@ -26,7 +27,7 @@ use crate::{
     types::{
         AuthorizedTransaction, BlockHash, BmmResult, Header, Tip, VERSION,
     },
-    util::join_set,
+    util::{ErrorChain, join_set},
 };
 
 pub(in crate::net::peer) struct ConnectionTask {
@@ -53,6 +54,38 @@ impl ConnectionTask {
         peer_tip_info: &TipInfo,
         peer_state_id: PeerStateId,
     ) -> Result<Option<bool>, blocking_task::TaskError> {
+        // If the peer's mainchain tip is not an ancestor of ours, then ignore
+        // the peer tip.
+        {
+            let rotxn = ctxt.env.read_txn()?;
+            if ctxt
+                .archive
+                .try_get_main_header_info(
+                    &rotxn,
+                    &peer_tip_info.tip.main_block_hash,
+                )?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            let side_tips_tip = ctxt
+                .archive
+                .side_tips()
+                .get_mainchain_tip(&rotxn)
+                .map_err(archive::Error::from)?;
+            // A node that never synced its mainchain state holds no tip to
+            // compare the peer against.
+            let Some(side_tips_tip_info) = side_tips_tip.tip_info else {
+                return Ok(None);
+            };
+            if !ctxt.archive.is_main_descendant(
+                &rotxn,
+                peer_tip_info.tip.main_block_hash,
+                side_tips_tip_info.block_hash,
+            )? {
+                return Ok(None);
+            }
+        }
         // Check if the peer tip is better, requesting headers if necessary
         let Some(tip_info) = tip_info else {
             // No tip.
@@ -317,7 +350,7 @@ impl ConnectionTask {
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
-                    return Ok(Some(true));
+                    return Ok(Some(false));
                 }
                 let main_ancestor = ctxt.archive.last_common_main_ancestor(
                     &rotxn,
@@ -609,8 +642,8 @@ impl ConnectionTask {
             }
             (_, _) => ResponseMessage::NoBlock { block_hash },
         };
-        let () =
-            Connection::send_response(ctxt.network, response_tx, resp).await?;
+        let () = Connection::send_response(ctxt.magic_bytes, response_tx, resp)
+            .await?;
         Ok(())
     }
 
@@ -657,12 +690,17 @@ impl ConnectionTask {
         let txid = tx.transaction.txid();
         let validate_tx_result = {
             let rotxn = ctxt.env.read_txn().map_err(EnvError::from)?;
-            ctxt.state.validate_transaction(&ctxt.archive, &rotxn, &tx)
+            ctxt.state.validate_transaction(
+                &ctxt.archive,
+                &rotxn,
+                &ctxt.batch_verification_ctxt,
+                &tx,
+            )
         };
         match validate_tx_result {
             Err(err) => {
                 Connection::send_response(
-                    ctxt.network,
+                    ctxt.magic_bytes,
                     response_tx,
                     ResponseMessage::TransactionRejected(txid),
                 )
@@ -671,7 +709,7 @@ impl ConnectionTask {
             }
             Ok(_) => {
                 Connection::send_response(
-                    ctxt.network,
+                    ctxt.magic_bytes,
                     response_tx,
                     ResponseMessage::TransactionAccepted(txid),
                 )
@@ -789,12 +827,16 @@ impl ConnectionTask {
                     .map_err(|_| Error::SendBlockingTask)?;
             }
             InternalMessage::BmmVerificationError(err) => {
-                let err: anyhow::Error = err;
-                tracing::error!("Error attempting BMM verification: {err:#}");
+                tracing::error!(
+                    "Error attempting BMM verification: {:#}",
+                    ErrorChain::new(&err)
+                );
             }
             InternalMessage::MainchainAncestorsError(err) => {
-                let err: anyhow::Error = err;
-                tracing::error!("Error fetching mainchain ancestors: {err:#}");
+                tracing::error!(
+                    "Error fetching mainchain ancestors: {:#}",
+                    ErrorChain::new(&err)
+                );
             }
             InternalMessage::MainchainAncestors(peer_state_id)
             | InternalMessage::Headers(peer_state_id)
@@ -847,10 +889,10 @@ impl ConnectionTask {
                     serialized_response,
                     response_tx,
                 }) => {
-                    let network = ctxt.network;
+                    let magic_bytes = ctxt.magic_bytes;
                     self.mailbox_tx.send_response_spawner.spawn(async move {
                         Connection::send_serialized_response(
-                            network,
+                            magic_bytes,
                             response_tx,
                             &serialized_response,
                         )
@@ -903,15 +945,16 @@ impl ConnectionTask {
                     .await?;
                 }
                 MailboxItem::PeerResponse(peer_response) => {
-                    let info = peer_response
-                        .response
-                        .map(|resp| {
-                            Info::Response(Box::new((
-                                resp,
-                                peer_response.request,
-                            )))
-                        })
-                        .into();
+                    let info = match peer_response.response {
+                        Ok(resp) => Info::Response(Box::new((
+                            resp,
+                            peer_response.request,
+                        ))),
+                        Err(err) => Info::Error {
+                            err: err.into(),
+                            resolved_addr: ctxt.resolved_address.clone(),
+                        },
+                    };
                     if self.info_tx.unbounded_send(info).is_err() {
                         tracing::error!("Failed to send response info")
                     };

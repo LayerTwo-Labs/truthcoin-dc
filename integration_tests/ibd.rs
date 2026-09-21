@@ -3,7 +3,9 @@
 use std::net::SocketAddr;
 
 use bip300301_enforcer_integration_tests::{
-    integration_test::{activate_sidechain, fund_enforcer, propose_sidechain},
+    integration_test::{
+        activate_sidechain, deposit, fund_enforcer, propose_sidechain,
+    },
     setup::{
         Mode, Network, PostSetup as EnforcerPostSetup,
         PreSetup as EnforcerPreSetup, SetupOpts as EnforcerSetupOpts,
@@ -14,7 +16,7 @@ use bip300301_enforcer_integration_tests::{
 use futures::{FutureExt, StreamExt as _, channel::mpsc, future::BoxFuture};
 use tokio::time::sleep;
 use tracing::Instrument as _;
-use truthcoin_dc_app_rpc_api::RpcClient as _;
+use truthcoin_dc_app_rpc_api::node::{PrivateRpcClient as _, RpcClient as _};
 
 use crate::{
     setup::{Init, PostSetup},
@@ -96,26 +98,81 @@ async fn check_peer_connection(
     }
 }
 
+/// What the syncer holds before it meets the sender.
+#[derive(Clone, Copy, Debug)]
+enum SyncerStart {
+    /// Fresh node: plain IBD.
+    Empty,
+    /// The syncer already BMM'd its own chain of three blocks, with a deposit
+    /// that lands in the second one and nothing in the third. Adopting the
+    /// sender's chain then has to disconnect a tip whose parent is the most
+    /// recent deposit block.
+    OwnChainWithDeposit,
+}
+
+/// Number of blocks the syncer holds under [`SyncerStart::OwnChainWithDeposit`]
+const OWN_CHAIN_BLOCKS: u32 = 3;
+
 async fn initial_block_download_task(
     bin_paths: BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
+    syncer_start: SyncerStart,
 ) -> anyhow::Result<()> {
-    let (mut enforcer_post_setup, truthcoin_nodes) =
+    use bitcoin::Amount;
+    const DEPOSIT_AMOUNT: Amount = Amount::from_sat(21_000_000);
+    const DEPOSIT_FEE: Amount = Amount::from_sat(1_000_000);
+
+    let (mut enforcer_post_setup, mut truthcoin_nodes) =
         setup(bin_paths, res_tx).await?;
+    let expected_syncer_blocks = match syncer_start {
+        SyncerStart::Empty => 0,
+        SyncerStart::OwnChainWithDeposit => {
+            tracing::info!("Syncer: BMM block 1 (no deposit)");
+            truthcoin_nodes
+                .syncer
+                .bmm(&mut enforcer_post_setup, 1)
+                .await?;
+            let deposit_address =
+                truthcoin_nodes.syncer.get_deposit_address().await?;
+            // `deposit` mines the mainchain deposit block, then
+            // `confirm_deposit` BMMs syncer block 2 to apply it.
+            tracing::info!("Syncer: deposit, applied by BMM block 2");
+            let () = deposit(
+                &mut enforcer_post_setup,
+                &mut truthcoin_nodes.syncer,
+                &deposit_address,
+                DEPOSIT_AMOUNT,
+                DEPOSIT_FEE,
+            )
+            .await?;
+            tracing::info!("Syncer: BMM block 3 (no deposit)");
+            truthcoin_nodes
+                .syncer
+                .bmm(&mut enforcer_post_setup, 1)
+                .await?;
+            let syncer_blocks =
+                truthcoin_nodes.syncer.rpc_client.getblockcount().await?;
+            anyhow::ensure!(
+                syncer_blocks == OWN_CHAIN_BLOCKS,
+                "syncer should hold {OWN_CHAIN_BLOCKS} blocks, has {syncer_blocks}"
+            );
+            OWN_CHAIN_BLOCKS
+        }
+    };
     const BMM_BLOCKS: u32 = 16;
     tracing::info!(blocks = %BMM_BLOCKS, "Attempting BMM");
     truthcoin_nodes
         .sender
         .bmm(&mut enforcer_post_setup, BMM_BLOCKS)
         .await?;
-    // Check that sender has all blocks, and syncer has 0
+    // Check that sender has all blocks, and syncer only its own
     {
         let sender_blocks =
             truthcoin_nodes.sender.rpc_client.getblockcount().await?;
         anyhow::ensure!(sender_blocks == BMM_BLOCKS);
         let syncer_blocks =
             truthcoin_nodes.syncer.rpc_client.getblockcount().await?;
-        anyhow::ensure!(syncer_blocks == 0);
+        anyhow::ensure!(syncer_blocks == expected_syncer_blocks);
     }
     tracing::info!("Attempting sync");
     tracing::debug!(
@@ -152,14 +209,31 @@ async fn initial_block_download_task(
     )
     .await?;
     tracing::debug!("Syncer still has connection to sender");
-    // Check that sender and syncer have all blocks
+    // Check that sender and syncer have all blocks, on the same tip
     {
         let sender_blocks =
             truthcoin_nodes.sender.rpc_client.getblockcount().await?;
         anyhow::ensure!(sender_blocks == BMM_BLOCKS);
         let syncer_blocks =
             truthcoin_nodes.syncer.rpc_client.getblockcount().await?;
-        anyhow::ensure!(syncer_blocks == BMM_BLOCKS);
+        anyhow::ensure!(
+            syncer_blocks == BMM_BLOCKS,
+            "syncer stuck at {syncer_blocks} blocks, sender at {sender_blocks}"
+        );
+        let sender_tip = truthcoin_nodes
+            .sender
+            .rpc_client
+            .get_best_sidechain_block_hash()
+            .await?;
+        let syncer_tip = truthcoin_nodes
+            .syncer
+            .rpc_client
+            .get_best_sidechain_block_hash()
+            .await?;
+        anyhow::ensure!(
+            sender_tip == syncer_tip,
+            "syncer tip {syncer_tip:?} != sender tip {sender_tip:?}"
+        );
     }
     drop(truthcoin_nodes.syncer);
     drop(truthcoin_nodes.sender);
@@ -174,13 +248,20 @@ async fn initial_block_download_task(
     Ok(())
 }
 
-async fn ibd(bin_paths: BinPaths) -> anyhow::Result<()> {
+async fn ibd(
+    bin_paths: BinPaths,
+    syncer_start: SyncerStart,
+) -> anyhow::Result<()> {
     let (res_tx, mut res_rx) = mpsc::unbounded();
     let _test_task: AbortOnDrop<()> = tokio::task::spawn({
         let res_tx = res_tx.clone();
         async move {
-            let res =
-                initial_block_download_task(bin_paths, res_tx.clone()).await;
+            let res = initial_block_download_task(
+                bin_paths,
+                res_tx.clone(),
+                syncer_start,
+            )
+            .await;
             let _send_err: Result<(), _> = res_tx.unbounded_send(res);
         }
         .in_current_span()
@@ -198,7 +279,22 @@ pub fn ibd_trial(
 ) -> AsyncTrial<BoxFuture<'static, anyhow::Result<()>>> {
     AsyncTrial::new(
         "initial_block_download",
-        ibd(bin_paths).boxed(),
+        ibd(bin_paths, SyncerStart::Empty).boxed(),
+        file_registry,
+        failure_collector,
+    )
+}
+
+/// IBD onto a node that must first reorg its own chain away, disconnecting a
+/// tip whose parent carries the latest deposit.
+pub fn reorg_across_deposit_trial(
+    bin_paths: BinPaths,
+    file_registry: TestFileRegistry,
+    failure_collector: TestFailureCollector,
+) -> AsyncTrial<BoxFuture<'static, anyhow::Result<()>>> {
+    AsyncTrial::new(
+        "reorg_across_deposit",
+        ibd(bin_paths, SyncerStart::OwnChainWithDeposit).boxed(),
         file_registry,
         failure_collector,
     )

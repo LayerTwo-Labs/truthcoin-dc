@@ -13,8 +13,8 @@ pub struct ReputationDbs {
 impl ReputationDbs {
     pub const NUM_DBS: u32 = 1;
 
-    pub fn new(
-        env: &sneed::Env,
+    pub fn new<Tls>(
+        env: &sneed::Env<Tls>,
         rwtxn: &mut RwTxn,
     ) -> Result<Self, sneed::env::error::CreateDb> {
         let reputation = DatabaseUnique::create(env, rwtxn, "reputation")?;

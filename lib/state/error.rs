@@ -97,6 +97,8 @@ pub enum Error {
 
     #[error("bundle too heavy {weight} > {max_weight}")]
     BundleTooHeavy { weight: u64, max_weight: u64 },
+    #[error("body too large")]
+    BodyTooLarge,
     #[error(transparent)]
     BorshSerialize(borsh::io::Error),
     #[error("Database consistency error: {0}")]
@@ -129,11 +131,13 @@ pub enum Error {
     NoStxo { outpoint: OutPoint },
     #[error("utxo {outpoint} doesn't exist")]
     NoUtxo { outpoint: OutPoint },
+    #[error("withdrawal output {outpoint} cannot be spent by a transaction")]
+    SpendWithdrawalOutput { outpoint: OutPoint },
     #[error("Withdrawal bundle event block doesn't exist")]
     NoWithdrawalBundleEventBlock,
 
     #[error(transparent)]
-    SignatureError(#[from] ed25519_dalek::SignatureError),
+    SignatureError(#[from] frost_ristretto255::Error),
 
     #[error("Unknown withdrawal bundle: {m6id}")]
     UnknownWithdrawalBundle { m6id: M6id },

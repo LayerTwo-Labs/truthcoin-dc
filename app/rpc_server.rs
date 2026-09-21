@@ -1,4 +1,7 @@
-use std::net::SocketAddr;
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+};
 
 use bitcoin::Amount;
 use jsonrpsee::{
@@ -8,6 +11,7 @@ use jsonrpsee::{
 };
 
 use tower_http::{
+    cors::CorsLayer,
     request_id::{
         MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
     },
@@ -23,19 +27,22 @@ use truthcoin_dc::{
     node::Node,
     state::period_to_name,
     types::{
-        Address, Authorization, Block, BlockHash, EncryptionPubKey,
-        FilledOutputContent, PointedOutput, Transaction, Txid, VerifyingKey,
-        WithdrawalBundle,
+        Address, Authorization, AuthorizedTransaction, Block, BlockHash,
+        BlockIndex, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx,
+        EncryptionPubKey, FilledOutputContent, MainchainSyncProgress,
+        PointedOutput, Transaction, Txid, VerifyingKey, WithdrawalBundle,
     },
     validation::DecisionValidator,
-    wallet::{Balance, CreateMarketInput, DecisionClaimInput},
+    wallet::{Balance, CreateMarketInput, DecisionClaimInput, TransferDests},
 };
 use truthcoin_dc_app_rpc_api::{
-    ConsensusResults, CreateTradeRequest, CreateTradeResponse, DecisionFilter,
-    DecisionListItem, DecisionState, DecisionSummary, MarketAmplifyBetaRequest,
-    MarketBuyRequest, MarketBuyResponse, MarketSellRequest, MarketSellResponse,
-    ParticipationStats, PeriodStats, RpcServer, SubmitBallotRequest, TxInfo,
-    VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
+    self as rpc_api, ConsensusResults, CreateTradeRequest, CreateTradeResponse,
+    DecisionFilter, DecisionListItem, DecisionState, DecisionSummary,
+    GetBlockTemplateResponse, MarketAmplifyBetaRequest, MarketBuyRequest,
+    MarketBuyResponse, MarketDimension, MarketDimensionKind, MarketOutcome,
+    MarketSellRequest, MarketSellResponse, MarketStatus, MempoolTx,
+    ParticipationStats, PeriodStats, PointedSpentOutput, SubmitBallotRequest,
+    TxInfo, VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
 };
 
 use crate::app::App;
@@ -50,6 +57,116 @@ where
 {
     let error = anyhow::Error::from(error);
     custom_err_msg(format!("{error:#}"))
+}
+
+fn market_dimension_data(
+    market: &truthcoin_dc::state::markets::Market,
+    decisions: &HashMap<
+        truthcoin_dc::state::decisions::DecisionId,
+        truthcoin_dc::state::decisions::Decision,
+    >,
+) -> Result<Vec<MarketDimension>, truthcoin_dc::state::Error> {
+    market
+        .dimension_specs
+        .iter()
+        .enumerate()
+        .map(|(dimension_index, dimension_spec)| {
+            let decision_id = match dimension_spec {
+                truthcoin_dc::state::markets::DimensionSpec::Single(id)
+                | truthcoin_dc::state::markets::DimensionSpec::Categorical(
+                    id,
+                ) => *id,
+            };
+            let decision = decisions.get(&decision_id).ok_or(
+                truthcoin_dc::state::markets::MarketError::DecisionNotFound {
+                    decision_id,
+                },
+            )?;
+
+            let kind = match &decision.decision_type {
+                truthcoin_dc::state::decisions::DecisionType::Binary => {
+                    let (lower, upper) = decision.get_binary_labels();
+                    MarketDimensionKind::Binary {
+                        lower_label: lower,
+                        upper_label: upper,
+                    }
+                }
+                truthcoin_dc::state::decisions::DecisionType::Scaled {
+                    min,
+                    max,
+                    increment,
+                } => {
+                    let lower = decision
+                        .option_0_label
+                        .clone()
+                        .unwrap_or_else(|| "Lower basis".to_string());
+                    let upper = decision
+                        .option_1_label
+                        .clone()
+                        .unwrap_or_else(|| "Upper basis".to_string());
+                    MarketDimensionKind::Scaled {
+                        min: *min,
+                        max: *max,
+                        increment: *increment,
+                        // Decision definitions currently have no unit field.
+                        unit: None,
+                        lower_label: lower,
+                        upper_label: upper,
+                    }
+                }
+                truthcoin_dc::state::decisions::DecisionType::Category {
+                    options,
+                } => MarketDimensionKind::Category {
+                    options: options.clone(),
+                },
+            };
+
+            Ok(MarketDimension {
+                dimension_index,
+                decision_id: decision_id.to_hex(),
+                name: decision.header.clone(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn market_outcomes(
+    market: &truthcoin_dc::state::markets::Market,
+    decisions: &HashMap<
+        truthcoin_dc::state::decisions::DecisionId,
+        truthcoin_dc::state::decisions::Decision,
+    >,
+    prices: &[f64],
+) -> Vec<MarketOutcome> {
+    market
+        .get_valid_state_combos()
+        .iter()
+        .enumerate()
+        .map(|(display_index, (full_state_index, coordinates))| {
+            let name = match market
+                .describe_outcome_by_state(*full_state_index, decisions)
+            {
+                Ok(description) => description,
+                Err(_) => format!("Outcome {full_state_index}"),
+            };
+            let current_price =
+                prices.get(display_index).copied().unwrap_or(0.0);
+
+            MarketOutcome {
+                outcome_index: display_index,
+                label: name,
+                price: current_price,
+                volume_sats: market
+                    .outcome_volumes_sats
+                    .get(display_index)
+                    .copied()
+                    .unwrap_or(0),
+                full_state_index: *full_state_index,
+                coordinates: (*coordinates).clone(),
+            }
+        })
+        .collect()
 }
 
 /// Per-decision slot allocation request.
@@ -173,7 +290,7 @@ pub(crate) fn allocate_decision_slots(
 fn parse_market_id(
     market_id: &str,
 ) -> RpcResult<truthcoin_dc::state::MarketId> {
-    let market_id_bytes = hex::decode(market_id)
+    let market_id_bytes = const_hex::decode(market_id)
         .map_err(|_| custom_err_msg("Invalid market ID hex format"))?;
 
     if market_id_bytes.len() != 6 {
@@ -185,11 +302,13 @@ fn parse_market_id(
     Ok(truthcoin_dc::state::MarketId::new(id_array))
 }
 
-pub struct RpcServerImpl {
+#[derive(Clone)]
+#[repr(transparent)]
+pub struct RpcServerImpl<const ENABLE_PRIVATE_API: bool> {
     app: App,
 }
 
-impl RpcServerImpl {
+impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
     #[inline(always)]
     fn node(&self) -> &Node {
         &self.app.node
@@ -233,8 +352,10 @@ impl RpcServerImpl {
                 None => truthcoin_dc_app_rpc_api::DecisionContentInfo::Empty,
                 Some(decision) => {
                     truthcoin_dc_app_rpc_api::DecisionContentInfo::Decision({
-                        let id = hex::encode(decision.id());
-                        let mm = hex::encode(decision.market_maker_pubkey_hash);
+                        let id = const_hex::encode(decision.id());
+                        let mm = const_hex::encode(
+                            decision.market_maker_pubkey_hash,
+                        );
                         truthcoin_dc_app_rpc_api::DecisionInfo {
                             id,
                             market_maker_pubkey_hash: mm,
@@ -281,7 +402,6 @@ impl RpcServerImpl {
             .get_market_decisions(&market)
             .map_err(custom_err)?;
 
-        let mut outcomes = Vec::new();
         let valid_state_combos = market.get_valid_state_combos();
 
         let mempool_shares_opt = self
@@ -306,35 +426,9 @@ impl RpcServerImpl {
                 });
 
         let total_volume_sats = market.total_volume_sats;
-
-        for (i, (state_idx, _combo)) in valid_state_combos.iter().enumerate() {
-            let name = match market
-                .describe_outcome_by_state(*state_idx, &decisions)
-            {
-                Ok(description) => description,
-                Err(_) => format!("Outcome {state_idx}"),
-            };
-
-            let current_price = prices.get(i).copied().unwrap_or(0.0);
-            let probability = current_price;
-            let volume_sats =
-                market.outcome_volumes_sats.get(i).copied().unwrap_or(0);
-
-            outcomes.push(truthcoin_dc_app_rpc_api::MarketOutcome {
-                name,
-                current_price,
-                probability,
-                volume_sats,
-                index: i,
-                display_index: i,
-            });
-        }
-
-        let decision_ids: Vec<String> = market
-            .decision_ids
-            .iter()
-            .map(|decision_id| decision_id.to_hex())
-            .collect();
+        let dimensions =
+            market_dimension_data(&market, &decisions).map_err(custom_err)?;
+        let outcomes = market_outcomes(&market, &decisions, &prices);
 
         let resolution = if computed_state
             == truthcoin_dc::state::markets::MarketState::Settled
@@ -356,27 +450,21 @@ impl RpcServerImpl {
                     winning_outcomes.push(
                         truthcoin_dc_app_rpc_api::WinningOutcome {
                             outcome_index: i,
-                            outcome_name: name,
-                            final_price,
+                            label: name,
+                            price: final_price,
                         },
                     );
                 }
             }
 
             let summary = if winning_outcomes.len() == 1 {
-                format!("Resolved: {}", winning_outcomes[0].outcome_name)
+                format!("Resolved: {}", winning_outcomes[0].label)
             } else if winning_outcomes.is_empty() {
                 "No winning outcome".to_string()
             } else {
                 let names: Vec<String> = winning_outcomes
                     .iter()
-                    .map(|w| {
-                        format!(
-                            "{} ({:.1}%)",
-                            w.outcome_name,
-                            w.final_price * 100.0
-                        )
-                    })
+                    .map(|w| format!("{} ({:.1}%)", w.label, w.price * 100.0))
                     .collect();
                 format!("Resolved: {}", names.join(", "))
             };
@@ -394,24 +482,22 @@ impl RpcServerImpl {
             .node
             .get_market_treasury_sats(&market_id_struct)
             .map_err(custom_err)?;
-        let treasury_btc = (treasury_sats as f64) / 100_000_000.0;
-
         let market_data = truthcoin_dc_app_rpc_api::MarketData {
             market_id,
             title: market.title.clone(),
             description: market.description.clone(),
-            outcomes,
-            state: format!("{computed_state:?}"),
-            market_maker: market.creator_address.to_string(),
-            expires_at: market.expires_at_height,
-            beta: effective_b,
-            trading_fee: market.trading_fee(),
             tags: market.tags.clone(),
+            creator_address: market.creator_address.to_string(),
             created_at_height: market.created_at_height,
-            treasury: treasury_btc,
+            expires_at_height: market.expires_at_height,
+            dimensions,
+            outcomes,
+            state: MarketStatus::from(computed_state),
+            beta: effective_b,
+            liquidity_base_sats: market.liquidity_base_sats,
+            treasury_sats,
             total_volume_sats,
-            liquidity: treasury_btc,
-            decision_ids,
+            trading_fee_rate: market.trading_fee(),
             resolution,
             tx_pow_hash_selector: market.tx_pow_hash_selector,
             tx_pow_ordering: market.tx_pow_ordering,
@@ -559,332 +645,110 @@ impl RpcServerImpl {
     }
 }
 
+pub struct PrivateOnlyRpcServerImpl;
+
 #[async_trait]
-impl RpcServer for RpcServerImpl {
-    async fn get_block(&self, block_hash: BlockHash) -> RpcResult<Block> {
-        let block = self.node().get_block(block_hash).map_err(custom_err)?;
-        Ok(block)
-    }
-
-    async fn get_best_sidechain_block_hash(
-        &self,
-    ) -> RpcResult<Option<BlockHash>> {
-        self.node().try_get_tip().map_err(custom_err)
-    }
-
-    async fn get_best_mainchain_block_hash(
-        &self,
-    ) -> RpcResult<Option<bitcoin::BlockHash>> {
-        let Some(sidechain_hash) =
-            self.node().try_get_tip().map_err(custom_err)?
-        else {
-            return Ok(None);
-        };
-        let block_hash = self
-            .node()
-            .get_best_main_verification(sidechain_hash)
-            .map_err(custom_err)?;
-        Ok(Some(block_hash))
-    }
-
-    async fn get_bmm_inclusions(
-        &self,
-        block_hash: truthcoin_dc::types::BlockHash,
-    ) -> RpcResult<Vec<bitcoin::BlockHash>> {
-        self.app
-            .node
-            .get_bmm_inclusions(block_hash)
-            .map_err(custom_err)
-    }
-
-    async fn get_new_address(&self) -> RpcResult<Address> {
-        self.app.wallet.get_new_address().map_err(custom_err)
-    }
-
-    async fn get_voter_address(&self) -> RpcResult<Address> {
-        self.app.wallet.voter_address().map_err(custom_err)
-    }
-
-    async fn get_new_encryption_key(&self) -> RpcResult<EncryptionPubKey> {
-        self.app.wallet.get_new_encryption_key().map_err(custom_err)
-    }
-
-    async fn get_new_verifying_key(&self) -> RpcResult<VerifyingKey> {
-        self.app.wallet.get_new_verifying_key().map_err(custom_err)
-    }
-
-    async fn get_transaction(
-        &self,
-        txid: Txid,
-    ) -> RpcResult<Option<Transaction>> {
-        self.node().try_get_transaction(txid).map_err(custom_err)
-    }
-
-    async fn get_transaction_info(
-        &self,
-        txid: Txid,
-    ) -> RpcResult<Option<TxInfo>> {
-        let Some((filled_tx, txin)) = self
-            .app
-            .node
-            .try_get_filled_transaction(txid)
-            .map_err(custom_err)?
-        else {
-            return Ok(None);
-        };
-        let confirmations = match txin {
-            Some(txin) => {
-                let tip_height = self
-                    .app
-                    .node
-                    .try_get_tip_height()
-                    .map_err(custom_err)?
-                    .expect("Height should exist for tip");
-                let height = self
-                    .app
-                    .node
-                    .get_height(txin.block_hash)
-                    .map_err(custom_err)?;
-                Some(tip_height - height)
-            }
-            None => None,
-        };
-        let fee_sats = filled_tx
-            .transaction
-            .bitcoin_fee()
-            .map_err(custom_err)?
-            .unwrap()
-            .to_sat();
-        let res = TxInfo {
-            confirmations,
-            fee_sats,
-            txin,
-        };
-        Ok(Some(res))
-    }
-
-    async fn get_wallet_addresses(&self) -> RpcResult<Vec<Address>> {
-        let addrs = self.app.wallet.get_addresses().map_err(custom_err)?;
-        let mut res: Vec<_> = addrs.into_iter().collect();
-        res.sort_by_key(|addr| addr.as_base58());
-        Ok(res)
-    }
-
-    async fn get_wallet_utxos(
-        &self,
-    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>> {
-        let utxos = self.app.wallet.get_utxos().map_err(custom_err)?;
-        let utxos = utxos
-            .into_iter()
-            .map(|(outpoint, output)| PointedOutput { outpoint, output })
-            .collect();
-        Ok(utxos)
-    }
-
-    async fn getblockcount(&self) -> RpcResult<u32> {
-        let height = self.node().try_get_tip_height().map_err(custom_err)?;
-        Ok(height.map_or(0, |h| h + 1))
-    }
-
-    async fn latest_failed_withdrawal_bundle_height(
-        &self,
-    ) -> RpcResult<Option<u32>> {
-        let height = self
-            .app
-            .node
-            .get_latest_failed_bundle_height()
-            .map_err(custom_err)?;
-        Ok(height)
-    }
-
-    async fn list_peers(&self) -> RpcResult<Vec<Peer>> {
-        let peers = self.node().get_active_peers();
-        Ok(peers)
-    }
-
-    async fn list_utxos(
-        &self,
-    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>> {
-        let utxos = self.node().get_all_utxos().map_err(custom_err)?;
-        let res = utxos
-            .into_iter()
-            .map(|(outpoint, output)| PointedOutput { outpoint, output })
-            .collect();
-        Ok(res)
-    }
-
-    async fn mine(&self, fee: Option<u64>) -> RpcResult<()> {
-        let fee = fee.map(bitcoin::Amount::from_sat);
-        self.app
-            .local_pool
-            .spawn_pinned({
-                let app = self.app.clone();
-                move || async move { app.mine(fee).await.map_err(custom_err) }
-            })
-            .await
-            .unwrap()
-    }
-
-    async fn my_unconfirmed_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
-        let addresses = self.app.wallet.get_addresses().map_err(custom_err)?;
-        let utxos = self
-            .app
-            .node
-            .get_unconfirmed_utxos_by_addresses(&addresses)
-            .map_err(custom_err)?
-            .into_iter()
-            .map(|(outpoint, output)| PointedOutput { outpoint, output })
-            .collect();
-        Ok(utxos)
-    }
-
+impl rpc_api::open_api::RpcServer for PrivateOnlyRpcServerImpl {
     async fn openapi_schema(&self) -> RpcResult<utoipa::openapi::OpenApi> {
-        let res =
-            <truthcoin_dc_app_rpc_api::RpcDoc as utoipa::OpenApi>::openapi();
-        Ok(res)
+        rpc_api::private_openapi().map_err(custom_err)
     }
+}
 
-    async fn pending_withdrawal_bundle(
-        &self,
-    ) -> RpcResult<Option<WithdrawalBundle>> {
-        self.app
-            .node
-            .get_pending_withdrawal_bundle()
-            .map_err(custom_err)
+#[async_trait]
+impl rpc_api::open_api::RpcServer for RpcServerImpl<false> {
+    async fn openapi_schema(&self) -> RpcResult<utoipa::openapi::OpenApi> {
+        rpc_api::public_openapi().map_err(custom_err)
+    }
+}
+
+#[async_trait]
+impl rpc_api::open_api::RpcServer for RpcServerImpl<true> {
+    async fn openapi_schema(&self) -> RpcResult<utoipa::openapi::OpenApi> {
+        rpc_api::openapi().map_err(custom_err)
+    }
+}
+
+#[async_trait]
+impl rpc_api::node::PrivateRpcServer for RpcServerImpl<true> {
+    async fn invalidate_block(&self, block_hash: BlockHash) -> RpcResult<()> {
+        self.node().invalidate_block(block_hash).map_err(custom_err)
     }
 
     async fn remove_from_mempool(&self, txid: Txid) -> RpcResult<()> {
         self.node().remove_from_mempool(txid).map_err(custom_err)
     }
 
-    async fn set_seed_from_mnemonic(&self, mnemonic: String) -> RpcResult<()> {
-        self.app
-            .wallet
-            .set_seed_from_mnemonic(mnemonic.as_str())
-            .map_err(custom_err)
-    }
-
-    async fn sidechain_wealth_sats(&self) -> RpcResult<u64> {
-        let sidechain_wealth =
-            self.node().get_sidechain_wealth().map_err(custom_err)?;
-        Ok(sidechain_wealth.to_sat())
-    }
-
-    async fn sign_arbitrary_msg(
-        &self,
-        verifying_key: VerifyingKey,
-        msg: String,
-    ) -> RpcResult<Signature> {
-        self.app
-            .wallet
-            .sign_arbitrary_msg(&verifying_key, &msg)
-            .map_err(custom_err)
-    }
-
-    async fn sign_arbitrary_msg_as_addr(
-        &self,
-        address: Address,
-        msg: String,
-    ) -> RpcResult<Authorization> {
-        self.app
-            .wallet
-            .sign_arbitrary_msg_as_addr(&address, &msg)
-            .map_err(custom_err)
-    }
-
     async fn stop(&self) {
         std::process::exit(0);
     }
 
-    async fn transfer(
+    async fn connect_peer(&self, addr: SocketAddr) -> RpcResult<()> {
+        self.node().connect_peer(addr).map_err(custom_err)
+    }
+
+    async fn forget_peer(&self, addr: SocketAddr) -> RpcResult<()> {
+        match self.app.node.forget_peer(&addr) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(custom_err(err)),
+        }
+    }
+
+    async fn sync_to_tip(&self, block_hash: BlockHash) -> RpcResult<bool> {
+        self.node()
+            .sync_to_tip(block_hash)
+            .await
+            .map_err(custom_err)
+    }
+}
+
+#[async_trait]
+impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
+    for RpcServerImpl<ENABLE_PRIVATE_API>
+{
+    async fn await_block_height(
         &self,
-        dest: Address,
-        value_sats: u64,
-        fee_sats: u64,
-        memo: Option<String>,
-    ) -> RpcResult<Txid> {
-        let memo = match memo {
-            None => None,
-            Some(memo) => {
-                let hex = hex::decode(memo).map_err(custom_err)?;
-                Some(hex)
+        target_height: u32,
+        timeout_ms: Option<u64>,
+    ) -> RpcResult<u32> {
+        use tokio::time::{Duration, sleep, timeout};
+
+        let timeout_duration =
+            Duration::from_millis(timeout_ms.unwrap_or(10000));
+
+        let result = timeout(timeout_duration, async {
+            loop {
+                let current_height = self
+                    .node()
+                    .try_get_tip_height()
+                    .map_err(custom_err)?
+                    .unwrap_or(0);
+
+                if current_height >= target_height {
+                    return Ok::<u32, jsonrpsee::types::ErrorObjectOwned>(
+                        current_height,
+                    );
+                }
+
+                sleep(Duration::from_millis(100)).await;
             }
-        };
-        let tx = self
-            .app
-            .wallet
-            .create_transfer(
-                dest,
-                Amount::from_sat(value_sats),
-                Amount::from_sat(fee_sats),
-                memo,
-            )
-            .map_err(custom_err)?;
-        let txid = tx.txid();
-        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(txid)
-    }
+        })
+        .await;
 
-    async fn transfer_votecoin(
-        &self,
-        dest: Address,
-        amount: f64,
-        fee_sats: u64,
-        memo: Option<String>,
-    ) -> RpcResult<Txid> {
-        let memo = match memo {
-            None => None,
-            Some(memo) => {
-                let hex = hex::decode(memo).map_err(custom_err)?;
-                Some(hex)
+        match result {
+            Ok(Ok(height)) => Ok(height),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                // Timeout - return current height
+                let current_height = self
+                    .node()
+                    .try_get_tip_height()
+                    .map_err(custom_err)?
+                    .unwrap_or(0);
+                Err(custom_err_msg(format!(
+                    "Timeout waiting for block height {target_height}. Current height: {current_height}"
+                )))
             }
-        };
-        let tx = self
-            .app
-            .wallet
-            .transfer_reputation(dest, amount, Amount::from_sat(fee_sats), memo)
-            .map_err(custom_err)?;
-        let txid = tx.txid();
-        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(txid)
-    }
-
-    async fn verify_signature(
-        &self,
-        signature: Signature,
-        verifying_key: VerifyingKey,
-        dst: Dst,
-        msg: String,
-    ) -> RpcResult<bool> {
-        let res = authorization::verify(
-            signature,
-            &verifying_key,
-            dst,
-            msg.as_bytes(),
-        );
-        Ok(res)
-    }
-
-    async fn withdraw(
-        &self,
-        mainchain_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
-        amount_sats: u64,
-        fee_sats: u64,
-        mainchain_fee_sats: u64,
-    ) -> RpcResult<Txid> {
-        let tx = self
-            .app
-            .wallet
-            .create_withdrawal(
-                mainchain_address,
-                Amount::from_sat(amount_sats),
-                Amount::from_sat(mainchain_fee_sats),
-                Amount::from_sat(fee_sats),
-            )
-            .map_err(custom_err)?;
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(txid)
+        }
     }
 
     async fn calculate_initial_liquidity(
@@ -981,157 +845,42 @@ impl RpcServer for RpcServerImpl {
         })
     }
 
-    async fn bitcoin_balance(&self) -> RpcResult<Balance> {
-        self.app.wallet.get_bitcoin_balance().map_err(custom_err)
-    }
-
-    async fn create_deposit(
+    async fn connect_block(
         &self,
-        address: Address,
-        value_sats: u64,
-        fee_sats: u64,
-    ) -> RpcResult<bitcoin::Txid> {
-        let tx = self
-            .app
-            .wallet
-            .create_transfer(
-                address,
-                bitcoin::Amount::from_sat(value_sats),
-                bitcoin::Amount::from_sat(fee_sats),
-                None,
-            )
-            .map_err(custom_err)?;
-
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-
-        let bitcoin_txid = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::Hash::from_byte_array(txid.0),
-        );
-        Ok(bitcoin_txid)
-    }
-
-    async fn connect_peer(&self, addr: SocketAddr) -> RpcResult<()> {
-        self.node().connect_peer(addr).map_err(custom_err)
-    }
-
-    async fn forget_peer(&self, addr: SocketAddr) -> RpcResult<()> {
-        match self.app.node.forget_peer(&addr) {
-            Ok(_) => Ok(()),
-            Err(err) => Err(custom_err(err)),
-        }
-    }
-
-    async fn decrypt_msg(
-        &self,
-        encryption_pubkey: EncryptionPubKey,
-        ciphertext: String,
-    ) -> RpcResult<String> {
-        let ciphertext_bytes = hex::decode(&ciphertext).map_err(|e| {
-            ErrorObject::owned(
-                -32602,
-                "Invalid hex string",
-                Some(e.to_string()),
-            )
-        })?;
-
-        let decrypted_bytes = self
-            .app
-            .wallet
-            .decrypt_msg(&encryption_pubkey, &ciphertext_bytes)
-            .map_err(custom_err)?;
-
-        Ok(hex::encode(decrypted_bytes))
-    }
-
-    async fn encrypt_msg(
-        &self,
-        _encryption_pubkey: EncryptionPubKey,
-        _msg: String,
-    ) -> RpcResult<String> {
-        Err(ErrorObject::owned(
-            -32601,
-            "Encryption not implemented",
-            Some("Use external encryption tools"),
-        ))
-    }
-
-    async fn format_deposit_address(
-        &self,
-        address: Address,
-    ) -> RpcResult<String> {
-        Ok(format!("{address}"))
-    }
-
-    async fn generate_mnemonic(&self) -> RpcResult<String> {
-        let mnemonic = bip39::Mnemonic::new(
-            bip39::MnemonicType::Words12,
-            bip39::Language::English,
-        );
-        Ok(mnemonic.to_string())
-    }
-
-    async fn refresh_wallet(&self) -> RpcResult<()> {
-        self.app.update().map_err(custom_err)
-    }
-
-    async fn await_block_height(
-        &self,
-        target_height: u32,
-        timeout_ms: Option<u64>,
-    ) -> RpcResult<u32> {
-        use tokio::time::{Duration, sleep, timeout};
-
-        let timeout_duration =
-            Duration::from_millis(timeout_ms.unwrap_or(10000));
-
-        let result = timeout(timeout_duration, async {
-            loop {
-                let current_height = self
-                    .node()
-                    .try_get_tip_height()
-                    .map_err(custom_err)?
-                    .unwrap_or(0);
-
-                if current_height >= target_height {
-                    return Ok::<u32, jsonrpsee::types::ErrorObjectOwned>(
-                        current_height,
-                    );
+        block: Block,
+        main_block_hash: bitcoin::BlockHash,
+    ) -> RpcResult<bool> {
+        self.app
+            .local_pool
+            .spawn_pinned({
+                let app = self.app.clone();
+                move || async move {
+                    app.connect_block(block, main_block_hash)
+                        .await
+                        .map_err(custom_err)
                 }
-
-                sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await;
-
-        match result {
-            Ok(Ok(height)) => Ok(height),
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                // Timeout - return current height
-                let current_height = self
-                    .node()
-                    .try_get_tip_height()
-                    .map_err(custom_err)?
-                    .unwrap_or(0);
-                Err(custom_err_msg(format!(
-                    "Timeout waiting for block height {target_height}. Current height: {current_height}"
-                )))
-            }
-        }
+            })
+            .await
+            .unwrap()
     }
 
-    async fn sync_to_tip(&self, block_hash: BlockHash) -> RpcResult<bool> {
+    async fn decision_fee_for_id(
+        &self,
+        decision_id_hex: String,
+    ) -> RpcResult<u64> {
+        use truthcoin_dc::state::decisions::DecisionId;
+        let decision_id = DecisionId::from_hex(&decision_id_hex)
+            .map_err(|e| custom_err_msg(format!("invalid decision id: {e}")))?;
         self.node()
-            .sync_to_tip(block_hash)
-            .await
+            .fee_for_decision_id(decision_id)
             .map_err(custom_err)
     }
 
-    async fn decision_status(
+    async fn decision_get(
         &self,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionPeriodStatus> {
-        self.decisions_status().await
+        decision_id: String,
+    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::DecisionDetails>> {
+        self.get_decision_by_id(decision_id).await
     }
 
     async fn decision_list(
@@ -1213,8 +962,8 @@ impl RpcServer for RpcServerImpl {
 
                 let did = entry.decision_id;
                 let decision = entry.decision.map(|d| {
-                    let id = hex::encode(d.id());
-                    let mm = hex::encode(d.market_maker_pubkey_hash);
+                    let id = const_hex::encode(d.id());
+                    let mm = const_hex::encode(d.market_maker_pubkey_hash);
                     truthcoin_dc_app_rpc_api::DecisionInfo {
                         id,
                         market_maker_pubkey_hash: mm,
@@ -1237,128 +986,6 @@ impl RpcServer for RpcServerImpl {
         }
 
         Ok(results)
-    }
-
-    async fn decision_get(
-        &self,
-        decision_id: String,
-    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::DecisionDetails>> {
-        self.get_decision_by_id(decision_id).await
-    }
-
-    async fn decision_claim(
-        &self,
-        request: truthcoin_dc_app_rpc_api::DecisionClaimRequest,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionClaimResponse> {
-        use truthcoin_dc::state::decisions::DecisionType;
-
-        let decision_type = match request.decision_type.as_str() {
-            "binary" => DecisionType::Binary,
-            "scaled" => {
-                let min_val = request.min.ok_or_else(|| {
-                    custom_err_msg("min is required for scaled decisions")
-                })?;
-                let max_val = request.max.ok_or_else(|| {
-                    custom_err_msg("max is required for scaled decisions")
-                })?;
-                let increment = request.increment.unwrap_or(1.0);
-                DecisionType::Scaled {
-                    min: min_val,
-                    max: max_val,
-                    increment,
-                }
-            }
-            "category" => {
-                if request.decisions.len() != 1 {
-                    return Err(custom_err_msg(
-                        "Category claim must have exactly \
-                         1 decision entry",
-                    ));
-                }
-                let labels = request.decisions[0]
-                    .option_labels
-                    .clone()
-                    .unwrap_or_default();
-                if labels.len() < 2 {
-                    return Err(custom_err_msg(
-                        "Category claim requires at least \
-                         2 option labels",
-                    ));
-                }
-                DecisionType::Category { options: labels }
-            }
-            other => {
-                return Err(custom_err_msg(format!(
-                    "Unknown decision_type: '{other}'. \
-                     Expected 'binary', 'scaled', or 'category'"
-                )));
-            }
-        };
-
-        let slot_requests: Vec<SlotRequest> = request
-            .decisions
-            .iter()
-            .map(|item| SlotRequest {
-                period_index: item.period_index,
-                decision_type: decision_type.clone(),
-                header: item.header.clone(),
-                description: item.description.clone().unwrap_or_default(),
-                option_0_label: item.option_0_label.clone(),
-                option_1_label: item.option_1_label.clone(),
-                option_labels: item.option_labels.clone(),
-                tags: item.tags.clone(),
-            })
-            .collect();
-
-        let allocated =
-            allocate_decision_slots(&self.app.node, &slot_requests)?;
-
-        let listing_fee_paid_sats: u64 = allocated
-            .iter()
-            .try_fold(0u64, |acc, slot| acc.checked_add(slot.listing_fee_sats))
-            .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
-
-        if let Some(cap) = request.max_listing_fee_sats
-            && listing_fee_paid_sats > cap
-        {
-            return Err(custom_err_msg(format!(
-                "Listing fee {listing_fee_paid_sats} exceeds \
-                 max_listing_fee_sats {cap}"
-            )));
-        }
-
-        let entries: Vec<_> =
-            allocated.iter().map(|slot| slot.entry.clone()).collect();
-        let decision_ids_hex: Vec<String> = allocated
-            .iter()
-            .map(|slot| slot.decision_id.to_hex())
-            .collect();
-
-        let total_fee = Amount::from_sat(
-            listing_fee_paid_sats
-                .checked_add(request.tx_fee_sats)
-                .ok_or_else(|| custom_err_msg("total fee overflow"))?,
-        );
-
-        let tx = self
-            .app
-            .wallet
-            .claim_decision(
-                DecisionClaimInput {
-                    decision_type,
-                    decisions: entries,
-                },
-                total_fee,
-            )
-            .map_err(custom_err)?;
-
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(truthcoin_dc_app_rpc_api::DecisionClaimResponse {
-            txid,
-            decision_ids: decision_ids_hex,
-            listing_fee_paid_sats,
-        })
     }
 
     async fn decision_listing_fee(
@@ -1385,251 +1012,204 @@ impl RpcServer for RpcServerImpl {
         })
     }
 
-    async fn decision_fee_for_id(
+    async fn decision_status(
         &self,
-        decision_id_hex: String,
-    ) -> RpcResult<u64> {
-        use truthcoin_dc::state::decisions::DecisionId;
-        let decision_id = DecisionId::from_hex(&decision_id_hex)
-            .map_err(|e| custom_err_msg(format!("invalid decision id: {e}")))?;
-        self.node()
-            .fee_for_decision_id(decision_id)
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionPeriodStatus> {
+        self.decisions_status().await
+    }
+
+    async fn get_best_mainchain_block_hash(
+        &self,
+    ) -> RpcResult<Option<bitcoin::BlockHash>> {
+        let Some(sidechain_hash) =
+            self.node().try_get_tip().map_err(custom_err)?
+        else {
+            return Ok(None);
+        };
+        let block_hash = self
+            .node()
+            .get_best_main_verification(sidechain_hash)
+            .map_err(custom_err)?;
+        Ok(Some(block_hash))
+    }
+
+    async fn get_best_sidechain_block_hash(
+        &self,
+    ) -> RpcResult<Option<BlockHash>> {
+        self.node().try_get_tip().map_err(custom_err)
+    }
+
+    async fn get_block(&self, block_hash: BlockHash) -> RpcResult<Block> {
+        let block = self.node().get_block(block_hash).map_err(custom_err)?;
+        Ok(block)
+    }
+
+    async fn get_block_hash(
+        &self,
+        height: u32,
+    ) -> RpcResult<Option<BlockHash>> {
+        self.node().try_get_block_hash(height).map_err(custom_err)
+    }
+
+    async fn get_block_index(
+        &self,
+        block_hash: BlockHash,
+    ) -> RpcResult<BlockIndex> {
+        let body = self.node().get_body(block_hash).map_err(custom_err)?;
+        let txs = body
+            .transactions
+            .iter()
+            .map(|tx| {
+                let raw = borsh::to_vec(tx).map_err(custom_err)?;
+                Ok(BlockIndexTx {
+                    txid: tx.txid(),
+                    size: raw.len() as u64,
+                    raw: const_hex::encode(raw),
+                })
+            })
+            .collect::<RpcResult<_>>()?;
+        let events = self
+            .node()
+            .get_block_index_events(block_hash)
+            .map_err(custom_err)?;
+        Ok(BlockIndex {
+            txs,
+            deposits: events
+                .deposits
+                .into_iter()
+                .map(|(outpoint, output)| BlockIndexDeposit {
+                    outpoint,
+                    output,
+                })
+                .collect(),
+            bundle_spends: events
+                .bundle_spends
+                .into_iter()
+                .map(|(outpoint, m6id)| BlockIndexSpend { outpoint, m6id })
+                .collect(),
+        })
+    }
+
+    async fn get_bmm_inclusions(
+        &self,
+        block_hash: truthcoin_dc::types::BlockHash,
+    ) -> RpcResult<Vec<bitcoin::BlockHash>> {
+        self.app
+            .node
+            .get_bmm_inclusions(block_hash)
             .map_err(custom_err)
     }
 
-    async fn market_create(
+    async fn get_stxos(
         &self,
-        request: truthcoin_dc_app_rpc_api::MarketCreateRequest,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::MarketCreateResponse> {
-        use truthcoin_dc::state::decisions::{DecisionId, DecisionType};
-        use truthcoin_dc::types::ClaimDecisionPayload;
-        use truthcoin_dc_app_rpc_api::{
-            ClaimedDecisionInfo, DimensionInput, MarketCreateResponse,
-        };
-
-        if request.dimensions.is_empty() {
-            return Err(custom_err_msg(
-                "market_create requires at least one dimension",
-            ));
-        }
-
-        let mut slot_requests: Vec<SlotRequest> = Vec::new();
-        let mut existing_ids: Vec<Option<DecisionId>> = Vec::new();
-
-        for (i, dim) in request.dimensions.iter().enumerate() {
-            match dim {
-                DimensionInput::Existing { id } => {
-                    let decision_id =
-                        DecisionId::from_hex(id).map_err(|e| {
-                            custom_err_msg(format!(
-                                "Dimension {i}: invalid decision id {id}: {e}"
-                            ))
-                        })?;
-                    existing_ids.push(Some(decision_id));
-                }
-                DimensionInput::New {
-                    period_index,
-                    decision_type,
-                    header,
-                    description,
-                    option_0_label,
-                    option_1_label,
-                    option_labels,
-                    tags,
-                    min,
-                    max,
-                    increment,
-                } => {
-                    let ty = match decision_type.as_str() {
-                        "binary" => DecisionType::Binary,
-                        "scaled" => {
-                            let min_v = min.ok_or_else(|| {
-                                custom_err_msg(format!(
-                                    "Dimension {i}: scaled decision requires \
-                                     min"
-                                ))
-                            })?;
-                            let max_v = max.ok_or_else(|| {
-                                custom_err_msg(format!(
-                                    "Dimension {i}: scaled decision requires \
-                                     max"
-                                ))
-                            })?;
-                            let inc = increment.unwrap_or(1.0);
-                            DecisionType::Scaled {
-                                min: min_v,
-                                max: max_v,
-                                increment: inc,
-                            }
-                        }
-                        "category" => {
-                            let labels =
-                                option_labels.clone().ok_or_else(|| {
-                                    custom_err_msg(format!(
-                                        "Dimension {i}: category decision \
-                                         requires option_labels"
-                                    ))
-                                })?;
-                            if labels.len() < 2 {
-                                return Err(custom_err_msg(format!(
-                                    "Dimension {i}: category decision requires \
-                                     at least 2 option_labels"
-                                )));
-                            }
-                            DecisionType::Category { options: labels }
-                        }
-                        other => {
-                            return Err(custom_err_msg(format!(
-                                "Dimension {i}: unknown decision_type '{other}'"
-                            )));
-                        }
-                    };
-
-                    slot_requests.push(SlotRequest {
-                        period_index: *period_index,
-                        decision_type: ty,
-                        header: header.clone(),
-                        description: description.clone().unwrap_or_default(),
-                        option_0_label: option_0_label.clone(),
-                        option_1_label: option_1_label.clone(),
-                        option_labels: option_labels.clone(),
-                        tags: tags.clone(),
-                    });
-                    existing_ids.push(None);
-                }
-            }
-        }
-
-        let allocated =
-            allocate_decision_slots(&self.app.node, &slot_requests)?;
-
-        let total_listing_fee: u64 = allocated
-            .iter()
-            .try_fold(0u64, |acc, slot| acc.checked_add(slot.listing_fee_sats))
-            .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
-
-        if let Some(cap) = request.max_listing_fee_sats
-            && total_listing_fee > cap
-        {
-            return Err(custom_err_msg(format!(
-                "Listing fee {total_listing_fee} exceeds \
-                 max_listing_fee_sats {cap}"
-            )));
-        }
-
-        let mut resolved: Vec<(DecisionId, DecisionType)> =
-            Vec::with_capacity(request.dimensions.len());
-        let mut new_decisions_info: Vec<ClaimedDecisionInfo> = Vec::new();
-        let mut alloc_iter = allocated.iter();
-        for (i, dim) in request.dimensions.iter().enumerate() {
-            match dim {
-                DimensionInput::Existing { .. } => {
-                    let decision_id = existing_ids[i]
-                        .expect("existing dim must have resolved id");
-                    let entry = self
-                        .app
-                        .node
-                        .get_decision_entry(decision_id)
-                        .map_err(custom_err)?
-                        .ok_or_else(|| {
-                            custom_err_msg(format!(
-                                "Dimension {i}: decision {} does not exist",
-                                decision_id.to_hex()
-                            ))
-                        })?;
-                    let decision = entry.decision.ok_or_else(|| {
-                        custom_err_msg(format!(
-                            "Dimension {i}: decision {} was never claimed",
-                            decision_id.to_hex()
-                        ))
-                    })?;
-                    resolved
-                        .push((decision_id, decision.decision_type.clone()));
-                }
-                DimensionInput::New { period_index, .. } => {
-                    let slot = alloc_iter.next().expect(
-                        "allocated count must match new dimension count",
-                    );
-                    resolved
-                        .push((slot.decision_id, slot.decision_type.clone()));
-                    new_decisions_info.push(ClaimedDecisionInfo {
-                        id: slot.decision_id.to_hex(),
-                        period_index: *period_index,
-                        listing_fee_paid_sats: slot.listing_fee_sats,
-                    });
-                }
-            }
-        }
-
-        let dimensions_str = {
-            let inner: Vec<String> = resolved
-                .iter()
-                .map(|(id, ty)| match ty {
-                    DecisionType::Category { .. } => {
-                        format!("[{}]", id.to_hex())
-                    }
-                    _ => id.to_hex(),
-                })
-                .collect();
-            format!("[{}]", inner.join(","))
-        };
-
-        let category_option_counts: Vec<usize> = resolved
-            .iter()
-            .filter_map(|(_, ty)| match ty {
-                DecisionType::Category { options } => Some(options.len()),
-                _ => None,
-            })
-            .collect();
-        let category_option_counts = if category_option_counts.is_empty() {
-            None
-        } else {
-            Some(category_option_counts)
-        };
-
-        let new_claims: Vec<ClaimDecisionPayload> = allocated
-            .iter()
-            .map(|slot| ClaimDecisionPayload {
-                decision_type: slot.decision_type.clone(),
-                decisions: vec![slot.entry.clone()],
-            })
-            .collect();
-
-        let total_fee = Amount::from_sat(
-            total_listing_fee
-                .checked_add(request.tx_fee_sats)
-                .ok_or_else(|| custom_err_msg("total fee overflow"))?,
-        );
-
-        let (tx, market_id) = self
+        addresses: HashSet<Address>,
+    ) -> RpcResult<Vec<PointedSpentOutput>> {
+        let res = self
             .app
-            .wallet
-            .create_market(
-                CreateMarketInput {
-                    title: request.title,
-                    description: request.description,
-                    dimensions: dimensions_str,
-                    beta: request.beta,
-                    trading_fee: request.trading_fee,
-                    initial_liquidity: request.initial_liquidity,
-                    category_option_counts,
-                    tx_pow_hash_selector: request.tx_pow_hash_selector,
-                    tx_pow_ordering: request.tx_pow_ordering,
-                    tx_pow_difficulty: request.tx_pow_difficulty,
-                    new_claims,
-                },
-                total_fee,
-            )
+            .node
+            .get_stxos_by_addresses(&addresses)
+            .map_err(custom_err)?
+            .into_iter()
+            .map(|(outpoint, output)| PointedSpentOutput { outpoint, output })
+            .collect();
+        Ok(res)
+    }
+
+    async fn get_transaction(
+        &self,
+        txid: Txid,
+    ) -> RpcResult<Option<Transaction>> {
+        self.node().try_get_transaction(txid).map_err(custom_err)
+    }
+
+    async fn get_transaction_info(
+        &self,
+        txid: Txid,
+    ) -> RpcResult<Option<TxInfo>> {
+        let Some((filled_tx, txin)) = self
+            .app
+            .node
+            .try_get_filled_transaction(txid)
+            .map_err(custom_err)?
+        else {
+            return Ok(None);
+        };
+        let confirmations = match txin {
+            Some(txin) => {
+                let tip_height = self
+                    .app
+                    .node
+                    .try_get_tip_height()
+                    .map_err(custom_err)?
+                    .expect("Height should exist for tip");
+                let height = self
+                    .app
+                    .node
+                    .get_height(txin.block_hash)
+                    .map_err(custom_err)?;
+                Some(tip_height - height)
+            }
+            None => None,
+        };
+        let fee_sats = filled_tx
+            .transaction
+            .bitcoin_fee()
+            .map_err(custom_err)?
+            .unwrap()
+            .to_sat();
+        let res = TxInfo {
+            confirmations,
+            fee_sats,
+            txin,
+        };
+        Ok(Some(res))
+    }
+
+    async fn get_utxos(
+        &self,
+        addresses: HashSet<Address>,
+    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>> {
+        let res = self
+            .app
+            .node
+            .get_utxos_by_addresses(&addresses)
+            .map_err(custom_err)?
+            .into_iter()
+            .map(|(outpoint, output)| PointedOutput { outpoint, output })
+            .collect();
+        Ok(res)
+    }
+
+    async fn getblockcount(&self) -> RpcResult<u32> {
+        let height = self.node().try_get_tip_height().map_err(custom_err)?;
+        Ok(height.map_or(0, |h| h + 1))
+    }
+
+    async fn latest_failed_withdrawal_bundle_height(
+        &self,
+    ) -> RpcResult<Option<u32>> {
+        let height = self
+            .app
+            .node
+            .get_latest_failed_bundle_height()
             .map_err(custom_err)?;
+        Ok(height)
+    }
 
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-
-        Ok(MarketCreateResponse {
-            txid,
-            market_id: market_id.to_string(),
-            claimed_decisions: new_decisions_info,
-        })
+    async fn list_mempool(&self) -> RpcResult<Vec<MempoolTx>> {
+        let txs = self.node().get_all_transactions().map_err(custom_err)?;
+        txs.into_iter()
+            .map(|authorized| {
+                let tx = authorized.transaction;
+                let raw = borsh::to_vec(&tx).map_err(custom_err)?;
+                Ok(MempoolTx {
+                    txid: tx.txid(),
+                    size: raw.len() as u64,
+                    tx,
+                    raw: const_hex::encode(raw),
+                })
+            })
+            .collect()
     }
 
     async fn list_open_periods_with_pricing(
@@ -1699,6 +1279,35 @@ impl RpcServer for RpcServerImpl {
         Ok(summaries)
     }
 
+    async fn list_peers(&self) -> RpcResult<Vec<Peer>> {
+        let peers = self.node().get_active_peers();
+        Ok(peers)
+    }
+
+    async fn list_utxos(
+        &self,
+    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>> {
+        let utxos = self.node().get_all_utxos().map_err(custom_err)?;
+        let res = utxos
+            .into_iter()
+            .map(|(outpoint, output)| PointedOutput { outpoint, output })
+            .collect();
+        Ok(res)
+    }
+
+    async fn mainchain_sync_progress(
+        &self,
+    ) -> RpcResult<MainchainSyncProgress> {
+        Ok(self.node().mainchain_sync_progress())
+    }
+
+    async fn market_get(
+        &self,
+        market_id: String,
+    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::MarketData>> {
+        self.view_market(market_id).await
+    }
+
     async fn market_list(
         &self,
     ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::MarketSummary>> {
@@ -1711,7 +1320,7 @@ impl RpcServer for RpcServerImpl {
         let market_summaries = markets_with_states
             .into_iter()
             .map(|(market, computed_state)| {
-                let market_id_hex = hex::encode(market.id.as_bytes());
+                let market_id_hex = const_hex::encode(market.id.as_bytes());
 
                 truthcoin_dc_app_rpc_api::MarketSummary {
                     market_id: market_id_hex,
@@ -1724,7 +1333,7 @@ impl RpcServer for RpcServerImpl {
                         market.description.clone()
                     },
                     outcome_count: market.get_outcome_count(),
-                    state: format!("{computed_state:?}"),
+                    state: MarketStatus::from(computed_state),
                     volume_sats: market.total_volume_sats,
                     created_at_height: market.created_at_height,
                 }
@@ -1732,273 +1341,6 @@ impl RpcServer for RpcServerImpl {
             .collect();
 
         Ok(market_summaries)
-    }
-
-    async fn market_get(
-        &self,
-        market_id: String,
-    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::MarketData>> {
-        self.view_market(market_id).await
-    }
-
-    async fn market_buy(
-        &self,
-        request: MarketBuyRequest,
-    ) -> RpcResult<MarketBuyResponse> {
-        let market_id_struct = parse_market_id(&request.market_id)?;
-
-        let market = self
-            .node()
-            .get_market_by_id(&market_id_struct)
-            .map_err(custom_err)?
-            .ok_or_else(|| custom_err_msg("Market not found"))?;
-
-        // Use mempool shares and effective treasury (confirmed + pending
-        // amplify_beta deposits) for cost calculation. This ensures the tx
-        // is created with correct cost for its expected position in the
-        // mempool ordering.
-        let current_shares = self
-            .app
-            .node
-            .get_mempool_shares(&market_id_struct)
-            .map_err(custom_err)?
-            .unwrap_or_else(|| market.shares().clone());
-        let effective_b =
-            self.app.node.get_market_beta(&market).map_err(custom_err)?;
-
-        let mut new_shares = current_shares.clone();
-        new_shares[request.outcome_index] += request.shares_amount;
-        let trade_cost = trading::calculate_update_cost(
-            &current_shares,
-            &new_shares,
-            effective_b,
-        )
-        .map_err(|e| {
-            custom_err_msg(format!("LMSR cost calculation failed: {e:?}"))
-        })?;
-
-        let buy_cost =
-            trading::calculate_buy_cost(trade_cost, market.trading_fee())
-                .map_err(|e| {
-                    custom_err_msg(format!("Cost calculation failed: {e}"))
-                })?;
-        let trading_fee_sats = buy_cost.trading_fee_sats;
-        let cost_sats = buy_cost.total_cost_sats;
-
-        let new_price = trading::calculate_prices(&new_shares, effective_b)
-            .ok()
-            .and_then(|p| p.get(request.outcome_index).copied())
-            .unwrap_or(0.0);
-
-        if request.dry_run.unwrap_or(false) {
-            return Ok(MarketBuyResponse {
-                txid: None,
-                cost_sats,
-                trading_fee_sats,
-                new_price,
-            });
-        }
-
-        let max_cost = request.max_cost.ok_or_else(|| {
-            custom_err_msg("max_cost is required when dry_run is false")
-        })?;
-
-        if cost_sats > max_cost {
-            return Err(custom_err_msg(format!(
-                "Share cost {cost_sats} exceeds maximum cost {max_cost} (slippage protection)",
-            )));
-        }
-
-        let trader = self
-            .app
-            .wallet
-            .get_addresses()
-            .map_err(custom_err)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| custom_err_msg("Wallet has no addresses"))?;
-
-        let prev_block_hash = self
-            .app
-            .node
-            .try_get_tip()
-            .map_err(custom_err)?
-            .ok_or_else(|| custom_err_msg("Chain has no tip"))?;
-
-        let tx = self
-            .app
-            .wallet
-            .trade(
-                market_id_struct,
-                request.outcome_index,
-                request.shares_amount,
-                trader,
-                max_cost, // limit_sats = max_cost for buy
-                Some(market.tx_pow_config()),
-                prev_block_hash,
-            )
-            .map_err(custom_err)?;
-
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-
-        Ok(MarketBuyResponse {
-            txid: Some(txid.to_string()),
-            cost_sats,
-            trading_fee_sats,
-            new_price,
-        })
-    }
-
-    async fn market_sell(
-        &self,
-        request: MarketSellRequest,
-    ) -> RpcResult<MarketSellResponse> {
-        let market_id_struct = parse_market_id(&request.market_id)?;
-
-        let market = self
-            .node()
-            .get_market_by_id(&market_id_struct)
-            .map_err(custom_err)?
-            .ok_or_else(|| custom_err_msg("Market not found"))?;
-
-        let seller_positions = self
-            .node()
-            .get_user_share_positions(&request.seller_address)
-            .map_err(custom_err)?;
-
-        let owned_shares = seller_positions
-            .iter()
-            .find(|(mid, oidx, _)| {
-                *mid == market_id_struct
-                    && *oidx == request.outcome_index as u32
-            })
-            .map(|(_, _, shares)| *shares)
-            .unwrap_or(0);
-
-        if owned_shares < request.shares_amount {
-            return Err(custom_err_msg(format!(
-                "Insufficient shares: address {} owns {} but trying to sell {}",
-                request.seller_address, owned_shares, request.shares_amount
-            )));
-        }
-
-        // Use mempool shares and effective treasury (confirmed + pending
-        // amplify_beta deposits) for proceeds calculation.
-        let current_shares = self
-            .app
-            .node
-            .get_mempool_shares(&market_id_struct)
-            .map_err(custom_err)?
-            .unwrap_or_else(|| market.shares().clone());
-        let effective_b =
-            self.app.node.get_market_beta(&market).map_err(custom_err)?;
-
-        // Calculate proceeds: C(current_shares) - C(new_shares)
-        let mut new_shares = current_shares.clone();
-        new_shares[request.outcome_index] -= request.shares_amount;
-
-        // Calculate cost difference: old_cost - new_cost = proceeds (positive when selling)
-        let old_cost =
-            trading::calculate_treasury(&current_shares, effective_b).map_err(
-                |e| custom_err_msg(format!("Cost calculation error: {e:?}")),
-            )?;
-        let new_cost = trading::calculate_treasury(&new_shares, effective_b)
-            .map_err(|e| {
-                custom_err_msg(format!("Cost calculation error: {e:?}"))
-            })?;
-
-        let proceeds_btc = old_cost - new_cost;
-
-        let sell_proceeds = trading::calculate_sell_proceeds(
-            proceeds_btc,
-            market.trading_fee(),
-        )
-        .map_err(|e| {
-            custom_err_msg(format!("Proceeds calculation failed: {e}"))
-        })?;
-        let proceeds_sats = sell_proceeds.gross_proceeds_sats;
-        let trading_fee_sats = sell_proceeds.trading_fee_sats;
-        let net_proceeds_sats = sell_proceeds.net_proceeds_sats;
-
-        let new_price = trading::calculate_prices(&new_shares, effective_b)
-            .ok()
-            .and_then(|p| p.get(request.outcome_index).copied())
-            .unwrap_or(0.0);
-
-        if request.dry_run.unwrap_or(false) {
-            return Ok(MarketSellResponse {
-                txid: None,
-                proceeds_sats,
-                trading_fee_sats,
-                net_proceeds_sats,
-                new_price,
-            });
-        }
-
-        let min_proceeds = request.min_proceeds.unwrap_or(0);
-
-        if net_proceeds_sats < min_proceeds {
-            return Err(custom_err_msg(format!(
-                "Net proceeds {net_proceeds_sats} below minimum {min_proceeds} (slippage protection)",
-            )));
-        }
-
-        let prev_block_hash = self
-            .app
-            .node
-            .try_get_tip()
-            .map_err(custom_err)?
-            .ok_or_else(|| custom_err_msg("Chain has no tip"))?;
-
-        let tx = self
-            .app
-            .wallet
-            .trade(
-                market_id_struct,
-                request.outcome_index,
-                -request.shares_amount, // Negative for sell
-                request.seller_address,
-                min_proceeds,
-                Some(market.tx_pow_config()),
-                prev_block_hash,
-            )
-            .map_err(custom_err)?;
-
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-
-        Ok(MarketSellResponse {
-            txid: Some(txid.to_string()),
-            proceeds_sats,
-            trading_fee_sats,
-            net_proceeds_sats,
-            new_price,
-        })
-    }
-
-    async fn market_amplify_beta(
-        &self,
-        request: MarketAmplifyBetaRequest,
-    ) -> RpcResult<String> {
-        let market_id = parse_market_id(&request.market_id)?;
-        let market = self
-            .node()
-            .get_market_by_id(&market_id)
-            .map_err(custom_err)?
-            .ok_or_else(|| custom_err_msg("Market not found"))?;
-        let tx = self
-            .app
-            .wallet
-            .amplify_beta(
-                market_id,
-                request.amount_sats,
-                market.creator_address,
-            )
-            .map_err(custom_err)?;
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(txid.to_string())
     }
 
     async fn market_positions(
@@ -2028,216 +1370,44 @@ impl RpcServer for RpcServerImpl {
         }
     }
 
-    async fn vote_voter(
+    async fn pending_withdrawal_bundle(
         &self,
-        address: Address,
-    ) -> RpcResult<Option<VoterInfoFull>> {
-        let current_timestamp =
-            self.node().get_mainchain_timestamp().map_err(custom_err)?;
-        let current_height = self
-            .node()
-            .try_get_tip_height()
-            .map_err(custom_err)?
-            .unwrap_or(0);
-        let config = self.node().get_decision_config();
-        let decisions_db = self.node().get_decisions_db();
-
-        let rotxn = self.node().read_txn().map_err(custom_err)?;
-
-        let votecoin_balance = self
-            .app
+    ) -> RpcResult<Option<WithdrawalBundle>> {
+        self.app
             .node
-            .reputation()
-            .get_reputation(&rotxn, &address)
-            .map_err(custom_err)?;
-
-        let votes = self
-            .app
-            .node
-            .voting_state()
-            .databases()
-            .get_votes_by_voter(&rotxn, address)
-            .map_err(custom_err)?;
-
-        let genesis_ts_voter = self
-            .node()
-            .get_genesis_timestamp()
-            .map_err(custom_err)?
-            .unwrap_or(0);
-
-        let active_period_opt = self
-            .app
-            .node
-            .voting_state()
-            .get_active_period(
-                &rotxn,
-                current_timestamp,
-                current_height,
-                config,
-                decisions_db,
-                genesis_ts_voter,
-            )
-            .map_err(custom_err)?;
-
-        let mut periods_active: std::collections::HashSet<u32> =
-            std::collections::HashSet::new();
-        for key in votes.keys() {
-            periods_active.insert(key.period_id.as_u32());
-        }
-
-        let current_period_participation =
-            if let Some(period) = active_period_opt {
-                let period_votes: Vec<_> = votes
-                    .iter()
-                    .filter(|(key, _)| key.period_id == period.id)
-                    .collect();
-
-                let votes_cast = period_votes.len() as u32;
-                let decisions_available = period.decision_ids.len() as u32;
-                let participation_rate = if decisions_available > 0 {
-                    votes_cast as f64 / decisions_available as f64
-                } else {
-                    0.0
-                };
-
-                Some(ParticipationStats {
-                    period_id: period.id.as_u32(),
-                    votes_cast,
-                    decisions_available,
-                    participation_rate,
-                })
-            } else {
-                None
-            };
-
-        Ok(Some(VoterInfoFull {
-            address: address.to_string(),
-            votecoin_balance,
-            total_votes: votes.len() as u64,
-            periods_active: periods_active.len() as u32,
-            is_active: !votes.is_empty(),
-            current_period_participation,
-        }))
+            .get_pending_withdrawal_bundle()
+            .map_err(custom_err)
     }
 
-    async fn vote_voters(&self) -> RpcResult<Vec<VoterInfo>> {
-        let rotxn = self.node().read_txn().map_err(custom_err)?;
-
-        let reputations = self
-            .app
-            .node
-            .reputation()
-            .get_all_reputations(&rotxn)
-            .map_err(custom_err)?;
-
-        let mut voter_infos = Vec::with_capacity(reputations.len());
-
-        for (voter_address, votecoin_balance) in reputations {
-            let votes = self
-                .app
-                .node
-                .voting_state()
-                .databases()
-                .get_votes_by_voter(&rotxn, voter_address)
-                .map_err(custom_err)?;
-
-            voter_infos.push(VoterInfo {
-                address: voter_address.to_string(),
-                votecoin_balance,
-                total_votes: votes.len() as u64,
-                is_active: !votes.is_empty(),
-            });
-        }
-
-        Ok(voter_infos)
-    }
-
-    async fn vote_submit(
-        &self,
-        votes: Vec<truthcoin_dc_app_rpc_api::BallotItem>,
-        fee_sats: u64,
-    ) -> RpcResult<String> {
-        use truthcoin_dc::types::BallotItem;
-
-        let request = SubmitBallotRequest { votes, fee_sats };
-
-        if request.votes.is_empty() {
-            return Err(custom_err_msg("Ballot cannot be empty"));
-        }
-
-        let mut batch_items = Vec::new();
-        let mut period_id: Option<u32> = None;
-
-        for vote in request.votes {
-            let decision_id = DecisionValidator::parse_decision_id_from_hex(
-                &vote.decision_id,
-            )
-            .map_err(|e| custom_err_msg(format!("Invalid decision ID: {e}")))?;
-
-            let vote_period = decision_id.voting_period();
-
-            match period_id {
-                None => period_id = Some(vote_period),
-                Some(p) if p != vote_period => {
-                    return Err(custom_err_msg(format!(
-                        "All votes in ballot must be for \
-                         same period. Expected {}, got {} \
-                         for decision {}",
-                        p, vote_period, vote.decision_id
-                    )));
-                }
-                _ => {}
-            }
-
-            let entry = self
-                .node()
-                .get_decision_entry(decision_id)
-                .map_err(custom_err)?
-                .ok_or_else(|| {
-                    custom_err_msg(format!(
-                        "Decision {} does not exist",
-                        vote.decision_id
-                    ))
-                })?;
-
-            let decision = entry.decision.ok_or_else(|| {
+    async fn push_tx(&self, tx_hex: String) -> RpcResult<Txid> {
+        let bytes = const_hex::decode(&tx_hex)
+            .map_err(|e| custom_err_msg(format!("invalid hex: {e}")))?;
+        let tx: AuthorizedTransaction =
+            bincode::deserialize(&bytes).map_err(|e| {
                 custom_err_msg(format!(
-                    "Decision {} has no decision claimed",
-                    vote.decision_id
+                    "failed to deserialize AuthorizedTransaction: {e}"
                 ))
             })?;
+        let txid = tx.transaction.txid();
+        self.app.node.submit_transaction(&tx).map_err(custom_err)?;
+        Ok(txid)
+    }
 
-            let normalized_value = decision
-                .validate_and_normalize(vote.vote_value)
-                .map_err(|e| custom_err_msg(format!("{e}")))?;
+    async fn sidechain_wealth_sats(&self) -> RpcResult<u64> {
+        let sidechain_wealth =
+            self.node().get_sidechain_wealth().map_err(custom_err)?;
+        Ok(sidechain_wealth.to_sat())
+    }
 
-            batch_items.push(BallotItem {
-                decision_id_bytes: decision_id.as_bytes(),
-                vote_value: normalized_value,
-            });
-        }
-
-        let period_id = period_id.unwrap();
-        let fee = bitcoin::Amount::from_sat(request.fee_sats);
-
-        tracing::info!(
-            "vote_submit: Voter attempting to submit {} \
-             votes for period {}",
-            batch_items.len(),
-            period_id
-        );
-
-        let tx = self
+    async fn submit_transaction(
+        &self,
+        transaction: AuthorizedTransaction,
+    ) -> RpcResult<Txid> {
+        let () = self
             .app
-            .wallet
-            .submit_ballot(batch_items, period_id, fee)
+            .submit_transaction(&transaction)
             .map_err(custom_err)?;
-
-        let txid = tx.txid();
-
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-
-        Ok(format!("{txid}"))
+        Ok(transaction.transaction.txid())
     }
 
     async fn vote_list(&self, filter: VoteFilter) -> RpcResult<Vec<VoteInfo>> {
@@ -2617,6 +1787,130 @@ impl RpcServer for RpcServerImpl {
         }))
     }
 
+    async fn vote_voter(
+        &self,
+        address: Address,
+    ) -> RpcResult<Option<VoterInfoFull>> {
+        let current_timestamp =
+            self.node().get_mainchain_timestamp().map_err(custom_err)?;
+        let current_height = self
+            .node()
+            .try_get_tip_height()
+            .map_err(custom_err)?
+            .unwrap_or(0);
+        let config = self.node().get_decision_config();
+        let decisions_db = self.node().get_decisions_db();
+
+        let rotxn = self.node().read_txn().map_err(custom_err)?;
+
+        let votecoin_balance = self
+            .app
+            .node
+            .reputation()
+            .get_reputation(&rotxn, &address)
+            .map_err(custom_err)?;
+
+        let votes = self
+            .app
+            .node
+            .voting_state()
+            .databases()
+            .get_votes_by_voter(&rotxn, address)
+            .map_err(custom_err)?;
+
+        let genesis_ts_voter = self
+            .node()
+            .get_genesis_timestamp()
+            .map_err(custom_err)?
+            .unwrap_or(0);
+
+        let active_period_opt = self
+            .app
+            .node
+            .voting_state()
+            .get_active_period(
+                &rotxn,
+                current_timestamp,
+                current_height,
+                config,
+                decisions_db,
+                genesis_ts_voter,
+            )
+            .map_err(custom_err)?;
+
+        let mut periods_active: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+        for key in votes.keys() {
+            periods_active.insert(key.period_id.as_u32());
+        }
+
+        let current_period_participation =
+            if let Some(period) = active_period_opt {
+                let period_votes: Vec<_> = votes
+                    .iter()
+                    .filter(|(key, _)| key.period_id == period.id)
+                    .collect();
+
+                let votes_cast = period_votes.len() as u32;
+                let decisions_available = period.decision_ids.len() as u32;
+                let participation_rate = if decisions_available > 0 {
+                    votes_cast as f64 / decisions_available as f64
+                } else {
+                    0.0
+                };
+
+                Some(ParticipationStats {
+                    period_id: period.id.as_u32(),
+                    votes_cast,
+                    decisions_available,
+                    participation_rate,
+                })
+            } else {
+                None
+            };
+
+        Ok(Some(VoterInfoFull {
+            address: address.to_string(),
+            votecoin_balance,
+            total_votes: votes.len() as u64,
+            periods_active: periods_active.len() as u32,
+            is_active: !votes.is_empty(),
+            current_period_participation,
+        }))
+    }
+
+    async fn vote_voters(&self) -> RpcResult<Vec<VoterInfo>> {
+        let rotxn = self.node().read_txn().map_err(custom_err)?;
+
+        let reputations = self
+            .app
+            .node
+            .reputation()
+            .get_all_reputations(&rotxn)
+            .map_err(custom_err)?;
+
+        let mut voter_infos = Vec::with_capacity(reputations.len());
+
+        for (voter_address, votecoin_balance) in reputations {
+            let votes = self
+                .app
+                .node
+                .voting_state()
+                .databases()
+                .get_votes_by_voter(&rotxn, voter_address)
+                .map_err(custom_err)?;
+
+            voter_infos.push(VoterInfo {
+                address: voter_address.to_string(),
+                votecoin_balance,
+                total_votes: votes.len() as u64,
+                is_active: !votes.is_empty(),
+            });
+        }
+
+        Ok(voter_infos)
+    }
+
     async fn votecoin_balance(&self, address: Address) -> RpcResult<f64> {
         let rotxn = self.node().read_txn().map_err(custom_err)?;
 
@@ -2629,20 +1923,1032 @@ impl RpcServer for RpcServerImpl {
 
         Ok(votecoin_balance)
     }
+}
 
-    async fn push_tx(&self, tx_hex: String) -> RpcResult<Txid> {
-        use truthcoin_dc::types::AuthorizedTransaction;
-        let bytes = hex::decode(&tx_hex)
-            .map_err(|e| custom_err_msg(format!("invalid hex: {e}")))?;
-        let tx: AuthorizedTransaction =
-            bincode::deserialize(&bytes).map_err(|e| {
+#[async_trait]
+impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
+    async fn get_block_template(&self) -> RpcResult<GetBlockTemplateResponse> {
+        let template = self
+            .app
+            .local_pool
+            .spawn_pinned({
+                let app = self.app.clone();
+                move || async move {
+                    app.get_block_template().await.map_err(custom_err)
+                }
+            })
+            .await
+            .unwrap()?;
+        Ok(GetBlockTemplateResponse {
+            critical_hash: template.header.hash(),
+            block: Block {
+                header: template.header,
+                body: template.body,
+                height: template.height,
+            },
+            fees_sats: template.fees.to_sat(),
+        })
+    }
+
+    async fn get_new_address(&self) -> RpcResult<Address> {
+        self.app.wallet.get_new_address().map_err(custom_err)
+    }
+
+    async fn get_voter_address(&self) -> RpcResult<Address> {
+        self.app.wallet.voter_address().map_err(custom_err)
+    }
+
+    async fn get_new_encryption_key(&self) -> RpcResult<EncryptionPubKey> {
+        self.app.wallet.get_new_encryption_key().map_err(custom_err)
+    }
+
+    async fn get_new_verifying_key(&self) -> RpcResult<VerifyingKey> {
+        self.app.wallet.get_new_verifying_key().map_err(custom_err)
+    }
+
+    async fn get_wallet_addresses(&self) -> RpcResult<Vec<Address>> {
+        let addrs = self.app.wallet.get_addresses().map_err(custom_err)?;
+        let mut res: Vec<_> = addrs.into_iter().collect();
+        res.sort_by_key(|addr| addr.as_base58());
+        Ok(res)
+    }
+
+    async fn get_wallet_utxos(
+        &self,
+    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>> {
+        let utxos = self.app.wallet.get_utxos().map_err(custom_err)?;
+        let utxos = utxos
+            .into_iter()
+            .map(|(outpoint, output)| PointedOutput { outpoint, output })
+            .collect();
+        Ok(utxos)
+    }
+
+    async fn mine(&self, fee: Option<u64>) -> RpcResult<()> {
+        let fee = fee.map(bitcoin::Amount::from_sat);
+        self.app
+            .local_pool
+            .spawn_pinned({
+                let app = self.app.clone();
+                move || async move { app.mine(fee).await.map_err(custom_err) }
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn my_unconfirmed_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
+        let addresses = self.app.wallet.get_addresses().map_err(custom_err)?;
+        let utxos = self
+            .app
+            .node
+            .get_unconfirmed_utxos_by_addresses(&addresses)
+            .map_err(custom_err)?
+            .into_iter()
+            .map(|(outpoint, output)| PointedOutput { outpoint, output })
+            .collect();
+        Ok(utxos)
+    }
+
+    async fn set_seed_from_mnemonic(&self, mnemonic: String) -> RpcResult<()> {
+        self.app
+            .wallet
+            .set_seed_from_mnemonic(mnemonic.as_str())
+            .map_err(custom_err)
+    }
+
+    async fn sign_arbitrary_msg(
+        &self,
+        verifying_key: VerifyingKey,
+        msg: String,
+    ) -> RpcResult<Signature> {
+        self.app
+            .wallet
+            .sign_arbitrary_msg(rand::rng(), &verifying_key, &msg)
+            .map_err(custom_err)
+    }
+
+    async fn sign_arbitrary_msg_as_addr(
+        &self,
+        address: Address,
+        msg: String,
+    ) -> RpcResult<Authorization> {
+        self.app
+            .wallet
+            .sign_arbitrary_msg_as_addr(rand::rng(), &address, &msg)
+            .map_err(custom_err)
+    }
+
+    async fn sign_transaction(
+        &self,
+        transaction: Transaction,
+        broadcast: Option<bool>,
+    ) -> RpcResult<AuthorizedTransaction> {
+        let authorized = self
+            .app
+            .wallet
+            .authorize(rand::rng(), transaction)
+            .map_err(custom_err)?;
+        if let Some(true) = broadcast {
+            let () = self
+                .app
+                .submit_transaction(&authorized)
+                .map_err(custom_err)?;
+        }
+        Ok(authorized)
+    }
+
+    async fn transfer(
+        &self,
+        dest: Address,
+        value_sats: u64,
+        fee_sats: u64,
+        memo: Option<String>,
+    ) -> RpcResult<Txid> {
+        let memo = match memo {
+            None => None,
+            Some(memo) => {
+                let hex = const_hex::decode(memo).map_err(custom_err)?;
+                Some(hex)
+            }
+        };
+        let tx = self
+            .app
+            .wallet
+            .create_transfer(
+                dest,
+                Amount::from_sat(value_sats),
+                Amount::from_sat(fee_sats),
+                memo,
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    async fn transfer_many(
+        &self,
+        dests: TransferDests,
+        fee_sats: u64,
+    ) -> RpcResult<Txid> {
+        let dests = dests
+            .0
+            .into_iter()
+            .map(|(address, value_sats)| {
+                (address, Amount::from_sat(value_sats))
+            })
+            .collect();
+        let tx = self
+            .app
+            .wallet
+            .create_transfer_many(&dests, Amount::from_sat(fee_sats))
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    async fn transfer_votecoin(
+        &self,
+        dest: Address,
+        amount: f64,
+        fee_sats: u64,
+        memo: Option<String>,
+    ) -> RpcResult<Txid> {
+        let memo = match memo {
+            None => None,
+            Some(memo) => {
+                let hex = const_hex::decode(memo).map_err(custom_err)?;
+                Some(hex)
+            }
+        };
+        let tx = self
+            .app
+            .wallet
+            .transfer_reputation(dest, amount, Amount::from_sat(fee_sats), memo)
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    async fn verify_signature(
+        &self,
+        signature: Signature,
+        verifying_key: VerifyingKey,
+        dst: Dst,
+        msg: String,
+    ) -> RpcResult<bool> {
+        let res = authorization::verify(
+            signature,
+            &verifying_key,
+            dst,
+            msg.as_bytes(),
+        );
+        Ok(res)
+    }
+
+    async fn withdraw(
+        &self,
+        mainchain_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
+        amount_sats: u64,
+        fee_sats: u64,
+        mainchain_fee_sats: u64,
+    ) -> RpcResult<Txid> {
+        let tx = self
+            .app
+            .wallet
+            .create_withdrawal(
+                mainchain_address,
+                Amount::from_sat(amount_sats),
+                Amount::from_sat(mainchain_fee_sats),
+                Amount::from_sat(fee_sats),
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    async fn bitcoin_balance(&self) -> RpcResult<Balance> {
+        self.app.wallet.get_bitcoin_balance().map_err(custom_err)
+    }
+
+    async fn create_deposit(
+        &self,
+        address: Address,
+        value_sats: u64,
+        fee_sats: u64,
+    ) -> RpcResult<bitcoin::Txid> {
+        let tx = self
+            .app
+            .wallet
+            .create_transfer(
+                address,
+                bitcoin::Amount::from_sat(value_sats),
+                bitcoin::Amount::from_sat(fee_sats),
+                None,
+            )
+            .map_err(custom_err)?;
+
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+
+        let bitcoin_txid = bitcoin::Txid::from_raw_hash(
+            bitcoin::hashes::Hash::from_byte_array(txid.0),
+        );
+        Ok(bitcoin_txid)
+    }
+
+    async fn decrypt_msg(
+        &self,
+        encryption_pubkey: EncryptionPubKey,
+        ciphertext: String,
+    ) -> RpcResult<String> {
+        let ciphertext_bytes = const_hex::decode(&ciphertext).map_err(|e| {
+            ErrorObject::owned(
+                -32602,
+                "Invalid hex string",
+                Some(e.to_string()),
+            )
+        })?;
+
+        let decrypted_bytes = self
+            .app
+            .wallet
+            .decrypt_msg(&encryption_pubkey, &ciphertext_bytes)
+            .map_err(custom_err)?;
+
+        Ok(const_hex::encode(decrypted_bytes))
+    }
+
+    async fn encrypt_msg(
+        &self,
+        _encryption_pubkey: EncryptionPubKey,
+        _msg: String,
+    ) -> RpcResult<String> {
+        Err(ErrorObject::owned(
+            -32601,
+            "Encryption not implemented",
+            Some("Use external encryption tools"),
+        ))
+    }
+
+    async fn format_deposit_address(
+        &self,
+        address: Address,
+    ) -> RpcResult<String> {
+        Ok(format!("{address}"))
+    }
+
+    async fn generate_mnemonic(&self) -> RpcResult<String> {
+        let mnemonic = bip39::Mnemonic::new(
+            bip39::MnemonicType::Words12,
+            bip39::Language::English,
+        );
+        Ok(mnemonic.to_string())
+    }
+
+    async fn refresh_wallet(&self) -> RpcResult<()> {
+        self.app.update().map_err(custom_err)
+    }
+
+    async fn decision_claim(
+        &self,
+        request: truthcoin_dc_app_rpc_api::DecisionClaimRequest,
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionClaimResponse> {
+        use truthcoin_dc::state::decisions::DecisionType;
+
+        let decision_type = match request.decision_type.as_str() {
+            "binary" => DecisionType::Binary,
+            "scaled" => {
+                let min_val = request.min.ok_or_else(|| {
+                    custom_err_msg("min is required for scaled decisions")
+                })?;
+                let max_val = request.max.ok_or_else(|| {
+                    custom_err_msg("max is required for scaled decisions")
+                })?;
+                let increment = request.increment.unwrap_or(1.0);
+                DecisionType::Scaled {
+                    min: min_val,
+                    max: max_val,
+                    increment,
+                }
+            }
+            "category" => {
+                if request.decisions.len() != 1 {
+                    return Err(custom_err_msg(
+                        "Category claim must have exactly \
+                         1 decision entry",
+                    ));
+                }
+                let labels = request.decisions[0]
+                    .option_labels
+                    .clone()
+                    .unwrap_or_default();
+                if labels.len() < 2 {
+                    return Err(custom_err_msg(
+                        "Category claim requires at least \
+                         2 option labels",
+                    ));
+                }
+                DecisionType::Category { options: labels }
+            }
+            other => {
+                return Err(custom_err_msg(format!(
+                    "Unknown decision_type: '{other}'. \
+                     Expected 'binary', 'scaled', or 'category'"
+                )));
+            }
+        };
+
+        let slot_requests: Vec<SlotRequest> = request
+            .decisions
+            .iter()
+            .map(|item| SlotRequest {
+                period_index: item.period_index,
+                decision_type: decision_type.clone(),
+                header: item.header.clone(),
+                description: item.description.clone().unwrap_or_default(),
+                option_0_label: item.option_0_label.clone(),
+                option_1_label: item.option_1_label.clone(),
+                option_labels: item.option_labels.clone(),
+                tags: item.tags.clone(),
+            })
+            .collect();
+
+        let allocated =
+            allocate_decision_slots(&self.app.node, &slot_requests)?;
+
+        let listing_fee_paid_sats: u64 = allocated
+            .iter()
+            .try_fold(0u64, |acc, slot| acc.checked_add(slot.listing_fee_sats))
+            .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
+
+        if let Some(cap) = request.max_listing_fee_sats
+            && listing_fee_paid_sats > cap
+        {
+            return Err(custom_err_msg(format!(
+                "Listing fee {listing_fee_paid_sats} exceeds \
+                 max_listing_fee_sats {cap}"
+            )));
+        }
+
+        let entries: Vec<_> =
+            allocated.iter().map(|slot| slot.entry.clone()).collect();
+        let decision_ids_hex: Vec<String> = allocated
+            .iter()
+            .map(|slot| slot.decision_id.to_hex())
+            .collect();
+
+        let total_fee = Amount::from_sat(
+            listing_fee_paid_sats
+                .checked_add(request.tx_fee_sats)
+                .ok_or_else(|| custom_err_msg("total fee overflow"))?,
+        );
+
+        let tx = self
+            .app
+            .wallet
+            .claim_decision(
+                DecisionClaimInput {
+                    decision_type,
+                    decisions: entries,
+                },
+                total_fee,
+            )
+            .map_err(custom_err)?;
+
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(truthcoin_dc_app_rpc_api::DecisionClaimResponse {
+            txid,
+            decision_ids: decision_ids_hex,
+            listing_fee_paid_sats,
+        })
+    }
+
+    async fn market_create(
+        &self,
+        request: truthcoin_dc_app_rpc_api::MarketCreateRequest,
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::MarketCreateResponse> {
+        use truthcoin_dc::state::decisions::{DecisionId, DecisionType};
+        use truthcoin_dc::types::ClaimDecisionPayload;
+        use truthcoin_dc_app_rpc_api::{
+            ClaimedDecisionInfo, DimensionInput, MarketCreateResponse,
+        };
+
+        if request.dimensions.is_empty() {
+            return Err(custom_err_msg(
+                "market_create requires at least one dimension",
+            ));
+        }
+
+        let mut slot_requests: Vec<SlotRequest> = Vec::new();
+        let mut existing_ids: Vec<Option<DecisionId>> = Vec::new();
+
+        for (i, dim) in request.dimensions.iter().enumerate() {
+            match dim {
+                DimensionInput::Existing { id } => {
+                    let decision_id =
+                        DecisionId::from_hex(id).map_err(|e| {
+                            custom_err_msg(format!(
+                                "Dimension {i}: invalid decision id {id}: {e}"
+                            ))
+                        })?;
+                    existing_ids.push(Some(decision_id));
+                }
+                DimensionInput::New {
+                    period_index,
+                    decision_type,
+                    header,
+                    description,
+                    option_0_label,
+                    option_1_label,
+                    option_labels,
+                    tags,
+                    min,
+                    max,
+                    increment,
+                } => {
+                    let ty = match decision_type.as_str() {
+                        "binary" => DecisionType::Binary,
+                        "scaled" => {
+                            let min_v = min.ok_or_else(|| {
+                                custom_err_msg(format!(
+                                    "Dimension {i}: scaled decision requires \
+                                     min"
+                                ))
+                            })?;
+                            let max_v = max.ok_or_else(|| {
+                                custom_err_msg(format!(
+                                    "Dimension {i}: scaled decision requires \
+                                     max"
+                                ))
+                            })?;
+                            let inc = increment.unwrap_or(1.0);
+                            DecisionType::Scaled {
+                                min: min_v,
+                                max: max_v,
+                                increment: inc,
+                            }
+                        }
+                        "category" => {
+                            let labels =
+                                option_labels.clone().ok_or_else(|| {
+                                    custom_err_msg(format!(
+                                        "Dimension {i}: category decision \
+                                         requires option_labels"
+                                    ))
+                                })?;
+                            if labels.len() < 2 {
+                                return Err(custom_err_msg(format!(
+                                    "Dimension {i}: category decision requires \
+                                     at least 2 option_labels"
+                                )));
+                            }
+                            DecisionType::Category { options: labels }
+                        }
+                        other => {
+                            return Err(custom_err_msg(format!(
+                                "Dimension {i}: unknown decision_type '{other}'"
+                            )));
+                        }
+                    };
+
+                    slot_requests.push(SlotRequest {
+                        period_index: *period_index,
+                        decision_type: ty,
+                        header: header.clone(),
+                        description: description.clone().unwrap_or_default(),
+                        option_0_label: option_0_label.clone(),
+                        option_1_label: option_1_label.clone(),
+                        option_labels: option_labels.clone(),
+                        tags: tags.clone(),
+                    });
+                    existing_ids.push(None);
+                }
+            }
+        }
+
+        let allocated =
+            allocate_decision_slots(&self.app.node, &slot_requests)?;
+
+        let total_listing_fee: u64 = allocated
+            .iter()
+            .try_fold(0u64, |acc, slot| acc.checked_add(slot.listing_fee_sats))
+            .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
+
+        if let Some(cap) = request.max_listing_fee_sats
+            && total_listing_fee > cap
+        {
+            return Err(custom_err_msg(format!(
+                "Listing fee {total_listing_fee} exceeds \
+                 max_listing_fee_sats {cap}"
+            )));
+        }
+
+        let mut resolved: Vec<(DecisionId, DecisionType)> =
+            Vec::with_capacity(request.dimensions.len());
+        let mut new_decisions_info: Vec<ClaimedDecisionInfo> = Vec::new();
+        let mut alloc_iter = allocated.iter();
+        for (i, dim) in request.dimensions.iter().enumerate() {
+            match dim {
+                DimensionInput::Existing { .. } => {
+                    let decision_id = existing_ids[i]
+                        .expect("existing dim must have resolved id");
+                    let entry = self
+                        .app
+                        .node
+                        .get_decision_entry(decision_id)
+                        .map_err(custom_err)?
+                        .ok_or_else(|| {
+                            custom_err_msg(format!(
+                                "Dimension {i}: decision {} does not exist",
+                                decision_id.to_hex()
+                            ))
+                        })?;
+                    let decision = entry.decision.ok_or_else(|| {
+                        custom_err_msg(format!(
+                            "Dimension {i}: decision {} was never claimed",
+                            decision_id.to_hex()
+                        ))
+                    })?;
+                    resolved
+                        .push((decision_id, decision.decision_type.clone()));
+                }
+                DimensionInput::New { period_index, .. } => {
+                    let slot = alloc_iter.next().expect(
+                        "allocated count must match new dimension count",
+                    );
+                    resolved
+                        .push((slot.decision_id, slot.decision_type.clone()));
+                    new_decisions_info.push(ClaimedDecisionInfo {
+                        id: slot.decision_id.to_hex(),
+                        period_index: *period_index,
+                        listing_fee_paid_sats: slot.listing_fee_sats,
+                    });
+                }
+            }
+        }
+
+        let dimensions_str = {
+            let inner: Vec<String> = resolved
+                .iter()
+                .map(|(id, ty)| match ty {
+                    DecisionType::Category { .. } => {
+                        format!("[{}]", id.to_hex())
+                    }
+                    _ => id.to_hex(),
+                })
+                .collect();
+            format!("[{}]", inner.join(","))
+        };
+
+        let category_option_counts: Vec<usize> = resolved
+            .iter()
+            .filter_map(|(_, ty)| match ty {
+                DecisionType::Category { options } => Some(options.len()),
+                _ => None,
+            })
+            .collect();
+        let category_option_counts = if category_option_counts.is_empty() {
+            None
+        } else {
+            Some(category_option_counts)
+        };
+
+        let new_claims: Vec<ClaimDecisionPayload> = allocated
+            .iter()
+            .map(|slot| ClaimDecisionPayload {
+                decision_type: slot.decision_type.clone(),
+                decisions: vec![slot.entry.clone()],
+            })
+            .collect();
+
+        let total_fee = Amount::from_sat(
+            total_listing_fee
+                .checked_add(request.tx_fee_sats)
+                .ok_or_else(|| custom_err_msg("total fee overflow"))?,
+        );
+
+        let (tx, market_id) = self
+            .app
+            .wallet
+            .create_market(
+                CreateMarketInput {
+                    title: request.title,
+                    description: request.description,
+                    dimensions: dimensions_str,
+                    beta: request.beta,
+                    trading_fee: request.trading_fee,
+                    initial_liquidity: request.initial_liquidity,
+                    category_option_counts,
+                    tx_pow_hash_selector: request.tx_pow_hash_selector,
+                    tx_pow_ordering: request.tx_pow_ordering,
+                    tx_pow_difficulty: request.tx_pow_difficulty,
+                    new_claims,
+                },
+                total_fee,
+            )
+            .map_err(custom_err)?;
+
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+
+        Ok(MarketCreateResponse {
+            txid,
+            market_id: market_id.to_string(),
+            claimed_decisions: new_decisions_info,
+        })
+    }
+
+    async fn market_buy(
+        &self,
+        request: MarketBuyRequest,
+    ) -> RpcResult<MarketBuyResponse> {
+        let market_id_struct = parse_market_id(&request.market_id)?;
+
+        let market = self
+            .node()
+            .get_market_by_id(&market_id_struct)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Market not found"))?;
+
+        // Use mempool shares and effective treasury (confirmed + pending
+        // amplify_beta deposits) for cost calculation. This ensures the tx
+        // is created with correct cost for its expected position in the
+        // mempool ordering.
+        let current_shares = self
+            .app
+            .node
+            .get_mempool_shares(&market_id_struct)
+            .map_err(custom_err)?
+            .unwrap_or_else(|| market.shares().clone());
+        let effective_b =
+            self.app.node.get_market_beta(&market).map_err(custom_err)?;
+
+        let mut new_shares = current_shares.clone();
+        new_shares[request.outcome_index] += request.shares_amount;
+        let trade_cost = trading::calculate_update_cost(
+            &current_shares,
+            &new_shares,
+            effective_b,
+        )
+        .map_err(|e| {
+            custom_err_msg(format!("LMSR cost calculation failed: {e:?}"))
+        })?;
+
+        let buy_cost =
+            trading::calculate_buy_cost(trade_cost, market.trading_fee())
+                .map_err(|e| {
+                    custom_err_msg(format!("Cost calculation failed: {e}"))
+                })?;
+        let trading_fee_sats = buy_cost.trading_fee_sats;
+        let cost_sats = buy_cost.total_cost_sats;
+
+        let new_price = trading::calculate_prices(&new_shares, effective_b)
+            .ok()
+            .and_then(|p| p.get(request.outcome_index).copied())
+            .unwrap_or(0.0);
+
+        if request.dry_run.unwrap_or(false) {
+            return Ok(MarketBuyResponse {
+                txid: None,
+                cost_sats,
+                trading_fee_sats,
+                new_price,
+            });
+        }
+
+        let max_cost = request.max_cost.ok_or_else(|| {
+            custom_err_msg("max_cost is required when dry_run is false")
+        })?;
+
+        if cost_sats > max_cost {
+            return Err(custom_err_msg(format!(
+                "Share cost {cost_sats} exceeds maximum cost {max_cost} (slippage protection)",
+            )));
+        }
+
+        let trader = self
+            .app
+            .wallet
+            .get_addresses()
+            .map_err(custom_err)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| custom_err_msg("Wallet has no addresses"))?;
+
+        let prev_block_hash = self
+            .app
+            .node
+            .try_get_tip()
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Chain has no tip"))?;
+
+        let tx = self
+            .app
+            .wallet
+            .trade(
+                market_id_struct,
+                request.outcome_index,
+                request.shares_amount,
+                trader,
+                max_cost, // limit_sats = max_cost for buy
+                Some(market.tx_pow_config()),
+                prev_block_hash,
+            )
+            .map_err(custom_err)?;
+
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+
+        Ok(MarketBuyResponse {
+            txid: Some(txid.to_string()),
+            cost_sats,
+            trading_fee_sats,
+            new_price,
+        })
+    }
+
+    async fn market_sell(
+        &self,
+        request: MarketSellRequest,
+    ) -> RpcResult<MarketSellResponse> {
+        let market_id_struct = parse_market_id(&request.market_id)?;
+
+        let market = self
+            .node()
+            .get_market_by_id(&market_id_struct)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Market not found"))?;
+
+        let seller_positions = self
+            .node()
+            .get_user_share_positions(&request.seller_address)
+            .map_err(custom_err)?;
+
+        let owned_shares = seller_positions
+            .iter()
+            .find(|(mid, oidx, _)| {
+                *mid == market_id_struct
+                    && *oidx == request.outcome_index as u32
+            })
+            .map(|(_, _, shares)| *shares)
+            .unwrap_or(0);
+
+        if owned_shares < request.shares_amount {
+            return Err(custom_err_msg(format!(
+                "Insufficient shares: address {} owns {} but trying to sell {}",
+                request.seller_address, owned_shares, request.shares_amount
+            )));
+        }
+
+        // Use mempool shares and effective treasury (confirmed + pending
+        // amplify_beta deposits) for proceeds calculation.
+        let current_shares = self
+            .app
+            .node
+            .get_mempool_shares(&market_id_struct)
+            .map_err(custom_err)?
+            .unwrap_or_else(|| market.shares().clone());
+        let effective_b =
+            self.app.node.get_market_beta(&market).map_err(custom_err)?;
+
+        // Calculate proceeds: C(current_shares) - C(new_shares)
+        let mut new_shares = current_shares.clone();
+        new_shares[request.outcome_index] -= request.shares_amount;
+
+        // Calculate cost difference: old_cost - new_cost = proceeds (positive when selling)
+        let old_cost =
+            trading::calculate_treasury(&current_shares, effective_b).map_err(
+                |e| custom_err_msg(format!("Cost calculation error: {e:?}")),
+            )?;
+        let new_cost = trading::calculate_treasury(&new_shares, effective_b)
+            .map_err(|e| {
+                custom_err_msg(format!("Cost calculation error: {e:?}"))
+            })?;
+
+        let proceeds_btc = old_cost - new_cost;
+
+        let sell_proceeds = trading::calculate_sell_proceeds(
+            proceeds_btc,
+            market.trading_fee(),
+        )
+        .map_err(|e| {
+            custom_err_msg(format!("Proceeds calculation failed: {e}"))
+        })?;
+        let proceeds_sats = sell_proceeds.gross_proceeds_sats;
+        let trading_fee_sats = sell_proceeds.trading_fee_sats;
+        let net_proceeds_sats = sell_proceeds.net_proceeds_sats;
+
+        let new_price = trading::calculate_prices(&new_shares, effective_b)
+            .ok()
+            .and_then(|p| p.get(request.outcome_index).copied())
+            .unwrap_or(0.0);
+
+        if request.dry_run.unwrap_or(false) {
+            return Ok(MarketSellResponse {
+                txid: None,
+                proceeds_sats,
+                trading_fee_sats,
+                net_proceeds_sats,
+                new_price,
+            });
+        }
+
+        let min_proceeds = request.min_proceeds.unwrap_or(0);
+
+        if net_proceeds_sats < min_proceeds {
+            return Err(custom_err_msg(format!(
+                "Net proceeds {net_proceeds_sats} below minimum {min_proceeds} (slippage protection)",
+            )));
+        }
+
+        let prev_block_hash = self
+            .app
+            .node
+            .try_get_tip()
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Chain has no tip"))?;
+
+        let tx = self
+            .app
+            .wallet
+            .trade(
+                market_id_struct,
+                request.outcome_index,
+                -request.shares_amount, // Negative for sell
+                request.seller_address,
+                min_proceeds,
+                Some(market.tx_pow_config()),
+                prev_block_hash,
+            )
+            .map_err(custom_err)?;
+
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+
+        Ok(MarketSellResponse {
+            txid: Some(txid.to_string()),
+            proceeds_sats,
+            trading_fee_sats,
+            net_proceeds_sats,
+            new_price,
+        })
+    }
+
+    async fn market_amplify_beta(
+        &self,
+        request: MarketAmplifyBetaRequest,
+    ) -> RpcResult<String> {
+        let market_id = parse_market_id(&request.market_id)?;
+        let market = self
+            .node()
+            .get_market_by_id(&market_id)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Market not found"))?;
+        let tx = self
+            .app
+            .wallet
+            .amplify_beta(
+                market_id,
+                request.amount_sats,
+                market.creator_address,
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid.to_string())
+    }
+
+    async fn vote_submit(
+        &self,
+        votes: Vec<truthcoin_dc_app_rpc_api::BallotItem>,
+        fee_sats: u64,
+    ) -> RpcResult<String> {
+        use truthcoin_dc::types::BallotItem;
+
+        let request = SubmitBallotRequest { votes, fee_sats };
+
+        if request.votes.is_empty() {
+            return Err(custom_err_msg("Ballot cannot be empty"));
+        }
+
+        let mut batch_items = Vec::new();
+        let mut period_id: Option<u32> = None;
+
+        for vote in request.votes {
+            let decision_id = DecisionValidator::parse_decision_id_from_hex(
+                &vote.decision_id,
+            )
+            .map_err(|e| custom_err_msg(format!("Invalid decision ID: {e}")))?;
+
+            let vote_period = decision_id.voting_period();
+
+            match period_id {
+                None => period_id = Some(vote_period),
+                Some(p) if p != vote_period => {
+                    return Err(custom_err_msg(format!(
+                        "All votes in ballot must be for \
+                         same period. Expected {}, got {} \
+                         for decision {}",
+                        p, vote_period, vote.decision_id
+                    )));
+                }
+                _ => {}
+            }
+
+            let entry = self
+                .node()
+                .get_decision_entry(decision_id)
+                .map_err(custom_err)?
+                .ok_or_else(|| {
+                    custom_err_msg(format!(
+                        "Decision {} does not exist",
+                        vote.decision_id
+                    ))
+                })?;
+
+            let decision = entry.decision.ok_or_else(|| {
                 custom_err_msg(format!(
-                    "failed to deserialize AuthorizedTransaction: {e}"
+                    "Decision {} has no decision claimed",
+                    vote.decision_id
                 ))
             })?;
-        let txid = tx.transaction.txid();
-        self.app.node.submit_transaction(tx).map_err(custom_err)?;
-        Ok(txid)
+
+            let normalized_value = decision
+                .validate_and_normalize(vote.vote_value)
+                .map_err(|e| custom_err_msg(format!("{e}")))?;
+
+            batch_items.push(BallotItem {
+                decision_id_bytes: decision_id.as_bytes(),
+                vote_value: normalized_value,
+            });
+        }
+
+        let period_id = period_id.unwrap();
+        let fee = bitcoin::Amount::from_sat(request.fee_sats);
+
+        tracing::info!(
+            "vote_submit: Voter attempting to submit {} \
+             votes for period {}",
+            batch_items.len(),
+            period_id
+        );
+
+        let tx = self
+            .app
+            .wallet
+            .submit_ballot(batch_items, period_id, fee)
+            .map_err(custom_err)?;
+
+        let txid = tx.txid();
+
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+
+        Ok(format!("{txid}"))
     }
 
     async fn create_trade(
@@ -2657,8 +2963,8 @@ impl RpcServer for RpcServerImpl {
             .map_err(custom_err)?
             .ok_or_else(|| custom_err_msg("Market not found"))?;
 
-        let prev_block_bytes =
-            hex::decode(&request.prev_block_hash).map_err(|e| {
+        let prev_block_bytes = const_hex::decode(&request.prev_block_hash)
+            .map_err(|e| {
                 custom_err_msg(format!("invalid prev_block_hash hex: {e}"))
             })?;
         if prev_block_bytes.len() != 32 {
@@ -2696,7 +3002,11 @@ impl RpcServer for RpcServerImpl {
             )
             .map_err(custom_err)?;
 
-        let authorized = self.app.wallet.authorize(tx).map_err(custom_err)?;
+        let authorized = self
+            .app
+            .wallet
+            .authorize(rand::rng(), tx)
+            .map_err(custom_err)?;
         let txid = authorized.transaction.txid();
         let bytes = bincode::serialize(&authorized).map_err(|e| {
             custom_err_msg(format!(
@@ -2704,95 +3014,9 @@ impl RpcServer for RpcServerImpl {
             ))
         })?;
         Ok(CreateTradeResponse {
-            signed_tx_hex: hex::encode(bytes),
+            signed_tx_hex: const_hex::encode(bytes),
             txid: txid.to_string(),
         })
-    }
-    async fn sign_native_buy_intent(
-        &self,
-        intent: truthcoin_dc::types::native::BuyIntentV1,
-    ) -> RpcResult<Authorization> {
-        self.app
-            .wallet
-            .sign_native_buy_intent(&intent)
-            .map_err(custom_err)
-    }
-
-    async fn sign_native_escrow_mutation(
-        &self,
-        intent: truthcoin_dc::types::native::EscrowMutationIntentV1,
-        signer: Address,
-    ) -> RpcResult<Authorization> {
-        self.app
-            .wallet
-            .sign_native_escrow_mutation(&intent, signer)
-            .map_err(custom_err)
-    }
-
-    async fn create_native_operation(
-        &self,
-        operation: truthcoin_dc::types::native::NativeOperationV1,
-        fee_sats: u64,
-    ) -> RpcResult<CreateTradeResponse> {
-        use truthcoin_dc::types::native::NativeOperationV1;
-        let config = if let NativeOperationV1::BuyForIntent { intent, .. } =
-            &operation
-        {
-            Some(
-                self.node()
-                    .get_market_by_id(&intent.market_id)
-                    .map_err(custom_err)?
-                    .ok_or_else(|| custom_err_msg("Market not found"))?
-                    .tx_pow_config(),
-            )
-        } else {
-            None
-        };
-        let tx = self
-            .app
-            .wallet
-            .native_operation(operation, fee_sats, config)
-            .map_err(custom_err)?;
-        let authorized = self.app.wallet.authorize(tx).map_err(custom_err)?;
-        Ok(CreateTradeResponse {
-            txid: authorized.transaction.txid().to_string(),
-            signed_tx_hex: hex::encode(
-                bincode::serialize(&authorized).map_err(custom_err)?,
-            ),
-        })
-    }
-
-    async fn get_native_escrow(
-        &self,
-        escrow_id: String,
-    ) -> RpcResult<Option<truthcoin_dc::types::native::ShareEscrowV1>> {
-        let mut id = [0u8; 32];
-        hex::decode_to_slice(escrow_id, &mut id).map_err(custom_err)?;
-        self.node().get_native_escrow(id).map_err(custom_err)
-    }
-
-    async fn get_native_effect(
-        &self,
-        transaction_id: String,
-    ) -> RpcResult<Option<truthcoin_dc::types::native::NativeEffectV1>> {
-        let mut id = [0u8; 32];
-        hex::decode_to_slice(transaction_id, &mut id).map_err(custom_err)?;
-        self.node().get_native_effect(id).map_err(custom_err)
-    }
-
-    async fn get_native_reserved_shares(
-        &self,
-        owner: Address,
-        market_id: String,
-        outcome_index: u32,
-    ) -> RpcResult<i64> {
-        self.node()
-            .get_native_reserved_shares(
-                owner,
-                parse_market_id(&market_id)?,
-                outcome_index,
-            )
-            .map_err(custom_err)
     }
 }
 
@@ -2817,61 +3041,247 @@ impl MakeRequestId for RequestIdMaker {
     }
 }
 
+pub struct ServerAddresses {
+    _rpc_addr: SocketAddr,
+    _private_rpc_addr: SocketAddr,
+}
+
 pub async fn run_server(
     app: App,
+    private_rpc_url: url::Url,
     rpc_url: url::Url,
-) -> anyhow::Result<SocketAddr> {
+) -> anyhow::Result<ServerAddresses> {
     const REQUEST_ID_HEADER: &str = "x-request-id";
 
-    let tracer = tower::ServiceBuilder::new()
-        .layer(SetRequestIdLayer::new(
-            http::HeaderName::from_static(REQUEST_ID_HEADER),
-            RequestIdMaker,
-        ))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(move |request: &http::Request<_>| {
-                    let request_id = request
-                        .headers()
-                        .get(http::HeaderName::from_static(REQUEST_ID_HEADER))
-                        .and_then(|h| h.to_str().ok())
-                        .filter(|s| !s.is_empty());
+    let tracer = || {
+        tower::ServiceBuilder::new()
+            .layer(SetRequestIdLayer::new(
+                http::HeaderName::from_static(REQUEST_ID_HEADER),
+                RequestIdMaker,
+            ))
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(move |request: &http::Request<_>| {
+                        let request_id = request
+                            .headers()
+                            .get(http::HeaderName::from_static(
+                                REQUEST_ID_HEADER,
+                            ))
+                            .and_then(|h| h.to_str().ok())
+                            .filter(|s| !s.is_empty());
 
-                    tracing::span!(
-                        tracing::Level::DEBUG,
-                        "request",
-                        method = %request.method(),
-                        uri = %request.uri(),
-                        request_id,
+                        tracing::span!(
+                            tracing::Level::DEBUG,
+                            "request",
+                            method = %request.method(),
+                            uri = %request.uri(),
+                            request_id,
+                        )
+                    })
+                    .on_request(())
+                    .on_eos(())
+                    .on_response(
+                        DefaultOnResponse::new().level(tracing::Level::INFO),
                     )
-                })
-                .on_request(())
-                .on_eos(())
-                .on_response(
-                    DefaultOnResponse::new().level(tracing::Level::INFO),
-                )
-                .on_failure(
-                    DefaultOnFailure::new().level(tracing::Level::ERROR),
-                ),
-        )
-        .layer(PropagateRequestIdLayer::new(http::HeaderName::from_static(
-            REQUEST_ID_HEADER,
-        )))
-        .into_inner();
-
-    let http_middleware = tower::ServiceBuilder::new().layer(tracer);
-    let rpc_middleware = RpcServiceBuilder::new().rpc_logger(1024);
+                    .on_failure(
+                        DefaultOnFailure::new().level(tracing::Level::ERROR),
+                    ),
+            )
+            .layer(PropagateRequestIdLayer::new(http::HeaderName::from_static(
+                REQUEST_ID_HEADER,
+            )))
+            .into_inner()
+    };
+    let http_middleware = || {
+        tower::ServiceBuilder::new()
+            .layer(tracer())
+            .layer(CorsLayer::permissive())
+    };
+    let rpc_middleware = || RpcServiceBuilder::new().rpc_logger(1024);
 
     let server = Server::builder()
-        .set_http_middleware(http_middleware)
-        .set_rpc_middleware(rpc_middleware)
+        .set_http_middleware(http_middleware())
+        .set_rpc_middleware(rpc_middleware())
         .build(rpc_url.socket_addrs(|| None)?.as_slice())
         .await?;
+    let rpc_server_addr = server.local_addr()?;
 
-    let addr = server.local_addr()?;
-    let handle = server.start(RpcServerImpl { app }.into_rpc());
+    let server_addrs = if private_rpc_url != rpc_url {
+        let private_rpc_server = Server::builder()
+            .set_http_middleware(http_middleware())
+            .set_rpc_middleware(rpc_middleware())
+            .build(private_rpc_url.socket_addrs(|| None)?.as_slice())
+            .await?;
+        let private_rpc_server_addr = private_rpc_server.local_addr()?;
+        let rpc_server_handle = {
+            let rpc_server_impl = RpcServerImpl::<false> { app: app.clone() };
+            let mut rpc_module =
+                rpc_api::open_api::RpcServer::into_rpc(rpc_server_impl.clone());
+            rpc_module
+                .merge(rpc_api::node::RpcServer::into_rpc(rpc_server_impl))?;
+            server.start(rpc_module)
+        };
+        let private_rpc_server_handle = {
+            let rpc_server_impl = RpcServerImpl::<true> { app };
+            let mut rpc_module = rpc_api::open_api::RpcServer::into_rpc(
+                PrivateOnlyRpcServerImpl,
+            );
+            rpc_module.merge(rpc_api::node::PrivateRpcServer::into_rpc(
+                rpc_server_impl.clone(),
+            ))?;
+            rpc_module
+                .merge(rpc_api::wallet::RpcServer::into_rpc(rpc_server_impl))?;
+            private_rpc_server.start(rpc_module)
+        };
+        tokio::spawn(async {
+            tokio::select! {
+                () = rpc_server_handle.stopped() => (),
+                () = private_rpc_server_handle.stopped() => (),
+            }
+        });
+        ServerAddresses {
+            _rpc_addr: rpc_server_addr,
+            _private_rpc_addr: private_rpc_server_addr,
+        }
+    } else {
+        let rpc_server_impl = RpcServerImpl::<true> { app };
+        let mut rpc_module =
+            rpc_api::open_api::RpcServer::into_rpc(rpc_server_impl.clone());
+        rpc_module.merge(rpc_api::node::PrivateRpcServer::into_rpc(
+            rpc_server_impl.clone(),
+        ))?;
+        rpc_module.merge(rpc_api::node::RpcServer::into_rpc(
+            rpc_server_impl.clone(),
+        ))?;
+        rpc_module
+            .merge(rpc_api::wallet::RpcServer::into_rpc(rpc_server_impl))?;
+        let handle = server.start(rpc_module);
+        tokio::spawn(handle.stopped());
+        ServerAddresses {
+            _rpc_addr: rpc_server_addr,
+            _private_rpc_addr: rpc_server_addr,
+        }
+    };
+    Ok(server_addrs)
+}
 
-    tokio::spawn(handle.stopped());
+#[cfg(test)]
+mod tests {
+    use super::{market_dimension_data, market_outcomes};
+    use std::collections::HashMap;
 
-    Ok(addr)
+    use truthcoin_dc::state::{
+        MarketBuilder,
+        decisions::{Decision, DecisionId, DecisionType},
+        markets::DimensionSpec,
+    };
+    use truthcoin_dc::types::Address;
+    use truthcoin_dc_app_rpc_api::MarketDimensionKind;
+
+    #[test]
+    fn multidimensional_market_exposes_ordered_categorical_and_scaled_axes() {
+        let category_id = DecisionId::new(true, 1, 0).unwrap();
+        let scaled_id = DecisionId::new(true, 1, 1).unwrap();
+        let mut decisions = HashMap::new();
+        decisions.insert(
+            category_id,
+            Decision::new(
+                [0; 20],
+                DecisionType::Category {
+                    options: vec![
+                        "North, East".to_string(),
+                        "Central [C]".to_string(),
+                        "South × West".to_string(),
+                    ],
+                },
+                "Region".to_string(),
+                String::new(),
+                None,
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        decisions.insert(
+            scaled_id,
+            Decision::new(
+                [0; 20],
+                DecisionType::Scaled {
+                    min: 10.0,
+                    max: 50.0,
+                    increment: 5.0,
+                },
+                "Estimate".to_string(),
+                String::new(),
+                Some("Low basis".to_string()),
+                Some("High basis".to_string()),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+
+        let market = MarketBuilder::new(
+            "Categorical × scaled".to_string(),
+            Address::ALL_ZEROS,
+        )
+        .with_dimensions(vec![
+            DimensionSpec::Categorical(category_id),
+            DimensionSpec::Single(scaled_id),
+        ])
+        .build(42, None, &decisions)
+        .unwrap();
+
+        let dimensions = market_dimension_data(&market, &decisions).unwrap();
+        assert_eq!(dimensions.len(), 2);
+        assert_eq!(dimensions[0].dimension_index, 0);
+        assert_eq!(dimensions[0].decision_id, category_id.to_hex());
+        assert!(matches!(
+            &dimensions[0].kind,
+            MarketDimensionKind::Category { options }
+                if options == &vec![
+                    "North, East".to_string(),
+                    "Central [C]".to_string(),
+                    "South × West".to_string(),
+                ]
+        ));
+        assert_eq!(dimensions[1].dimension_index, 1);
+        assert_eq!(dimensions[1].decision_id, scaled_id.to_hex());
+        assert!(matches!(
+            &dimensions[1].kind,
+            MarketDimensionKind::Scaled {
+                min,
+                max,
+                increment,
+                unit,
+                lower_label,
+                upper_label,
+            } if *min == 10.0
+                && *max == 50.0
+                && *increment == 5.0
+                && unit.is_none()
+                && lower_label == "Low basis"
+                && upper_label == "High basis"
+        ));
+
+        let prices = vec![
+            1.0 / market.get_outcome_count() as f64;
+            market.get_outcome_count()
+        ];
+        let outcomes = market_outcomes(&market, &decisions, &prices);
+        let valid_combos = market.get_valid_state_combos();
+        assert_eq!(outcomes.len(), valid_combos.len());
+
+        for (display_index, (outcome, (full_state_index, coordinates))) in
+            outcomes.iter().zip(valid_combos.iter()).enumerate()
+        {
+            assert_eq!(outcome.outcome_index, display_index);
+            assert_eq!(outcome.full_state_index, *full_state_index);
+            assert_eq!(outcome.coordinates.as_slice(), coordinates.as_slice());
+            assert_eq!(outcome.price, prices[display_index]);
+            assert!(
+                outcome.label.contains("Region")
+                    || outcome.label.contains("Estimate")
+            );
+        }
+    }
 }

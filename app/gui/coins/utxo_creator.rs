@@ -38,7 +38,7 @@ pub struct UtxoCreator {
     // None corresponds to no memo
     memo_user_input: Option<String>,
     // None corresponds to no memo
-    memo_encoded: Option<Result<MemoEncoded, hex::FromHexError>>,
+    memo_encoded: Option<Result<MemoEncoded, const_hex::FromHexError>>,
 }
 
 impl std::fmt::Display for UtxoType {
@@ -80,8 +80,8 @@ impl UtxoCreator {
     fn try_encode_memo(
         memo_encoding: MemoEncoding,
         memo_user_input: &str,
-    ) -> Result<MemoEncoded, hex::FromHexError> {
-        let decoded_hex = hex::decode(memo_user_input);
+    ) -> Result<MemoEncoded, const_hex::FromHexError> {
+        let decoded_hex = const_hex::decode(memo_user_input);
         if memo_user_input.is_empty() {
             return Ok((Vec::new(), None));
         }
@@ -233,7 +233,7 @@ impl UtxoCreator {
                     .add_enabled(app.is_some(), Button::new("generate"))
                     .clicked()
                 {
-                    match app.unwrap().get_new_main_address() {
+                    match app.unwrap().get_new_main_address_blocking() {
                         Ok(main_address) => {
                             self.main_address = format!("{main_address}");
                         }

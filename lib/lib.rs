@@ -1,8 +1,3 @@
-#![feature(impl_trait_in_assoc_type)]
-#![feature(trait_alias)]
-#![feature(try_find)]
-#![feature(yeet_expr)]
-
 pub mod archive;
 pub mod authorization;
 pub mod math;
