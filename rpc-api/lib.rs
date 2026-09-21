@@ -458,10 +458,6 @@ pub struct InitialLiquidityCalculation {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct BallotItem {
     pub decision_id: String,
-    /// Explicit abstention. When true, `vote_value` is ignored and the node
-    /// emits the canonical finite abstain wire sentinel.
-    #[serde(default)]
-    pub abstain: bool,
     /// The vote value in real units (e.g., 270 for electoral votes).
     /// For scaled decisions, the value must equal `min + k * increment`
     /// for some non-negative integer `k`, with `vote_value <= max`.
@@ -987,22 +983,6 @@ pub trait Rpc {
         &self,
         request: CreateTradeRequest,
     ) -> RpcResult<CreateTradeResponse>;
-    /// Construct and dry-run a fresh parent-bound candidate from signed transactions.
-    #[method(name = "create_bmm_candidate")]
-    async fn create_bmm_candidate(
-        &self,
-        signed_transactions: Vec<String>,
-        coinbase_address: Address,
-    ) -> RpcResult<truthcoin_dc::types::native::NativeBmmCandidateV1>;
-
-    /// Fund one validated attempt; a losing/expired candidate must be rebuilt.
-    #[method(name = "bid_bmm_candidate")]
-    async fn bid_bmm_candidate(
-        &self,
-        candidate: truthcoin_dc::types::native::NativeBmmCandidateV1,
-        bid_sats: u64,
-    ) -> RpcResult<Option<String>>;
-
     /// Sign a recipient's chain-bound, fill-once buy permission.
     #[open_api_method(output_schema(ToSchema))]
     #[method(name = "sign_native_buy_intent")]
@@ -1011,7 +991,7 @@ pub trait Rpc {
         intent: BuyIntentV1,
     ) -> RpcResult<Authorization>;
 
-    /// Sign a chain-bound assignment or split as one current rights holder.
+    /// Sign a chain-bound whole-escrow assignment as one current rights holder.
     #[open_api_method(output_schema(ToSchema))]
     #[method(name = "sign_native_escrow_mutation")]
     async fn sign_native_escrow_mutation(

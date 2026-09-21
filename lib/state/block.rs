@@ -3446,20 +3446,12 @@ mod native_integration_tests {
             }
             let original =
                 state.native().get_escrow(&txn, id).unwrap().unwrap();
-            for spec in [
-                EscrowMutationV1::Split {
-                    escrow_id: id,
-                    split_shares: 20,
-                    first_reference: [21; 32],
-                    second_reference: [22; 32],
-                },
-                EscrowMutationV1::Assign {
-                    escrow_id: id,
-                    new_claim_address: rights_address(&c),
-                    new_refund_address: rights_address(&c),
-                    reference: [23; 32],
-                },
-            ] {
+            for spec in [EscrowMutationV1::Assign {
+                escrow_id: id,
+                new_claim_address: rights_address(&c),
+                new_refund_address: rights_address(&c),
+                reference: [23; 32],
+            }] {
                 let mutate = mutation(spec, 2, &a, Some(&b));
                 assert!(
                     execute(&state, &mut txn, &mut update, &mutate, 1, 5)
@@ -3599,7 +3591,7 @@ mod native_integration_tests {
     }
 
     #[test]
-    fn native_split_assign_and_claim_ordered_atomic_rights_and_undo() {
+    fn native_assign_and_claim_ordered_atomic_rights_and_undo() {
         let (env, state, _dir, market, owner) = fixture();
         let a = rights_key(11);
         let b = rights_key(12);
@@ -3618,64 +3610,9 @@ mod native_integration_tests {
         let mut txn = env.write_txn().unwrap();
         let mut update = StateUpdate::new();
         execute(&state, &mut txn, &mut update, &lock_tx, 1, 5).unwrap();
-        let split_spec = EscrowMutationV1::Split {
-            escrow_id: id,
-            split_shares: 21,
-            first_reference: [21; 32],
-            second_reference: [22; 32],
-        };
-        let missing = mutation(split_spec.clone(), 2, &a, None);
-        assert!(
-            execute(&state, &mut txn, &mut update, &missing, 1, 5).is_err()
-        );
-        let wrong = mutation(split_spec.clone(), 2, &a, Some(&c));
-        assert!(execute(&state, &mut txn, &mut update, &wrong, 1, 5).is_err());
-        let split = mutation(split_spec, 2, &a, Some(&b));
-        execute(&state, &mut txn, &mut update, &split, 1, 5).unwrap();
-        let first = child_escrow_id(split.txid().0, 0);
-        let second = child_escrow_id(split.txid().0, 1);
-        assert_eq!(
-            state
-                .native()
-                .reserved_shares(&txn, owner, market, 0)
-                .unwrap(),
-            70
-        );
-        assert_eq!(
-            state
-                .native()
-                .get_escrow(&txn, first)
-                .unwrap()
-                .unwrap()
-                .shares,
-            21
-        );
-        assert_eq!(
-            state
-                .native()
-                .get_escrow(&txn, second)
-                .unwrap()
-                .unwrap()
-                .shares,
-            49
-        );
-        assert!(
-            execute(
-                &state,
-                &mut txn,
-                &mut update,
-                &filled(NativeOperationV1::ClaimEscrow {
-                    escrow_id: id,
-                    preimage: [9; 32]
-                }),
-                1,
-                5
-            )
-            .is_err()
-        );
         let assign = mutation(
             EscrowMutationV1::Assign {
-                escrow_id: first,
+                escrow_id: id,
                 new_claim_address: rights_address(&c),
                 new_refund_address: rights_address(&c),
                 reference: [23; 32],
@@ -3684,6 +3621,20 @@ mod native_integration_tests {
             &a,
             Some(&b),
         );
+        let spec = EscrowMutationV1::Assign {
+            escrow_id: id,
+            new_claim_address: rights_address(&c),
+            new_refund_address: rights_address(&c),
+            reference: [23; 32],
+        };
+        for invalid in [
+            mutation(spec.clone(), 3, &a, None),
+            mutation(spec, 3, &a, Some(&c)),
+        ] {
+            assert!(
+                execute(&state, &mut txn, &mut update, &invalid, 1, 5).is_err()
+            );
+        }
         execute(&state, &mut txn, &mut update, &assign, 1, 5).unwrap();
         let receipt = state
             .native()
@@ -3705,7 +3656,7 @@ mod native_integration_tests {
         );
         let stale = mutation(
             EscrowMutationV1::Assign {
-                escrow_id: first,
+                escrow_id: id,
                 new_claim_address: rights_address(&a),
                 new_refund_address: rights_address(&b),
                 reference: [24; 32],
@@ -3717,7 +3668,7 @@ mod native_integration_tests {
         assert!(execute(&state, &mut txn, &mut update, &stale, 1, 5).is_err());
         let back = mutation(
             EscrowMutationV1::Assign {
-                escrow_id: first,
+                escrow_id: id,
                 new_claim_address: rights_address(&a),
                 new_refund_address: rights_address(&b),
                 reference: [24; 32],
@@ -3729,13 +3680,13 @@ mod native_integration_tests {
         execute(&state, &mut txn, &mut update, &back, 1, 5).unwrap();
         assert!(execute(&state, &mut txn, &mut update, &assign, 1, 5).is_err()); // consumed nonce even after rights return
         let claim = filled(NativeOperationV1::ClaimEscrow {
-            escrow_id: first,
+            escrow_id: id,
             preimage: [9; 32],
         });
         execute(&state, &mut txn, &mut update, &claim, 1, 5).unwrap();
         let terminal = mutation(
             EscrowMutationV1::Assign {
-                escrow_id: first,
+                escrow_id: id,
                 new_claim_address: rights_address(&c),
                 new_refund_address: rights_address(&c),
                 reference: [25; 32],
@@ -3752,7 +3703,7 @@ mod native_integration_tests {
                 .native()
                 .reserved_shares(&txn, owner, market, 0)
                 .unwrap(),
-            49
+            0
         );
         // Historical assignment still describes exactly what was delivered.
         assert_eq!(
@@ -3764,11 +3715,9 @@ mod native_integration_tests {
             receipt
         );
         update.apply_all_changes(&state, &mut txn, 1).unwrap();
-        assert_eq!(balance(&state, &txn, rights_address(&a), market), 21);
+        assert_eq!(balance(&state, &txn, rights_address(&a), market), 70);
         state.native().restore(&state, &mut txn, 1).unwrap();
-        for eid in [id, first, second] {
-            assert!(state.native().get_escrow(&txn, eid).unwrap().is_none());
-        }
+        assert!(state.native().get_escrow(&txn, id).unwrap().is_none());
         assert_eq!(balance(&state, &txn, owner, market), 100);
         assert_eq!(
             state
@@ -3786,7 +3735,7 @@ mod native_integration_tests {
         );
     }
     #[test]
-    fn native_cash_split_preserves_zero_remainder_deadline_and_undo() {
+    fn native_cash_assignment_preserves_value_deadline_and_undo() {
         for total in [0, 1, u64::MAX] {
             let (env, state, _dir, market, owner) = fixture();
             let key = rights_key(20);
@@ -3808,34 +3757,34 @@ mod native_integration_tests {
             };
             let mut txn = env.write_txn().unwrap();
             state.native().create_escrow(&mut txn, 1, &escrow).unwrap();
-            let split = mutation(
-                EscrowMutationV1::Split {
+            let destination = rights_address(&rights_key(21));
+            let assign = mutation(
+                EscrowMutationV1::Assign {
                     escrow_id: escrow.escrow_id,
-                    split_shares: 2,
-                    first_reference: [33; 32],
-                    second_reference: [34; 32],
+                    new_claim_address: destination,
+                    new_refund_address: destination,
+                    reference: [33; 32],
                 },
                 6,
                 &key,
                 None,
             );
             let mut update = StateUpdate::new();
-            execute(&state, &mut txn, &mut update, &split, 2, 20).unwrap(); // elapsed deadline preserved, no extension
-            let a = state
+            execute(&state, &mut txn, &mut update, &assign, 2, 20).unwrap();
+            let assigned = state
                 .native()
-                .get_escrow(&txn, child_escrow_id(split.txid().0, 0))
+                .get_escrow(&txn, escrow.escrow_id)
                 .unwrap()
                 .unwrap();
-            let b = state
-                .native()
-                .get_escrow(&txn, child_escrow_id(split.txid().0, 1))
-                .unwrap()
-                .unwrap();
-            let first = ((total as u128) * 2 / 7) as u64;
-            assert_eq!(a.asset, EscrowAssetV1::NativeCash(first));
-            assert_eq!(b.asset, EscrowAssetV1::NativeCash(total - first));
-            assert_eq!(a.claim_before_parent, escrow.claim_before_parent);
-            assert_eq!(a.hashlock, escrow.hashlock);
+            assert_eq!(assigned.asset, EscrowAssetV1::NativeCash(total));
+            assert_eq!(assigned.shares, escrow.shares);
+            assert_eq!(
+                assigned.claim_before_parent,
+                escrow.claim_before_parent
+            );
+            assert_eq!(assigned.hashlock, escrow.hashlock);
+            assert_eq!(assigned.claim_address, destination);
+            assert_eq!(assigned.refund_address, destination);
             assert_eq!(state.native().cash_liability(&txn).unwrap(), total);
             assert_eq!(
                 state
@@ -3848,13 +3797,6 @@ mod native_integration_tests {
             assert_eq!(
                 state.native().get_escrow(&txn, escrow.escrow_id).unwrap(),
                 Some(escrow)
-            );
-            assert!(
-                state
-                    .native()
-                    .get_escrow(&txn, a.escrow_id)
-                    .unwrap()
-                    .is_none()
             );
             assert_eq!(state.native().cash_liability(&txn).unwrap(), total);
         }

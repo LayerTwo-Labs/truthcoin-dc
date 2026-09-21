@@ -266,6 +266,14 @@ impl Ballot {
         }
         let non_abstain: Vec<&BallotRow> =
             self.rows.iter().filter(|r| !r.abstain).collect();
+        if non_abstain.is_empty() {
+            return (
+                false,
+                Some(
+                    "At least one row must be voted (not Abstain)".to_string(),
+                ),
+            );
+        }
         for row in &non_abstain {
             if let Err(reason) = validate_row(row) {
                 return (false, Some(reason));
@@ -287,14 +295,7 @@ impl Ballot {
         };
 
         let mut items: Vec<BallotItem> = Vec::new();
-        for row in &self.rows {
-            if row.abstain {
-                items.push(BallotItem {
-                    decision_id_bytes: row.decision_id.as_bytes(),
-                    vote_value: truthcoin_dc::validation::VoteValidator::ABSTAIN_WIRE_VALUE,
-                });
-                continue;
-            }
+        for row in self.rows.iter().filter(|r| !r.abstain) {
             let user_value = match row_user_value(row) {
                 Ok(v) => v,
                 Err(reason) => {
@@ -317,7 +318,7 @@ impl Ballot {
         }
 
         if items.is_empty() {
-            self.error = Some("No ballot rows to submit".to_string());
+            self.error = Some("No non-abstain votes to submit".to_string());
             return;
         }
 

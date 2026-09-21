@@ -1298,22 +1298,15 @@ where
         } => {
             use truthcoin_dc_app_rpc_api::BallotItem;
             let vote_items = if let Some(batch) = votes {
-                // Parse batch format: "id1:val1,id2:abstain"
+                // Parse batch format: "id1:val1,id2:val2"
                 batch
                     .split(',')
                     .filter_map(|pair| {
                         let parts: Vec<&str> = pair.trim().split(':').collect();
                         if parts.len() == 2 {
-                            let abstain =
-                                parts[1].eq_ignore_ascii_case("abstain");
-                            let val: f64 = if abstain {
-                                0.0
-                            } else {
-                                parts[1].parse().ok()?
-                            };
+                            let val: f64 = parts[1].parse().ok()?;
                             Some(BallotItem {
                                 decision_id: parts[0].to_string(),
-                                abstain,
                                 vote_value: val,
                             })
                         } else {
@@ -1324,8 +1317,6 @@ where
             } else if let (Some(id), Some(val)) = (decision_id, vote_value) {
                 vec![BallotItem {
                     decision_id: id,
-                    abstain: val
-                        == truthcoin_dc::validation::VoteValidator::ABSTAIN_WIRE_VALUE,
                     vote_value: val,
                 }]
             } else {

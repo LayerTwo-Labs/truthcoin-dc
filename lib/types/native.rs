@@ -51,18 +51,9 @@ impl BuyIntentV1 {
     }
 }
 
-/// General assignment or exact subdivision of existing conditional rights.
+/// Joint assignment of whole conditional rights.
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub enum EscrowMutationV1 {
-    Split {
-        #[schema(value_type = Vec<u8>)]
-        escrow_id: NativeId,
-        split_shares: i64,
-        #[schema(value_type = Vec<u8>)]
-        first_reference: NativeId,
-        #[schema(value_type = Vec<u8>)]
-        second_reference: NativeId,
-    },
     Assign {
         #[schema(value_type = Vec<u8>)]
         escrow_id: NativeId,
@@ -76,9 +67,7 @@ pub enum EscrowMutationV1 {
 impl EscrowMutationV1 {
     pub fn escrow_id(&self) -> NativeId {
         match self {
-            Self::Split { escrow_id, .. } | Self::Assign { escrow_id, .. } => {
-                *escrow_id
-            }
+            Self::Assign { escrow_id, .. } => *escrow_id,
         }
     }
 }
@@ -152,7 +141,7 @@ pub enum NativeOperationV1 {
         nonce: NativeId,
         #[schema(value_type = Vec<u8>)]
         reference: NativeId,
-        /// False permanently fixes both destinations and prohibits subdivision.
+        /// False permanently fixes both destinations and prohibits reassignment.
         #[serde(default)]
         mutable_rights: bool,
     },
@@ -237,14 +226,6 @@ pub enum EscrowStatusV1 {
         #[schema(value_type = Vec<u8>)]
         transaction_id: NativeId,
     },
-    Split {
-        #[schema(value_type = Vec<u8>)]
-        transaction_id: NativeId,
-        #[schema(value_type = Vec<u8>)]
-        first_child_id: NativeId,
-        #[schema(value_type = Vec<u8>)]
-        second_child_id: NativeId,
-    },
 }
 
 #[derive(
@@ -273,7 +254,7 @@ pub struct ShareEscrowV1 {
     pub reference: NativeId,
     pub asset: EscrowAssetV1,
     pub status: EscrowStatusV1,
-    /// Set only at creation; assignment and splitting cannot change this value.
+    /// Set only at creation; assignment cannot change this value.
     pub mutable_rights: bool,
 }
 
@@ -298,10 +279,6 @@ pub enum NativeEffectKindV1 {
         previous_refund_address: Address,
         valid_from_parent: u32,
         valid_before_parent: u32,
-    },
-    Split {
-        first_child: ShareEscrowV1,
-        second_child: ShareEscrowV1,
     },
 }
 
@@ -336,28 +313,11 @@ pub struct NativeEffectV1 {
     pub escrow_snapshot: Option<ShareEscrowV1>,
 }
 
-pub fn child_escrow_id(transaction_id: NativeId, child_index: u8) -> NativeId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"TRUTHCOIN_NATIVE_ESCROW_CHILD_V1\0");
-    hasher.update(&transaction_id);
-    hasher.update(&[child_index]);
-    *hasher.finalize().as_bytes()
-}
-
 pub fn escrow_id(transaction_id: NativeId) -> NativeId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"TRUTHCOIN_NATIVE_ESCROW_V1\0");
     hasher.update(&transaction_id);
     *hasher.finalize().as_bytes()
-}
-
-/// Local bidder preview. This is not proof of inclusion or execution.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct NativeBmmCandidateV1 {
-    pub header: super::Header,
-    pub body: super::Body,
-    pub parent_height: u32,
-    pub preview_effects: Vec<NativeEffectV1>,
 }
 
 #[cfg(test)]

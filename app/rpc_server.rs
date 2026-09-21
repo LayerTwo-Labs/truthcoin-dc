@@ -2207,13 +2207,9 @@ impl RpcServer for RpcServerImpl {
                 ))
             })?;
 
-            let normalized_value = if vote.abstain {
-                truthcoin_dc::validation::VoteValidator::ABSTAIN_WIRE_VALUE
-            } else {
-                decision
-                    .validate_and_normalize(vote.vote_value)
-                    .map_err(|e| custom_err_msg(format!("{e}")))?
-            };
+            let normalized_value = decision
+                .validate_and_normalize(vote.vote_value)
+                .map_err(|e| custom_err_msg(format!("{e}")))?;
 
             batch_items.push(BallotItem {
                 decision_id_bytes: decision_id.as_bytes(),
@@ -2712,92 +2708,6 @@ impl RpcServer for RpcServerImpl {
             txid: txid.to_string(),
         })
     }
-    async fn create_bmm_candidate(
-        &self,
-        signed_transactions: Vec<String>,
-        coinbase_address: Address,
-    ) -> RpcResult<truthcoin_dc::types::native::NativeBmmCandidateV1> {
-        if signed_transactions.len() > 1000 {
-            return Err(custom_err_msg("too many candidate transactions"));
-        }
-        let mut transactions = Vec::with_capacity(signed_transactions.len());
-        for encoded in signed_transactions {
-            transactions.push(
-                bincode::deserialize::<
-                    truthcoin_dc::types::AuthorizedTransaction,
-                >(&hex::decode(encoded).map_err(custom_err)?)
-                .map_err(custom_err)?,
-            );
-        }
-        let miner = self
-            .app
-            .miner
-            .as_ref()
-            .ok_or_else(|| custom_err_msg("BMM wallet unavailable"))?;
-        let parent = miner
-            .write()
-            .await
-            .cusf_mainchain
-            .get_chain_tip()
-            .await
-            .map_err(custom_err)?
-            .block_hash;
-        if !self
-            .node()
-            .request_mainchain_ancestor_infos(parent)
-            .await
-            .map_err(custom_err)?
-        {
-            return Err(custom_err_msg("parent ancestry unavailable"));
-        }
-        self.node()
-            .create_bmm_candidate(parent, transactions, coinbase_address)
-            .map_err(custom_err)
-    }
-
-    async fn bid_bmm_candidate(
-        &self,
-        candidate: truthcoin_dc::types::native::NativeBmmCandidateV1,
-        bid_sats: u64,
-    ) -> RpcResult<Option<String>> {
-        let candidate = self
-            .node()
-            .preview_bmm_candidate(candidate.header, candidate.body)
-            .map_err(custom_err)?;
-        let miner = self
-            .app
-            .miner
-            .as_ref()
-            .ok_or_else(|| custom_err_msg("BMM wallet unavailable"))?;
-        let mut miner = miner.write().await;
-        miner
-            .attempt_bmm(
-                bid_sats,
-                candidate.parent_height - 1,
-                candidate.header,
-                candidate.body,
-            )
-            .await
-            .map_err(custom_err)?;
-        let Some((main_hash, header, body)) =
-            miner.confirm_bmm().await.map_err(custom_err)?
-        else {
-            return Ok(None);
-        };
-        drop(miner);
-        if self
-            .node()
-            .submit_block(main_hash, &header, &body)
-            .await
-            .map_err(custom_err)?
-        {
-            self.app.update().map_err(custom_err)?;
-            Ok(Some(header.hash().to_string()))
-        } else {
-            Ok(None)
-        }
-    }
-
     async fn sign_native_buy_intent(
         &self,
         intent: truthcoin_dc::types::native::BuyIntentV1,

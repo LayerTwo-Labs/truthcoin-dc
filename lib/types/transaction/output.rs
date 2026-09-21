@@ -63,7 +63,7 @@ pub struct BitcoinContent(
     pub bitcoin::Amount,
 );
 
-fn borsh_serialize_canonical_bitcoin_address<V, W>(
+fn borsh_serialize_bitcoin_address<V, W>(
     bitcoin_address: &bitcoin::Address<V>,
     writer: &mut W,
 ) -> borsh::io::Result<()>
@@ -71,14 +71,11 @@ where
     V: bitcoin::address::NetworkValidation,
     W: borsh::io::Write,
 {
-    // The network/HRP is part of the LMDB `FilledOutput` representation and
-    // affects withdrawal aggregation order. Commit the canonical display form
-    // so replay can reconstruct exactly the state that a native node stores.
-    let canonical = bitcoin_address
+    let spk = bitcoin_address
         .as_unchecked()
         .assume_checked_ref()
-        .to_string();
-    borsh::BorshSerialize::serialize(&canonical, writer)
+        .script_pubkey();
+    borsh::BorshSerialize::serialize(spk.as_bytes(), writer)
 }
 
 mod withdrawal_content {
@@ -160,7 +157,7 @@ mod withdrawal_content {
             borsh(serialize_with = "super::borsh_serialize_bitcoin_amount"),
         ],
         main_address_attrs: [
-            borsh(serialize_with = "super::borsh_serialize_canonical_bitcoin_address"),
+            borsh(serialize_with = "super::borsh_serialize_bitcoin_address"),
         ],
     );
 
