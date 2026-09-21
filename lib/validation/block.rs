@@ -54,7 +54,7 @@ impl BlockValidator {
             state.try_get_height(rotxn)?.map_or(0, |height| height + 1);
 
         let mut coinbase_value = bitcoin::Amount::ZERO;
-        for output in &body.coinbase {
+        for output in &body.coinbase.outputs {
             coinbase_value = coinbase_value
                 .checked_add(output.get_bitcoin_value())
                 .ok_or(AmountOverflowError)?;
@@ -441,13 +441,16 @@ mod tests {
         let rotxn = env.read_txn().unwrap();
 
         let body = Body {
-            coinbase: vec![Output {
-                address: Address::ALL_ZEROS,
-                content: OutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::ZERO,
-                )),
-                memo: vec![0u8; Body::MAX_SIZE + 1],
-            }],
+            coinbase: crate::types::Coinbase {
+                memo: Vec::new(),
+                outputs: vec![Output {
+                    address: Address::ALL_ZEROS,
+                    content: OutputContent::Bitcoin(BitcoinOutputContent(
+                        bitcoin::Amount::ZERO,
+                    )),
+                    memo: vec![0u8; Body::MAX_SIZE + 1],
+                }],
+            },
             transactions: Vec::new(),
             authorizations: Vec::new(),
             actor_proofs: Vec::new(),

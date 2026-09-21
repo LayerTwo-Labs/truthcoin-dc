@@ -1,13 +1,15 @@
 //! State errors
 #![allow(clippy::duplicated_attributes)]
 
+use std::path::PathBuf;
+
 use sneed::{db::error as db, env::error as env, rwtxn::error as rwtxn};
 use thiserror::Error;
 use transitive::Transitive;
 
 use crate::types::{
     AmountOverflowError, AmountUnderflowError, BlockHash, M6id, MerkleRoot,
-    OutPoint, WithdrawalBundleError,
+    OutPoint, Version, WithdrawalBundleError,
 };
 
 #[derive(Debug, Error)]
@@ -63,6 +65,12 @@ impl std::error::Error for FillTxOutputContents {}
 #[transitive(from(rwtxn::Commit, rwtxn::Error))]
 #[transitive(from(rwtxn::Error, sneed::Error))]
 pub enum Error {
+    #[error(
+        "Incompatible DB version ({}). Please clear the DB (`{}`) and re-sync",
+        .version,
+        .db_path.display()
+    )]
+    IncompatibleVersion { version: Version, db_path: PathBuf },
     #[error(transparent)]
     Market(#[from] crate::state::markets::MarketError),
     #[error(transparent)]

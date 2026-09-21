@@ -11,6 +11,84 @@ use super::serde_hexstr_human_readable;
 
 pub type Hash = [u8; blake3::OUT_LEN];
 
+/// Declare a transparent wrapper around [`Hash`], with the conversions and
+/// the hex formatting that every such wrapper needs.
+macro_rules! new_hash_wrapper {
+    ($vis:vis $ident:ident) => {
+        #[derive(
+            BorshSerialize,
+            BorshDeserialize,
+            Clone,
+            Copy,
+            Default,
+            Deserialize,
+            Eq,
+            Hash,
+            Ord,
+            PartialEq,
+            PartialOrd,
+            Serialize,
+        )]
+        #[repr(transparent)]
+        #[serde(transparent)]
+        $vis struct $ident(
+            #[serde(with = "serde_hexstr_human_readable")] pub Hash,
+        );
+
+        impl From<Hash> for $ident {
+            fn from(other: Hash) -> Self {
+                Self(other)
+            }
+        }
+
+        impl From<$ident> for Hash {
+            fn from(other: $ident) -> Self {
+                other.0
+            }
+        }
+
+        impl FromStr for $ident {
+            type Err = const_hex::FromHexError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Hash::from_hex(s).map(Self)
+            }
+        }
+
+        impl std::fmt::Debug for $ident {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", const_hex::encode(self.0))
+            }
+        }
+
+        impl std::fmt::Display for $ident {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", const_hex::encode(self.0))
+            }
+        }
+
+        impl utoipa::PartialSchema for $ident {
+            fn schema()
+            -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+                let obj = utoipa::openapi::Object::with_type(
+                    utoipa::openapi::Type::String,
+                );
+                utoipa::openapi::RefOr::T(utoipa::openapi::Schema::Object(obj))
+            }
+        }
+
+        impl utoipa::ToSchema for $ident {
+            fn name() -> std::borrow::Cow<'static, str> {
+                std::borrow::Cow::Borrowed(stringify!($ident))
+            }
+        }
+    };
+}
+
+new_hash_wrapper!(pub CoinbaseMerkleRoot);
+new_hash_wrapper!(pub CoinbaseTxid);
+new_hash_wrapper!(pub OutputsMerkleRoot);
+
 #[derive(
     BorshSerialize,
     BorshDeserialize,

@@ -196,8 +196,8 @@ pub fn show_utxo(
         OutPoint::Deposit(outpoint) => {
             ("deposit", format!("{}", outpoint.txid), outpoint.vout)
         }
-        OutPoint::Coinbase { merkle_root, vout } => {
-            ("coinbase", format!("{merkle_root}"), *vout)
+        OutPoint::Coinbase { txid, vout } => {
+            ("coinbase", format!("{txid}"), *vout)
         }
         OutPoint::MarketFunds {
             market_id,
@@ -250,8 +250,8 @@ pub fn show_unconfirmed_utxo(
         OutPoint::Deposit(outpoint) => {
             ("deposit", format!("{}", outpoint.txid), outpoint.vout)
         }
-        OutPoint::Coinbase { merkle_root, vout } => {
-            ("coinbase", format!("{merkle_root}"), *vout)
+        OutPoint::Coinbase { txid, vout } => {
+            ("coinbase", format!("{txid}"), *vout)
         }
         OutPoint::MarketFunds {
             market_id,

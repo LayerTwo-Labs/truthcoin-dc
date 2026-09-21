@@ -1377,7 +1377,7 @@ mod tests {
             BatchVerificationContext::new(&mut rand::rng());
 
         let empty_body = Body {
-            coinbase: Vec::new(),
+            coinbase: crate::types::Coinbase::default(),
             transactions: Vec::new(),
             authorizations: Vec::new(),
             actor_proofs: Vec::new(),

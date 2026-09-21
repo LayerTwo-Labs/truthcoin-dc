@@ -1840,7 +1840,7 @@ mod test {
 
         let main_hash = bitcoin::BlockHash::from_byte_array([1; 32]);
         let body = Body {
-            coinbase: Vec::new(),
+            coinbase: crate::types::Coinbase::default(),
             transactions: Vec::new(),
             authorizations: Vec::new(),
             actor_proofs: Vec::new(),

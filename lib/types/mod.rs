@@ -23,8 +23,12 @@ mod transaction;
 pub mod tx_pow;
 
 pub use address::Address;
-pub use hashes::{AssetId, BlockHash, Hash, M6id, MerkleRoot, Txid};
+pub use hashes::{
+    AssetId, BlockHash, CoinbaseMerkleRoot, CoinbaseTxid, Hash, M6id,
+    MerkleRoot, OutputsMerkleRoot, Txid,
+};
 pub use keys::{EncryptionPubKey, VerifyingKey};
+pub(crate) use transaction::output::borsh_serialize_bitcoin_amount;
 pub use transaction::{
     AssetOutput, AssetOutputContent, Authorized, AuthorizedTransaction,
     BallotItem, BitcoinOutput, BitcoinOutputContent, ClaimDecisionPayload,
@@ -169,6 +173,19 @@ pub struct Header {
 }
 
 impl Header {
+    pub fn compute_coinbase_txid(&self) -> CoinbaseTxid {
+        let Self {
+            merkle_root,
+            prev_side_hash,
+            prev_main_hash,
+        } = self;
+        Coinbase::compute_txid(
+            merkle_root,
+            prev_main_hash,
+            prev_side_hash.as_ref(),
+        )
+    }
+
     pub fn hash(&self) -> BlockHash {
         hashes::hash_with_scratch_buffer(self).into()
     }
@@ -487,9 +504,155 @@ pub struct TwoWayPegData {
     pub bundle_statuses: HashMap<M6id, WithdrawalBundleEvent>,
 }
 
+/// Hash to get a coinbase CBMT node commitment for a leaf value
+#[derive(BorshSerialize, Debug)]
+struct CoinbaseCbmtLeafPreCommitment<'a> {
+    #[borsh(serialize_with = "borsh_serialize_bitcoin_amount")]
+    value: bitcoin::Amount,
+    canonical_size: u64,
+    output: &'a Output,
+}
+
+/// Hash to get a coinbase CBMT node commitment for an internal node
+#[derive(BorshSerialize, Debug)]
+struct CoinbaseCbmtNodePreCommitment {
+    left_commitment: Hash,
+    #[borsh(serialize_with = "borsh_serialize_bitcoin_amount")]
+    value: bitcoin::Amount,
+    canonical_size: u64,
+    right_commitment: Hash,
+}
+
+/// Internal node of the coinbase CBMT
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CoinbaseCbmtNode {
+    commitment: Hash,
+    value: bitcoin::Amount,
+    canonical_size: u64,
+    /// CBT index. `CoinbaseCbmtNode` orders by this, and nothing else.
+    index: usize,
+}
+
+impl PartialOrd for CoinbaseCbmtNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CoinbaseCbmtNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.index.cmp(&other.index)
+    }
+}
+
+/// Marker type for merging coinbase branch commitments with value and
+/// canonical size totals.
+struct MergeValueSizeTotal;
+
+impl merkle_cbt::merkle_tree::Merge for MergeValueSizeTotal {
+    type Item = CoinbaseCbmtNode;
+
+    fn merge(lnode: &Self::Item, rnode: &Self::Item) -> Self::Item {
+        assert_eq!(lnode.index + 1, rnode.index);
+        let index = (lnode.index - 1) / 2;
+        let value = lnode.value + rnode.value;
+        let canonical_size = lnode.canonical_size + rnode.canonical_size;
+        let commitment =
+            hashes::hash_with_scratch_buffer(&CoinbaseCbmtNodePreCommitment {
+                left_commitment: lnode.commitment,
+                value,
+                canonical_size,
+                right_commitment: rnode.commitment,
+            });
+        CoinbaseCbmtNode {
+            commitment,
+            value,
+            canonical_size,
+            index,
+        }
+    }
+}
+
+/// Complete binary merkle tree over coinbase outputs
+type CoinbaseCbmt = merkle_cbt::CBMT<CoinbaseCbmtNode, MergeValueSizeTotal>;
+
+/// Coinbase transaction of a block
+#[derive(
+    BorshSerialize, Clone, Debug, Default, Deserialize, Serialize, ToSchema,
+)]
+pub struct Coinbase {
+    #[serde(with = "serde_hexstr_human_readable")]
+    #[schema(value_type = String)]
+    pub memo: Vec<u8>,
+    pub outputs: Vec<Output>,
+}
+
+impl Coinbase {
+    /// Commitment to every output, with the value and the canonical size
+    /// totalled at each branch.
+    fn compute_outputs_merkle_root(&self) -> OutputsMerkleRoot {
+        let n_outputs = self.outputs.len();
+        let leaves: Vec<CoinbaseCbmtNode> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                let value = output.get_bitcoin_value();
+                let canonical_size = output.canonical_size();
+                let commitment = hashes::hash_with_scratch_buffer(
+                    &CoinbaseCbmtLeafPreCommitment {
+                        value,
+                        canonical_size,
+                        output,
+                    },
+                );
+                CoinbaseCbmtNode {
+                    commitment,
+                    value,
+                    canonical_size,
+                    index: (index + n_outputs) - 1,
+                }
+            })
+            .collect();
+        let CoinbaseCbmtNode { commitment, .. } =
+            CoinbaseCbmt::build_merkle_root(leaves.as_slice());
+        commitment.into()
+    }
+
+    /// Commitment to the memo and the outputs
+    pub fn compute_merkle_root(&self) -> CoinbaseMerkleRoot {
+        let outputs_commitment = self.compute_outputs_merkle_root();
+        hashes::hash_with_scratch_buffer(&(&self.memo, outputs_commitment))
+            .into()
+    }
+
+    /// A coinbase txid hashes the merkle root of its block, the previous
+    /// mainchain hash, and the previous sidechain hash.
+    pub fn compute_txid(
+        merkle_root: &MerkleRoot,
+        prev_main_hash: &bitcoin::BlockHash,
+        prev_side_hash: Option<&BlockHash>,
+    ) -> CoinbaseTxid {
+        #[derive(BorshSerialize)]
+        struct HashComponents<'a> {
+            merkle_root: &'a MerkleRoot,
+            #[borsh(serialize_with = "borsh_serialize_bitcoin_block_hash")]
+            prev_main_hash: &'a bitcoin::BlockHash,
+            prev_side_hash: Option<&'a BlockHash>,
+        }
+
+        hashes::hash_with_scratch_buffer(&HashComponents {
+            merkle_root,
+            prev_main_hash,
+            prev_side_hash,
+        })
+        .into()
+    }
+}
+
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct Body {
-    pub coinbase: Vec<Output>,
+    pub coinbase: Coinbase,
     pub transactions: Vec<Transaction>,
     pub authorizations: Vec<Authorization>,
     #[serde(default)]
@@ -502,7 +665,7 @@ impl Body {
 
     pub fn new(
         authorized_transactions: Vec<AuthorizedTransaction>,
-        coinbase: Vec<Output>,
+        coinbase: Coinbase,
     ) -> Self {
         let mut authorizations = Vec::with_capacity(
             authorized_transactions
@@ -552,10 +715,10 @@ impl Body {
     }
 
     pub fn compute_merkle_root(
-        coinbase: &[Output],
+        coinbase: &Coinbase,
         txs: &[Transaction],
     ) -> MerkleRoot {
-        let coinbase_hash: Hash = hashes::hash_with_scratch_buffer(coinbase);
+        let coinbase_hash: Hash = coinbase.compute_merkle_root().into();
         let mut leaves: Vec<Hash> = std::iter::once(coinbase_hash)
             .chain(txs.iter().map(|tx| tx.txid().into()))
             .collect();
@@ -586,30 +749,11 @@ impl Body {
             .collect()
     }
 
-    pub fn get_outputs(&self) -> HashMap<OutPoint, Output> {
-        let mut outputs = HashMap::new();
-        let merkle_root =
-            Body::compute_merkle_root(&self.coinbase, &self.transactions);
-        for (vout, output) in self.coinbase.iter().enumerate() {
-            let vout = vout as u32;
-            let outpoint = OutPoint::Coinbase { merkle_root, vout };
-            outputs.insert(outpoint, output.clone());
-        }
-        for transaction in &self.transactions {
-            let txid = transaction.txid();
-            for (vout, output) in transaction.outputs.iter().enumerate() {
-                let vout = vout as u32;
-                let outpoint = OutPoint::Regular { txid, vout };
-                outputs.insert(outpoint, output.clone());
-            }
-        }
-        outputs
-    }
-
     pub fn get_coinbase_value(
         &self,
     ) -> Result<bitcoin::Amount, AmountOverflowError> {
         self.coinbase
+            .outputs
             .iter()
             .map(|output| output.get_bitcoin_value())
             .checked_sum()
@@ -838,6 +982,46 @@ mod withdrawal_bundle_order_regression {
                 m,
                 bundle_m6id(perm),
                 "m6id must not depend on aggregation order"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod coinbase_tests {
+    use bitcoin::hashes::Hash as _;
+
+    use super::{BlockHash, Coinbase, Header, MerkleRoot};
+
+    fn header(merkle_root: [u8; 32], main: u8, side: Option<u8>) -> Header {
+        Header {
+            merkle_root: MerkleRoot::from(merkle_root),
+            prev_side_hash: side.map(|b| BlockHash::from([b; 32])),
+            prev_main_hash: bitcoin::BlockHash::from_byte_array([main; 32]),
+        }
+    }
+
+    #[test]
+    fn coinbase_txid_binds_the_block_it_sits_in() {
+        let base = header([1; 32], 2, Some(3));
+        assert_eq!(
+            base.compute_coinbase_txid(),
+            Coinbase::compute_txid(
+                &base.merkle_root,
+                &base.prev_main_hash,
+                base.prev_side_hash.as_ref(),
+            )
+        );
+        for other in [
+            header([9; 32], 2, Some(3)),
+            header([1; 32], 9, Some(3)),
+            header([1; 32], 2, Some(9)),
+            header([1; 32], 2, None),
+        ] {
+            assert_ne!(
+                base.compute_coinbase_txid(),
+                other.compute_coinbase_txid(),
+                "{other:?} shares a coinbase txid with {base:?}"
             );
         }
     }

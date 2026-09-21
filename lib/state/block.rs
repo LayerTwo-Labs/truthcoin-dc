@@ -734,7 +734,7 @@ pub fn connect_prevalidated(
         state
             .genesis_timestamp
             .put(rwtxn, &(), &mainchain_timestamp)?;
-        if let Some(first_coinbase) = body.coinbase.first() {
+        if let Some(first_coinbase) = body.coinbase.outputs.first() {
             state.reputation().set_reputation(
                 rwtxn,
                 &first_coinbase.address,
@@ -780,13 +780,13 @@ pub fn connect_prevalidated(
     }
 
     crate::validation::BlockValidator::validate_coinbase_outputs(
-        &body.coinbase,
+        &body.coinbase.outputs,
         height,
     )?;
 
-    for (vout, output) in body.coinbase.iter().enumerate() {
+    for (vout, output) in body.coinbase.outputs.iter().enumerate() {
         let outpoint = OutPoint::Coinbase {
-            merkle_root: header.merkle_root,
+            txid: header.compute_coinbase_txid(),
             vout: vout as u32,
         };
         let filled_content = match output.content.clone() {
@@ -1209,10 +1209,14 @@ pub fn disconnect_tip(
     }
 
     // 6. Revert coinbase UTXOs
-    body.coinbase.iter().enumerate().rev().try_for_each(
-        |(vout, _output)| {
+    body.coinbase
+        .outputs
+        .iter()
+        .enumerate()
+        .rev()
+        .try_for_each(|(vout, _output)| {
             let outpoint = OutPoint::Coinbase {
-                merkle_root: header.merkle_root,
+                txid: header.compute_coinbase_txid(),
                 vout: vout as u32,
             };
             if state.delete_utxo(rwtxn, &outpoint)? {
@@ -1220,8 +1224,7 @@ pub fn disconnect_tip(
             } else {
                 Err(Error::NoUtxo { outpoint })
             }
-        },
-    )?;
+        })?;
 
     // 7. Rollback decision states (Claimed → Voting transitions)
     if height > 0 {

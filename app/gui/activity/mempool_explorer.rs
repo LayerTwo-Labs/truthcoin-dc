@@ -116,9 +116,9 @@ impl MempoolExplorer {
                                             format!("{}", outpoint.txid),
                                             outpoint.vout,
                                         ),
-                                        OutPoint::Coinbase { merkle_root, vout } => (
+                                        OutPoint::Coinbase { txid, vout } => (
                                             "coinbase",
-                                            format!("{merkle_root}"),
+                                            format!("{txid}"),
                                             *vout,
                                         ),
                                         OutPoint::MarketFunds {
