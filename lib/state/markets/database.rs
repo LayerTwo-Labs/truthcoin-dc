@@ -27,7 +27,7 @@ pub struct MarketsDatabase {
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Vec<MarketId>>>,
     decision_index:
         DatabaseUnique<SerdeBincode<DecisionId>, SerdeBincode<Vec<MarketId>>>,
-    share_accounts:
+    pub(crate) share_accounts:
         DatabaseUnique<SerdeBincode<Address>, SerdeBincode<ShareAccount>>,
     /// is_fee=false for treasury, is_fee=true for author fees
     market_funds_utxos:
@@ -474,6 +474,23 @@ impl MarketsDatabase {
                     &decisions,
                 )?;
 
+                let mut payout_addresses = std::collections::BTreeSet::new();
+                let mut pre_settlement_share_accounts = Vec::new();
+                for payout in &payout_summary.payouts {
+                    if payout_addresses.insert(payout.address) {
+                        let account = self
+                            .get_user_share_account(txn, &payout.address)?
+                            .ok_or_else(|| Error::InvalidTransaction {
+                                reason: format!(
+                                    "missing share account for payout address {}",
+                                    payout.address
+                                ),
+                            })?;
+                        pre_settlement_share_accounts
+                            .push((payout.address, account));
+                    }
+                }
+
                 // Apply payouts
                 self.apply_automatic_share_payouts(
                     state,
@@ -502,6 +519,7 @@ impl MarketsDatabase {
                     payout_summary: payout_summary.clone(),
                     treasury_utxo,
                     fee_utxo,
+                    pre_settlement_share_accounts,
                 });
 
                 results.push((market_id, payout_summary));
@@ -702,7 +720,7 @@ impl MarketsDatabase {
                 reason: "Insufficient shares for sell transaction".to_string(),
             })?;
 
-        if account.positions.is_empty() {
+        if account.positions.is_empty() && account.escrows.is_empty() {
             self.share_accounts.delete(txn, address)?;
         } else {
             self.share_accounts.put(txn, address, &account)?;
@@ -717,6 +735,21 @@ impl MarketsDatabase {
         address: &Address,
     ) -> Result<Option<ShareAccount>, Error> {
         Ok(self.share_accounts.try_get(txn, address)?)
+    }
+
+    pub fn restore_share_account(
+        &self,
+        txn: &mut RwTxn,
+        address: &Address,
+        account: Option<&ShareAccount>,
+    ) -> Result<(), Error> {
+        match account {
+            Some(account) => self.share_accounts.put(txn, address, account)?,
+            None => {
+                self.share_accounts.delete(txn, address)?;
+            }
+        }
+        Ok(())
     }
 
     /// Get all share accounts from the database (for debugging)
@@ -978,7 +1011,9 @@ impl MarketsDatabase {
         let mut sequence = 0u32;
 
         for payout in &payout_summary.payouts {
-            if payout.payout_sats > 0 {
+            let ordinary_payout =
+                state.native().settle_payout(txn, payout, block_height)?;
+            if ordinary_payout > 0 {
                 let outpoint = generate_share_payout_outpoint(
                     &payout.market_id,
                     &payout.address,
@@ -990,7 +1025,7 @@ impl MarketsDatabase {
                     address: payout.address,
                     content: FilledOutputContent::Bitcoin(
                         BitcoinOutputContent(bitcoin::Amount::from_sat(
-                            payout.payout_sats,
+                            ordinary_payout,
                         )),
                     ),
                     memo: vec![],

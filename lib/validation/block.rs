@@ -118,7 +118,20 @@ impl BlockValidator {
             return Err(Error::AuthorizationError);
         }
 
+        let parent_height = if body.transactions.iter().any(|tx| {
+            matches!(tx.data, Some(TransactionData::NativeOperation(_)))
+        }) {
+            archive
+                .get_main_height(rotxn, header.prev_main_hash)?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    crate::state::native::invalid("parent height overflow")
+                })?
+        } else {
+            0
+        };
         Ok(PrevalidatedBlock {
+            parent_height,
             filled_transactions: filled_txs,
             computed_merkle_root: merkle_root,
             coinbase_value,
@@ -164,6 +177,7 @@ impl BlockValidator {
     ) -> Result<bitcoin::Amount, Error> {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
 
+        crate::state::native::validate(state, archive, rotxn, tx)?;
         for (outpoint, output) in tx.spent_inputs() {
             // a withdrawal output is committed to a bundle and can only be
             // spent by the bundle, never by a transaction
