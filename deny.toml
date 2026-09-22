@@ -80,7 +80,6 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "Temporary ignore until aws-lc-rs and rustls-webpki get updated"},
     # bincode is unmaintained (transitive via heed)
     { id = "RUSTSEC-2025-0141", reason = "Transitive dependency from heed, awaiting upstream update to use alternative"},
-    { id = "RUSTSEC-2026-0247", reason = "The pinned enforcer integration harness uses cusf-enforcer-mempool -> imbl -> bitmaps. No patched bitmaps version exists." },
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 via atspi-common -> zbus-lockstep(-macros) -> zbus_xml parses fixed crate XML in macros and dependency tests." },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.30 via atspi-common -> zbus-lockstep(-macros) -> zbus_xml parses fixed crate XML in macros and dependency tests." },
     # ttf-parser is unmaintained (transitive via egui/eframe -> ab_glyph); no safe upgrade
@@ -88,8 +87,6 @@ ignore = [
     # quick-xml 0.30 (transitive via eframe -> accesskit_unix -> zbus_xml); fixed in 0.41, needs eframe bump
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 pinned by zbus_xml under eframe 0.31, no upgrade without eframe bump" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.30 pinned by zbus_xml under eframe 0.31, no upgrade without eframe bump" },
-    # bitmaps is unmaintained (transitive via cusf-enforcer-mempool -> imbl); dev-dependency only
-    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained, transitive via cusf-enforcer-mempool/imbl, no safe upgrade" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
@@ -132,9 +129,8 @@ exceptions = [
     { allow = ["CDLA-Permissive-2.0"], name = "webpki-root-certs", version = "1.0.5" },
     { allow = ["CDLA-Permissive-2.0"], name = "webpki-roots", version = "1.0.5" },
     { allow = ["LicenseRef-UFL-1.0", "OFL-1.1", "Ubuntu-font-1.0"], name = "epaint_default_fonts", version = "0.31.0" },
-    { allow = ["MPL-2.0"], name = "bitmaps", version = "3.2.1" },
-    { allow = ["MPL-2.0"], name = "imbl", version = "7.0.0" },
-    { allow = ["MPL-2.0"], name = "imbl-sized-chunks", version = "0.1.3" },
+    { allow = ["MPL-2.0"], name = "imbl", version = "7.0.2" },
+    { allow = ["MPL-2.0"], name = "imbl-sized-chunks", version = "0.2.0" },
     { allow = ["MPL-2.0"], name = "option-ext", version = "0.2.0" },
     { allow = ["MPL-2.0"], name = "webpki-roots", version = "0.25.4" },
     { allow = ["Zlib"], crate = "foldhash" },
