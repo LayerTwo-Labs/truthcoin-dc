@@ -4384,6 +4384,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "merkle-cbt"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "171d2f700835121c3b04ccf0880882987a050fd5c7ae88148abf537d33dd3a56"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "metal"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7708,6 +7717,7 @@ dependencies = [
  "jsonrpsee",
  "libes",
  "libm",
+ "merkle-cbt",
  "nalgebra",
  "ndarray",
  "nonempty 0.11.0",

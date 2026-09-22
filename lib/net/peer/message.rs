@@ -340,3 +340,34 @@ mod network_tests {
         assert_eq!(magics.len(), EXPECTED.len());
     }
 }
+
+#[cfg(test)]
+mod betanet_capture_tests {
+    use super::ResponseMessage;
+    use crate::types::Body;
+
+    #[test]
+    fn betanet_seed_genesis_response_matches_commitments() {
+        let bytes = include_bytes!("fixtures/betanet-genesis-response.bin");
+        let response: ResponseMessage = bincode::deserialize(bytes).unwrap();
+        assert_eq!(bincode::serialize(&response).unwrap(), bytes);
+        let ResponseMessage::Block { header, mut body } = response else {
+            panic!("expected block response");
+        };
+        assert_eq!(
+            header.hash().to_string(),
+            "bcac497706c7552b0bd6791212318ccea83b1d48d1164f54079dc482dc517bfb"
+        );
+        assert_eq!(
+            Body::compute_merkle_root(&body.coinbase, &body.transactions),
+            header.merkle_root
+        );
+        assert!(body.coinbase.memo.is_empty());
+        assert_eq!(body.coinbase.outputs.len(), 1);
+        body.coinbase.memo.push(1);
+        assert_ne!(
+            Body::compute_merkle_root(&body.coinbase, &body.transactions),
+            header.merkle_root
+        );
+    }
+}

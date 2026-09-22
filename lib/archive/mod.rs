@@ -115,8 +115,8 @@ impl Archive {
                 if db_version
                     < Version {
                         major: 0,
-                        minor: 15,
-                        patch: 1,
+                        minor: 18,
+                        patch: 0,
                     } =>
             {
                 return Err(Error::IncompatibleVersion {

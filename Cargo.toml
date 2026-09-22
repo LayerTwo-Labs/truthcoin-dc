@@ -28,6 +28,7 @@ hickory-resolver = { version = "0.26", default-features = false }
 http = "1.2.0"
 itertools = "0.14.0"
 jsonrpsee = { version = "0.26.0", features = ["tracing"] }
+merkle-cbt = "0.3.2"
 parking_lot = "0.12.1"
 prost = "0.14.3"
 # needs to line up with version required by frost-core

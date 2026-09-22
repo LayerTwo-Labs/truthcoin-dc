@@ -523,6 +523,10 @@ impl App {
                      block connection"
                 );
             }
+            let coinbase = types::Coinbase {
+                memo: Vec::new(),
+                outputs: coinbase,
+            };
             let merkle_root = Body::compute_merkle_root(
                 &coinbase,
                 &txs.iter()
@@ -547,7 +551,7 @@ impl App {
             });
             (bribe, header, body, tx_fees)
         } else {
-            let coinbase = Vec::new();
+            let coinbase = types::Coinbase::default();
             let merkle_root = Body::compute_merkle_root(&coinbase, &[]);
             let body = Body::new(Vec::new(), coinbase);
             let header = types::Header {

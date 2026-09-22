@@ -53,6 +53,7 @@ impl BlockExplorer {
                     bincode::serialize(&body).unwrap_or(vec![]).len();
                 let coinbase_value: bitcoin::Amount = body
                     .coinbase
+                    .outputs
                     .iter()
                     .map(GetBitcoinValue::get_bitcoin_value)
                     .sum();

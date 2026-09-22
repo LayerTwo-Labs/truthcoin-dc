@@ -48,8 +48,8 @@ impl ErrorRx {
         enum SourceItem {
             Error(error::channel_pool::SendMessage),
             Heartbeat(Heartbeat, channel_pool::LimiterGuard<Heartbeat>),
-            PeerResponse(PeerResponseItem),
-            Request(Request, channel_pool::LimiterGuard<Request>),
+            PeerResponse(Box<PeerResponseItem>),
+            Request(Box<Request>, channel_pool::LimiterGuard<Request>),
         }
         let (channel_pool, channel_pool_rx) = ChannelPool::new(connection);
         let channel_pool_stream = channel_pool_rx
@@ -59,7 +59,7 @@ impl ErrorRx {
                     SourceItem::Error(error)
                 }
                 futures::future::Either::Right(peer_response) => {
-                    SourceItem::PeerResponse(peer_response)
+                    SourceItem::PeerResponse(Box::new(peer_response))
                 }
             })
             .boxed();
@@ -90,7 +90,7 @@ impl ErrorRx {
                             .until_n_ready(request_cost(&request))
                             .await
                             .unwrap();
-                        SourceItem::Request(request, guard)
+                        SourceItem::Request(Box::new(request), guard)
                     }
                 }
             })
@@ -111,13 +111,13 @@ impl ErrorRx {
                     }
                 }
                 SourceItem::Request(request, guard) => {
-                    match channel_pool.send_request(request, guard) {
+                    match channel_pool.send_request(*request, guard) {
                         Ok(()) => None,
                         Err(err) => Some(err.into()),
                     }
                 }
                 SourceItem::PeerResponse(peer_response) => {
-                    match peer_response_tx.unbounded_send(peer_response) {
+                    match peer_response_tx.unbounded_send(*peer_response) {
                         Ok(()) => None,
                         Err(_err) => {
                             Some(error::request_queue::Error::PushPeerResponse)
