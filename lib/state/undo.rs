@@ -10,16 +10,15 @@ use crate::types::{Address, FilledOutput, OutPoint};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Exact pre-block snapshots for every existing market mutated by trades or
-/// liquidity amplification. Derived reversal is insufficient because market
-/// version and last-updated metadata cannot be reconstructed from a height.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MarketTransitionUndoData {
-    pub entries: Vec<Market>,
-    /// Exact pre-block share accounts touched by trades. Reversing quantities
-    /// alone cannot recover `last_updated_height`, including after a sell.
-    pub share_accounts:
-        Vec<(Address, Option<crate::state::markets::ShareAccount>)>,
+/// Exact snapshots stored in the EXISTING consolidation_undo row.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AccountUndoV3 {
+    pub accounts:
+        BTreeMap<Address, Option<crate::state::markets::ShareAccount>>,
+    pub markets: BTreeMap<MarketId, Market>,
+    pub cash_outputs: Vec<OutPoint>,
+    /// Outer None means the frame has not been initialized for a block.
+    pub previous_timestamp: Option<Option<u64>>,
 }
 
 /// Undo data for market settlement and automatic payouts (C1).
@@ -87,8 +86,9 @@ pub struct ReputationTransferUndoEntry {
 ///
 /// Captured before `consolidate_market_utxos` during connect.
 /// Used to restore pre-consolidation UTXO state during disconnect.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ConsolidationUndoData {
+    pub account_undo: AccountUndoV3,
     pub entries: Vec<ConsolidationUndoEntry>,
     /// Sell input change UTXOs created (to delete on revert)
     pub sell_input_change_utxos: Vec<OutPoint>,

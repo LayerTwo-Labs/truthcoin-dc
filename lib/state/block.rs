@@ -161,41 +161,22 @@ impl StateUpdate {
                 .filter(|settlement| settlement.is_amplify)
                 .map(|settlement| settlement.market_id),
         );
-        if !mutated_market_ids.is_empty() {
-            let mut entries = Vec::with_capacity(mutated_market_ids.len());
-            for market_id in mutated_market_ids {
+        let mut undo = state
+            .consolidation_undo
+            .try_get(rwtxn, &height)?
+            .unwrap_or_default();
+        for market_id in mutated_market_ids {
+            if !undo.account_undo.markets.contains_key(&market_id) {
                 let market = state
                     .markets()
                     .get_market(rwtxn, &market_id)?
-                    .ok_or_else(|| Error::InvalidTransaction {
-                        reason: format!(
-                            "Market {market_id:?} not found before mutation"
-                        ),
+                    .ok_or_else(|| {
+                        super::native::invalid("missing market before mutation")
                     })?;
-                entries.push(market);
+                undo.account_undo.markets.insert(market_id, market);
             }
-            let touched_addresses: std::collections::BTreeSet<_> = self
-                .share_account_changes
-                .keys()
-                .map(|(address, _)| *address)
-                .collect();
-            let mut share_accounts =
-                Vec::with_capacity(touched_addresses.len());
-            for address in touched_addresses {
-                share_accounts.push((
-                    address,
-                    state.markets().get_user_share_account(rwtxn, &address)?,
-                ));
-            }
-            state.market_transition_undo.put(
-                rwtxn,
-                &height,
-                &crate::state::undo::MarketTransitionUndoData {
-                    entries,
-                    share_accounts,
-                },
-            )?;
         }
+        state.consolidation_undo.put(rwtxn, &height, &undo)?;
 
         for creation in &self.market_creations {
             state
@@ -719,6 +700,7 @@ impl StateUpdate {
         Ok(Some(crate::state::undo::ConsolidationUndoData {
             entries: undo_entries,
             sell_input_change_utxos,
+            ..Default::default()
         }))
     }
 
@@ -784,11 +766,12 @@ pub fn connect_prevalidated(
     // so disconnect_tip is a true inverse, including at genesis.
     let previous_mainchain_timestamp =
         state.try_get_mainchain_timestamp(rwtxn)?;
-    state.mainchain_timestamp_undo.put(
-        rwtxn,
-        &height,
-        &previous_mainchain_timestamp,
-    )?;
+    let mut undo = state
+        .consolidation_undo
+        .try_get(rwtxn, &height)?
+        .unwrap_or_default();
+    undo.account_undo.previous_timestamp = Some(previous_mainchain_timestamp);
+    state.consolidation_undo.put(rwtxn, &height, &undo)?;
 
     if height == 0 {
         state
@@ -964,9 +947,14 @@ pub fn connect_prevalidated(
     if let Some(consolidation_undo) =
         state_update.apply_all_changes(state, rwtxn, height)?
     {
-        state
+        let mut undo = state
             .consolidation_undo
-            .put(rwtxn, &height, &consolidation_undo)?;
+            .try_get(rwtxn, &height)?
+            .unwrap_or_default();
+        undo.entries.extend(consolidation_undo.entries);
+        undo.sell_input_change_utxos
+            .extend(consolidation_undo.sell_input_change_utxos);
+        state.consolidation_undo.put(rwtxn, &height, &undo)?;
     }
 
     if height == 0 {
@@ -1144,11 +1132,9 @@ pub fn disconnect_tip(
         state.consolidation_undo.try_get(rwtxn, &height)?
     {
         revert_consolidation(state, rwtxn, &consolidation_undo)?;
-        state.consolidation_undo.delete(rwtxn, &height)?;
     }
 
     // 5. Revert transaction-level UTXOs and tx-specific state
-    let mut trade_share_deltas: Vec<TradeShareDelta> = Vec::new();
 
     let skipped_tx_indices: HashSet<u32> = state
         .skipped_tx_indices_undo
@@ -1173,11 +1159,7 @@ pub fn disconnect_tip(
             }
             // Native undo restores exact touched accounts and escrow rows below.
             Some(TxData::NativeOperation(_)) => {}
-            Some(TxData::Trade { .. }) => {
-                let delta =
-                    revert_trade_market_state(state, rwtxn, &filled_tx)?;
-                trade_share_deltas.push(delta);
-            }
+            Some(TxData::Trade { .. }) => {}
             Some(TxData::SubmitVote { .. }) => {
                 let () = revert_submit_vote(state, rwtxn, &filled_tx)?;
             }
@@ -1185,9 +1167,7 @@ pub fn disconnect_tip(
                 let () = revert_submit_ballot(state, rwtxn, &filled_tx)?;
             }
             Some(TxData::TransferReputation { .. }) => {}
-            Some(TxData::AmplifyBeta { .. }) => {
-                let () = revert_amplify_beta(state, rwtxn, &filled_tx)?;
-            }
+            Some(TxData::AmplifyBeta { .. }) => {}
         }
 
         tx.outputs.iter().enumerate().rev().try_for_each(
@@ -1223,62 +1203,7 @@ pub fn disconnect_tip(
         state.skipped_tx_indices_undo.delete(rwtxn, &height)?;
     }
 
-    // 3b. Apply batched share account changes from trade reverts
-    if !trade_share_deltas.is_empty() {
-        let mut batched: std::collections::HashMap<
-            (Address, MarketId),
-            std::collections::HashMap<u32, i64>,
-        > = std::collections::HashMap::new();
-
-        for delta in &trade_share_deltas {
-            batched
-                .entry((delta.address, delta.market_id))
-                .or_default()
-                .entry(delta.outcome_index)
-                .and_modify(|v| *v += delta.share_delta)
-                .or_insert(delta.share_delta);
-        }
-
-        for ((address, market_id), outcome_changes) in &batched {
-            for (&outcome_index, &net_delta) in outcome_changes {
-                if net_delta > 0 {
-                    state.markets().add_shares_to_account(
-                        rwtxn,
-                        address,
-                        *market_id,
-                        outcome_index,
-                        net_delta,
-                        height,
-                    )?;
-                } else if net_delta < 0 {
-                    state.markets().remove_shares_from_account(
-                        rwtxn,
-                        address,
-                        market_id,
-                        outcome_index,
-                        -net_delta,
-                        height,
-                    )?;
-                }
-            }
-        }
-    }
-
-    if let Some(market_undo) =
-        state.market_transition_undo.try_get(rwtxn, &height)?
-    {
-        for market in market_undo.entries {
-            state.markets().update_market(rwtxn, &market)?;
-        }
-        for (address, account) in market_undo.share_accounts {
-            state.markets().restore_share_account(
-                rwtxn,
-                &address,
-                account.as_ref(),
-            )?;
-        }
-        state.market_transition_undo.delete(rwtxn, &height)?;
-    }
+    // Exact pre-block snapshots replace quantity-derived market/account reversal.
     state.native().restore(state, rwtxn, height)?;
 
     // 3c. Revert reputation transfers
@@ -1342,12 +1267,11 @@ pub fn disconnect_tip(
 
     // 8. Restore consensus time and then update tip/height to the predecessor.
     let previous_mainchain_timestamp = state
-        .mainchain_timestamp_undo
+        .consolidation_undo
         .try_get(rwtxn, &height)?
+        .and_then(|u| u.account_undo.previous_timestamp)
         .ok_or_else(|| {
-            Error::DatabaseError(format!(
-                "missing mainchain timestamp undo at height {height}"
-            ))
+            super::native::invalid("missing initialized block undo")
         })?;
     match previous_mainchain_timestamp {
         Some(timestamp) => {
@@ -1357,7 +1281,7 @@ pub fn disconnect_tip(
             state.mainchain_timestamp.delete(rwtxn, &())?;
         }
     }
-    state.mainchain_timestamp_undo.delete(rwtxn, &height)?;
+    state.consolidation_undo.delete(rwtxn, &height)?;
     if height == 0 {
         state.genesis_timestamp.delete(rwtxn, &())?;
     }
@@ -1673,18 +1597,6 @@ fn configure_market_builder(
     builder
 }
 
-/// Derive the current effective beta for a market.
-/// `beta = liquidity_base_sats / ln(num_outcomes)`, where the liquidity base is
-/// the creation seed plus confirmed `AmplifyBeta` deposits (ordinary trade
-/// proceeds are excluded). Mempool-pending deposits are not counted until they
-/// confirm.
-fn market_beta(market: &crate::state::Market) -> f64 {
-    trading::derive_beta_from_liquidity(
-        market.liquidity_base_sats,
-        market.shares().len(),
-    )
-}
-
 /// Effective shares and beta for a market, folding in the trades already
 /// applied to `state_update` earlier in this block. Lets same-block trades
 /// price sequentially against running state instead of stale pre-block state.
@@ -1771,152 +1683,6 @@ fn revert_create_market(
     Ok(())
 }
 
-struct TradeShareDelta {
-    address: Address,
-    market_id: MarketId,
-    outcome_index: u32,
-    share_delta: i64,
-}
-
-fn revert_trade_market_state(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<TradeShareDelta, Error> {
-    let trade = filled_tx.trade().ok_or_else(|| Error::InvalidTransaction {
-        reason: "Not a trade transaction".to_string(),
-    })?;
-
-    let is_buy = trade.is_buy();
-    let height = state.try_get_height(rwtxn)?.unwrap_or(0);
-
-    let mut market = state
-        .markets()
-        .get_market(rwtxn, &trade.market_id)?
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "Market not found during trade revert".to_string(),
-        })?;
-
-    let shares_delta = trade.shares_abs() as i64;
-    let outcome = trade.outcome_index as usize;
-
-    let beta = market_beta(&market);
-
-    if is_buy {
-        let mut pre_trade_shares = market.shares().clone();
-        pre_trade_shares[outcome] -= shares_delta;
-
-        let base_cost = trading::calculate_update_cost(
-            &pre_trade_shares,
-            market.shares(),
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("LMSR calc failed during buy trade revert: {e:?}"),
-        })?;
-        let buy_cost =
-            trading::calculate_buy_cost(base_cost, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!(
-                        "Buy cost calc failed during trade revert: {e}"
-                    ),
-                })?;
-        market
-            .revert_trading_volume(outcome, buy_cost.total_cost_sats)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!(
-                    "Volume revert failed during buy trade revert: \
-                     {e:?}"
-                ),
-            })?;
-
-        market
-            .update_shares(pre_trade_shares, height)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Failed to revert market shares: {e:?}"),
-            })?;
-    } else {
-        let mut pre_trade_shares = market.shares().clone();
-        pre_trade_shares[outcome] += shares_delta;
-
-        let base_cost = trading::calculate_update_cost(
-            market.shares(),
-            &pre_trade_shares,
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("LMSR calc failed during sell trade revert: {e:?}"),
-        })?;
-        let sell_proceeds =
-            trading::calculate_sell_proceeds(base_cost, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                reason: format!(
-                    "Sell proceeds calc failed during trade \
-                         revert: {e}"
-                ),
-            })?;
-        market
-            .revert_trading_volume(outcome, sell_proceeds.gross_proceeds_sats)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!(
-                    "Volume revert failed during sell trade revert: \
-                     {e:?}"
-                ),
-            })?;
-
-        market
-            .update_shares(pre_trade_shares, height)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Failed to revert market shares: {e:?}"),
-            })?;
-    }
-
-    state.markets().update_market(rwtxn, &market)?;
-
-    if is_buy {
-        let change_outpoint = StateUpdate::generate_buy_change_outpoint(
-            &trade.market_id,
-            &trade.trader,
-            filled_tx.txid().0,
-        );
-        if let Err(e) = state.delete_utxo(rwtxn, &change_outpoint) {
-            tracing::trace!(
-                "UTXO not found during trade revert (expected if 0 change): {e:?}"
-            );
-        }
-    } else {
-        let payout_outpoint = StateUpdate::generate_sell_payout_outpoint(
-            &trade.market_id,
-            &trade.trader,
-            filled_tx.txid().0,
-        );
-        if let Err(e) = state.delete_utxo(rwtxn, &payout_outpoint) {
-            tracing::trace!(
-                "UTXO not found during trade revert (expected if 0 change): {e:?}"
-            );
-        }
-
-        let change_outpoint = StateUpdate::generate_sell_input_change_outpoint(
-            &trade.trader,
-            filled_tx.txid().0,
-        );
-        if let Err(e) = state.delete_utxo(rwtxn, &change_outpoint) {
-            tracing::trace!(
-                "UTXO not found during trade revert (expected if 0 change): {e:?}"
-            );
-        }
-    }
-
-    let account_delta = if is_buy { -shares_delta } else { shares_delta };
-
-    Ok(TradeShareDelta {
-        address: trade.trader,
-        market_id: trade.market_id,
-        outcome_index: trade.outcome_index,
-        share_delta: account_delta,
-    })
-}
-
 fn apply_utxo_changes(
     state: &State,
     rwtxn: &mut RwTxn,
@@ -1964,7 +1730,7 @@ fn apply_native_operation(
     state: &State,
     txn: &mut RwTxn,
     filled: &FilledTransaction,
-    operation: &crate::types::native::NativeOperationV2,
+    operation: &crate::types::native::NativeOperationV3,
     update: &mut StateUpdate,
     height: u32,
     parent_height: u32,
@@ -1979,7 +1745,7 @@ fn apply_native_operation(
     }
     let txid = filled.txid().0;
     match &operation.action {
-        NativeActionV2::MoveShares {
+        NativeActionV3::MoveShares {
             owner,
             recipient,
             market_id,
@@ -2008,7 +1774,7 @@ fn apply_native_operation(
                 *shares,
             )?;
         }
-        NativeActionV2::LockShares {
+        NativeActionV3::LockShares {
             owner,
             claim_address,
             refund_address,
@@ -2049,7 +1815,8 @@ fn apply_native_operation(
                 },
             )?;
         }
-        NativeActionV2::AssignEscrow {
+        NativeActionV3::AssignEscrow {
+            original_owner,
             escrow_id,
             new_claim_address,
             new_refund_address,
@@ -2058,23 +1825,25 @@ fn apply_native_operation(
                 txn,
                 height,
                 filled,
+                *original_owner,
                 *escrow_id,
                 *new_claim_address,
                 *new_refund_address,
                 operation.reference,
             )?;
         }
-        NativeActionV2::ResolveEscrow {
+        NativeActionV3::ResolveEscrow {
+            original_owner,
             escrow_id,
             resolution,
         } => {
             let mut escrow = state
                 .native()
-                .get_escrow(txn, *escrow_id)?
+                .get_escrow(txn, *original_owner, *escrow_id)?
                 .ok_or_else(|| invalid("unknown native escrow"))?;
             let preimage = match resolution {
-                EscrowResolutionV2::Claim { preimage } => Some(preimage),
-                EscrowResolutionV2::Refund => None,
+                EscrowResolutionV3::Claim { preimage } => Some(preimage),
+                EscrowResolutionV3::Refund => None,
             };
             validate_terminal(&escrow, parent_height, preimage)?;
             let refund = preimage.is_none();
@@ -2595,36 +2364,6 @@ fn apply_amplify_beta(
         transaction_id: filled_tx.transaction.txid().0,
         is_amplify: true,
     });
-
-    Ok(())
-}
-
-fn revert_amplify_beta(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<(), Error> {
-    let amplify =
-        filled_tx
-            .amplify_beta()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not an amplify_beta transaction".to_string(),
-            })?;
-
-    let mut market = state
-        .markets()
-        .get_market(rwtxn, &amplify.market_id)?
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "Market not found during amplify_beta revert".to_string(),
-        })?;
-    market.liquidity_base_sats = market
-        .liquidity_base_sats
-        .checked_sub(amplify.amount)
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "Liquidity base underflow during amplify_beta revert"
-                .to_string(),
-        })?;
-    state.markets().update_market(rwtxn, &market)?;
 
     Ok(())
 }

@@ -213,6 +213,10 @@ impl utoipa::ToSchema for MarketId {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ShareAccount {
+    pub escrows: BTreeMap<
+        crate::types::native::NativeId,
+        crate::types::native::ShareEscrowV1,
+    >,
     pub positions: BTreeMap<(MarketId, u32), i64>,
     pub last_updated_height: u32,
 }

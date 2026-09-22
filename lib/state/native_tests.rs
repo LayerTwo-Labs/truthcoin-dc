@@ -54,7 +54,7 @@ fn fixture() -> (sneed::Env, State, tempfile::TempDir, MarketId, Address) {
 }
 
 fn filled(
-    action: NativeActionV2,
+    action: NativeActionV3,
     owners: &[Address],
     tag: u8,
 ) -> FilledTransaction {
@@ -81,7 +81,7 @@ fn filled(
                 .collect(),
             outputs: vec![],
             memo: vec![],
-            data: Some(TxData::NativeOperation(NativeOperationV2 {
+            data: Some(TxData::NativeOperation(NativeOperationV3 {
                 genesis_hash: [0; 32].into(),
                 valid_from_parent: 0,
                 valid_before_parent: 100,
@@ -91,7 +91,7 @@ fn filled(
         },
     }
 }
-fn op(tx: &FilledTransaction) -> &NativeOperationV2 {
+fn op(tx: &FilledTransaction) -> &NativeOperationV3 {
     let Some(TxData::NativeOperation(op)) = &tx.transaction.data else {
         panic!()
     };
@@ -118,7 +118,7 @@ fn lock(
     mutable_rights: bool,
 ) -> FilledTransaction {
     filled(
-        NativeActionV2::LockShares {
+        NativeActionV3::LockShares {
             owner,
             claim_address: Address([2; 20]),
             refund_address: Address([3; 20]),
@@ -135,12 +135,13 @@ fn lock(
 }
 fn resolve(eid: NativeId, claim: bool, tag: u8) -> FilledTransaction {
     filled(
-        NativeActionV2::ResolveEscrow {
+        NativeActionV3::ResolveEscrow {
+            original_owner: Address([1; 20]),
             escrow_id: eid,
             resolution: if claim {
-                EscrowResolutionV2::Claim { preimage: [9; 32] }
+                EscrowResolutionV3::Claim { preimage: [9; 32] }
             } else {
-                EscrowResolutionV2::Refund
+                EscrowResolutionV3::Refund
             },
         },
         &[Address([8; 20])],
@@ -180,7 +181,7 @@ fn reservations_block_moves_sells_and_overlapping_locks() {
         .is_err()
     );
     let movement = filled(
-        NativeActionV2::MoveShares {
+        NativeActionV3::MoveShares {
             owner,
             recipient: Address([4; 20]),
             market_id: market,
@@ -211,7 +212,7 @@ fn reservations_block_moves_sells_and_overlapping_locks() {
     assert!(run(&state, &mut txn, &mut update, &actor_only, 1, 5).is_err());
     let mut available = movement.clone();
     if let Some(TxData::NativeOperation(op)) = &mut available.transaction.data {
-        if let NativeActionV2::MoveShares { shares, .. } = &mut op.action {
+        if let NativeActionV3::MoveShares { shares, .. } = &mut op.action {
             *shares = 30;
         }
     }
@@ -256,10 +257,11 @@ fn assignment_requires_current_both_owners_and_preserves_sealed_rights() {
         run(&state, &mut txn, &mut update, &locked, 1, 5).unwrap();
         let before = state
             .native()
-            .get_escrow(&txn, id(&locked))
+            .get_escrow(&txn, owner, id(&locked))
             .unwrap()
             .unwrap();
-        let action = NativeActionV2::AssignEscrow {
+        let action = NativeActionV3::AssignEscrow {
+            original_owner: Address([1; 20]),
             escrow_id: id(&locked),
             new_claim_address: Address([4; 20]),
             new_refund_address: Address([4; 20]),
@@ -285,7 +287,7 @@ fn assignment_requires_current_both_owners_and_preserves_sealed_rights() {
                 run(&state, &mut txn, &mut update, &assigned, 1, 5).is_err()
             );
             assert_eq!(
-                state.native().get_escrow(&txn, id(&locked)).unwrap(),
+                state.native().get_escrow(&txn, owner, id(&locked)).unwrap(),
                 Some(before)
             );
             continue;
@@ -294,7 +296,7 @@ fn assignment_requires_current_both_owners_and_preserves_sealed_rights() {
         assert!(run(&state, &mut txn, &mut update, &assigned, 1, 5).is_err());
         let after = state
             .native()
-            .get_escrow(&txn, id(&locked))
+            .get_escrow(&txn, owner, id(&locked))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -302,7 +304,8 @@ fn assignment_requires_current_both_owners_and_preserves_sealed_rights() {
             (before.shares, before.hashlock, before.claim_before_parent)
         );
         let back = filled(
-            NativeActionV2::AssignEscrow {
+            NativeActionV3::AssignEscrow {
+                original_owner: Address([1; 20]),
                 escrow_id: id(&locked),
                 new_claim_address: Address([2; 20]),
                 new_refund_address: Address([3; 20]),
@@ -333,9 +336,10 @@ fn deadlines_and_preimages_fail_without_mutating_escrow() {
     assert!(run(&state, &mut txn, &mut update, &locked, 1, 10).is_err());
     run(&state, &mut txn, &mut update, &locked, 1, 5).unwrap();
     let wrong = filled(
-        NativeActionV2::ResolveEscrow {
+        NativeActionV3::ResolveEscrow {
+            original_owner: Address([1; 20]),
             escrow_id: id(&locked),
-            resolution: EscrowResolutionV2::Claim { preimage: [8; 32] },
+            resolution: EscrowResolutionV3::Claim { preimage: [8; 32] },
         },
         &[owner],
         2,
@@ -371,7 +375,7 @@ fn deadlines_and_preimages_fail_without_mutating_escrow() {
     assert_eq!(
         state
             .native()
-            .get_escrow(&txn, id(&locked))
+            .get_escrow(&txn, owner, id(&locked))
             .unwrap()
             .unwrap()
             .status,
@@ -398,7 +402,7 @@ fn settlement_cash_remains_conditional_and_assignment_undo_is_exact() {
         run(&state, &mut txn, &mut update, &locked, 1, 5).unwrap();
         let original = state
             .native()
-            .get_escrow(&txn, id(&locked))
+            .get_escrow(&txn, owner, id(&locked))
             .unwrap()
             .unwrap();
         let ordinary = state
@@ -420,7 +424,8 @@ fn settlement_cash_remains_conditional_and_assignment_undo_is_exact() {
         let cash = state.native().cash_liability(&txn).unwrap();
         assert_eq!(ordinary.checked_add(cash), Some(payout));
         let assigned = filled(
-            NativeActionV2::AssignEscrow {
+            NativeActionV3::AssignEscrow {
+                original_owner: Address([1; 20]),
                 escrow_id: id(&locked),
                 new_claim_address: Address([4; 20]),
                 new_refund_address: Address([4; 20]),
@@ -450,7 +455,7 @@ fn settlement_cash_remains_conditional_and_assignment_undo_is_exact() {
         }
         state.native().restore(&state, &mut txn, 2).unwrap();
         assert_eq!(
-            state.native().get_escrow(&txn, id(&locked)).unwrap(),
+            state.native().get_escrow(&txn, owner, id(&locked)).unwrap(),
             Some(original)
         );
         assert!(
@@ -490,7 +495,8 @@ fn signatures_bind_native_payload_and_both_assignment_inputs() {
     let aa = authorization::get_address(&VerifyingKey::from(&a));
     let bb = authorization::get_address(&VerifyingKey::from(&b));
     let tx = filled(
-        NativeActionV2::AssignEscrow {
+        NativeActionV3::AssignEscrow {
+            original_owner: Address([1; 20]),
             escrow_id: [3; 32],
             new_claim_address: aa,
             new_refund_address: bb,
@@ -518,7 +524,8 @@ fn signatures_bind_native_payload_and_both_assignment_inputs() {
             1 => op.valid_before_parent += 1,
             2 => op.reference[0] ^= 1,
             3 => {
-                op.action = NativeActionV2::AssignEscrow {
+                op.action = NativeActionV3::AssignEscrow {
+                    original_owner: Address([1; 20]),
                     escrow_id: [3; 32],
                     new_claim_address: bb,
                     new_refund_address: aa,
@@ -546,6 +553,16 @@ fn signatures_bind_native_payload_and_both_assignment_inputs() {
 
 #[test]
 fn connected_blocks_restore_inputs_accounts_and_escrows_after_reorg() {
+    connected_reorg(false);
+}
+
+#[test]
+fn mixed_trade_and_lock_reorg_restores_market_accounts_and_cash() {
+    connected_reorg(true);
+}
+
+fn connected_reorg(with_trade: bool) {
+    use fallible_iterator::FallibleIterator;
     let (env, state, _dir, market, owner) = fixture();
     let archive = crate::archive::Archive::new(&env).unwrap();
     let mut txn = env.write_txn().unwrap();
@@ -617,11 +634,40 @@ fn connected_blocks_restore_inputs_accounts_and_escrows_after_reorg() {
             state.insert_utxo(&mut txn, point, output).unwrap();
         }
     }
+    let mut block_txs = vec![locked.clone()];
+    if with_trade {
+        let mut buy = lock(owner, market, 20, 1, false);
+        buy.transaction.data = Some(TxData::Trade {
+            market_id: market,
+            outcome_index: 0,
+            shares: 10,
+            trader: owner,
+            limit_sats: 10_000,
+            tx_pow_nonce: None,
+            prev_block_hash: genesis.hash(),
+        });
+        buy.spent_utxos[0].content = FilledOutputContent::Bitcoin(
+            BitcoinOutputContent(bitcoin::Amount::from_sat(10_000)),
+        );
+        state
+            .insert_utxo(
+                &mut txn,
+                &buy.transaction.inputs[0],
+                &buy.spent_utxos[0],
+            )
+            .unwrap();
+        block_txs.insert(0, buy);
+    }
+    let before_market =
+        bincode::serialize(&state.markets().get_market(&txn, &market).unwrap())
+            .unwrap();
+    let before_utxos: Vec<_> =
+        state.utxos.iter(&txn).unwrap().collect::<Vec<_>>().unwrap();
     let body = Body {
         coinbase: vec![],
-        transactions: vec![locked.transaction.clone()],
+        transactions: block_txs.iter().map(|t| t.transaction.clone()).collect(),
         authorizations: vec![],
-        actor_proofs: vec![None],
+        actor_proofs: vec![None; block_txs.len()],
     };
     let claim_body = Body {
         coinbase: vec![],
@@ -639,7 +685,7 @@ fn connected_blocks_restore_inputs_accounts_and_escrows_after_reorg() {
             &body,
             101,
             crate::state::PrevalidatedBlock {
-                filled_transactions: vec![locked.clone()],
+                filled_transactions: block_txs.clone(),
                 computed_merkle_root: lock_header.merkle_root,
                 coinbase_value: bitcoin::Amount::ZERO,
                 next_height: 1,
@@ -647,6 +693,9 @@ fn connected_blocks_restore_inputs_accounts_and_escrows_after_reorg() {
             },
         )
         .unwrap();
+        if with_trade {
+            assert_eq!(balance(&state, &txn, owner, market), 110);
+        }
         // The native action has no nonce table: the normal consumed input prevents replay.
         assert!(state.fill_transaction(&txn, &locked.transaction).is_err());
         connect_prevalidated(
@@ -677,7 +726,7 @@ fn connected_blocks_restore_inputs_accounts_and_escrows_after_reorg() {
         assert!(
             state
                 .native()
-                .get_escrow(&txn, id(&locked))
+                .get_escrow(&txn, owner, id(&locked))
                 .unwrap()
                 .is_none()
         );
@@ -700,5 +749,307 @@ fn connected_blocks_restore_inputs_accounts_and_escrows_after_reorg() {
                 .is_none()
         );
         state.fill_transaction(&txn, &locked.transaction).unwrap();
+        assert_eq!(
+            bincode::serialize(
+                &state.markets().get_market(&txn, &market).unwrap()
+            )
+            .unwrap(),
+            before_market
+        );
+        let after_utxos: Vec<_> =
+            state.utxos.iter(&txn).unwrap().collect::<Vec<_>>().unwrap();
+        assert_eq!(after_utxos, before_utxos);
     }
+}
+
+#[test]
+fn automatic_settlement_retains_cash_only_account_and_undo_restores_it() {
+    use crate::state::markets::types::MarketPayoutSummary;
+    for payout in [0, 51] {
+        let (env, state, _dir, market, owner) = fixture();
+        let mut txn = env.write_txn().unwrap();
+        let mut update = StateUpdate::new();
+        let locked = lock(owner, market, 1, 70, true);
+        run(&state, &mut txn, &mut update, &locked, 1, 5).unwrap();
+        let original = state
+            .markets()
+            .get_user_share_account(&txn, &owner)
+            .unwrap()
+            .unwrap();
+        let summary = MarketPayoutSummary {
+            market_id: market,
+            treasury_distributed: payout,
+            total_fees_distributed: 0,
+            shareholder_count: 1,
+            payouts: vec![SharePayoutRecord {
+                market_id: market,
+                address: owner,
+                outcome_index: 0,
+                shares_redeemed: 100,
+                final_price: 0.51,
+                payout_sats: payout,
+            }],
+            fee_payouts: vec![],
+            creator_refund: None,
+            block_height: 2,
+        };
+        state
+            .markets()
+            .apply_automatic_share_payouts(&state, &mut txn, &summary, 2)
+            .unwrap();
+        let account = state
+            .markets()
+            .get_user_share_account(&txn, &owner)
+            .unwrap()
+            .unwrap();
+        assert!(account.positions.is_empty());
+        assert_eq!(account.escrows.len(), 1);
+        let cash = state.native().cash_liability(&txn).unwrap();
+        assert_eq!(cash, if payout == 0 { 0 } else { 36 });
+        let wrong = filled(
+            NativeActionV3::ResolveEscrow {
+                original_owner: Address([9; 20]),
+                escrow_id: id(&locked),
+                resolution: EscrowResolutionV3::Refund,
+            },
+            &[owner],
+            9,
+        );
+        assert!(run(&state, &mut txn, &mut update, &wrong, 3, 10).is_err());
+        let assign = filled(
+            NativeActionV3::AssignEscrow {
+                original_owner: owner,
+                escrow_id: id(&locked),
+                new_claim_address: Address([4; 20]),
+                new_refund_address: Address([4; 20]),
+            },
+            &[Address([2; 20]), Address([3; 20])],
+            2,
+        );
+        run(&state, &mut txn, &mut update, &assign, 3, 10).unwrap();
+        let refund = resolve(id(&locked), false, 3);
+        run(&state, &mut txn, &mut update, &refund, 3, 10).unwrap();
+        assert!(
+            state
+                .markets()
+                .get_user_share_account(&txn, &owner)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.native().cash_liability(&txn).unwrap(), 0);
+        let out = state
+            .utxos
+            .try_get(
+                &txn,
+                &OutPointKey::from_outpoint(
+                    &crate::state::native::cash_outpoint(refund.txid().0),
+                ),
+            )
+            .unwrap();
+        assert_eq!(out.is_some(), cash > 0);
+        if let Some(out) = out {
+            assert_eq!(out.address, Address([4; 20]));
+            assert_eq!(out.get_bitcoin_value().to_sat(), cash);
+        }
+        state.native().restore(&state, &mut txn, 3).unwrap();
+        assert_eq!(
+            state
+                .markets()
+                .get_user_share_account(&txn, &owner)
+                .unwrap(),
+            Some(account)
+        );
+        state
+            .markets()
+            .revert_automatic_share_payouts(&state, &mut txn, &summary, 2)
+            .unwrap();
+        state.native().restore(&state, &mut txn, 2).unwrap();
+        assert_eq!(
+            state
+                .markets()
+                .get_user_share_account(&txn, &owner)
+                .unwrap(),
+            Some(original)
+        );
+    }
+}
+
+#[test]
+fn escrow_limit_blocks_only_new_locks_and_does_not_require_an_index() {
+    let (env, state, _dir, market, owner) = fixture();
+    let mut txn = env.write_txn().unwrap();
+    let mut update = StateUpdate::new();
+    let locked = lock(owner, market, 1, 1, true);
+    run(&state, &mut txn, &mut update, &locked, 1, 5).unwrap();
+    let mut account = state
+        .markets()
+        .get_user_share_account(&txn, &owner)
+        .unwrap()
+        .unwrap();
+    let template = account.escrows.values().next().unwrap().clone();
+    for i in 1u32..1024 {
+        let mut e = template.clone();
+        e.escrow_id[..4].copy_from_slice(&i.to_le_bytes());
+        account.escrows.insert(e.escrow_id, e);
+    }
+    assert_eq!(account.escrows.len(), 1024);
+    account.positions.insert((market, 0), 2000);
+    state
+        .markets()
+        .restore_share_account(&mut txn, &owner, Some(&account))
+        .unwrap();
+    assert!(
+        run(
+            &state,
+            &mut txn,
+            &mut update,
+            &lock(owner, market, 2, 1, true),
+            2,
+            5
+        )
+        .is_err()
+    );
+    let assign = filled(
+        NativeActionV3::AssignEscrow {
+            original_owner: owner,
+            escrow_id: id(&locked),
+            new_claim_address: Address([4; 20]),
+            new_refund_address: Address([4; 20]),
+        },
+        &[Address([2; 20]), Address([3; 20])],
+        3,
+    );
+    run(&state, &mut txn, &mut update, &assign, 2, 5).unwrap();
+    run(
+        &state,
+        &mut txn,
+        &mut update,
+        &resolve(id(&locked), false, 4),
+        2,
+        10,
+    )
+    .unwrap();
+    let mut another = lock(owner, market, 5, 1, true);
+    if let Some(TxData::NativeOperation(op)) = &mut another.transaction.data {
+        if let NativeActionV3::LockShares {
+            claim_before_parent,
+            ..
+        } = &mut op.action
+        {
+            *claim_before_parent = 20;
+        }
+    }
+    run(&state, &mut txn, &mut update, &another, 2, 10).unwrap();
+    assert_eq!(
+        state
+            .markets()
+            .get_user_share_account(&txn, &owner)
+            .unwrap()
+            .unwrap()
+            .escrows
+            .len(),
+        1024
+    );
+}
+
+#[test]
+fn database_inventory_is_exactly_upstream_and_legacy_schema_is_rejected() {
+    let (env, state, dir, market, owner) = fixture();
+    assert_eq!(State::NUM_DBS, 36);
+    let mut txn = env.write_txn().unwrap();
+    let mut update = StateUpdate::new();
+    let locked = lock(owner, market, 1, 70, false);
+    run(&state, &mut txn, &mut update, &locked, 1, 5).unwrap();
+    run(
+        &state,
+        &mut txn,
+        &mut update,
+        &resolve(id(&locked), true, 2),
+        1,
+        6,
+    )
+    .unwrap();
+    update.apply_all_changes(&state, &mut txn, 1).unwrap();
+    state.native().restore(&state, &mut txn, 1).unwrap();
+    txn.commit().unwrap();
+    drop(state);
+    drop(env);
+    let mut opts = heed::EnvOpenOptions::new();
+    opts.max_dbs(36).map_size(64 * 1024 * 1024);
+    let raw = unsafe { opts.open(dir.path()) }.unwrap();
+    let txn = raw.read_txn().unwrap();
+    let main = raw
+        .open_database::<heed::types::Str, heed::types::Bytes>(&txn, None)
+        .unwrap()
+        .unwrap();
+    let actual: Vec<_> = main
+        .iter(&txn)
+        .unwrap()
+        .map(|r| r.unwrap().0.to_owned())
+        .collect();
+    let expected = vec![
+        "ballots",
+        "block_index_events",
+        "consensus_undo",
+        "consolidation_undo",
+        "decision_outcomes",
+        "decision_state_histories",
+        "deposit_blocks",
+        "genesis_timestamp",
+        "height",
+        "latest_failed_withdrawal_bundle",
+        "mainchain_timestamp",
+        "market_funds_utxos",
+        "markets",
+        "markets_by_decision",
+        "markets_by_expiry",
+        "markets_by_state",
+        "mempool_shares",
+        "minting_undo",
+        "pending_withdrawal_bundle",
+        "period_decisions",
+        "period_pricing",
+        "period_pricing_undo",
+        "period_stats",
+        "reputation",
+        "reputation_transfer_undo",
+        "settlement_undo",
+        "share_accounts",
+        "skipped_tx_indices_undo",
+        "state_version",
+        "stxos",
+        "tip",
+        "utxos",
+        "utxos_by_address",
+        "votes",
+        "withdrawal_bundle_event_blocks",
+        "withdrawal_bundles",
+    ];
+    assert_eq!(actual, expected);
+    drop(txn);
+    // Write the prior upstream value layout into the EXISTING version record.
+    let mut txn = raw.write_txn().unwrap();
+    let version = raw
+        .open_database::<sneed::UnitKey, heed::types::Bytes>(
+            &txn,
+            Some("state_version"),
+        )
+        .unwrap()
+        .unwrap();
+    version
+        .put(
+            &mut txn,
+            &(),
+            &bincode::serialize(&crate::types::Version {
+                major: 0,
+                minor: 18,
+                patch: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    txn.commit().unwrap();
+    drop(raw);
+    let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+    assert!(State::new(&env, None).is_err());
 }

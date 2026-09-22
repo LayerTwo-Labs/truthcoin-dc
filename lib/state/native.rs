@@ -1,20 +1,16 @@
 //! Native share operations. All state changes use the enclosing block's LMDB
 //! transaction. External replay derives receipts from successful transitions.
-use std::collections::BTreeMap;
-
 use fallible_iterator::FallibleIterator;
-use heed::types::SerdeBincode;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sneed::{DatabaseUnique, RoTxn, RwTxn};
+use sneed::{RoTxn, RwTxn};
 
-use super::{Error, ShareAccount, State, UtxoManager, markets::MarketId};
+use super::{Error, State, UtxoManager, markets::MarketId};
 use crate::types::{
     Address, BitcoinOutputContent, FilledOutput, FilledOutputContent,
     FilledTransaction, OutPoint, TransactionData,
     native::{
-        EscrowAssetV1, EscrowStatusV1, NativeActionV2, NativeId,
-        NativeOperationV2, ShareEscrowV1,
+        EscrowAssetV1, EscrowStatusV1, NativeActionV3, NativeId,
+        NativeOperationV3, ShareEscrowV1,
     },
 };
 
@@ -28,50 +24,25 @@ pub(crate) fn invalid(reason: impl Into<String>) -> Error {
     }
 }
 
-#[derive(Clone)]
-pub struct NativeDbs {
-    pub reservations: DatabaseUnique<
-        SerdeBincode<(Address, MarketId, u32)>,
-        SerdeBincode<BTreeMap<NativeId, i64>>,
-    >,
-    pub escrows:
-        DatabaseUnique<SerdeBincode<NativeId>, SerdeBincode<ShareEscrowV1>>,
-    pub undo: DatabaseUnique<SerdeBincode<u32>, SerdeBincode<NativeUndoV1>>,
+/// A borrowed view of existing share-account and consolidation-undo records.
+/// This type creates no databases and owns no database handles.
+pub struct NativeState<'a> {
+    pub(crate) state: &'a State,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct NativeUndoV1 {
-    pub escrows: BTreeMap<NativeId, Option<ShareEscrowV1>>,
-    pub accounts: BTreeMap<Address, Option<ShareAccount>>,
-    pub cash_outputs: Vec<OutPoint>,
-}
-
-impl NativeDbs {
-    pub const NUM_DBS: u32 = 3;
-
-    pub fn new<Tls>(
-        env: &sneed::Env<Tls>,
-        txn: &mut RwTxn,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            reservations: DatabaseUnique::create(
-                env,
-                txn,
-                "native_reservations",
-            )?,
-            escrows: DatabaseUnique::create(env, txn, "native_escrows")?,
-            undo: DatabaseUnique::create(env, txn, "native_undo")?,
-        })
-    }
-
+impl NativeState<'_> {
     pub fn get_escrow(
         &self,
         txn: &RoTxn,
+        owner: Address,
         id: NativeId,
     ) -> Result<Option<ShareEscrowV1>, Error> {
-        Ok(self.escrows.try_get(txn, &id)?)
+        Ok(self
+            .state
+            .markets()
+            .get_user_share_account(txn, &owner)?
+            .and_then(|a| a.escrows.get(&id).cloned()))
     }
-
     pub fn reserved_shares(
         &self,
         txn: &RoTxn,
@@ -79,92 +50,74 @@ impl NativeDbs {
         market: MarketId,
         outcome: u32,
     ) -> Result<i64, Error> {
-        self.reservations
-            .try_get(txn, &(owner, market, outcome))?
+        self.state
+            .markets()
+            .get_user_share_account(txn, &owner)?
             .unwrap_or_default()
+            .escrows
             .values()
-            .try_fold(0i64, |total, q| {
-                total
-                    .checked_add(*q)
+            .filter(|e| {
+                e.market_id == market
+                    && e.outcome_index == outcome
+                    && e.asset == EscrowAssetV1::Shares
+            })
+            .try_fold(0i64, |sum, e| {
+                sum.checked_add(e.shares)
                     .ok_or_else(|| invalid("reserved shares overflow"))
             })
     }
-
     fn write_escrow(
         &self,
         txn: &mut RwTxn,
+        owner: Address,
         id: NativeId,
         next: Option<&ShareEscrowV1>,
     ) -> Result<(), Error> {
-        if let Some(previous) = self.escrows.try_get(txn, &id)? {
-            if previous.status == EscrowStatusV1::Locked
-                && previous.asset == EscrowAssetV1::Shares
-            {
-                let key = (
-                    previous.owner,
-                    previous.market_id,
-                    previous.outcome_index,
-                );
-                let mut reservations =
-                    self.reservations.try_get(txn, &key)?.unwrap_or_default();
-                reservations.remove(&id);
-                if reservations.is_empty() {
-                    self.reservations.delete(txn, &key)?;
-                } else {
-                    self.reservations.put(txn, &key, &reservations)?;
+        let mut account = self
+            .state
+            .markets()
+            .get_user_share_account(txn, &owner)?
+            .unwrap_or_default();
+        match next {
+            Some(e) => {
+                if e.owner != owner || e.escrow_id != id {
+                    return Err(invalid("escrow account mismatch"));
                 }
+                if !account.escrows.contains_key(&id)
+                    && account.escrows.len() >= 1024
+                {
+                    return Err(invalid("too many live escrows in account"));
+                }
+                account.escrows.insert(id, e.clone());
+            }
+            None => {
+                account.escrows.remove(&id);
             }
         }
-        if let Some(escrow) = next {
-            if escrow.status == EscrowStatusV1::Locked
-                && escrow.asset == EscrowAssetV1::Shares
-            {
-                let key =
-                    (escrow.owner, escrow.market_id, escrow.outcome_index);
-                let mut reservations =
-                    self.reservations.try_get(txn, &key)?.unwrap_or_default();
-                if reservations.len() >= 1024 {
-                    return Err(invalid("too many active native reservations"));
-                }
-                reservations.insert(id, escrow.shares);
-                self.reservations.put(txn, &key, &reservations)?;
-            }
-            self.escrows.put(txn, &id, escrow)?;
-        } else {
-            self.escrows.delete(txn, &id)?;
-        }
-        Ok(())
+        self.state.markets().restore_share_account(
+            txn,
+            &owner,
+            if account.positions.is_empty() && account.escrows.is_empty() {
+                None
+            } else {
+                Some(&account)
+            },
+        )
     }
-
     pub fn cash_liability(&self, txn: &RoTxn) -> Result<u64, Error> {
         let mut total = 0u64;
-        let mut iter = self.escrows.iter(txn)?;
-        while let Some((_, escrow)) = iter.next()? {
-            if escrow.status == EscrowStatusV1::Locked {
-                if let EscrowAssetV1::NativeCash(amount) = escrow.asset {
+        let mut records = self.state.markets().share_accounts.iter(txn)?;
+        while let Some((_, a)) = records.next()? {
+            for e in a.escrows.values() {
+                if let EscrowAssetV1::NativeCash(value) = e.asset {
                     total = total
-                        .checked_add(amount)
+                        .checked_add(value)
                         .ok_or_else(|| invalid("escrow cash overflow"))?;
                 }
             }
         }
         Ok(total)
     }
-
-    fn capture_escrow(
-        &self,
-        txn: &mut RwTxn,
-        height: u32,
-        id: NativeId,
-    ) -> Result<(), Error> {
-        let mut undo = self.undo.try_get(txn, &height)?.unwrap_or_default();
-        if !undo.escrows.contains_key(&id) {
-            undo.escrows.insert(id, self.escrows.try_get(txn, &id)?);
-            self.undo.put(txn, &height, &undo)?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn capture_account(
         &self,
         state: &State,
@@ -172,29 +125,33 @@ impl NativeDbs {
         height: u32,
         address: Address,
     ) -> Result<(), Error> {
-        let mut undo = self.undo.try_get(txn, &height)?.unwrap_or_default();
-        if !undo.accounts.contains_key(&address) {
-            undo.accounts.insert(
+        let mut undo = state
+            .consolidation_undo
+            .try_get(txn, &height)?
+            .unwrap_or_default();
+        if !undo.account_undo.accounts.contains_key(&address) {
+            undo.account_undo.accounts.insert(
                 address,
                 state.markets().get_user_share_account(txn, &address)?,
             );
-            self.undo.put(txn, &height, &undo)?;
+            state.consolidation_undo.put(txn, &height, &undo)?;
         }
         Ok(())
     }
-
     pub(crate) fn create_escrow(
         &self,
         txn: &mut RwTxn,
         height: u32,
         escrow: &ShareEscrowV1,
     ) -> Result<(), Error> {
-        if self.escrows.try_get(txn, &escrow.escrow_id)?.is_some() {
+        if self
+            .get_escrow(txn, escrow.owner, escrow.escrow_id)?
+            .is_some()
+        {
             return Err(invalid("escrow already exists"));
         }
-        self.capture_escrow(txn, height, escrow.escrow_id)?;
-        self.write_escrow(txn, escrow.escrow_id, Some(escrow))?;
-        Ok(())
+        self.capture_account(self.state, txn, height, escrow.owner)?;
+        self.write_escrow(txn, escrow.owner, escrow.escrow_id, Some(escrow))
     }
 
     pub(crate) fn assign(
@@ -202,24 +159,25 @@ impl NativeDbs {
         txn: &mut RwTxn,
         height: u32,
         filled: &FilledTransaction,
+        owner: Address,
         id: NativeId,
         claim: crate::types::Address,
         refund: crate::types::Address,
         reference: NativeId,
     ) -> Result<(), Error> {
         let mut escrow = self
-            .get_escrow(txn, id)?
+            .get_escrow(txn, owner, id)?
             .ok_or_else(|| invalid("unknown native escrow"))?;
         if escrow.status != EscrowStatusV1::Locked || !escrow.mutable_rights {
             return Err(invalid("escrow is terminal or sealed"));
         }
         require_owner_input(filled, escrow.claim_address)?;
         require_owner_input(filled, escrow.refund_address)?;
-        self.capture_escrow(txn, height, id)?;
+        self.capture_account(self.state, txn, height, owner)?;
         escrow.claim_address = claim;
         escrow.refund_address = refund;
         escrow.reference = reference;
-        self.write_escrow(txn, id, Some(&escrow))
+        self.write_escrow(txn, owner, id, Some(&escrow))
     }
 
     pub(crate) fn terminate(
@@ -232,7 +190,7 @@ impl NativeDbs {
         recipient: Address,
         refund: bool,
     ) -> Result<(), Error> {
-        self.capture_escrow(txn, height, escrow.escrow_id)?;
+        self.capture_account(state, txn, height, escrow.owner)?;
         if let EscrowAssetV1::NativeCash(amount) = escrow.asset {
             if amount > 0 {
                 let outpoint = cash_outpoint(txid);
@@ -249,10 +207,12 @@ impl NativeDbs {
                         memo: Vec::new(),
                     },
                 )?;
-                let mut undo =
-                    self.undo.try_get(txn, &height)?.unwrap_or_default();
-                undo.cash_outputs.push(outpoint);
-                self.undo.put(txn, &height, &undo)?;
+                let mut undo = state
+                    .consolidation_undo
+                    .try_get(txn, &height)?
+                    .unwrap_or_default();
+                undo.account_undo.cash_outputs.push(outpoint);
+                state.consolidation_undo.put(txn, &height, &undo)?;
             }
         }
         escrow.status = if refund {
@@ -264,7 +224,7 @@ impl NativeDbs {
                 transaction_id: txid,
             }
         };
-        self.write_escrow(txn, escrow.escrow_id, Some(escrow))?;
+        self.write_escrow(txn, escrow.owner, escrow.escrow_id, None)?;
         Ok(())
     }
 
@@ -277,22 +237,19 @@ impl NativeDbs {
         payout: &super::markets::types::SharePayoutRecord,
         height: u32,
     ) -> Result<u64, Error> {
-        let reservations = self
-            .reservations
-            .try_get(
-                txn,
-                &(payout.address, payout.market_id, payout.outcome_index),
-            )?
+        let account = state
+            .markets()
+            .get_user_share_account(txn, &payout.address)?
             .unwrap_or_default();
-        let mut locks = Vec::with_capacity(reservations.len());
-        for id in reservations.keys() {
-            locks.push((
-                *id,
-                self.escrows
-                    .try_get(txn, id)?
-                    .ok_or_else(|| invalid("missing reserved escrow"))?,
-            ));
-        }
+        let locks: Vec<_> = account
+            .escrows
+            .into_iter()
+            .filter(|(_, e)| {
+                e.market_id == payout.market_id
+                    && e.outcome_index == payout.outcome_index
+                    && e.asset == EscrowAssetV1::Shares
+            })
+            .collect();
         if locks.is_empty() {
             return Ok(payout.payout_sats);
         }
@@ -309,9 +266,8 @@ impl NativeDbs {
         for ((id, mut escrow), (_, amount)) in
             locks.into_iter().zip(allocations)
         {
-            self.capture_escrow(txn, height, id)?;
             escrow.asset = EscrowAssetV1::NativeCash(amount);
-            self.write_escrow(txn, id, Some(&escrow))?;
+            self.write_escrow(txn, escrow.owner, id, Some(&escrow))?;
         }
         Ok(ordinary)
     }
@@ -322,21 +278,20 @@ impl NativeDbs {
         txn: &mut RwTxn,
         height: u32,
     ) -> Result<(), Error> {
-        if let Some(undo) = self.undo.try_get(txn, &height)? {
-            for outpoint in undo.cash_outputs {
-                state.delete_utxo(txn, &outpoint)?;
+        if let Some(undo) = state.consolidation_undo.try_get(txn, &height)? {
+            for point in undo.account_undo.cash_outputs {
+                state.delete_utxo(txn, &point)?;
             }
-            for (id, previous) in undo.escrows {
-                self.write_escrow(txn, id, previous.as_ref())?;
-            }
-            for (address, account) in undo.accounts {
+            for (address, account) in undo.account_undo.accounts {
                 state.markets().restore_share_account(
                     txn,
                     &address,
                     account.as_ref(),
                 )?;
             }
-            self.undo.delete(txn, &height)?;
+            for (_, market) in undo.account_undo.markets {
+                state.markets().restore_market(txn, &market)?;
+            }
         }
         Ok(())
     }
@@ -452,14 +407,14 @@ pub fn validate(
         return Err(invalid("native action belongs to another chain"));
     }
     match &op.action {
-        NativeActionV2::MoveShares {
+        NativeActionV3::MoveShares {
             owner,
             market_id,
             outcome_index,
             shares,
             ..
         }
-        | NativeActionV2::LockShares {
+        | NativeActionV3::LockShares {
             owner,
             market_id,
             outcome_index,
@@ -500,13 +455,13 @@ fn validate_shares(
 }
 
 pub fn check_deadline(
-    op: &NativeOperationV2,
+    op: &NativeOperationV3,
     parent: u32,
 ) -> Result<(), Error> {
     if parent < op.valid_from_parent || parent >= op.valid_before_parent {
         return Err(invalid("native action outside signed parent interval"));
     }
-    if let NativeActionV2::LockShares {
+    if let NativeActionV3::LockShares {
         claim_before_parent,
         ..
     } = op.action

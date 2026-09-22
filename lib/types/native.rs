@@ -8,16 +8,16 @@ pub type NativeId = [u8; 32];
 
 /// Signed as part of the ordinary transaction. Consuming its inputs prevents replay.
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct NativeOperationV2 {
+pub struct NativeOperationV3 {
     pub genesis_hash: BlockHash,
     pub valid_from_parent: u32,
     pub valid_before_parent: u32,
     #[schema(value_type = Vec<u8>)]
     pub reference: NativeId,
-    pub action: NativeActionV2,
+    pub action: NativeActionV3,
 }
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub enum NativeActionV2 {
+pub enum NativeActionV3 {
     MoveShares {
         owner: Address,
         recipient: Address,
@@ -39,11 +39,13 @@ pub enum NativeActionV2 {
         mutable_rights: bool,
     },
     ResolveEscrow {
+        original_owner: Address,
         #[schema(value_type = Vec<u8>)]
         escrow_id: NativeId,
-        resolution: EscrowResolutionV2,
+        resolution: EscrowResolutionV3,
     },
     AssignEscrow {
+        original_owner: Address,
         #[schema(value_type = Vec<u8>)]
         escrow_id: NativeId,
         new_claim_address: Address,
@@ -51,7 +53,7 @@ pub enum NativeActionV2 {
     },
 }
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub enum EscrowResolutionV2 {
+pub enum EscrowResolutionV3 {
     Claim {
         #[schema(value_type = Vec<u8>)]
         preimage: NativeId,
@@ -128,7 +130,7 @@ pub struct ShareEscrowV1 {
 
 pub fn escrow_id(genesis: BlockHash, transaction_id: NativeId) -> NativeId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"TRUTHCOIN_NATIVE_ESCROW_V2\0");
+    hasher.update(b"TRUTHCOIN_NATIVE_ESCROW_V3\0");
     hasher.update(&genesis.0);
     hasher.update(&transaction_id);
     *hasher.finalize().as_bytes()

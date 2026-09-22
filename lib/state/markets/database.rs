@@ -27,7 +27,7 @@ pub struct MarketsDatabase {
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Vec<MarketId>>>,
     decision_index:
         DatabaseUnique<SerdeBincode<DecisionId>, SerdeBincode<Vec<MarketId>>>,
-    share_accounts:
+    pub(crate) share_accounts:
         DatabaseUnique<SerdeBincode<Address>, SerdeBincode<ShareAccount>>,
     /// is_fee=false for treasury, is_fee=true for author fees
     market_funds_utxos:
@@ -720,7 +720,7 @@ impl MarketsDatabase {
                 reason: "Insufficient shares for sell transaction".to_string(),
             })?;
 
-        if account.positions.is_empty() {
+        if account.positions.is_empty() && account.escrows.is_empty() {
             self.share_accounts.delete(txn, address)?;
         } else {
             self.share_accounts.put(txn, address, &account)?;
