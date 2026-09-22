@@ -120,11 +120,11 @@ impl NativeState<'_> {
     }
     pub(crate) fn capture_account(
         &self,
-        state: &State,
         txn: &mut RwTxn,
         height: u32,
         address: Address,
     ) -> Result<(), Error> {
+        let state = self.state;
         let mut undo = state
             .consolidation_undo
             .try_get(txn, &height)?
@@ -150,7 +150,7 @@ impl NativeState<'_> {
         {
             return Err(invalid("escrow already exists"));
         }
-        self.capture_account(self.state, txn, height, escrow.owner)?;
+        self.capture_account(txn, height, escrow.owner)?;
         self.write_escrow(txn, escrow.owner, escrow.escrow_id, Some(escrow))
     }
 
@@ -173,7 +173,7 @@ impl NativeState<'_> {
         }
         require_owner_input(filled, escrow.claim_address)?;
         require_owner_input(filled, escrow.refund_address)?;
-        self.capture_account(self.state, txn, height, owner)?;
+        self.capture_account(txn, height, owner)?;
         escrow.claim_address = claim;
         escrow.refund_address = refund;
         escrow.reference = reference;
@@ -182,15 +182,14 @@ impl NativeState<'_> {
 
     pub(crate) fn terminate(
         &self,
-        state: &State,
         txn: &mut RwTxn,
         height: u32,
-        escrow: &mut ShareEscrowV1,
+        escrow: &ShareEscrowV1,
         txid: NativeId,
         recipient: Address,
-        refund: bool,
     ) -> Result<(), Error> {
-        self.capture_account(state, txn, height, escrow.owner)?;
+        let state = self.state;
+        self.capture_account(txn, height, escrow.owner)?;
         if let EscrowAssetV1::NativeCash(amount) = escrow.asset {
             if amount > 0 {
                 let outpoint = cash_outpoint(txid);
@@ -215,15 +214,6 @@ impl NativeState<'_> {
                 state.consolidation_undo.put(txn, &height, &undo)?;
             }
         }
-        escrow.status = if refund {
-            EscrowStatusV1::Refunded {
-                transaction_id: txid,
-            }
-        } else {
-            EscrowStatusV1::Claimed {
-                transaction_id: txid,
-            }
-        };
         self.write_escrow(txn, escrow.owner, escrow.escrow_id, None)?;
         Ok(())
     }
@@ -232,11 +222,11 @@ impl NativeState<'_> {
     /// Zero-valued locks retain their claim/refund conditions.
     pub(crate) fn settle_payout(
         &self,
-        state: &State,
         txn: &mut RwTxn,
         payout: &super::markets::types::SharePayoutRecord,
         height: u32,
     ) -> Result<u64, Error> {
+        let state = self.state;
         let account = state
             .markets()
             .get_user_share_account(txn, &payout.address)?
@@ -253,7 +243,7 @@ impl NativeState<'_> {
         if locks.is_empty() {
             return Ok(payout.payout_sats);
         }
-        self.capture_account(state, txn, height, payout.address)?;
+        self.capture_account(txn, height, payout.address)?;
         let quantities: Vec<_> = locks
             .iter()
             .map(|(id, escrow)| (*id, escrow.shares))
@@ -274,10 +264,10 @@ impl NativeState<'_> {
 
     pub(crate) fn restore(
         &self,
-        state: &State,
         txn: &mut RwTxn,
         height: u32,
     ) -> Result<(), Error> {
+        let state = self.state;
         if let Some(undo) = state.consolidation_undo.try_get(txn, &height)? {
             for point in undo.account_undo.cash_outputs {
                 state.delete_utxo(txn, &point)?;

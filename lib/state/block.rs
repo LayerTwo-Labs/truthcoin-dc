@@ -266,9 +266,7 @@ impl StateUpdate {
         for ((address, market_id), outcome_changes) in
             &self.share_account_changes
         {
-            state
-                .native()
-                .capture_account(state, rwtxn, height, *address)?;
+            state.native().capture_account(rwtxn, height, *address)?;
             for (&outcome_index, &share_delta) in outcome_changes {
                 if share_delta != 0 {
                     if share_delta > 0 {
@@ -858,7 +856,7 @@ pub fn connect_prevalidated(
     for (idx, filled_tx) in filled_txs.iter().enumerate() {
         match &filled_tx.transaction.data {
             Some(TxData::NativeOperation(operation)) => {
-                if !apply_native_operation(
+                apply_native_operation(
                     state,
                     rwtxn,
                     filled_tx,
@@ -866,9 +864,7 @@ pub fn connect_prevalidated(
                     &mut state_update,
                     height,
                     parent_height,
-                )? {
-                    skipped_tx_indices.insert(idx);
-                }
+                )?;
             }
             Some(TxData::Trade { .. }) => {
                 match apply_trade(
@@ -1204,7 +1200,7 @@ pub fn disconnect_tip(
     }
 
     // Exact pre-block snapshots replace quantity-derived market/account reversal.
-    state.native().restore(state, rwtxn, height)?;
+    state.native().restore(rwtxn, height)?;
 
     // 3c. Revert reputation transfers
     if let Some(rep_undo) =
@@ -1734,7 +1730,7 @@ fn apply_native_operation(
     update: &mut StateUpdate,
     height: u32,
     parent_height: u32,
-) -> Result<bool, Error> {
+) -> Result<(), Error> {
     use super::native::{
         check_deadline, invalid, require_owner_input, validate_terminal,
     };
@@ -1837,7 +1833,7 @@ fn apply_native_operation(
             escrow_id,
             resolution,
         } => {
-            let mut escrow = state
+            let escrow = state
                 .native()
                 .get_escrow(txn, *original_owner, *escrow_id)?
                 .ok_or_else(|| invalid("unknown native escrow"))?;
@@ -1865,18 +1861,12 @@ fn apply_native_operation(
                     escrow.shares,
                 )?;
             }
-            state.native().terminate(
-                state,
-                txn,
-                height,
-                &mut escrow,
-                txid,
-                recipient,
-                refund,
-            )?;
+            state
+                .native()
+                .terminate(txn, height, &escrow, txid, recipient)?;
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn effective_native_shares(
@@ -1955,10 +1945,8 @@ fn native_share_transfer(
         .ok_or_else(|| {
             super::native::invalid("recipient native share overflow")
         })?;
-    state.native().capture_account(state, txn, height, owner)?;
-    state
-        .native()
-        .capture_account(state, txn, height, recipient)?;
+    state.native().capture_account(txn, height, owner)?;
+    state.native().capture_account(txn, height, recipient)?;
     for (address, delta) in [(owner, -quantity), (recipient, quantity)] {
         let entry = update
             .share_account_changes

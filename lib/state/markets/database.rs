@@ -1011,12 +1011,8 @@ impl MarketsDatabase {
         let mut sequence = 0u32;
 
         for payout in &payout_summary.payouts {
-            let ordinary_payout = state.native().settle_payout(
-                state,
-                txn,
-                payout,
-                block_height,
-            )?;
+            let ordinary_payout =
+                state.native().settle_payout(txn, payout, block_height)?;
             if ordinary_payout > 0 {
                 let outpoint = generate_share_payout_outpoint(
                     &payout.market_id,
