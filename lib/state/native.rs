@@ -4,7 +4,10 @@ use fallible_iterator::FallibleIterator;
 use sha2::{Digest, Sha256};
 use sneed::{RoTxn, RwTxn};
 
-use super::{Error, State, UtxoManager, markets::MarketId};
+use super::{
+    Error, State, UtxoManager,
+    markets::{MarketId, ShareAccount},
+};
 use crate::types::{
     Address, BitcoinOutputContent, FilledOutput, FilledOutputContent,
     FilledTransaction, OutPoint, TransactionData,
@@ -31,17 +34,24 @@ pub struct NativeState<'a> {
 }
 
 impl NativeState<'_> {
+    fn account(
+        &self,
+        txn: &RoTxn,
+        owner: Address,
+    ) -> Result<ShareAccount, Error> {
+        Ok(self
+            .state
+            .markets()
+            .get_user_share_account(txn, &owner)?
+            .unwrap_or_default())
+    }
     pub fn get_escrow(
         &self,
         txn: &RoTxn,
         owner: Address,
         id: NativeId,
     ) -> Result<Option<ShareEscrowV1>, Error> {
-        Ok(self
-            .state
-            .markets()
-            .get_user_share_account(txn, &owner)?
-            .and_then(|a| a.escrows.get(&id).cloned()))
+        Ok(self.account(txn, owner)?.escrows.remove(&id))
     }
     pub fn reserved_shares(
         &self,
@@ -50,10 +60,7 @@ impl NativeState<'_> {
         market: MarketId,
         outcome: u32,
     ) -> Result<i64, Error> {
-        self.state
-            .markets()
-            .get_user_share_account(txn, &owner)?
-            .unwrap_or_default()
+        self.account(txn, owner)?
             .escrows
             .values()
             .filter(|e| {
@@ -69,39 +76,25 @@ impl NativeState<'_> {
     fn write_escrow(
         &self,
         txn: &mut RwTxn,
-        owner: Address,
-        id: NativeId,
-        next: Option<&ShareEscrowV1>,
+        escrow: &ShareEscrowV1,
+        remove: bool,
     ) -> Result<(), Error> {
-        let mut account = self
-            .state
-            .markets()
-            .get_user_share_account(txn, &owner)?
-            .unwrap_or_default();
-        match next {
-            Some(e) => {
-                if e.owner != owner || e.escrow_id != id {
-                    return Err(invalid("escrow account mismatch"));
-                }
-                if !account.escrows.contains_key(&id)
-                    && account.escrows.len() >= 1024
-                {
-                    return Err(invalid("too many live escrows in account"));
-                }
-                account.escrows.insert(id, e.clone());
+        let mut account = self.account(txn, escrow.owner)?;
+        if remove {
+            account.escrows.remove(&escrow.escrow_id);
+        } else {
+            if !account.escrows.contains_key(&escrow.escrow_id)
+                && account.escrows.len() >= 1024
+            {
+                return Err(invalid("too many live escrows in account"));
             }
-            None => {
-                account.escrows.remove(&id);
-            }
+            account.escrows.insert(escrow.escrow_id, escrow.clone());
         }
         self.state.markets().restore_share_account(
             txn,
-            &owner,
-            if account.positions.is_empty() && account.escrows.is_empty() {
-                None
-            } else {
-                Some(&account)
-            },
+            &escrow.owner,
+            (!(account.positions.is_empty() && account.escrows.is_empty()))
+                .then_some(&account),
         )
     }
     pub fn cash_liability(&self, txn: &RoTxn) -> Result<u64, Error> {
@@ -151,7 +144,7 @@ impl NativeState<'_> {
             return Err(invalid("escrow already exists"));
         }
         self.capture_account(txn, height, escrow.owner)?;
-        self.write_escrow(txn, escrow.owner, escrow.escrow_id, Some(escrow))
+        self.write_escrow(txn, escrow, false)
     }
 
     pub(crate) fn assign(
@@ -177,7 +170,7 @@ impl NativeState<'_> {
         escrow.claim_address = claim;
         escrow.refund_address = refund;
         escrow.reference = reference;
-        self.write_escrow(txn, owner, id, Some(&escrow))
+        self.write_escrow(txn, &escrow, false)
     }
 
     pub(crate) fn terminate(
@@ -196,15 +189,12 @@ impl NativeState<'_> {
                 state.insert_utxo(
                     txn,
                     &outpoint,
-                    &FilledOutput {
-                        address: recipient,
-                        content: FilledOutputContent::Bitcoin(
-                            BitcoinOutputContent(bitcoin::Amount::from_sat(
-                                amount,
-                            )),
-                        ),
-                        memo: Vec::new(),
-                    },
+                    &FilledOutput::new(
+                        recipient,
+                        FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                            bitcoin::Amount::from_sat(amount),
+                        )),
+                    ),
                 )?;
                 let mut undo = state
                     .consolidation_undo
@@ -214,8 +204,7 @@ impl NativeState<'_> {
                 state.consolidation_undo.put(txn, &height, &undo)?;
             }
         }
-        self.write_escrow(txn, escrow.owner, escrow.escrow_id, None)?;
-        Ok(())
+        self.write_escrow(txn, escrow, true)
     }
 
     /// Divide the existing owner/outcome payout without creating cash.
@@ -226,11 +215,7 @@ impl NativeState<'_> {
         payout: &super::markets::types::SharePayoutRecord,
         height: u32,
     ) -> Result<u64, Error> {
-        let state = self.state;
-        let account = state
-            .markets()
-            .get_user_share_account(txn, &payout.address)?
-            .unwrap_or_default();
+        let account = self.account(txn, payout.address)?;
         let locks: Vec<_> = account
             .escrows
             .into_iter()
@@ -253,11 +238,9 @@ impl NativeState<'_> {
             payout.payout_sats,
             &quantities,
         )?;
-        for ((id, mut escrow), (_, amount)) in
-            locks.into_iter().zip(allocations)
-        {
+        for ((_, mut escrow), amount) in locks.into_iter().zip(allocations) {
             escrow.asset = EscrowAssetV1::NativeCash(amount);
-            self.write_escrow(txn, escrow.owner, id, Some(&escrow))?;
+            self.write_escrow(txn, &escrow, false)?;
         }
         Ok(ordinary)
     }
@@ -288,11 +271,11 @@ impl NativeState<'_> {
 }
 
 /// Canonical integer apportionment, keyed by lock id; ordinary shares sort first.
-pub fn allocate_settlement(
+fn allocate_settlement(
     total_shares: i64,
     payout: u64,
     locks: &[(NativeId, i64)],
-) -> Result<(u64, Vec<(NativeId, u64)>), Error> {
+) -> Result<(u64, Vec<u64>), Error> {
     if total_shares <= 0 {
         return Err(invalid("invalid settlement share count"));
     }
@@ -326,14 +309,7 @@ pub fn allocate_settlement(
     for (index, _, _) in remainders.into_iter().take((payout - paid) as usize) {
         amounts[index] += 1;
     }
-    Ok((
-        amounts[0],
-        locks
-            .iter()
-            .enumerate()
-            .map(|(index, (id, _))| (*id, amounts[index + 1]))
-            .collect(),
-    ))
+    Ok((amounts.remove(0), amounts))
 }
 
 pub fn cash_outpoint(txid: NativeId) -> OutPoint {
@@ -412,34 +388,23 @@ pub fn validate(
             ..
         } => {
             require_owner_input(tx, *owner)?;
-            validate_shares(state, txn, *market_id, *outcome_index, *shares)?;
+            if *shares <= 0 {
+                return Err(invalid("native share quantity must be positive"));
+            }
+            let market = state
+                .markets()
+                .get_market(txn, market_id)?
+                .ok_or_else(|| invalid("unknown native share market"))?;
+            if !market.state().allows_trading()
+                || (*outcome_index as usize) >= market.shares().len()
+            {
+                return Err(invalid(
+                    "native share market is closed or outcome invalid",
+                ));
+            }
         }
         // Assignment owners are checked during ordered execution, not at block start.
         _ => (),
-    }
-    Ok(())
-}
-
-fn validate_shares(
-    state: &State,
-    txn: &RoTxn,
-    market: MarketId,
-    outcome: u32,
-    shares: i64,
-) -> Result<(), Error> {
-    if shares <= 0 {
-        return Err(invalid("native share quantity must be positive"));
-    }
-    let market = state
-        .markets()
-        .get_market(txn, &market)?
-        .ok_or_else(|| invalid("unknown native share market"))?;
-    if !market.state().allows_trading()
-        || (outcome as usize) >= market.shares().len()
-    {
-        return Err(invalid(
-            "native share market is closed or outcome invalid",
-        ));
     }
     Ok(())
 }
@@ -455,10 +420,9 @@ pub fn check_deadline(
         claim_before_parent,
         ..
     } = op.action
+        && parent >= claim_before_parent
     {
-        if parent >= claim_before_parent {
-            return Err(invalid("expired native lock"));
-        }
+        return Err(invalid("expired native lock"));
     }
     Ok(())
 }
@@ -472,20 +436,18 @@ pub fn validate_terminal(
         return Err(invalid("escrow already terminated"));
     }
     match preimage {
-        Some(secret) => {
-            if parent_height >= escrow.claim_before_parent {
-                return Err(invalid("escrow claim expired"));
-            }
-            let digest: [u8; 32] = Sha256::digest(secret).into();
-            if digest != escrow.hashlock {
-                return Err(invalid("invalid escrow preimage"));
-            }
+        Some(_) if parent_height >= escrow.claim_before_parent => {
+            return Err(invalid("escrow claim expired"));
         }
-        None => {
-            if parent_height < escrow.claim_before_parent {
-                return Err(invalid("escrow refund too early"));
-            }
+        Some(secret)
+            if <NativeId>::from(Sha256::digest(secret)) != escrow.hashlock =>
+        {
+            return Err(invalid("invalid escrow preimage"));
         }
+        None if parent_height < escrow.claim_before_parent => {
+            return Err(invalid("escrow refund too early"));
+        }
+        _ => (),
     }
     Ok(())
 }
@@ -496,21 +458,12 @@ mod tests {
     #[test]
     fn apportionment_conserves_integer_payout_and_zero_successors() {
         let ids = [([1; 32], 1), ([2; 32], 1)];
-        assert_eq!(
-            allocate_settlement(3, 2, &ids).unwrap(),
-            (1, vec![([1; 32], 1), ([2; 32], 0)])
-        );
-        assert_eq!(
-            allocate_settlement(3, 0, &ids).unwrap(),
-            (0, vec![([1; 32], 0), ([2; 32], 0)])
-        );
+        assert_eq!(allocate_settlement(3, 2, &ids).unwrap(), (1, vec![1, 0]));
+        assert_eq!(allocate_settlement(3, 0, &ids).unwrap(), (0, vec![0, 0]));
         for payout in 0..100 {
             let (ordinary, locked) =
                 allocate_settlement(3, payout, &ids).unwrap();
-            assert_eq!(
-                ordinary + locked.iter().map(|(_, cash)| *cash).sum::<u64>(),
-                payout
-            );
+            assert_eq!(ordinary + locked.iter().sum::<u64>(), payout);
         }
         assert!(allocate_settlement(1, 2, &ids).is_err());
     }

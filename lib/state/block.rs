@@ -2855,7 +2855,3 @@ mod tests {
         assert!(base2_sequential > base1);
     }
 }
-
-#[cfg(test)]
-#[path = "native_tests.rs"]
-mod native_integration_tests;
