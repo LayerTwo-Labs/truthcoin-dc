@@ -5,7 +5,7 @@ members = ["app", "cli", "integration_tests", "lib", "rpc-api"]
 [workspace.package]
 authors = ["Ash Manning <ash@layertwolabs.com>"]
 edition = "2024"
-license-file = "LICENSE.txt"
+license = "MIT"
 publish = false
 version = "0.16.3"
 
