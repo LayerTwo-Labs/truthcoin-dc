@@ -17,6 +17,7 @@ use crate::{
     transfer_many::transfer_many_trial,
     unknown_withdrawal::unknown_withdrawal_trial,
     util::BinPaths,
+    wallet_sync::wallet_sync_trial,
 };
 
 fn deposit_withdraw_roundtrip(
@@ -96,6 +97,11 @@ pub fn tests(
             file_registry.clone(),
             failure_collector.clone(),
         ),
-        roundtrip_trial(bin_paths, file_registry, failure_collector),
+        roundtrip_trial(
+            bin_paths.clone(),
+            file_registry.clone(),
+            failure_collector.clone(),
+        ),
+        wallet_sync_trial(bin_paths, file_registry, failure_collector),
     ]
 }
