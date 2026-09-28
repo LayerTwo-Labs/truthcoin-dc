@@ -342,15 +342,18 @@ impl Connection {
         );
         let mut message_buf = magic_bytes.to_vec();
         bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &response)?;
+        let stream_id = response_tx.id();
         response_tx.write_all(&message_buf).await.map_err(|err| {
-            {
-                error::connection::Send::Write {
-                    stream_id: response_tx.id(),
-                    source: err,
-                }
+            error::connection::Send::Write {
+                stream_id,
+                source: err,
             }
-            .into()
-        })
+        })?;
+        // A SendStream that drops without this resets the stream, and the reset
+        // discards data the peer has not read. `send_request` and
+        // `send_heartbeat` both finish their streams for the same reason.
+        response_tx.finish()?;
+        Ok(())
     }
 }
 
@@ -543,12 +546,84 @@ pub struct Peer {
 
 #[cfg(test)]
 mod test {
-    use std::num::NonZeroUsize;
+    use std::{
+        collections::HashSet,
+        net::{Ipv4Addr, SocketAddr},
+        num::NonZeroUsize,
+        time::Duration,
+    };
 
     use crate::{
-        net::peer::{Connection, message::GetBlockRequest},
+        net::{
+            make_server_endpoint,
+            peer::{
+                Connection,
+                message::{self, GetBlockRequest, ResponseMessage},
+            },
+            tests::set_crypto_provider,
+        },
         types::BlockHash,
     };
+
+    const TEST_MAGIC: message::MagicBytes = *b"TEST";
+
+    /// A peer reads a response some time after it arrives. `send_response` must
+    /// finish its stream, because a stream that resets discards the bytes the
+    /// peer did not read, and the peer then reads an incomplete message.
+    #[tokio::test]
+    async fn send_response_survives_a_late_read() -> anyhow::Result<()> {
+        set_crypto_provider();
+        let (server, _cert) = make_server_endpoint(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            HashSet::new(),
+        )?;
+        let (client, _cert) = make_server_endpoint(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            HashSet::new(),
+        )?;
+        let server_addr = server.local_addr()?;
+
+        let accept = tokio::spawn(async move {
+            let incoming =
+                server.accept().await.expect("no incoming connection");
+            let conn = incoming.await.expect("the handshake failed");
+            let (tx, _rx) = conn.accept_bi().await.expect("no stream");
+            Connection::send_response(
+                TEST_MAGIC,
+                tx,
+                ResponseMessage::NoBlock {
+                    block_hash: BlockHash([7u8; 32]),
+                },
+            )
+            .await
+            .expect("the response failed");
+            // Hold the connection open, so only the stream state decides what
+            // the peer reads.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let conn = client.connect(server_addr, "localhost")?.await?;
+        let (mut tx, mut rx) = conn.open_bi().await?;
+        tx.write_all(b"ping").await?;
+        tx.finish()?;
+        // The peer answers and drops its stream while this task sleeps.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut magic_bytes = [0u8; message::MAGIC_BYTES_LEN];
+        rx.read_exact(&mut magic_bytes).await?;
+        assert_eq!(magic_bytes, TEST_MAGIC);
+        let response_bytes = rx.read_to_end(1024).await?;
+        let response: ResponseMessage = bincode::deserialize(&response_bytes)?;
+        assert!(matches!(
+            response,
+            ResponseMessage::NoBlock {
+                block_hash: BlockHash(hash),
+            } if hash == [7u8; 32]
+        ));
+
+        accept.abort();
+        Ok(())
+    }
 
     /// A large (up to 10MB) block response must be granted substantially more
     /// time than the heartbeat timeout, so that a slow but steadily-progressing
