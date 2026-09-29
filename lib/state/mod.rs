@@ -13,9 +13,9 @@ use crate::{
     types::{
         Address, AmountOverflowError, Authorized, AuthorizedTransaction,
         BlockHash, BlockIndexEvents, Body, FilledOutput, FilledTransaction,
-        GetBitcoinValue as _, Header, InPoint, M6id, MerkleRoot, OutPoint,
-        OutPointKey, SpentOutput, Transaction, VERSION, Version,
-        WithdrawalBundle, WithdrawalBundleStatus,
+        GetAddress as _, GetBitcoinValue as _, Header, InPoint, M6id,
+        MerkleRoot, OutPoint, OutPointKey, SpentOutput, Transaction, VERSION,
+        Version, WithdrawalBundle, WithdrawalBundleStatus,
         proto::mainchain::TwoWayPegData,
     },
     util::Watchable,
@@ -637,8 +637,12 @@ impl State {
         rotxn: &RoTxn,
         transaction: AuthorizedTransaction,
     ) -> Result<Authorized<FilledTransaction>, Error> {
-        let filled_tx =
+        let mut filled_tx =
             self.fill_transaction(rotxn, &transaction.transaction)?;
+        filled_tx.actor_address = transaction
+            .actor_proof
+            .as_ref()
+            .map(|auth| auth.get_address());
         let authorizations = transaction.authorizations;
         Ok(Authorized {
             transaction: filled_tx,
@@ -1008,5 +1012,34 @@ impl Watchable<()> for State {
     type WatchStream = tokio_stream::wrappers::WatchStream<()>;
     fn watch(&self) -> Self::WatchStream {
         tokio_stream::wrappers::WatchStream::new(self.tip.watch().clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authorization::{SigningKey, authorize, get_address};
+
+    #[test]
+    fn fill_authorized_transaction_sets_actor_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None).unwrap();
+
+        let key = SigningKey::from_scalar(
+            curve25519_dalek::Scalar::from_bytes_mod_order([7; 32]),
+        )
+        .unwrap();
+        let actor = get_address(&(&key).into());
+        let mut tx =
+            authorize(rand::rng(), &[(actor, &key)], Transaction::default())
+                .unwrap();
+        tx.actor_proof = tx.authorizations.pop();
+
+        let rotxn = env.read_txn().unwrap();
+        let filled = state.fill_authorized_transaction(&rotxn, tx).unwrap();
+        assert_eq!(filled.transaction.actor_address, Some(actor));
     }
 }
