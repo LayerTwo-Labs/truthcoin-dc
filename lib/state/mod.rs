@@ -41,6 +41,7 @@ pub mod block;
 pub mod decisions;
 pub mod error;
 pub mod markets;
+pub mod native;
 mod rollback;
 pub mod type_aliases;
 pub mod undo;
@@ -66,6 +67,7 @@ pub struct PrevalidatedBlock {
     pub computed_merkle_root: MerkleRoot,
     pub coinbase_value: bitcoin::Amount,
     pub next_height: u32,
+    pub parent_height: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -84,6 +86,13 @@ type WithdrawalBundlesDb = DatabaseUnique<
         RollBack<HeightStamped<WithdrawalBundleStatus>>,
     )>,
 >;
+
+// Existing state_version database; v3 changes account and undo value encodings.
+#[derive(Serialize, Deserialize)]
+struct StateStorageVersion {
+    application: Version,
+    native_schema: u32,
+}
 
 #[derive(Clone)]
 pub struct State {
@@ -116,7 +125,7 @@ pub struct State {
         SerdeBincode<u32>,
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     >,
-    _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
+    _version: DatabaseUnique<UnitKey, SerdeBincode<StateStorageVersion>>,
     // Undo databases for disconnect_tip chain reorganization support
     settlement_undo: DatabaseUnique<
         SerdeBincode<u32>,
@@ -255,7 +264,11 @@ impl State {
                 decisions::DecisionConfig::testing(nz),
             )?
         } else {
-            decisions::Dbs::new(env, &mut rwtxn)?
+            decisions::Dbs::new_with_config(
+                env,
+                &mut rwtxn,
+                decisions::DecisionConfig::production(),
+            )?
         };
         let markets = MarketsDatabase::new(env, &mut rwtxn)?;
         let voting = VotingSystem::new(env, &mut rwtxn)?;
@@ -285,8 +298,29 @@ impl State {
             "withdrawal_bundle_event_blocks",
         )?;
         let version = DatabaseUnique::create(env, &mut rwtxn, "state_version")?;
-        if version.try_get(&rwtxn, &())?.is_none() {
-            version.put(&mut rwtxn, &(), &*VERSION)?;
+        match version.try_get(&rwtxn, &()).map_err(|_| {
+            native::invalid(
+                "incompatible state schema; migrate or rebuild before opening",
+            )
+        })? {
+            Some(StateStorageVersion {
+                native_schema: 3, ..
+            }) => (),
+            Some(_) => {
+                return Err(native::invalid(
+                    "unsupported native account schema",
+                ));
+            }
+            None => {
+                version.put(
+                    &mut rwtxn,
+                    &(),
+                    &StateStorageVersion {
+                        application: (*VERSION).clone(),
+                        native_schema: 3,
+                    },
+                )?;
+            }
         }
         let settlement_undo =
             DatabaseUnique::create(env, &mut rwtxn, "settlement_undo")?;
@@ -338,6 +372,10 @@ impl State {
 
     pub fn decisions(&self) -> &decisions::Dbs {
         &self.decisions
+    }
+
+    pub fn native(&self) -> native::NativeState<'_> {
+        native::NativeState { state: self }
     }
 
     pub fn markets(&self) -> &MarketsDatabase {

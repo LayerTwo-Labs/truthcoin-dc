@@ -540,6 +540,7 @@ pub enum TransactionData {
         amount: u64,
         market_author: Address,
     },
+    NativeOperation(super::native::NativeOperationV3),
 }
 
 pub type TxData = TransactionData;

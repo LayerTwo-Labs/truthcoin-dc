@@ -10,6 +10,17 @@ use crate::types::{Address, FilledOutput, OutPoint};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Exact snapshots stored in the EXISTING consolidation_undo row.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AccountUndoV3 {
+    pub accounts:
+        BTreeMap<Address, Option<crate::state::markets::ShareAccount>>,
+    pub markets: BTreeMap<MarketId, Market>,
+    pub cash_outputs: Vec<OutPoint>,
+    /// Outer None means the frame has not been initialized for a block.
+    pub previous_timestamp: Option<Option<u64>>,
+}
+
 /// Undo data for market settlement and automatic payouts (C1).
 ///
 /// Captured before `transition_and_payout_resolved_markets` during connect.
@@ -29,6 +40,9 @@ pub struct SettlementUndoEntry {
     pub treasury_utxo: Option<(OutPoint, FilledOutput)>,
     /// Fee UTXO that existed before payouts consumed it
     pub fee_utxo: Option<(OutPoint, FilledOutput)>,
+    /// Exact pre-settlement accounts for every shareholder touched by payout.
+    pub pre_settlement_share_accounts:
+        Vec<(Address, crate::state::markets::ShareAccount)>,
 }
 
 /// Undo data for consensus voting state commit (C2).
@@ -72,8 +86,9 @@ pub struct ReputationTransferUndoEntry {
 ///
 /// Captured before `consolidate_market_utxos` during connect.
 /// Used to restore pre-consolidation UTXO state during disconnect.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ConsolidationUndoData {
+    pub account_undo: AccountUndoV3,
     pub entries: Vec<ConsolidationUndoEntry>,
     /// Sell input change UTXOs created (to delete on revert)
     pub sell_input_change_utxos: Vec<OutPoint>,

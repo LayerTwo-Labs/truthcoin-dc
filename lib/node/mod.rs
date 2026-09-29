@@ -393,7 +393,8 @@ where
                     | crate::types::TxData::SubmitVote { .. }
                     | crate::types::TxData::SubmitBallot { .. }
                     | crate::types::TxData::TransferReputation { .. }
-                    | crate::types::TxData::AmplifyBeta { .. } => {}
+                    | crate::types::TxData::AmplifyBeta { .. }
+                    | crate::types::TxData::NativeOperation(_) => {}
                 }
             }
 
@@ -1185,7 +1186,8 @@ where
             | TxData::SubmitVote { .. }
             | TxData::SubmitBallot { .. }
             | TxData::TransferReputation { .. }
-            | TxData::AmplifyBeta { .. } => Ok(true),
+            | TxData::AmplifyBeta { .. }
+            | TxData::NativeOperation(_) => Ok(true),
         }
     }
 
