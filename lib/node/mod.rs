@@ -1114,7 +1114,7 @@ where
                         limit_sats
                     );
 
-                    if buy_cost.total_cost_sats > *limit_sats {
+                    if buy_cost.exceeds_limit(*limit_sats) {
                         tracing::info!(
                             "Slippage exceeded for buy tx: cost {} sats > max {} sats",
                             buy_cost.total_cost_sats,

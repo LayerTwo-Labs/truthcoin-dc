@@ -57,6 +57,13 @@ pub struct BuyCost {
     pub total_cost_sats: u64,
 }
 
+impl BuyCost {
+    /// True if `total_cost_sats` exceeds `limit_sats`.
+    pub fn exceeds_limit(&self, limit_sats: u64) -> bool {
+        self.total_cost_sats > limit_sats
+    }
+}
+
 /// `net_proceeds_sats` = `gross_proceeds_sats - trading_fee_sats`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SellProceeds {
