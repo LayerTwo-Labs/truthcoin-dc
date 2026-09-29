@@ -6,7 +6,6 @@ use std::{
     sync::Arc,
 };
 
-use bitcoin::amount::CheckedSum as _;
 use fallible_iterator::{FallibleIterator, IteratorExt};
 use heed::EnvFlags;
 use sneed::{DbError, Env, EnvError, RoTxn, RwTxnError, env};
@@ -25,8 +24,8 @@ use crate::{
     types::{
         Address, AmountOverflowError, AmountUnderflowError, Authorized,
         AuthorizedTransaction, Block, BlockHash, BlockIndexEvents, BmmResult,
-        Body, FilledOutput, FilledTransaction, GetBitcoinValue, Header,
-        InPoint, MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
+        Body, FilledOutput, FilledTransaction, Header, InPoint,
+        MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
         SpentOutput, Tip, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
         net::SeedAddress,
         proto::{self, mainchain},
@@ -113,6 +112,13 @@ impl From<state::Error> for Error {
     fn from(err: state::Error) -> Self {
         Self::State(Box::new(err))
     }
+}
+
+/// Fee that the block builder credits to the coinbase for a transaction.
+fn block_template_fee(
+    filled_tx: &FilledTransaction,
+) -> Result<bitcoin::Amount, Error> {
+    Ok(crate::validation::BlockValidator::miner_fee(filled_tx)?)
 }
 
 pub type FilledTransactionWithPosition =
@@ -851,8 +857,6 @@ where
         number: usize,
     ) -> Result<(Vec<Authorized<FilledTransaction>>, bitcoin::Amount), Error>
     {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
-
         let mut rwtxn = self.env.write_txn()?;
 
         // Take non-trade TXs first, then trade TXs in chronological order
@@ -879,11 +883,6 @@ where
 
         for transaction in combined_txs {
             let txid = transaction.transaction.txid();
-            let is_trade = transaction
-                .transaction
-                .data
-                .as_ref()
-                .is_some_and(|d| d.is_trade());
 
             let inputs: HashSet<_> =
                 transaction.transaction.inputs.iter().copied().collect();
@@ -930,27 +929,7 @@ where
                 }
             }
 
-            // Compute fee: constant for trade TXs, input-output for others
-            let tx_fee = if is_trade {
-                bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
-            } else {
-                let value_in: bitcoin::Amount = filled_transaction
-                    .transaction
-                    .spent_utxos
-                    .iter()
-                    .map(GetBitcoinValue::get_bitcoin_value)
-                    .checked_sum()
-                    .ok_or(AmountOverflowError)?;
-                let value_out: bitcoin::Amount = filled_transaction
-                    .transaction
-                    .transaction
-                    .outputs
-                    .iter()
-                    .map(GetBitcoinValue::get_bitcoin_value)
-                    .checked_sum()
-                    .ok_or(AmountOverflowError)?;
-                value_in.checked_sub(value_out).ok_or(AmountOverflowError)?
-            };
+            let tx_fee = block_template_fee(&filled_transaction.transaction)?;
 
             fee = fee.checked_add(tx_fee).ok_or(AmountUnderflowError)?;
             spent_utxos.extend(filled_transaction.transaction.inputs());
@@ -1862,5 +1841,39 @@ where
             .new_tip_ready_confirm(new_tip)
             .await
             .map_err(Error::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::trading::TRADE_MINER_FEE_SATS;
+    use crate::types::{BitcoinOutputContent, FilledOutputContent, TxData};
+
+    #[test]
+    fn block_template_fee_excludes_amplify_beta_deposit() {
+        let amount = 50_000;
+        let amplify = FilledTransaction {
+            transaction: Transaction {
+                data: Some(TxData::AmplifyBeta {
+                    market_id: MarketId::new([1; 6]),
+                    amount,
+                    market_author: Address::ALL_ZEROS,
+                }),
+                ..Transaction::default()
+            },
+            spent_utxos: vec![FilledOutput {
+                address: Address::ALL_ZEROS,
+                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                    bitcoin::Amount::from_sat(amount + TRADE_MINER_FEE_SATS),
+                )),
+                memo: vec![],
+            }],
+            actor_address: None,
+        };
+        assert_eq!(
+            block_template_fee(&amplify).unwrap(),
+            bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
+        );
     }
 }
