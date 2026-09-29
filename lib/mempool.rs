@@ -548,15 +548,19 @@ mod p2p_validation_bypass_tests {
 
     use super::MemPool;
     use crate::archive::Archive;
-    use crate::authorization::{Authorization, get_address, Signature};
+    use crate::authorization::{
+        Authorization, BatchVerificationContext, Dst, SigningKey, get_address,
+        sign,
+    };
     use crate::state::{State, UtxoManager};
     use crate::types::{
-        Address, AuthorizedTransaction, FilledOutput, FilledOutputContent, OutPoint,
-        Output, OutputContent, Transaction, Txid, VerifyingKey,
+        Address, AuthorizedTransaction, FilledOutput, FilledOutputContent,
+        OutPoint, Output, OutputContent, Transaction, Txid, VerifyingKey,
     };
 
-    fn signing_key(seed: u8) -> ed25519_dalek::SigningKey {
-        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    fn signing_key(seed: u8) -> SigningKey {
+        let scalar = curve25519_dalek::Scalar::from_bytes_mod_order([seed; 32]);
+        SigningKey::from_scalar(scalar).expect("non-zero scalar")
     }
 
     fn temp_env() -> sneed::Env {
@@ -578,7 +582,7 @@ mod p2p_validation_bypass_tests {
         let mempool = MemPool::new(&env).expect("MemPool::new");
 
         let victim = signing_key(1);
-        let victim_vk = VerifyingKey(victim.verifying_key());
+        let victim_vk = VerifyingKey::from(&victim);
         let victim_addr: Address = get_address(&victim_vk);
         let funding_outpoint = OutPoint::Regular {
             txid: Txid([7u8; 32]),
@@ -586,9 +590,9 @@ mod p2p_validation_bypass_tests {
         };
         let funded_output = FilledOutput {
             address: victim_addr,
-            content: FilledOutputContent::Bitcoin(crate::types::BitcoinOutputContent(
-                Amount::from_sat(100_000),
-            )),
+            content: FilledOutputContent::Bitcoin(
+                crate::types::BitcoinOutputContent(Amount::from_sat(100_000)),
+            ),
             memo: vec![],
         };
         {
@@ -602,10 +606,12 @@ mod p2p_validation_bypass_tests {
         let tx = Transaction {
             inputs: vec![funding_outpoint],
             outputs: vec![Output {
-                address: get_address(&VerifyingKey(signing_key(2).verifying_key())),
-                content: OutputContent::Bitcoin(crate::types::BitcoinOutputContent(
-                    Amount::from_sat(90_000),
-                )),
+                address: get_address(&VerifyingKey::from(&signing_key(2))),
+                content: OutputContent::Bitcoin(
+                    crate::types::BitcoinOutputContent(Amount::from_sat(
+                        90_000,
+                    )),
+                ),
                 memo: vec![],
             }],
             memo: vec![],
@@ -614,7 +620,12 @@ mod p2p_validation_bypass_tests {
 
         let forged = Authorization {
             verifying_key: victim_vk,
-            signature: Signature(ed25519_dalek::Signature::from_bytes(&[0u8; 64])),
+            signature: sign(
+                rand::rng(),
+                &victim,
+                Dst::Transaction,
+                b"not this transaction",
+            ),
         };
         let authd_tx = AuthorizedTransaction {
             transaction: tx,
@@ -624,9 +635,16 @@ mod p2p_validation_bypass_tests {
 
         {
             let rotxn = env.read_txn().expect("read txn");
-            let result = state.validate_transaction(&archive, &rotxn, &authd_tx);
-            eprintln!("validate_transaction(forged tx) => {result:?}");
-            assert!(result.is_err(), "validator must reject the forged-sig tx: {result:?}");
+            let result = state.validate_transaction(
+                &archive,
+                &rotxn,
+                &BatchVerificationContext::new(&mut rand::rng()),
+                &authd_tx,
+            );
+            assert!(
+                result.is_err(),
+                "validator must reject the forged-sig tx: {result:?}"
+            );
             assert!(
                 format!("{result:?}").to_lowercase().contains("authoriz"),
                 "rejection must be an authorization error, got {result:?}"

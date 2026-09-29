@@ -1488,6 +1488,7 @@ impl NetTask {
                                         .validate_transaction(
                                             &self.ctxt.archive,
                                             &rwtxn,
+                                            &self.ctxt.net.batch_verification_ctxt,
                                             &new_tx,
                                         )
                                         .map_err(
