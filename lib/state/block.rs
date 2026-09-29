@@ -12,6 +12,7 @@ use crate::{
     },
 };
 
+#[derive(Default)]
 struct StateUpdate {
     market_updates: Vec<MarketStateUpdate>,
     market_creations: Vec<MarketCreation>,
@@ -815,13 +816,7 @@ pub fn connect_prevalidated(
     for (idx, filled_tx) in filled_txs.iter().enumerate() {
         match &filled_tx.transaction.data {
             Some(TxData::Trade { .. }) => {
-                match apply_trade(
-                    state,
-                    rwtxn,
-                    filled_tx,
-                    &mut state_update,
-                    height,
-                )? {
+                match apply_trade(state, rwtxn, filled_tx, &mut state_update)? {
                     TradeApplyResult::Applied => {}
                     TradeApplyResult::Skipped { reason } => {
                         tracing::info!(
@@ -1839,11 +1834,10 @@ fn apply_utxo_changes(
     Ok(())
 }
 
-/// Trades of a block under construction, applied in block order.
+/// Trades and `AmplifyBeta` deposits of a block under construction, applied
+/// in block order with the same rules as block connect.
 #[derive(Default)]
-pub struct TradeSimulation {
-    cumulative_states: HashMap<MarketId, ndarray::Array1<i64>>,
-}
+pub struct TradeSimulation(StateUpdate);
 
 impl TradeSimulation {
     pub fn apply(
@@ -1852,119 +1846,25 @@ impl TradeSimulation {
         rotxn: &RoTxn,
         filled_tx: &FilledTransaction,
     ) -> Result<TradeApplyResult, Error> {
-        let Some(TxData::Trade {
-            market_id,
-            outcome_index,
-            shares,
-            trader,
-            limit_sats,
-            ..
-        }) = &filled_tx.transaction.data
-        else {
-            return Ok(TradeApplyResult::Applied);
-        };
-        let is_buy = *shares > 0;
-        let shares_abs = shares.unsigned_abs();
-
-        let Some(market) = state.markets().get_market(rotxn, market_id)? else {
-            return Ok(TradeApplyResult::Skipped {
-                reason: format!("Market {market_id} not found"),
-            });
-        };
-        let beta = market_beta(&market);
-
-        if !is_buy {
-            let owned_shares = state
-                .markets()
-                .get_user_share_account(rotxn, trader)?
-                .as_ref()
-                .and_then(|account| {
-                    account
-                        .positions
-                        .get(&(*market_id, *outcome_index))
-                        .copied()
-                })
-                .unwrap_or(0);
-            if owned_shares < 0 || (owned_shares as u64) < shares_abs {
-                return Ok(TradeApplyResult::Skipped {
-                    reason: format!(
-                        "Insufficient shares for sell: {trader} owns {owned_shares} but trying to sell {shares_abs}"
-                    ),
-                });
+        match &filled_tx.transaction.data {
+            Some(TxData::Trade { .. }) => {
+                apply_trade(state, rotxn, filled_tx, &mut self.0)
             }
+            Some(TxData::AmplifyBeta { .. }) => {
+                apply_amplify_beta(filled_tx, &mut self.0)?;
+                Ok(TradeApplyResult::Applied)
+            }
+            _ => Ok(TradeApplyResult::Applied),
         }
-
-        let current_shares = self
-            .cumulative_states
-            .get(market_id)
-            .cloned()
-            .unwrap_or_else(|| market.shares().clone());
-        let mut new_shares = current_shares.clone();
-        new_shares[*outcome_index as usize] += *shares;
-
-        if is_buy {
-            let base_cost = trading::calculate_update_cost(
-                &current_shares,
-                &new_shares,
-                beta,
-            )
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("LMSR calculation failed: {e:?}"),
-            })?;
-            let buy_cost =
-                trading::calculate_buy_cost(base_cost, market.trading_fee())
-                    .map_err(|e| Error::InvalidTransaction {
-                        reason: format!("Buy cost calculation failed: {e}"),
-                    })?;
-            if buy_cost.exceeds_limit(*limit_sats) {
-                return Ok(TradeApplyResult::Skipped {
-                    reason: format!(
-                        "Slippage exceeded for buy tx: cost {} sats + miner fee {} sats > max {} sats",
-                        buy_cost.total_cost_sats,
-                        trading::TRADE_MINER_FEE_SATS,
-                        limit_sats
-                    ),
-                });
-            }
-        } else {
-            let gross_proceeds = trading::calculate_update_cost(
-                &new_shares,
-                &current_shares,
-                beta,
-            )
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("LMSR calculation failed: {e:?}"),
-            })?;
-            let sell_proceeds = trading::calculate_sell_proceeds(
-                gross_proceeds,
-                market.trading_fee(),
-            )
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Sell proceeds calculation failed: {e}"),
-            })?;
-            if *limit_sats > 0 && sell_proceeds.net_proceeds_sats < *limit_sats
-            {
-                return Ok(TradeApplyResult::Skipped {
-                    reason: format!(
-                        "Slippage exceeded for sell tx: proceeds {} sats < min {} sats",
-                        sell_proceeds.net_proceeds_sats, limit_sats
-                    ),
-                });
-            }
-        }
-
-        self.cumulative_states.insert(*market_id, new_shares);
-        Ok(TradeApplyResult::Applied)
     }
 }
 
 /// Returns `TradeApplyResult::Skipped` for slippage failures (soft-fail).
 fn apply_trade(
     state: &State,
-    rwtxn: &mut RwTxn,
+    rotxn: &RoTxn,
     filled_tx: &FilledTransaction,
     state_update: &mut StateUpdate,
-    _height: u32,
 ) -> Result<TradeApplyResult, Error> {
     use crate::math::trading::TRADE_MINER_FEE_SATS;
 
@@ -1978,7 +1878,7 @@ fn apply_trade(
 
     let market = state
         .markets()
-        .get_market(rwtxn, &trade.market_id)?
+        .get_market(rotxn, &trade.market_id)?
         .ok_or_else(|| Error::InvalidTransaction {
             reason: format!("Market {:?} does not exist", trade.market_id),
         })?;
@@ -2056,7 +1956,7 @@ fn apply_trade(
     } else {
         let seller_account = state
             .markets()
-            .get_user_share_account(rwtxn, &trade.trader)?;
+            .get_user_share_account(rotxn, &trade.trader)?;
 
         let owned_shares = seller_account
             .as_ref()
@@ -2648,6 +2548,114 @@ fn apply_transfer_reputation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bitcoin_input(sats: u64) -> FilledOutput {
+        FilledOutput {
+            address: Address::ALL_ZEROS,
+            content: FilledOutputContent::Bitcoin(
+                crate::types::BitcoinOutputContent(bitcoin::Amount::from_sat(
+                    sats,
+                )),
+            ),
+            memo: vec![],
+        }
+    }
+
+    fn filled_tx(data: TxData, input_sats: u64) -> FilledTransaction {
+        FilledTransaction {
+            transaction: crate::types::Transaction {
+                data: Some(data),
+                ..Default::default()
+            },
+            spent_utxos: vec![bitcoin_input(input_sats)],
+            actor_address: None,
+        }
+    }
+
+    #[test]
+    fn trade_simulation_prices_at_same_block_amplified_beta() {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+        use crate::state::MarketBuilder;
+        use crate::state::decisions::{Decision, DecisionId, DecisionType};
+        use crate::state::markets::DimensionSpec;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None).unwrap();
+
+        let decision_id = DecisionId::new(true, 0, 0).unwrap();
+        let decision = Decision::new(
+            Address::ALL_ZEROS.0,
+            DecisionType::Binary,
+            "Header".to_string(),
+            "Desc".to_string(),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let mut market =
+            MarketBuilder::new("Market".to_string(), Address::ALL_ZEROS)
+                .with_dimensions(vec![DimensionSpec::Single(decision_id)])
+                .build(0, None, &HashMap::from([(decision_id, decision)]))
+                .unwrap();
+        market.liquidity_base_sats = 10_000;
+        market.shares = ndarray::Array1::from(vec![0, 20_000]);
+        let mut rwtxn = env.write_txn().unwrap();
+        state.markets().add_market(&mut rwtxn, &market).unwrap();
+
+        let shares = 1_000;
+        let mut new_shares = market.shares.clone();
+        new_shares[0] += shares;
+        let base_cost = trading::calculate_update_cost(
+            &market.shares,
+            &new_shares,
+            market_beta(&market),
+        )
+        .unwrap();
+        let cost = trading::calculate_buy_cost(base_cost, market.trading_fee())
+            .unwrap()
+            .total_cost_sats;
+        let trade = filled_tx(
+            TxData::Trade {
+                market_id: market.id,
+                outcome_index: 0,
+                shares,
+                trader: Address::ALL_ZEROS,
+                limit_sats: cost + TRADE_MINER_FEE_SATS,
+                tx_pow_nonce: None,
+                prev_block_hash: crate::types::BlockHash([0; 32]),
+            },
+            100_000,
+        );
+        let amount = 1_000_000;
+        let amplify = filled_tx(
+            TxData::AmplifyBeta {
+                market_id: market.id,
+                amount,
+                market_author: Address::ALL_ZEROS,
+            },
+            amount + TRADE_MINER_FEE_SATS,
+        );
+
+        let mut trades = TradeSimulation::default();
+        assert!(matches!(
+            trades.apply(&state, &rwtxn, &trade).unwrap(),
+            TradeApplyResult::Applied
+        ));
+
+        let mut trades = TradeSimulation::default();
+        assert!(matches!(
+            trades.apply(&state, &rwtxn, &amplify).unwrap(),
+            TradeApplyResult::Applied
+        ));
+        assert!(matches!(
+            trades.apply(&state, &rwtxn, &trade).unwrap(),
+            TradeApplyResult::Skipped { .. }
+        ));
+    }
 
     #[test]
     fn test_double_spend_protection_same_block() {
