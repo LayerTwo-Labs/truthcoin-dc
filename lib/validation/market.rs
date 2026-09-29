@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::state::Error;
 use crate::state::decisions::{DecisionId, DecisionType};
@@ -108,12 +108,21 @@ impl MarketValidator {
             });
         }
 
+        let mut seen_decisions = HashSet::new();
         for spec in dimension_specs {
             let decision_id = match spec {
                 DimensionSpec::Single(id) | DimensionSpec::Categorical(id) => {
                     id
                 }
             };
+
+            if !seen_decisions.insert(decision_id) {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Duplicate dimension for decision {decision_id:?}"
+                    ),
+                });
+            }
 
             if let Some(ty) = pending_types.get(decision_id) {
                 if let DimensionSpec::Categorical(_) = spec {
@@ -644,6 +653,99 @@ mod tests {
     fn market_fewer_than_two_outcomes_rejected() {
         let shares = Array1::from_vec(vec![100]);
         assert!(MarketValidator::validate_market_shares(&shares).is_err());
+    }
+
+    #[test]
+    fn market_creation_duplicate_dimension_rejected() {
+        use crate::state::decisions::Decision;
+        use crate::state::markets::compute_market_id;
+        use crate::types::{
+            BitcoinOutputContent, FilledOutputContent, OutPoint, Output,
+            OutputContent, Transaction, TransactionData, Txid,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
+        options
+            .map_size(16 * 1024 * 1024)
+            .max_dbs(crate::state::State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
+        let state = crate::state::State::new(&env, None).unwrap();
+
+        let maker = Address([1; 20]);
+        let decision_id = DecisionId::new(false, 1, 0).unwrap();
+        let decision = Decision::new(
+            maker.0,
+            DecisionType::Binary,
+            "h".to_string(),
+            String::new(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .decisions()
+            .claim_decision(
+                &mut rwtxn,
+                decision_id,
+                decision,
+                Txid::default(),
+                None,
+            )
+            .unwrap();
+        rwtxn.commit().unwrap();
+
+        let dimension_specs = vec![
+            DimensionSpec::Single(decision_id),
+            DimensionSpec::Single(decision_id),
+        ];
+        let market_id = compute_market_id("t", "", &maker, &dimension_specs);
+        let tx = FilledTransaction {
+            transaction: Transaction {
+                inputs: vec![OutPoint::Regular {
+                    txid: Txid::default(),
+                    vout: 0,
+                }],
+                outputs: vec![Output::new(
+                    maker,
+                    OutputContent::MarketFunds {
+                        market_id: *market_id.as_bytes(),
+                        amount: BitcoinOutputContent(
+                            bitcoin::Amount::from_sat(1000),
+                        ),
+                        is_fee: false,
+                    },
+                )],
+                memo: Vec::new(),
+                data: Some(TransactionData::CreateMarket {
+                    title: "t".to_string(),
+                    description: String::new(),
+                    dimension_specs,
+                    new_claims: Vec::new(),
+                    trading_fee: None,
+                    tx_pow_hash_selector: None,
+                    tx_pow_ordering: None,
+                    tx_pow_difficulty: None,
+                }),
+            },
+            spent_utxos: vec![Output::new(
+                maker,
+                FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                    bitcoin::Amount::from_sat(2000),
+                )),
+            )],
+            actor_address: None,
+        };
+
+        let rotxn = env.read_txn().unwrap();
+        assert!(
+            MarketValidator::validate_market_creation(
+                &state, &rotxn, &tx, None
+            )
+            .is_err()
+        );
     }
 
     #[test]
