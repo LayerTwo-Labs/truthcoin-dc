@@ -137,6 +137,16 @@ pub struct BlockTemplate {
     pub fees: bitcoin::Amount,
 }
 
+/// Aborts the task when the last holder drops it. A dropped `App` clone
+/// must not stop the task that the other clones still use.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort()
+    }
+}
+
 #[derive(Clone)]
 pub struct App {
     pub node: Arc<Node>,
@@ -145,7 +155,7 @@ pub struct App {
     pub utxos: Arc<RwLock<HashMap<OutPoint, FilledOutput>>>,
     pub unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
     pub runtime: Arc<tokio::runtime::Runtime>,
-    task: Arc<JoinHandle<()>>,
+    _task: Arc<AbortOnDrop>,
     pub local_pool: LocalPoolHandle,
 }
 
@@ -365,7 +375,7 @@ impl App {
             unconfirmed_utxos,
             utxos,
             runtime: Arc::new(runtime),
-            task: Arc::new(task),
+            _task: Arc::new(AbortOnDrop(task)),
             local_pool,
         })
     }
@@ -693,12 +703,6 @@ impl App {
     }
 }
 
-impl Drop for App {
-    fn drop(&mut self) {
-        self.task.abort()
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::{net::SocketAddr, time::Duration};
@@ -756,5 +760,44 @@ mod test {
         } = timeout(Duration::from_secs(30), proto_support).await?;
         assert!(!block_producer && !miner && !wallet);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::oneshot;
+
+    use super::AbortOnDrop;
+
+    /// Spawn a task that waits for a start signal, then reports that it ran.
+    fn gated_task() -> (oneshot::Sender<()>, oneshot::Receiver<()>, AbortOnDrop)
+    {
+        let (start_tx, start_rx) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _: Result<(), _> = start_rx.await;
+            let _: Result<(), _> = done_tx.send(());
+        });
+        (start_tx, done_rx, AbortOnDrop(task))
+    }
+
+    #[tokio::test]
+    async fn a_dropped_clone_keeps_the_task() {
+        let (start_tx, done_rx, guard) = gated_task();
+        let guard = Arc::new(guard);
+        drop(guard.clone());
+        let _: Result<(), _> = start_tx.send(());
+        assert!(done_rx.await.is_ok(), "a dropped clone stopped the task");
+    }
+
+    #[tokio::test]
+    async fn the_last_drop_stops_the_task() {
+        let (start_tx, done_rx, guard) = gated_task();
+        let guard = Arc::new(guard);
+        drop(guard);
+        let _: Result<(), _> = start_tx.send(());
+        assert!(done_rx.await.is_err(), "the last drop kept the task");
     }
 }

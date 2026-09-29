@@ -14,6 +14,7 @@ mod setup;
 mod transfer_many;
 mod unknown_withdrawal;
 mod util;
+mod wallet_sync;
 
 #[derive(Parser)]
 struct Cli {
