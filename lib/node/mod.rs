@@ -1114,10 +1114,11 @@ where
                         limit_sats
                     );
 
-                    if buy_cost.total_cost_sats > *limit_sats {
+                    if buy_cost.exceeds_limit(*limit_sats) {
                         tracing::info!(
-                            "Slippage exceeded for buy tx: cost {} sats > max {} sats",
+                            "Slippage exceeded for buy tx: cost {} sats + miner fee {} sats > max {} sats",
                             buy_cost.total_cost_sats,
+                            trading::TRADE_MINER_FEE_SATS,
                             limit_sats
                         );
                         return Ok(false);
