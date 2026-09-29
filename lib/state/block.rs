@@ -12,6 +12,7 @@ use crate::{
     },
 };
 
+#[derive(Default)]
 struct StateUpdate {
     market_updates: Vec<MarketStateUpdate>,
     market_creations: Vec<MarketCreation>,
@@ -57,7 +58,7 @@ pub struct PendingBuySettlement {
     pub is_amplify: bool,
 }
 
-enum TradeApplyResult {
+pub enum TradeApplyResult {
     Applied,
     Skipped { reason: String },
 }
@@ -815,13 +816,7 @@ pub fn connect_prevalidated(
     for (idx, filled_tx) in filled_txs.iter().enumerate() {
         match &filled_tx.transaction.data {
             Some(TxData::Trade { .. }) => {
-                match apply_trade(
-                    state,
-                    rwtxn,
-                    filled_tx,
-                    &mut state_update,
-                    height,
-                )? {
+                match apply_trade(state, rwtxn, filled_tx, &mut state_update)? {
                     TradeApplyResult::Applied => {}
                     TradeApplyResult::Skipped { reason } => {
                         tracing::info!(
@@ -1839,13 +1834,41 @@ fn apply_utxo_changes(
     Ok(())
 }
 
+/// Trades and `AmplifyBeta` deposits of a block under construction, applied
+/// in block order with the same rules as block connect.
+#[derive(Default)]
+pub struct TradeSimulation(StateUpdate);
+
+impl TradeSimulation {
+    pub fn apply(
+        &mut self,
+        state: &State,
+        archive: &crate::archive::Archive,
+        rotxn: &RoTxn,
+        filled_tx: &FilledTransaction,
+    ) -> Result<TradeApplyResult, Error> {
+        match &filled_tx.transaction.data {
+            Some(TxData::Trade { .. }) => {
+                crate::validation::MarketValidator::validate_trade(
+                    state, archive, rotxn, filled_tx, None,
+                )?;
+                apply_trade(state, rotxn, filled_tx, &mut self.0)
+            }
+            Some(TxData::AmplifyBeta { .. }) => {
+                apply_amplify_beta(filled_tx, &mut self.0)?;
+                Ok(TradeApplyResult::Applied)
+            }
+            _ => Ok(TradeApplyResult::Applied),
+        }
+    }
+}
+
 /// Returns `TradeApplyResult::Skipped` for slippage failures (soft-fail).
 fn apply_trade(
     state: &State,
-    rwtxn: &mut RwTxn,
+    rotxn: &RoTxn,
     filled_tx: &FilledTransaction,
     state_update: &mut StateUpdate,
-    _height: u32,
 ) -> Result<TradeApplyResult, Error> {
     use crate::math::trading::TRADE_MINER_FEE_SATS;
 
@@ -1859,7 +1882,7 @@ fn apply_trade(
 
     let market = state
         .markets()
-        .get_market(rwtxn, &trade.market_id)?
+        .get_market(rotxn, &trade.market_id)?
         .ok_or_else(|| Error::InvalidTransaction {
             reason: format!("Market {:?} does not exist", trade.market_id),
         })?;
@@ -1937,7 +1960,7 @@ fn apply_trade(
     } else {
         let seller_account = state
             .markets()
-            .get_user_share_account(rwtxn, &trade.trader)?;
+            .get_user_share_account(rotxn, &trade.trader)?;
 
         let owned_shares = seller_account
             .as_ref()
@@ -2529,6 +2552,217 @@ fn apply_transfer_reputation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bitcoin_input(sats: u64) -> FilledOutput {
+        FilledOutput {
+            address: Address::ALL_ZEROS,
+            content: FilledOutputContent::Bitcoin(
+                crate::types::BitcoinOutputContent(bitcoin::Amount::from_sat(
+                    sats,
+                )),
+            ),
+            memo: vec![],
+        }
+    }
+
+    fn filled_tx(data: TxData, input_sats: u64) -> FilledTransaction {
+        FilledTransaction {
+            transaction: crate::types::Transaction {
+                inputs: vec![OutPoint::Regular {
+                    txid: crate::types::Txid([0; 32]),
+                    vout: 0,
+                }],
+                data: Some(data),
+                ..Default::default()
+            },
+            spent_utxos: vec![bitcoin_input(input_sats)],
+            actor_address: None,
+        }
+    }
+
+    struct TradingFixture {
+        _dir: tempfile::TempDir,
+        env: sneed::Env,
+        state: State,
+        archive: crate::archive::Archive,
+        market: crate::state::Market,
+        tip: crate::types::BlockHash,
+    }
+
+    fn trading_fixture() -> TradingFixture {
+        use crate::archive::Archive;
+        use crate::state::MarketBuilder;
+        use crate::state::decisions::{Decision, DecisionId, DecisionType};
+        use crate::state::markets::DimensionSpec;
+        use bitcoin::hashes::Hash as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None).unwrap();
+        let archive = Archive::new(&env).unwrap();
+
+        let decision_id = DecisionId::new(true, 0, 0).unwrap();
+        let decision = Decision::new(
+            Address::ALL_ZEROS.0,
+            DecisionType::Binary,
+            "Header".to_string(),
+            "Desc".to_string(),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let mut market =
+            MarketBuilder::new("Market".to_string(), Address::ALL_ZEROS)
+                .with_dimensions(vec![DimensionSpec::Single(decision_id)])
+                .build(0, None, &HashMap::from([(decision_id, decision)]))
+                .unwrap();
+        market.liquidity_base_sats = 10_000;
+        market.shares = ndarray::Array1::from(vec![0, 20_000]);
+
+        let header = Header {
+            merkle_root: MerkleRoot::default(),
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+        };
+        let tip = header.hash();
+        let mut rwtxn = env.write_txn().unwrap();
+        archive.put_header(&mut rwtxn, &header).unwrap();
+        state.tip.put(&mut rwtxn, &(), &tip).unwrap();
+        state.height.put(&mut rwtxn, &(), &0).unwrap();
+        state.markets().add_market(&mut rwtxn, &market).unwrap();
+        rwtxn.commit().unwrap();
+
+        TradingFixture {
+            _dir: dir,
+            env,
+            state,
+            archive,
+            market,
+            tip,
+        }
+    }
+
+    fn buy_cost(market: &crate::state::Market, shares: i64) -> u64 {
+        let mut new_shares = market.shares.clone();
+        new_shares[0] += shares;
+        let base_cost = trading::calculate_update_cost(
+            &market.shares,
+            &new_shares,
+            market_beta(market),
+        )
+        .unwrap();
+        trading::calculate_buy_cost(base_cost, market.trading_fee())
+            .unwrap()
+            .total_cost_sats
+    }
+
+    #[test]
+    fn trade_simulation_prices_at_same_block_amplified_beta() {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
+        let TradingFixture {
+            env,
+            state,
+            archive,
+            market,
+            tip,
+            ..
+        } = trading_fixture();
+        let rotxn = env.read_txn().unwrap();
+
+        let shares = 1_000;
+        let trade = filled_tx(
+            TxData::Trade {
+                market_id: market.id,
+                outcome_index: 0,
+                shares,
+                trader: Address::ALL_ZEROS,
+                limit_sats: buy_cost(&market, shares) + TRADE_MINER_FEE_SATS,
+                tx_pow_nonce: None,
+                prev_block_hash: tip,
+            },
+            100_000,
+        );
+        let amount = 1_000_000;
+        let amplify = filled_tx(
+            TxData::AmplifyBeta {
+                market_id: market.id,
+                amount,
+                market_author: Address::ALL_ZEROS,
+            },
+            amount + TRADE_MINER_FEE_SATS,
+        );
+
+        let mut trades = TradeSimulation::default();
+        assert!(matches!(
+            trades.apply(&state, &archive, &rotxn, &trade).unwrap(),
+            TradeApplyResult::Applied
+        ));
+
+        let mut trades = TradeSimulation::default();
+        assert!(matches!(
+            trades.apply(&state, &archive, &rotxn, &amplify).unwrap(),
+            TradeApplyResult::Applied
+        ));
+        assert!(matches!(
+            trades.apply(&state, &archive, &rotxn, &trade).unwrap(),
+            TradeApplyResult::Skipped { .. }
+        ));
+    }
+
+    #[test]
+    fn trade_simulation_rejects_sell_of_same_block_buy() {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
+        let TradingFixture {
+            env,
+            state,
+            archive,
+            market,
+            tip,
+            ..
+        } = trading_fixture();
+        let rotxn = env.read_txn().unwrap();
+
+        let shares = 20_000;
+        let trade = |shares, limit_sats| {
+            filled_tx(
+                TxData::Trade {
+                    market_id: market.id,
+                    outcome_index: 0,
+                    shares,
+                    trader: Address::ALL_ZEROS,
+                    limit_sats,
+                    tx_pow_nonce: None,
+                    prev_block_hash: tip,
+                },
+                100_000,
+            )
+        };
+        let buy =
+            trade(shares, buy_cost(&market, shares) + TRADE_MINER_FEE_SATS);
+        let sell = trade(-shares, 0);
+
+        let mut trades = TradeSimulation::default();
+        assert!(matches!(
+            trades.apply(&state, &archive, &rotxn, &buy).unwrap(),
+            TradeApplyResult::Applied
+        ));
+        let result = trades.apply(&state, &archive, &rotxn, &sell);
+        assert!(
+            matches!(
+                &result,
+                Err(Error::InvalidTransaction { reason })
+                    if reason.starts_with("Insufficient shares")
+            ),
+            "sell of same-block shares must fail prevalidation: {:?}",
+            result.as_ref().err()
+        );
+    }
 
     #[test]
     fn test_double_spend_protection_same_block() {

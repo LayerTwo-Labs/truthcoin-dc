@@ -12,21 +12,23 @@ use sneed::{DbError, Env, EnvError, RoTxn, RwTxnError, env};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
-use ndarray::Array1;
-
 use crate::{
     archive::{self, Archive},
     authorization::{BatchVerificationContext, rand_core::CryptoRng},
     math::trading,
     mempool::{self, MemPool},
     net::{self, DialSeedsHandle, Net, Peer},
-    state::{self, State, markets::MarketId},
+    state::{
+        self, State,
+        block::{TradeApplyResult, TradeSimulation},
+        markets::MarketId,
+    },
     types::{
         Address, AmountOverflowError, AmountUnderflowError, Authorized,
         AuthorizedTransaction, Block, BlockHash, BlockIndexEvents, BmmResult,
         Body, FilledOutput, FilledTransaction, Header, InPoint,
         MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
-        SpentOutput, Tip, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
+        SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
         net::SeedAddress,
         proto::{self, mainchain},
     },
@@ -878,8 +880,7 @@ where
         let mut fee = bitcoin::Amount::ZERO;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
-        let mut cumulative_market_states: HashMap<MarketId, Array1<i64>> =
-            HashMap::new();
+        let mut trades = TradeSimulation::default();
 
         for transaction in combined_txs {
             let txid = transaction.transaction.txid();
@@ -906,22 +907,24 @@ where
                 }
             };
 
-            match self.check_trade_slippage(
+            match trades.apply(
+                &self.state,
+                &self.archive,
                 &rwtxn,
-                &filled_transaction,
-                &mut cumulative_market_states,
+                &filled_transaction.transaction,
             ) {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(TradeApplyResult::Applied) => {}
+                Ok(TradeApplyResult::Skipped { reason }) => {
                     tracing::info!(
-                        "Skipping tx {} due to slippage - will retry next block",
-                        txid
+                        "Skipping tx {} due to slippage - will retry next block: {}",
+                        txid,
+                        reason
                     );
                     continue;
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Slippage check error for {}: {:?} - skipping",
+                        "Skipping tx {} that fails the trade checks: {:?}",
                         txid,
                         e
                     );
@@ -937,236 +940,6 @@ where
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok((returned_transactions, fee))
-    }
-
-    /// Check if a trade transaction passes slippage validation against cumulative market state.
-    ///
-    /// Returns:
-    /// - `Ok(true)` if the tx passes slippage check (or is not a market trade)
-    /// - `Ok(false)` if slippage exceeded (tx should be skipped, not deleted)
-    /// - `Err(...)` if there's an error checking (tx should be skipped)
-    ///
-    /// For Trade transactions, this checks the cost/proceeds against
-    /// the cumulative market state (accounting for prior txs in this block) and updates
-    /// the cumulative state if the check passes.
-    fn check_trade_slippage(
-        &self,
-        rotxn: &sneed::RoTxn,
-        filled_tx: &Authorized<FilledTransaction>,
-        cumulative_states: &mut HashMap<MarketId, Array1<i64>>,
-    ) -> Result<bool, Error> {
-        let tx_data = match &filled_tx.transaction.transaction.data {
-            Some(data) => data,
-            None => return Ok(true), // Non-data txs always pass
-        };
-
-        match tx_data {
-            TxData::Trade {
-                market_id,
-                outcome_index,
-                shares,
-                trader,
-                limit_sats,
-                ..
-            } => {
-                let is_buy = *shares > 0;
-                let shares_abs = shares.unsigned_abs();
-
-                tracing::debug!(
-                    "check_trade_slippage: Trade ({}) market={}, outcome={}, shares={}, limit={}",
-                    if is_buy { "buy" } else { "sell" },
-                    market_id,
-                    outcome_index,
-                    shares,
-                    limit_sats
-                );
-
-                let market =
-                    match self.state.markets().get_market(rotxn, market_id)? {
-                        Some(m) => m,
-                        None => {
-                            tracing::warn!(
-                                "Market {} not found for slippage check",
-                                market_id
-                            );
-                            return Ok(false);
-                        }
-                    };
-
-                let beta = self.derive_market_beta(&market)?;
-                tracing::debug!(
-                    "check_trade_slippage: found market with {} outcomes, beta={}",
-                    market.shares().len(),
-                    beta
-                );
-
-                // For sells, verify trader owns sufficient shares
-                if !is_buy {
-                    let seller_account = self
-                        .state
-                        .markets()
-                        .get_user_share_account(rotxn, trader)?;
-
-                    let owned_shares = seller_account
-                        .as_ref()
-                        .and_then(|account| {
-                            account
-                                .positions
-                                .get(&(*market_id, *outcome_index))
-                                .copied()
-                        })
-                        .unwrap_or(0);
-
-                    tracing::debug!(
-                        "check_trade_slippage: seller {} owns {} shares, trying to sell {}",
-                        trader,
-                        owned_shares,
-                        shares_abs
-                    );
-
-                    if owned_shares < 0 || (owned_shares as u64) < shares_abs {
-                        tracing::info!(
-                            "Insufficient shares for sell: {} owns {} but trying to sell {} - skipping",
-                            trader,
-                            owned_shares,
-                            shares_abs
-                        );
-                        return Ok(false);
-                    }
-                }
-
-                // Get cumulative state (or confirmed state if first tx for this market)
-                let current_shares = cumulative_states
-                    .get(market_id)
-                    .cloned()
-                    .unwrap_or_else(|| market.shares().clone());
-                tracing::debug!(
-                    "check_trade_slippage: current_shares={:?}",
-                    current_shares
-                );
-
-                // Calculate new shares after trade (sign of shares handles direction)
-                let mut new_shares = current_shares.clone();
-                new_shares[*outcome_index as usize] += *shares;
-                tracing::debug!(
-                    "check_trade_slippage: new_shares={:?}",
-                    new_shares
-                );
-
-                if is_buy {
-                    // Buy: cost = LMSR(current -> new)
-                    let base_cost = trading::calculate_update_cost(
-                        &current_shares,
-                        &new_shares,
-                        beta,
-                    )
-                    .map_err(|e| {
-                        Error::State(Box::new(
-                            state::Error::InvalidTransaction {
-                                reason: format!(
-                                    "LMSR calculation failed: {e:?}"
-                                ),
-                            },
-                        ))
-                    })?;
-                    tracing::debug!(
-                        "check_trade_slippage: base_cost={}",
-                        base_cost
-                    );
-
-                    let buy_cost = trading::calculate_buy_cost(
-                        base_cost,
-                        market.trading_fee(),
-                    )
-                    .map_err(|e| {
-                        Error::State(Box::new(
-                            state::Error::InvalidTransaction {
-                                reason: format!(
-                                    "Buy cost calculation failed: {e}"
-                                ),
-                            },
-                        ))
-                    })?;
-                    tracing::debug!(
-                        "check_trade_slippage: total_cost={}, limit={}",
-                        buy_cost.total_cost_sats,
-                        limit_sats
-                    );
-
-                    if buy_cost.exceeds_limit(*limit_sats) {
-                        tracing::info!(
-                            "Slippage exceeded for buy tx: cost {} sats + miner fee {} sats > max {} sats",
-                            buy_cost.total_cost_sats,
-                            trading::TRADE_MINER_FEE_SATS,
-                            limit_sats
-                        );
-                        return Ok(false);
-                    }
-                    // Note: We intentionally do NOT check if embedded costs match recalculated costs.
-                    // Multiple transactions targeting the same market in a block will have different
-                    // cumulative costs. The slippage check (above) is sufficient - if the cost is
-                    // within the user's limit_sats, the transaction is valid.
-                } else {
-                    // Sell: proceeds = LMSR(new -> current)
-                    let gross_proceeds = trading::calculate_update_cost(
-                        &new_shares,
-                        &current_shares,
-                        beta,
-                    )
-                    .map_err(|e| {
-                        Error::State(Box::new(
-                            state::Error::InvalidTransaction {
-                                reason: format!(
-                                    "LMSR calculation failed: {e:?}"
-                                ),
-                            },
-                        ))
-                    })?;
-
-                    let sell_proceeds = trading::calculate_sell_proceeds(
-                        gross_proceeds,
-                        market.trading_fee(),
-                    )
-                    .map_err(|e| {
-                        Error::State(Box::new(
-                            state::Error::InvalidTransaction {
-                                reason: format!(
-                                    "Sell proceeds calculation failed: {e}"
-                                ),
-                            },
-                        ))
-                    })?;
-
-                    // Only check slippage limit if limit_sats > 0
-                    // (limit_sats = 0 means "no minimum proceeds requirement")
-                    if *limit_sats > 0
-                        && sell_proceeds.net_proceeds_sats < *limit_sats
-                    {
-                        tracing::info!(
-                            "Slippage exceeded for sell tx: proceeds {} sats < min {} sats",
-                            sell_proceeds.net_proceeds_sats,
-                            limit_sats
-                        );
-                        return Ok(false);
-                    }
-                    // Note: We intentionally do NOT check if embedded costs match recalculated costs.
-                    // Multiple transactions targeting the same market in a block will have different
-                    // cumulative proceeds. The slippage check (above) is sufficient - if proceeds
-                    // meet the user's limit_sats minimum, the transaction is valid.
-                }
-
-                // Update cumulative state for subsequent txs
-                cumulative_states.insert(*market_id, new_shares);
-                tracing::debug!("check_trade_slippage: Trade passed");
-                Ok(true)
-            }
-            TxData::ClaimDecision(_)
-            | TxData::CreateMarket { .. }
-            | TxData::SubmitVote { .. }
-            | TxData::SubmitBallot { .. }
-            | TxData::TransferReputation { .. }
-            | TxData::AmplifyBeta { .. } => Ok(true),
-        }
     }
 
     pub fn try_get_transaction(
