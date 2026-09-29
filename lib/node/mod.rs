@@ -6,7 +6,6 @@ use std::{
     sync::Arc,
 };
 
-use bitcoin::amount::CheckedSum as _;
 use fallible_iterator::{FallibleIterator, IteratorExt};
 use heed::EnvFlags;
 use sneed::{DbError, Env, EnvError, RoTxn, RwTxnError, env};
@@ -25,8 +24,8 @@ use crate::{
     types::{
         Address, AmountOverflowError, AmountUnderflowError, Authorized,
         AuthorizedTransaction, Block, BlockHash, BlockIndexEvents, BmmResult,
-        Body, FilledOutput, FilledTransaction, GetBitcoinValue, Header,
-        InPoint, MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
+        Body, FilledOutput, FilledTransaction, Header, InPoint,
+        MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
         SpentOutput, Tip, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
         net::SeedAddress,
         proto::{self, mainchain},
@@ -119,25 +118,7 @@ impl From<state::Error> for Error {
 fn block_template_fee(
     filled_tx: &FilledTransaction,
 ) -> Result<bitcoin::Amount, Error> {
-    use crate::math::trading::TRADE_MINER_FEE_SATS;
-
-    if filled_tx.is_trade() {
-        return Ok(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS));
-    }
-    let value_in: bitcoin::Amount = filled_tx
-        .spent_utxos
-        .iter()
-        .map(GetBitcoinValue::get_bitcoin_value)
-        .checked_sum()
-        .ok_or(AmountOverflowError)?;
-    let value_out: bitcoin::Amount = filled_tx
-        .transaction
-        .outputs
-        .iter()
-        .map(GetBitcoinValue::get_bitcoin_value)
-        .checked_sum()
-        .ok_or(AmountOverflowError)?;
-    Ok(value_in.checked_sub(value_out).ok_or(AmountOverflowError)?)
+    Ok(crate::validation::BlockValidator::miner_fee(filled_tx)?)
 }
 
 pub type FilledTransactionWithPosition =
@@ -1859,5 +1840,39 @@ where
             .new_tip_ready_confirm(new_tip)
             .await
             .map_err(Error::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::trading::TRADE_MINER_FEE_SATS;
+    use crate::types::{BitcoinOutputContent, FilledOutputContent, TxData};
+
+    #[test]
+    fn block_template_fee_excludes_amplify_beta_deposit() {
+        let amount = 50_000;
+        let amplify = FilledTransaction {
+            transaction: Transaction {
+                data: Some(TxData::AmplifyBeta {
+                    market_id: MarketId::new([1; 6]),
+                    amount,
+                    market_author: Address::ALL_ZEROS,
+                }),
+                ..Transaction::default()
+            },
+            spent_utxos: vec![FilledOutput {
+                address: Address::ALL_ZEROS,
+                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                    bitcoin::Amount::from_sat(amount + TRADE_MINER_FEE_SATS),
+                )),
+                memo: vec![],
+            }],
+            actor_address: None,
+        };
+        assert_eq!(
+            block_template_fee(&amplify).unwrap(),
+            bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
+        );
     }
 }
