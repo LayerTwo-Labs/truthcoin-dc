@@ -206,7 +206,9 @@ impl MarketValidator {
             }
         }
 
-        use crate::state::markets::compute_market_id;
+        use crate::state::markets::{
+            compute_market_id, generate_market_treasury_address,
+        };
         let expected_market_id = compute_market_id(
             view.title,
             view.description,
@@ -214,6 +216,8 @@ impl MarketValidator {
             dimension_specs,
         );
         let expected_market_id_bytes = *expected_market_id.as_bytes();
+        let treasury_address =
+            generate_market_treasury_address(&expected_market_id);
 
         let treasury_amount_sats = tx
             .outputs()
@@ -223,14 +227,16 @@ impl MarketValidator {
                     market_id,
                     amount,
                     is_fee: false,
-                } if market_id == &expected_market_id_bytes => {
+                } if market_id == &expected_market_id_bytes
+                    && output.address == treasury_address =>
+                {
                     Some(amount.0.to_sat())
                 }
                 _ => None,
             })
             .ok_or_else(|| Error::InvalidTransaction {
                 reason: format!(
-                    "CreateMarket tx must have MarketFunds (treasury) output with market_id {}",
+                    "CreateMarket tx must have MarketFunds (treasury) output with market_id {} to {treasury_address}",
                     const_hex::encode(expected_market_id_bytes)
                 ),
             })?;
@@ -607,6 +613,19 @@ impl MarketStateValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        archive::Archive,
+        state::{
+            State,
+            decisions::Decision,
+            markets::{compute_market_id, generate_market_treasury_address},
+        },
+        types::{
+            BitcoinOutputContent, FilledOutput, FilledOutputContent, Hash,
+            OutPoint, Output, OutputContent, Transaction, TransactionData,
+            Txid,
+        },
+    };
     use ndarray::Array1;
 
     #[test]
@@ -672,6 +691,108 @@ mod tests {
             MarketStateValidator::validate_market_state_transition(
                 MarketState::Cancelled,
                 MarketState::Trading
+            )
+            .is_err()
+        );
+    }
+
+    fn create_market_tx(
+        maker: Address,
+        dimension_specs: Vec<DimensionSpec>,
+        treasury_address: Address,
+    ) -> FilledTransaction {
+        let market_id =
+            compute_market_id("title", "", &maker, &dimension_specs);
+        FilledTransaction {
+            transaction: Transaction {
+                inputs: vec![OutPoint::Regular {
+                    txid: Txid(Hash::from([1; 32])),
+                    vout: 0,
+                }],
+                outputs: vec![Output {
+                    address: treasury_address,
+                    content: OutputContent::MarketFunds {
+                        market_id: *market_id.as_bytes(),
+                        amount: BitcoinOutputContent(
+                            bitcoin::Amount::from_sat(10_000),
+                        ),
+                        is_fee: false,
+                    },
+                    memo: vec![],
+                }],
+                memo: vec![],
+                data: Some(TransactionData::CreateMarket {
+                    title: "title".to_string(),
+                    description: String::new(),
+                    dimension_specs,
+                    new_claims: vec![],
+                    trading_fee: None,
+                    tx_pow_hash_selector: None,
+                    tx_pow_ordering: None,
+                    tx_pow_difficulty: None,
+                }),
+            },
+            spent_utxos: vec![FilledOutput {
+                address: maker,
+                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                    bitcoin::Amount::from_sat(20_000),
+                )),
+                memo: vec![],
+            }],
+            actor_address: None,
+        }
+    }
+
+    #[test]
+    fn treasury_output_must_pay_market_treasury_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None).unwrap();
+
+        let maker = Address([7; 20]);
+        let decision_id = DecisionId::new(false, 1, 0).unwrap();
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .decisions()
+            .claim_decision(
+                &mut rwtxn,
+                decision_id,
+                Decision {
+                    market_maker_pubkey_hash: maker.0,
+                    header: "decision".to_string(),
+                    description: String::new(),
+                    decision_type: DecisionType::Binary,
+                    option_0_label: None,
+                    option_1_label: None,
+                    tags: Vec::new(),
+                },
+                Txid(Hash::from([2; 32])),
+                None,
+            )
+            .unwrap();
+        rwtxn.commit().unwrap();
+        let rotxn = env.read_txn().unwrap();
+
+        let specs = vec![DimensionSpec::Single(decision_id)];
+        let treasury = generate_market_treasury_address(&compute_market_id(
+            "title", "", &maker, &specs,
+        ));
+        let canonical = create_market_tx(maker, specs.clone(), treasury);
+        MarketValidator::validate_market_creation(
+            &state, &rotxn, &canonical, None,
+        )
+        .unwrap();
+
+        let maker_owned = create_market_tx(maker, specs, maker);
+        assert!(
+            MarketValidator::validate_market_creation(
+                &state,
+                &rotxn,
+                &maker_owned,
+                None
             )
             .is_err()
         );
