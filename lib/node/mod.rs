@@ -907,6 +907,24 @@ where
                 }
             };
 
+            if filled_transaction.transaction.is_trade()
+                && let Err(err) =
+                    crate::validation::MarketValidator::validate_trade(
+                        &self.state,
+                        &self.archive,
+                        &rwtxn,
+                        &filled_transaction.transaction,
+                        None,
+                    )
+            {
+                tracing::info!(
+                    "Skipping tx {} that fails block prevalidation: {:?}",
+                    txid,
+                    err
+                );
+                continue;
+            }
+
             match trades.apply(
                 &self.state,
                 &rwtxn,
