@@ -178,6 +178,16 @@ impl VoteValidator {
         Self::validate_voter_eligibility(state, rotxn, &voter_address)?;
 
         let decision_id = DecisionId::from_bytes(vote_data.decision_id_bytes)?;
+        if vote_data.voting_period != decision_id.voting_period() {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Vote period mismatch: decision {} must be voted on in period {}, but transaction specifies period {}",
+                    decision_id.to_hex(),
+                    decision_id.voting_period(),
+                    vote_data.voting_period
+                ),
+            });
+        }
         let decision =
             Self::validate_decision_entry(state, rotxn, decision_id)?;
 
@@ -312,7 +322,17 @@ impl VoteValidator {
                 DecisionId::from_bytes(vote_item.decision_id_bytes)?;
 
             // Voting period is deterministically derived from decision: voting_period = period_index + 1
-            let period_id = VotingPeriodId::new(decision_id.voting_period());
+            let voting_period = decision_id.voting_period();
+            if voting_period != ballot_data.voting_period {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Ballot item {idx}: period mismatch: decision {} must be voted on in period {voting_period}, but transaction specifies period {}",
+                        decision_id.to_hex(),
+                        ballot_data.voting_period
+                    ),
+                });
+            }
+            let period_id = VotingPeriodId::new(voting_period);
 
             if !seen_votes.insert((period_id, decision_id)) {
                 return Err(Error::InvalidTransaction {
@@ -568,5 +588,152 @@ mod tests {
         use crate::math::voting::constants::round_reputation;
         let amount = 0.5_f64;
         assert_eq!(amount, round_reputation(amount));
+    }
+
+    struct VotingFixture {
+        _dir: tempfile::TempDir,
+        env: sneed::Env,
+        state: crate::state::State,
+        voter: crate::types::Address,
+        decision_id: crate::state::decisions::DecisionId,
+    }
+
+    fn voting_fixture() -> VotingFixture {
+        use crate::state::decisions::{Decision, DecisionId, DecisionType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("data.mdb");
+        std::fs::create_dir_all(&env_path).unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(crate::state::State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, &env_path) }.unwrap();
+        let state = crate::state::State::new(&env, None).unwrap();
+
+        let voter = crate::types::Address([1; 20]);
+        let decision_id = DecisionId::new(false, 1, 0).unwrap();
+        let decision = Decision::new(
+            [0u8; 20],
+            DecisionType::Binary,
+            "T".into(),
+            String::new(),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .reputation()
+            .set_reputation(&mut rwtxn, &voter, 1.0)
+            .unwrap();
+        state
+            .decisions()
+            .claim_decision(
+                &mut rwtxn,
+                decision_id,
+                decision,
+                crate::types::Txid([0; 32]),
+                None,
+            )
+            .unwrap();
+        state
+            .decisions()
+            .transition_decision_to_voting(&mut rwtxn, decision_id, 0)
+            .unwrap();
+        rwtxn.commit().unwrap();
+
+        VotingFixture {
+            _dir: dir,
+            env,
+            state,
+            voter,
+            decision_id,
+        }
+    }
+
+    fn filled_tx(
+        voter: crate::types::Address,
+        data: crate::types::TransactionData,
+    ) -> FilledTransaction {
+        FilledTransaction {
+            transaction: crate::types::Transaction {
+                data: Some(data),
+                ..Default::default()
+            },
+            spent_utxos: vec![],
+            actor_address: Some(voter),
+        }
+    }
+
+    fn assert_period_mismatch(result: Result<(), Error>) {
+        match result {
+            Err(Error::InvalidTransaction { reason }) => {
+                assert!(reason.contains("period mismatch"), "{reason}")
+            }
+            other => panic!("expected period mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vote_with_wrong_declared_period_rejected() {
+        let f = voting_fixture();
+        let vote = |voting_period| {
+            filled_tx(
+                f.voter,
+                crate::types::TransactionData::SubmitVote {
+                    voter: f.voter,
+                    decision_id_bytes: f.decision_id.as_bytes(),
+                    vote_value: 1.0,
+                    voting_period,
+                },
+            )
+        };
+        let rotxn = f.env.read_txn().unwrap();
+        let period = f.decision_id.voting_period();
+
+        VoteValidator::validate_vote_submission(
+            &f.state,
+            &rotxn,
+            &vote(period),
+            None,
+        )
+        .unwrap();
+        assert_period_mismatch(VoteValidator::validate_vote_submission(
+            &f.state,
+            &rotxn,
+            &vote(period + 1),
+            None,
+        ));
+    }
+
+    #[test]
+    fn ballot_with_wrong_declared_period_rejected() {
+        let f = voting_fixture();
+        let ballot = |voting_period| {
+            filled_tx(
+                f.voter,
+                crate::types::TransactionData::SubmitBallot {
+                    voter: f.voter,
+                    votes: vec![crate::types::BallotItem {
+                        decision_id_bytes: f.decision_id.as_bytes(),
+                        vote_value: 1.0,
+                    }],
+                    voting_period,
+                },
+            )
+        };
+        let rotxn = f.env.read_txn().unwrap();
+        let period = f.decision_id.voting_period();
+
+        VoteValidator::validate_ballot(&f.state, &rotxn, &ballot(period), None)
+            .unwrap();
+        assert_period_mismatch(VoteValidator::validate_ballot(
+            &f.state,
+            &rotxn,
+            &ballot(period + 1),
+            None,
+        ));
     }
 }
