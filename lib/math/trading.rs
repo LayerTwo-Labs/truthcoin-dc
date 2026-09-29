@@ -58,9 +58,10 @@ pub struct BuyCost {
 }
 
 impl BuyCost {
-    /// True if `total_cost_sats` exceeds `limit_sats`.
+    /// True if `total_cost_sats` plus [`TRADE_MINER_FEE_SATS`] exceeds
+    /// `limit_sats`.
     pub fn exceeds_limit(&self, limit_sats: u64) -> bool {
-        self.total_cost_sats > limit_sats
+        self.total_cost_sats + TRADE_MINER_FEE_SATS > limit_sats
     }
 }
 
@@ -159,6 +160,15 @@ mod tests {
             cost.total_cost_sats,
             cost.base_cost_sats + cost.trading_fee_sats
         );
+    }
+
+    #[test]
+    fn test_buy_cost_exceeds_limit_includes_miner_fee() {
+        let cost = calculate_buy_cost(100_000.0, 0.01).unwrap();
+        let limit = cost.total_cost_sats + TRADE_MINER_FEE_SATS;
+        assert!(!cost.exceeds_limit(limit));
+        assert!(cost.exceeds_limit(limit - 1));
+        assert!(cost.exceeds_limit(cost.total_cost_sats));
     }
 
     #[test]

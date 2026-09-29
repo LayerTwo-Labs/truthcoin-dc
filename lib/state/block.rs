@@ -1912,13 +1912,13 @@ fn apply_trade(
                     reason: format!("Buy cost calculation failed: {e}"),
                 })?;
 
-        let total_trade_cost = buy_cost.total_cost_sats;
-
-        if total_trade_cost + TRADE_MINER_FEE_SATS > trade.limit_sats {
+        if buy_cost.exceeds_limit(trade.limit_sats) {
             return Ok(TradeApplyResult::Skipped {
                 reason: format!(
                     "Buy cost {} sats + miner fee {} sats exceeds max cost {} sats",
-                    total_trade_cost, TRADE_MINER_FEE_SATS, trade.limit_sats
+                    buy_cost.total_cost_sats,
+                    TRADE_MINER_FEE_SATS,
+                    trade.limit_sats
                 ),
             });
         }
