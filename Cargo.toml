@@ -8,7 +8,7 @@ authors = ["Ash Manning <ash@layertwolabs.com>",
            "Marc Platt <plattmarc@proton.me>",
 ]
 edition = "2024"
-license-file = "LICENSE.txt"
+license = "MIT"
 publish = false
 version = "0.18.0"
 
