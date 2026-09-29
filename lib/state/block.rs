@@ -57,7 +57,7 @@ pub struct PendingBuySettlement {
     pub is_amplify: bool,
 }
 
-enum TradeApplyResult {
+pub enum TradeApplyResult {
     Applied,
     Skipped { reason: String },
 }
@@ -1837,6 +1837,125 @@ fn apply_utxo_changes(
     }
 
     Ok(())
+}
+
+/// Trades of a block under construction, applied in block order.
+#[derive(Default)]
+pub struct TradeSimulation {
+    cumulative_states: HashMap<MarketId, ndarray::Array1<i64>>,
+}
+
+impl TradeSimulation {
+    pub fn apply(
+        &mut self,
+        state: &State,
+        rotxn: &RoTxn,
+        filled_tx: &FilledTransaction,
+    ) -> Result<TradeApplyResult, Error> {
+        let Some(TxData::Trade {
+            market_id,
+            outcome_index,
+            shares,
+            trader,
+            limit_sats,
+            ..
+        }) = &filled_tx.transaction.data
+        else {
+            return Ok(TradeApplyResult::Applied);
+        };
+        let is_buy = *shares > 0;
+        let shares_abs = shares.unsigned_abs();
+
+        let Some(market) = state.markets().get_market(rotxn, market_id)? else {
+            return Ok(TradeApplyResult::Skipped {
+                reason: format!("Market {market_id} not found"),
+            });
+        };
+        let beta = market_beta(&market);
+
+        if !is_buy {
+            let owned_shares = state
+                .markets()
+                .get_user_share_account(rotxn, trader)?
+                .as_ref()
+                .and_then(|account| {
+                    account
+                        .positions
+                        .get(&(*market_id, *outcome_index))
+                        .copied()
+                })
+                .unwrap_or(0);
+            if owned_shares < 0 || (owned_shares as u64) < shares_abs {
+                return Ok(TradeApplyResult::Skipped {
+                    reason: format!(
+                        "Insufficient shares for sell: {trader} owns {owned_shares} but trying to sell {shares_abs}"
+                    ),
+                });
+            }
+        }
+
+        let current_shares = self
+            .cumulative_states
+            .get(market_id)
+            .cloned()
+            .unwrap_or_else(|| market.shares().clone());
+        let mut new_shares = current_shares.clone();
+        new_shares[*outcome_index as usize] += *shares;
+
+        if is_buy {
+            let base_cost = trading::calculate_update_cost(
+                &current_shares,
+                &new_shares,
+                beta,
+            )
+            .map_err(|e| Error::InvalidTransaction {
+                reason: format!("LMSR calculation failed: {e:?}"),
+            })?;
+            let buy_cost =
+                trading::calculate_buy_cost(base_cost, market.trading_fee())
+                    .map_err(|e| Error::InvalidTransaction {
+                        reason: format!("Buy cost calculation failed: {e}"),
+                    })?;
+            if buy_cost.exceeds_limit(*limit_sats) {
+                return Ok(TradeApplyResult::Skipped {
+                    reason: format!(
+                        "Slippage exceeded for buy tx: cost {} sats + miner fee {} sats > max {} sats",
+                        buy_cost.total_cost_sats,
+                        trading::TRADE_MINER_FEE_SATS,
+                        limit_sats
+                    ),
+                });
+            }
+        } else {
+            let gross_proceeds = trading::calculate_update_cost(
+                &new_shares,
+                &current_shares,
+                beta,
+            )
+            .map_err(|e| Error::InvalidTransaction {
+                reason: format!("LMSR calculation failed: {e:?}"),
+            })?;
+            let sell_proceeds = trading::calculate_sell_proceeds(
+                gross_proceeds,
+                market.trading_fee(),
+            )
+            .map_err(|e| Error::InvalidTransaction {
+                reason: format!("Sell proceeds calculation failed: {e}"),
+            })?;
+            if *limit_sats > 0 && sell_proceeds.net_proceeds_sats < *limit_sats
+            {
+                return Ok(TradeApplyResult::Skipped {
+                    reason: format!(
+                        "Slippage exceeded for sell tx: proceeds {} sats < min {} sats",
+                        sell_proceeds.net_proceeds_sats, limit_sats
+                    ),
+                });
+            }
+        }
+
+        self.cumulative_states.insert(*market_id, new_shares);
+        Ok(TradeApplyResult::Applied)
+    }
 }
 
 /// Returns `TradeApplyResult::Skipped` for slippage failures (soft-fail).
