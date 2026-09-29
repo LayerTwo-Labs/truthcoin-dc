@@ -298,24 +298,29 @@ impl BlockValidator {
         Ok(())
     }
 
+    /// Fee that a transaction pays to the block producer.
+    pub fn miner_fee(
+        filled_tx: &FilledTransaction,
+    ) -> Result<bitcoin::Amount, Error> {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
+        if filled_tx.is_trade() || filled_tx.is_amplify_beta() {
+            return Ok(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS));
+        }
+        filled_tx.bitcoin_fee()?.ok_or(Error::NotEnoughValueIn)
+    }
+
     pub fn validate_fees(
         coinbase_value: bitcoin::Amount,
         filled_txs: &[FilledTransaction],
         skipped_indices: &HashSet<usize>,
     ) -> Result<(), Error> {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
-
         let mut actual_total_fees = bitcoin::Amount::ZERO;
         for (idx, filled_tx) in filled_txs.iter().enumerate() {
             if skipped_indices.contains(&idx) {
                 continue;
             }
-            let tx_fee = if filled_tx.is_trade() || filled_tx.is_amplify_beta()
-            {
-                bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
-            } else {
-                filled_tx.bitcoin_fee()?.ok_or(Error::NotEnoughValueIn)?
-            };
+            let tx_fee = Self::miner_fee(filled_tx)?;
             actual_total_fees = actual_total_fees
                 .checked_add(tx_fee)
                 .ok_or(AmountOverflowError)?;

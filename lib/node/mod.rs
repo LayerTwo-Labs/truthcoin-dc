@@ -115,6 +115,31 @@ impl From<state::Error> for Error {
     }
 }
 
+/// Fee that the block builder credits to the coinbase for a transaction.
+fn block_template_fee(
+    filled_tx: &FilledTransaction,
+) -> Result<bitcoin::Amount, Error> {
+    use crate::math::trading::TRADE_MINER_FEE_SATS;
+
+    if filled_tx.is_trade() {
+        return Ok(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS));
+    }
+    let value_in: bitcoin::Amount = filled_tx
+        .spent_utxos
+        .iter()
+        .map(GetBitcoinValue::get_bitcoin_value)
+        .checked_sum()
+        .ok_or(AmountOverflowError)?;
+    let value_out: bitcoin::Amount = filled_tx
+        .transaction
+        .outputs
+        .iter()
+        .map(GetBitcoinValue::get_bitcoin_value)
+        .checked_sum()
+        .ok_or(AmountOverflowError)?;
+    Ok(value_in.checked_sub(value_out).ok_or(AmountOverflowError)?)
+}
+
 pub type FilledTransactionWithPosition =
     (Authorized<FilledTransaction>, Option<TxIn>);
 
@@ -851,8 +876,6 @@ where
         number: usize,
     ) -> Result<(Vec<Authorized<FilledTransaction>>, bitcoin::Amount), Error>
     {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
-
         let mut rwtxn = self.env.write_txn()?;
 
         // Take non-trade TXs first, then trade TXs in chronological order
@@ -879,11 +902,6 @@ where
 
         for transaction in combined_txs {
             let txid = transaction.transaction.txid();
-            let is_trade = transaction
-                .transaction
-                .data
-                .as_ref()
-                .is_some_and(|d| d.is_trade());
 
             let inputs: HashSet<_> =
                 transaction.transaction.inputs.iter().copied().collect();
@@ -930,27 +948,7 @@ where
                 }
             }
 
-            // Compute fee: constant for trade TXs, input-output for others
-            let tx_fee = if is_trade {
-                bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
-            } else {
-                let value_in: bitcoin::Amount = filled_transaction
-                    .transaction
-                    .spent_utxos
-                    .iter()
-                    .map(GetBitcoinValue::get_bitcoin_value)
-                    .checked_sum()
-                    .ok_or(AmountOverflowError)?;
-                let value_out: bitcoin::Amount = filled_transaction
-                    .transaction
-                    .transaction
-                    .outputs
-                    .iter()
-                    .map(GetBitcoinValue::get_bitcoin_value)
-                    .checked_sum()
-                    .ok_or(AmountOverflowError)?;
-                value_in.checked_sub(value_out).ok_or(AmountOverflowError)?
-            };
+            let tx_fee = block_template_fee(&filled_transaction.transaction)?;
 
             fee = fee.checked_add(tx_fee).ok_or(AmountUnderflowError)?;
             spent_utxos.extend(filled_transaction.transaction.inputs());
