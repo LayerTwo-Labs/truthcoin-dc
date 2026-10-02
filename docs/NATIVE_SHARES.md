@@ -1,6 +1,3 @@
-# Minimal native share swaps (v3)
-
-Truthcoin enforces native share ownership and conditional delivery. It does not know about Elements, ECX, foreign proofs, collateral pools, auctions or profit locks. Existing header bytes and transaction variants are unchanged; `TransactionData::NativeOperation(NativeOperationV3)` is appended. This is a consensus change for a coordinated fresh deployment, not live activation. The current activation constant is height zero; an existing network requires a reviewed activation/migration procedure.
 
 ## Transactions
 
