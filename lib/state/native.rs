@@ -73,29 +73,24 @@ impl NativeState<'_> {
                     .ok_or_else(|| invalid("reserved shares overflow"))
             })
     }
-    fn write_escrow(
+    /// Snapshot once per block and persist the complete account atomically.
+    pub(crate) fn update_account<T>(
         &self,
         txn: &mut RwTxn,
-        escrow: &ShareEscrowV1,
-        remove: bool,
-    ) -> Result<(), Error> {
-        let mut account = self.account(txn, escrow.owner)?;
-        if remove {
-            account.escrows.remove(&escrow.escrow_id);
-        } else {
-            if !account.escrows.contains_key(&escrow.escrow_id)
-                && account.escrows.len() >= 1024
-            {
-                return Err(invalid("too many live escrows in account"));
-            }
-            account.escrows.insert(escrow.escrow_id, escrow.clone());
-        }
+        height: u32,
+        owner: Address,
+        update: impl FnOnce(&mut ShareAccount) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut account = self.account(txn, owner)?;
+        let result = update(&mut account)?;
+        self.capture_account(txn, height, owner)?;
         self.state.markets().restore_share_account(
             txn,
-            &escrow.owner,
+            &owner,
             (!(account.positions.is_empty() && account.escrows.is_empty()))
                 .then_some(&account),
-        )
+        )?;
+        Ok(result)
     }
     pub fn cash_liability(&self, txn: &RoTxn) -> Result<u64, Error> {
         let mut total = 0u64;
@@ -137,40 +132,16 @@ impl NativeState<'_> {
         height: u32,
         escrow: &ShareEscrowV1,
     ) -> Result<(), Error> {
-        if self
-            .get_escrow(txn, escrow.owner, escrow.escrow_id)?
-            .is_some()
-        {
-            return Err(invalid("escrow already exists"));
-        }
-        self.capture_account(txn, height, escrow.owner)?;
-        self.write_escrow(txn, escrow, false)
-    }
-
-    pub(crate) fn assign(
-        &self,
-        txn: &mut RwTxn,
-        height: u32,
-        filled: &FilledTransaction,
-        owner: Address,
-        id: NativeId,
-        claim: crate::types::Address,
-        refund: crate::types::Address,
-        reference: NativeId,
-    ) -> Result<(), Error> {
-        let mut escrow = self
-            .get_escrow(txn, owner, id)?
-            .ok_or_else(|| invalid("unknown native escrow"))?;
-        if escrow.status != EscrowStatusV1::Locked || !escrow.mutable_rights {
-            return Err(invalid("escrow is terminal or sealed"));
-        }
-        require_owner_input(filled, escrow.claim_address)?;
-        require_owner_input(filled, escrow.refund_address)?;
-        self.capture_account(txn, height, owner)?;
-        escrow.claim_address = claim;
-        escrow.refund_address = refund;
-        escrow.reference = reference;
-        self.write_escrow(txn, &escrow, false)
+        self.update_account(txn, height, escrow.owner, |account| {
+            if account.escrows.contains_key(&escrow.escrow_id) {
+                return Err(invalid("escrow already exists"));
+            }
+            if account.escrows.len() >= 1024 {
+                return Err(invalid("too many live escrows in account"));
+            }
+            account.escrows.insert(escrow.escrow_id, escrow.clone());
+            Ok(())
+        })
     }
 
     pub(crate) fn terminate(
@@ -182,7 +153,6 @@ impl NativeState<'_> {
         recipient: Address,
     ) -> Result<(), Error> {
         let state = self.state;
-        self.capture_account(txn, height, escrow.owner)?;
         if let EscrowAssetV1::NativeCash(amount) = escrow.asset {
             if amount > 0 {
                 let outpoint = cash_outpoint(txid);
@@ -204,7 +174,10 @@ impl NativeState<'_> {
                 state.consolidation_undo.put(txn, &height, &undo)?;
             }
         }
-        self.write_escrow(txn, escrow, true)
+        self.update_account(txn, height, escrow.owner, |account| {
+            account.escrows.remove(&escrow.escrow_id);
+            Ok(())
+        })
     }
 
     /// Divide the existing owner/outcome payout without creating cash.
@@ -215,34 +188,33 @@ impl NativeState<'_> {
         payout: &super::markets::types::SharePayoutRecord,
         height: u32,
     ) -> Result<u64, Error> {
-        let account = self.account(txn, payout.address)?;
-        let locks: Vec<_> = account
-            .escrows
-            .into_iter()
-            .filter(|(_, e)| {
-                e.market_id == payout.market_id
-                    && e.outcome_index == payout.outcome_index
-                    && e.asset == EscrowAssetV1::Shares
-            })
-            .collect();
-        if locks.is_empty() {
-            return Ok(payout.payout_sats);
-        }
-        self.capture_account(txn, height, payout.address)?;
-        let quantities: Vec<_> = locks
-            .iter()
-            .map(|(id, escrow)| (*id, escrow.shares))
-            .collect();
-        let (ordinary, allocations) = allocate_settlement(
-            payout.shares_redeemed,
-            payout.payout_sats,
-            &quantities,
-        )?;
-        for ((_, mut escrow), amount) in locks.into_iter().zip(allocations) {
-            escrow.asset = EscrowAssetV1::NativeCash(amount);
-            self.write_escrow(txn, &escrow, false)?;
-        }
-        Ok(ordinary)
+        self.update_account(txn, height, payout.address, |account| {
+            let locks: Vec<_> = account
+                .escrows
+                .iter_mut()
+                .filter(|(_, escrow)| {
+                    escrow.market_id == payout.market_id
+                        && escrow.outcome_index == payout.outcome_index
+                        && escrow.asset == EscrowAssetV1::Shares
+                })
+                .collect();
+            if locks.is_empty() {
+                return Ok(payout.payout_sats);
+            }
+            let quantities: Vec<_> = locks
+                .iter()
+                .map(|(id, escrow)| (**id, escrow.shares))
+                .collect();
+            let (ordinary, allocations) = allocate_settlement(
+                payout.shares_redeemed,
+                payout.payout_sats,
+                &quantities,
+            )?;
+            for ((_, escrow), amount) in locks.into_iter().zip(allocations) {
+                escrow.asset = EscrowAssetV1::NativeCash(amount);
+            }
+            Ok(ordinary)
+        })
     }
 
     pub(crate) fn restore(

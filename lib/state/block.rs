@@ -1817,15 +1817,27 @@ fn apply_native_operation(
             new_claim_address,
             new_refund_address,
         } => {
-            state.native().assign(
+            state.native().update_account(
                 txn,
                 height,
-                filled,
                 *original_owner,
-                *escrow_id,
-                *new_claim_address,
-                *new_refund_address,
-                operation.reference,
+                |account| {
+                    let escrow = account
+                        .escrows
+                        .get_mut(escrow_id)
+                        .ok_or_else(|| invalid("unknown native escrow"))?;
+                    if escrow.status != EscrowStatusV1::Locked
+                        || !escrow.mutable_rights
+                    {
+                        return Err(invalid("escrow is terminal or sealed"));
+                    }
+                    require_owner_input(filled, escrow.claim_address)?;
+                    require_owner_input(filled, escrow.refund_address)?;
+                    escrow.claim_address = *new_claim_address;
+                    escrow.refund_address = *new_refund_address;
+                    escrow.reference = operation.reference;
+                    Ok(())
+                },
             )?;
         }
         NativeActionV3::ResolveEscrow {
