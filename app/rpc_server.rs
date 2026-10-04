@@ -302,6 +302,20 @@ fn parse_market_id(
     Ok(truthcoin_dc::state::MarketId::new(id_array))
 }
 
+fn check_buy_limit(
+    buy_cost: &trading::BuyCost,
+    max_cost: u64,
+) -> RpcResult<()> {
+    if buy_cost.exceeds_limit(max_cost) {
+        return Err(custom_err_msg(format!(
+            "Share cost {} sats + miner fee {} sats exceeds maximum cost {max_cost} sats (slippage protection)",
+            buy_cost.total_cost_sats,
+            trading::TRADE_MINER_FEE_SATS,
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 #[repr(transparent)]
 pub struct RpcServerImpl<const ENABLE_PRIVATE_API: bool> {
@@ -2665,11 +2679,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             custom_err_msg("max_cost is required when dry_run is false")
         })?;
 
-        if cost_sats > max_cost {
-            return Err(custom_err_msg(format!(
-                "Share cost {cost_sats} exceeds maximum cost {max_cost} (slippage protection)",
-            )));
-        }
+        check_buy_limit(&buy_cost, max_cost)?;
 
         let trader = self
             .app
@@ -3167,9 +3177,10 @@ pub async fn run_server(
 
 #[cfg(test)]
 mod tests {
-    use super::{market_dimension_data, market_outcomes};
+    use super::{check_buy_limit, market_dimension_data, market_outcomes};
     use std::collections::HashMap;
 
+    use truthcoin_dc::math::trading::BuyCost;
     use truthcoin_dc::state::{
         MarketBuilder,
         decisions::{Decision, DecisionId, DecisionType},
@@ -3177,6 +3188,25 @@ mod tests {
     };
     use truthcoin_dc::types::Address;
     use truthcoin_dc_app_rpc_api::MarketDimensionKind;
+
+    #[test]
+    fn market_buy_limit_counts_the_miner_fee() -> anyhow::Result<()> {
+        let buy_cost = BuyCost {
+            base_cost_sats: 1001,
+            trading_fee_sats: 10,
+            total_cost_sats: 1011,
+        };
+        let Err(err) = check_buy_limit(&buy_cost, 1100) else {
+            anyhow::bail!("max_cost 1100 sats passed the buy limit");
+        };
+        assert_eq!(
+            err.message(),
+            "Share cost 1011 sats + miner fee 1000 sats exceeds maximum cost 1100 sats (slippage protection)"
+        );
+        assert!(check_buy_limit(&buy_cost, 2010).is_err());
+        assert!(check_buy_limit(&buy_cost, 2011).is_ok());
+        Ok(())
+    }
 
     #[test]
     fn multidimensional_market_exposes_ordered_categorical_and_scaled_axes() {
