@@ -102,7 +102,7 @@ jobs:
           export TRUTHCOIN_APP='target/debug/truthcoin_dc_app'
           cargo run --example integration_tests
 
-  build-release:
+  test-build-release:
     strategy:
       fail-fast: false
       matrix:
@@ -123,7 +123,7 @@ jobs:
             name: x86_64-pc-windows-gnu
             binary-suffix: .exe
             rustflags: "-C linker=/usr/bin/x86_64-w64-mingw32-gcc"
-    name: Build, Release ((${{ matrix.name }}))
+    name: Test, Build, Release ((${{ matrix.name }}))
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -147,6 +147,9 @@ jobs:
       - name: Install windows-specific deps
         run: sudo apt install mingw-w64
         if: ${{ matrix.name == 'x86_64-pc-windows-gnu' }}
+
+      - name: Test
+        run: cargo test --tests
 
       - name: Build
         run: cargo build --release --target ${{ matrix.name }}
@@ -191,7 +194,7 @@ jobs:
   upload-releases-to-releases-drivechain-info:
     name: Upload releases to releases.drivechain.info
     runs-on: ubuntu-latest
-    needs: [build-release, integration-test]
+    needs: [integration-test, test-build-release]
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Download release assets
