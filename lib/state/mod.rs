@@ -1042,4 +1042,87 @@ mod tests {
         let filled = state.fill_authorized_transaction(&rotxn, tx).unwrap();
         assert_eq!(filled.transaction.actor_address, Some(actor));
     }
+
+    #[test]
+    fn sidechain_wealth() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::types::{BitcoinOutputContent, FilledOutputContent, Txid};
+
+        let value_output = |sats: u64| {
+            FilledOutput::new(
+                Address::ALL_ZEROS,
+                FilledOutputContent::Bitcoin(BitcoinOutputContent(
+                    bitcoin::Amount::from_sat(sats),
+                )),
+            )
+        };
+        let dir = tempfile::tempdir()?;
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }?;
+        let state = State::new(&env, None)?;
+        {
+            let mut rwtxn = env.write_txn()?;
+
+            // One unspent deposit UTXO: 50 sats.
+            let deposit_utxo_op = OutPoint::Deposit(bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([1; 32]),
+                vout: 0,
+            });
+            state.utxos.put(
+                &mut rwtxn,
+                &OutPointKey::from(&deposit_utxo_op),
+                &value_output(50),
+            )?;
+
+            // Two spent deposit STXOs: 100 + 100 sats.
+            for (i, sats) in [(2u8, 100u64), (3u8, 100u64)] {
+                let op = OutPoint::Deposit(bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([i; 32]),
+                    vout: 0,
+                });
+                let stxo = SpentOutput {
+                    output: value_output(sats),
+                    inpoint: InPoint::Regular {
+                        txid: Txid([i; 32]),
+                        vin: 0,
+                    },
+                };
+                state
+                    .stxos
+                    .put(&mut rwtxn, &OutPointKey::from(&op), &stxo)?;
+            }
+
+            // Two withdrawal STXOs: 10 + 10 sats.
+            for (i, sats) in [(4u8, 10u64), (5u8, 10u64)] {
+                let op = OutPoint::Regular {
+                    txid: Txid([i; 32]),
+                    vout: 0,
+                };
+                let stxo = SpentOutput {
+                    output: value_output(sats),
+                    inpoint: InPoint::Withdrawal {
+                        m6id: M6id(bitcoin::Txid::from_byte_array([i; 32])),
+                    },
+                };
+                state
+                    .stxos
+                    .put(&mut rwtxn, &OutPointKey::from(&op), &stxo)?;
+            }
+
+            rwtxn.commit()?;
+        }
+
+        let rotxn = env.read_txn()?;
+        let sidechain_wealth = state.sidechain_wealth(&rotxn)?;
+
+        // Deposit UTXO 50 + deposit STXOs 200 - withdrawal STXOs 20.
+        let expected_sidechain_wealth = bitcoin::Amount::from_sat(230);
+        anyhow::ensure!(
+            sidechain_wealth == expected_sidechain_wealth,
+            "Expected sidechain wealth ({expected_sidechain_wealth}), but computed ({sidechain_wealth})",
+        );
+        Ok(())
+    }
 }
