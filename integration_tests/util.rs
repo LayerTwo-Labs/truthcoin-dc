@@ -8,6 +8,7 @@ use bip300301_enforcer_integration_tests::util::{
     AbortOnDrop, BinPaths as EnforcerBinPaths, OnceLockExt as _, VarError,
     spawn_command_with_args,
 };
+use truthcoin_dc::types::Network;
 
 #[derive(Clone, Debug, Default)]
 pub struct BinPaths {
@@ -29,12 +30,11 @@ pub struct TruthcoinApp {
     pub mainchain_grpc_port: u16,
     /// Port to use for P2P networking
     pub net_port: u16,
+    pub network: Network,
     /// Port to use for the RPC server
     pub rpc_port: u16,
-    /// Use block-based decision periods for testing (value = blocks per period)
+    /// Blocks per voting period, for a test network
     pub decision_config_testing: Option<u32>,
-    /// Port to use for ZMQ server
-    pub zmq_port: u16,
 }
 
 impl TruthcoinApp {
@@ -55,16 +55,15 @@ impl TruthcoinApp {
             "--datadir".to_owned(),
             self.data_dir.display().to_string(),
             "--headless".to_owned(),
-            "--network".to_owned(),
-            "regtest".to_owned(),
-            "--mainchain-grpc-port".to_owned(),
-            self.mainchain_grpc_port.to_string(),
+            "--mainchain-grpc-url".to_owned(),
+            format!("http://127.0.0.1:{}", self.mainchain_grpc_port),
             "--net-addr".to_owned(),
             format!("127.0.0.1:{}", self.net_port),
-            "--rpc-port".to_owned(),
-            self.rpc_port.to_string(),
-            "--zmq-addr".to_owned(),
-            format!("127.0.0.1:{}", self.zmq_port),
+            format!("--network={}", self.network),
+            "--private-rpc-addr".to_owned(),
+            format!("127.0.0.1:{}", self.rpc_port),
+            "--rpc-addr".to_owned(),
+            format!("127.0.0.1:{}", self.rpc_port),
         ];
         if let Some(log_level) = self.log_level {
             default_args.push("--log-level".to_owned());

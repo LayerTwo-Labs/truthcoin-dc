@@ -52,7 +52,7 @@ async fn wallet_sync_task(
     };
     let miner = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("miner".to_owned()),
         },
         &enforcer_post_setup,
@@ -61,7 +61,7 @@ async fn wallet_sync_task(
     .await?;
     let wallet = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("wallet".to_owned()),
         },
         &enforcer_post_setup,
@@ -116,12 +116,12 @@ async fn wallet_sync_task(
     let () = miner.bmm_single(&mut enforcer_post_setup).await?;
 
     let deadline = tokio::time::Instant::now() + BALANCE_TIMEOUT;
-    let mut balance = wallet.rpc_client.bitcoin_balance().await?;
+    let mut balance = wallet.rpc_client.balance().await?;
     while balance.total != DEPOSIT_AMOUNT
         && tokio::time::Instant::now() < deadline
     {
         sleep(Duration::from_millis(500)).await;
-        balance = wallet.rpc_client.bitcoin_balance().await?;
+        balance = wallet.rpc_client.balance().await?;
     }
     let blocks = wallet.rpc_client.getblockcount().await?;
     anyhow::ensure!(

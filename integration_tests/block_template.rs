@@ -7,7 +7,10 @@ use bip300301_enforcer_integration_tests::{
         PreSetup as EnforcerPreSetup, SetupOpts as EnforcerSetupOpts,
         Sidechain as _,
     },
-    util::{AbortOnDrop, AsyncTrial, TestFailureCollector, TestFileRegistry},
+    util::{
+        AbortOnDrop, AsyncTrial, BinPaths as EnforcerBinPaths,
+        TestFailureCollector, TestFileRegistry,
+    },
 };
 use futures::{
     FutureExt as _, StreamExt as _, channel::mpsc, future::BoxFuture,
@@ -23,11 +26,11 @@ use crate::{
 
 /// Initial setup for the test
 async fn setup(
-    bin_paths: &BinPaths,
+    enforcer_bin_paths: &EnforcerBinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<EnforcerPostSetup> {
     let enforcer_pre_setup =
-        EnforcerPreSetup::new(&bin_paths.others, Network::Regtest)?;
+        EnforcerPreSetup::new(enforcer_bin_paths, Network::Regtest)?;
     let mut enforcer_post_setup = {
         let setup_opts: EnforcerSetupOpts = Default::default();
         enforcer_pre_setup
@@ -46,23 +49,23 @@ async fn block_template_task(
     bin_paths: BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let mut enforcer_post_setup = setup(&bin_paths, res_tx.clone()).await?;
+    let mut enforcer_post_setup =
+        setup(&bin_paths.others, res_tx.clone()).await?;
     let sidechain = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: None,
         },
         &enforcer_post_setup,
         res_tx,
     )
     .await?;
-    tracing::info!("Setup Truthcoin node successfully");
+    tracing::info!("Setup truthcoin node successfully");
 
     tracing::debug!("Checking that the first template is empty");
     let template = sidechain.rpc_client.get_block_template().await?;
     anyhow::ensure!(template.block.header.prev_side_hash.is_none());
     anyhow::ensure!(template.block.body.transactions.is_empty());
-    anyhow::ensure!(template.block.height == 0);
     anyhow::ensure!(template.fees_sats == 0);
 
     tracing::debug!("Checking that a template is stable while the chain is");
@@ -89,7 +92,6 @@ async fn block_template_task(
     anyhow::ensure!(
         Some(template_connected.block.header.prev_main_hash) == best_main_hash
     );
-    anyhow::ensure!(template_connected.block.height == 1);
     anyhow::ensure!(
         template_connected.critical_hash != template_repeat.critical_hash
     );

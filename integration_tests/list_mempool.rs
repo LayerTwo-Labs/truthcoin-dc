@@ -9,7 +9,10 @@ use bip300301_enforcer_integration_tests::{
         PreSetup as EnforcerPreSetup, SetupOpts as EnforcerSetupOpts,
         Sidechain as _,
     },
-    util::{AbortOnDrop, AsyncTrial, TestFailureCollector, TestFileRegistry},
+    util::{
+        AbortOnDrop, AsyncTrial, BinPaths as EnforcerBinPaths,
+        TestFailureCollector, TestFileRegistry,
+    },
 };
 use bitcoin::Amount;
 use futures::{
@@ -31,11 +34,11 @@ const TRANSFER_FEE: u64 = 1_000;
 
 /// Initial setup for the test
 async fn setup(
-    bin_paths: &BinPaths,
+    enforcer_bin_paths: &EnforcerBinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<EnforcerPostSetup> {
     let enforcer_pre_setup =
-        EnforcerPreSetup::new(&bin_paths.others, Network::Regtest)?;
+        EnforcerPreSetup::new(enforcer_bin_paths, Network::Regtest)?;
     let mut enforcer_post_setup = {
         let setup_opts: EnforcerSetupOpts = Default::default();
         enforcer_pre_setup
@@ -52,17 +55,18 @@ async fn list_mempool_task(
     bin_paths: BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let mut enforcer_post_setup = setup(&bin_paths, res_tx.clone()).await?;
+    let mut enforcer_post_setup =
+        setup(&bin_paths.others, res_tx.clone()).await?;
     let mut sidechain = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: None,
         },
         &enforcer_post_setup,
         res_tx,
     )
     .await?;
-    tracing::info!("Setup Truthcoin node successfully");
+    tracing::info!("Setup truthcoin node successfully");
 
     tracing::debug!("Checking that a fresh mempool is empty");
     anyhow::ensure!(sidechain.rpc_client.list_mempool().await?.is_empty());
@@ -82,16 +86,10 @@ async fn list_mempool_task(
     anyhow::ensure!(sidechain.rpc_client.list_mempool().await?.is_empty());
 
     let dest = sidechain.rpc_client.get_new_address().await?;
-    let transfer_tx = sidechain
+    let txid = sidechain
         .rpc_client
         .create_transfer(dest, TRANSFER_AMOUNT, TRANSFER_FEE)
         .await?;
-    let txid = sidechain
-        .rpc_client
-        .sign_transaction(transfer_tx, Some(true))
-        .await?
-        .transaction
-        .txid();
     tracing::info!(%txid, "Created a transfer");
 
     tracing::debug!("Checking that the mempool holds the transfer");
@@ -99,9 +97,16 @@ async fn list_mempool_task(
     anyhow::ensure!(mempool.len() == 1);
     let entry = &mempool[0];
     anyhow::ensure!(entry.txid == txid);
+    // The txid hashes over the canonical encoding, so both agree with the
+    // transaction the entry carries.
     anyhow::ensure!(entry.tx.txid() == txid);
+    anyhow::ensure!(entry.size == entry.tx.canonical_size()?);
     anyhow::ensure!(entry.size > 0);
-    anyhow::ensure!(const_hex::decode(&entry.raw)?.len() as u64 == entry.size);
+    // An Esplora index serves these bytes at /tx/{txid}/hex, so it never
+    // re-encodes the transaction itself.
+    anyhow::ensure!(
+        entry.raw == const_hex::encode(entry.tx.canonical_bytes()?)
+    );
 
     tracing::debug!("Checking that a block empties the mempool");
     let () = sidechain.bmm_single(&mut enforcer_post_setup).await?;

@@ -10,7 +10,10 @@ use bip300301_enforcer_integration_tests::{
         PreSetup as EnforcerPreSetup, SetupOpts as EnforcerSetupOpts,
         Sidechain as _,
     },
-    util::{AbortOnDrop, AsyncTrial, TestFailureCollector, TestFileRegistry},
+    util::{
+        AbortOnDrop, AsyncTrial, BinPaths as EnforcerBinPaths,
+        TestFailureCollector, TestFileRegistry,
+    },
 };
 use futures::{
     FutureExt as _, StreamExt as _, channel::mpsc, future::BoxFuture,
@@ -27,11 +30,11 @@ use crate::{
 
 /// Initial setup for the test
 async fn setup(
-    bin_paths: &BinPaths,
+    enforcer_bin_paths: &EnforcerBinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<EnforcerPostSetup> {
     let enforcer_pre_setup =
-        EnforcerPreSetup::new(&bin_paths.others, Network::Regtest)?;
+        EnforcerPreSetup::new(enforcer_bin_paths, Network::Regtest)?;
     let mut enforcer_post_setup = {
         let setup_opts: EnforcerSetupOpts = Default::default();
         enforcer_pre_setup
@@ -55,17 +58,18 @@ async fn unknown_withdrawal_task(
     bin_paths: BinPaths,
     res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let mut enforcer_post_setup = setup(&bin_paths, res_tx.clone()).await?;
+    let mut enforcer_post_setup =
+        setup(&bin_paths.others, res_tx.clone()).await?;
     let mut sidechain_withdrawer = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("withdrawer".to_owned()),
         },
         &enforcer_post_setup,
         res_tx.clone(),
     )
     .await?;
-    tracing::info!("Setup Truthcoin withdrawer node successfully");
+    tracing::info!("Setup truthcoin withdrawer node successfully");
     let withdrawer_deposit_address =
         sidechain_withdrawer.get_deposit_address().await?;
     let () = deposit(
@@ -89,14 +93,14 @@ async fn unknown_withdrawal_task(
     // New sidechain node, starting from scratch
     let mut sidechain_successor = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("successor".to_owned()),
         },
         &enforcer_post_setup,
         res_tx,
     )
     .await?;
-    tracing::info!("Setup Truthcoin successor node successfully");
+    tracing::info!("Setup truthcoin successor node successfully");
     tracing::debug!("BMM 1 block");
     sidechain_successor
         .bmm_single(&mut enforcer_post_setup)

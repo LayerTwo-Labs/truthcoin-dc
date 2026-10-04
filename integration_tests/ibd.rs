@@ -46,25 +46,25 @@ async fn setup(
     };
     let sidechain_sender = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("sender".to_owned()),
         },
         &enforcer_post_setup,
         res_tx.clone(),
     )
     .await?;
-    tracing::info!("Setup Truthcoin send node successfully");
+    tracing::info!("Setup truthcoin send node successfully");
     let sidechain_syncer = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("syncer".to_owned()),
         },
         &enforcer_post_setup,
         res_tx,
     )
     .await?;
-    tracing::info!("Setup Truthcoin sync node successfully");
-    let truthcoin_nodes = TruthcoinNodes {
+    tracing::info!("Setup truthcoin sync node successfully");
+    let truthcoin_dc_nodes = TruthcoinNodes {
         sender: sidechain_sender,
         syncer: sidechain_syncer,
     };
@@ -74,21 +74,22 @@ async fn setup(
     let () = activate_sidechain::<PostSetup>(&mut enforcer_post_setup).await?;
     tracing::info!("Activated sidechain successfully");
     let () = fund_enforcer::<PostSetup>(&mut enforcer_post_setup).await?;
-    Ok((enforcer_post_setup, truthcoin_nodes))
+    Ok((enforcer_post_setup, truthcoin_dc_nodes))
 }
 
-/// Check that a Truthcoin node is connected to the specified peer
+/// Check that a truthcoin node is connected to the specified peer
 async fn check_peer_connection(
-    truthcoin_setup: &PostSetup,
+    truthcoin_dc_setup: &PostSetup,
     expected_peer: SocketAddr,
 ) -> anyhow::Result<()> {
-    let peers = truthcoin_setup
+    let peers = truthcoin_dc_setup
         .rpc_client
         .list_peers()
         .await?
         .iter()
         .map(|p| p.address)
         .collect::<Vec<_>>();
+
     if peers.contains(&expected_peer) {
         Ok(())
     } else {
@@ -106,7 +107,9 @@ enum SyncerStart {
     /// The syncer already BMM'd its own chain of three blocks, with a deposit
     /// that lands in the second one and nothing in the third. Adopting the
     /// sender's chain then has to disconnect a tip whose parent is the most
-    /// recent deposit block.
+    /// recent deposit block, which is the shape that panicked the alphanet
+    /// seed in `State::disconnect` (`two_way_peg_data.rs`, deposit-height
+    /// assert) on 2026-09-09.
     OwnChainWithDeposit,
 }
 
@@ -122,36 +125,36 @@ async fn initial_block_download_task(
     const DEPOSIT_AMOUNT: Amount = Amount::from_sat(21_000_000);
     const DEPOSIT_FEE: Amount = Amount::from_sat(1_000_000);
 
-    let (mut enforcer_post_setup, mut truthcoin_nodes) =
+    let (mut enforcer_post_setup, mut truthcoin_dc_nodes) =
         setup(bin_paths, res_tx).await?;
     let expected_syncer_blocks = match syncer_start {
         SyncerStart::Empty => 0,
         SyncerStart::OwnChainWithDeposit => {
             tracing::info!("Syncer: BMM block 1 (no deposit)");
-            truthcoin_nodes
+            truthcoin_dc_nodes
                 .syncer
                 .bmm(&mut enforcer_post_setup, 1)
                 .await?;
             let deposit_address =
-                truthcoin_nodes.syncer.get_deposit_address().await?;
+                truthcoin_dc_nodes.syncer.get_deposit_address().await?;
             // `deposit` mines the mainchain deposit block, then
             // `confirm_deposit` BMMs syncer block 2 to apply it.
             tracing::info!("Syncer: deposit, applied by BMM block 2");
             let () = deposit(
                 &mut enforcer_post_setup,
-                &mut truthcoin_nodes.syncer,
+                &mut truthcoin_dc_nodes.syncer,
                 &deposit_address,
                 DEPOSIT_AMOUNT,
                 DEPOSIT_FEE,
             )
             .await?;
             tracing::info!("Syncer: BMM block 3 (no deposit)");
-            truthcoin_nodes
+            truthcoin_dc_nodes
                 .syncer
                 .bmm(&mut enforcer_post_setup, 1)
                 .await?;
             let syncer_blocks =
-                truthcoin_nodes.syncer.rpc_client.getblockcount().await?;
+                truthcoin_dc_nodes.syncer.rpc_client.getblockcount().await?;
             anyhow::ensure!(
                 syncer_blocks == OWN_CHAIN_BLOCKS,
                 "syncer should hold {OWN_CHAIN_BLOCKS} blocks, has {syncer_blocks}"
@@ -161,42 +164,42 @@ async fn initial_block_download_task(
     };
     const BMM_BLOCKS: u32 = 16;
     tracing::info!(blocks = %BMM_BLOCKS, "Attempting BMM");
-    truthcoin_nodes
+    truthcoin_dc_nodes
         .sender
         .bmm(&mut enforcer_post_setup, BMM_BLOCKS)
         .await?;
     // Check that sender has all blocks, and syncer only its own
     {
         let sender_blocks =
-            truthcoin_nodes.sender.rpc_client.getblockcount().await?;
+            truthcoin_dc_nodes.sender.rpc_client.getblockcount().await?;
         anyhow::ensure!(sender_blocks == BMM_BLOCKS);
         let syncer_blocks =
-            truthcoin_nodes.syncer.rpc_client.getblockcount().await?;
+            truthcoin_dc_nodes.syncer.rpc_client.getblockcount().await?;
         anyhow::ensure!(syncer_blocks == expected_syncer_blocks);
     }
     tracing::info!("Attempting sync");
     tracing::debug!(
-        sender_addr = %truthcoin_nodes.sender.net_addr(),
-        syncer_addr = %truthcoin_nodes.syncer.net_addr(),
+        sender_addr = %truthcoin_dc_nodes.sender.net_addr(),
+        syncer_addr = %truthcoin_dc_nodes.syncer.net_addr(),
         "Connecting syncer to sender");
-    let () = truthcoin_nodes
+    let () = truthcoin_dc_nodes
         .syncer
         .rpc_client
-        .connect_peer(truthcoin_nodes.sender.net_addr().into())
+        .connect_peer(truthcoin_dc_nodes.sender.net_addr().into())
         .await?;
     // Wait for connection to be established
     sleep(std::time::Duration::from_secs(1)).await;
     tracing::debug!("Checking peer connections");
     // Check peer connections
     let () = check_peer_connection(
-        &truthcoin_nodes.syncer,
-        truthcoin_nodes.sender.net_addr().into(),
+        &truthcoin_dc_nodes.syncer,
+        truthcoin_dc_nodes.sender.net_addr().into(),
     )
     .await?;
     tracing::debug!("Syncer has connection to sender");
     let () = check_peer_connection(
-        &truthcoin_nodes.sender,
-        truthcoin_nodes.syncer.net_addr().into(),
+        &truthcoin_dc_nodes.sender,
+        truthcoin_dc_nodes.syncer.net_addr().into(),
     )
     .await?;
     tracing::debug!("Sender has connection to syncer");
@@ -204,28 +207,28 @@ async fn initial_block_download_task(
     sleep(std::time::Duration::from_secs(10)).await;
     // Check peer connections
     let () = check_peer_connection(
-        &truthcoin_nodes.syncer,
-        truthcoin_nodes.sender.net_addr().into(),
+        &truthcoin_dc_nodes.syncer,
+        truthcoin_dc_nodes.sender.net_addr().into(),
     )
     .await?;
     tracing::debug!("Syncer still has connection to sender");
     // Check that sender and syncer have all blocks, on the same tip
     {
         let sender_blocks =
-            truthcoin_nodes.sender.rpc_client.getblockcount().await?;
+            truthcoin_dc_nodes.sender.rpc_client.getblockcount().await?;
         anyhow::ensure!(sender_blocks == BMM_BLOCKS);
         let syncer_blocks =
-            truthcoin_nodes.syncer.rpc_client.getblockcount().await?;
+            truthcoin_dc_nodes.syncer.rpc_client.getblockcount().await?;
         anyhow::ensure!(
             syncer_blocks == BMM_BLOCKS,
             "syncer stuck at {syncer_blocks} blocks, sender at {sender_blocks}"
         );
-        let sender_tip = truthcoin_nodes
+        let sender_tip = truthcoin_dc_nodes
             .sender
             .rpc_client
             .get_best_sidechain_block_hash()
             .await?;
-        let syncer_tip = truthcoin_nodes
+        let syncer_tip = truthcoin_dc_nodes
             .syncer
             .rpc_client
             .get_best_sidechain_block_hash()
@@ -235,8 +238,8 @@ async fn initial_block_download_task(
             "syncer tip {syncer_tip:?} != sender tip {sender_tip:?}"
         );
     }
-    drop(truthcoin_nodes.syncer);
-    drop(truthcoin_nodes.sender);
+    drop(truthcoin_dc_nodes.syncer);
+    drop(truthcoin_dc_nodes.sender);
     tracing::info!(
         "Removing {}",
         enforcer_post_setup.directories.base_dir.path().display()

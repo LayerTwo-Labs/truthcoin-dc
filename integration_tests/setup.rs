@@ -5,7 +5,6 @@ use std::{
 };
 
 use bip300301_enforcer_integration_tests::{
-    mine,
     setup::{PostSetup as EnforcerPostSetup, Sidechain},
     util::AbortOnDrop,
 };
@@ -14,7 +13,7 @@ use futures::{TryFutureExt as _, channel::mpsc, future};
 use reserve_port::ReservedPort;
 use thiserror::Error;
 use tokio::time::sleep;
-use truthcoin_dc::types::{OutputContent, PointedOutput};
+use truthcoin_dc::types::{Network, OutputContent, PointedOutput};
 use truthcoin_dc_app_rpc_api::{node::RpcClient as _, wallet::RpcClient as _};
 
 use crate::util::TruthcoinApp;
@@ -23,7 +22,6 @@ use crate::util::TruthcoinApp;
 pub struct ReservedPorts {
     pub net: ReservedPort,
     pub rpc: ReservedPort,
-    pub zmq: ReservedPort,
 }
 
 impl ReservedPorts {
@@ -31,14 +29,13 @@ impl ReservedPorts {
         Ok(Self {
             net: ReservedPort::random()?,
             rpc: ReservedPort::random()?,
-            zmq: ReservedPort::random()?,
         })
     }
 }
 
 #[derive(Debug)]
 pub struct Init {
-    pub truthcoin_app: PathBuf,
+    pub truthcoin_dc_app: PathBuf,
     pub data_dir_suffix: Option<String>,
 }
 
@@ -52,7 +49,7 @@ pub enum BmmError {
 
 #[derive(Debug, Error)]
 pub enum SetupError {
-    #[error("Failed to create Truthcoin dir")]
+    #[error("Failed to create truthcoin dir")]
     CreateTruthcoinDir(#[source] std::io::Error),
     #[error(transparent)]
     ReservePort(#[from] reserve_port::Error),
@@ -85,7 +82,7 @@ pub struct PostSetup {
     // MUST occur before temp dirs and reserved ports in order to ensure that processes are dropped
     // before reserved ports are freed and temp dirs are cleared
     pub _truthcoin_app_task: AbortOnDrop<()>,
-    /// RPC client for truthcoin_app
+    /// RPC client for truthcoin_dc_app
     pub rpc_client: jsonrpsee::http_client::HttpClient,
     /// Address for receiving deposits
     pub deposit_address: truthcoin_dc::types::Address,
@@ -100,18 +97,12 @@ impl PostSetup {
         &self,
         post_setup: &mut EnforcerPostSetup,
     ) -> Result<(), BmmError> {
-        use bip300301_enforcer_lib::proto::mainchain::{
-            AckAllProposalsPolicy, WithdrawalBundlePolicy,
-        };
-        let mining_policy = mine::MiningPolicy {
-            ack: AckAllProposalsPolicy::ACK_ALL_PROPOSALS_POLICY_ALL,
-            bundle: WithdrawalBundlePolicy::WITHDRAWAL_BUNDLE_POLICY_ALL,
-        };
+        use bip300301_enforcer_integration_tests::mine::{MiningPolicy, mine};
         let ((), ()) = future::try_join(
             self.rpc_client.mine(None).map_err(BmmError::from),
             async {
                 sleep(Duration::from_secs(1)).await;
-                mine::mine::<Self>(post_setup, 1, mining_policy)
+                mine::<Self>(post_setup, 1, MiningPolicy::VOTE)
                     .await
                     .map_err(BmmError::from)
             },
@@ -156,7 +147,7 @@ impl Sidechain for PostSetup {
         res_tx: mpsc::UnboundedSender<anyhow::Result<()>>,
     ) -> Result<Self, Self::SetupError> {
         let reserved_ports = ReservedPorts::new()?;
-        let truthcoin_dir = if let Some(suffix) = init.data_dir_suffix {
+        let truthcoin_dc_dir = if let Some(suffix) = init.data_dir_suffix {
             post_setup
                 .directories
                 .base_dir
@@ -165,37 +156,40 @@ impl Sidechain for PostSetup {
         } else {
             post_setup.directories.base_dir.path().join("truthcoin")
         };
-        std::fs::create_dir(&truthcoin_dir)
+        std::fs::create_dir(&truthcoin_dc_dir)
             .map_err(Self::SetupError::CreateTruthcoinDir)?;
-        let truthcoin_app = TruthcoinApp {
-            path: init.truthcoin_app,
-            data_dir: truthcoin_dir,
+        let truthcoin_dc_app = TruthcoinApp {
+            path: init.truthcoin_dc_app,
+            data_dir: truthcoin_dc_dir,
             log_level: Some(tracing::Level::TRACE),
             mainchain_grpc_port: post_setup
                 .reserved_ports
                 .enforcer_serve_grpc
                 .port(),
             net_port: reserved_ports.net.port(),
+            network: Network::Regtest,
             rpc_port: reserved_ports.rpc.port(),
             decision_config_testing: Some(10),
-            zmq_port: reserved_ports.zmq.port(),
         };
-        let truthcoin_app_task = truthcoin_app
+        let truthcoin_dc_app_task = truthcoin_dc_app
             .spawn_command_with_args::<String, String, _, _, _>([], [], {
                 let res_tx = res_tx.clone();
                 move |err| {
                     let _err: Result<(), _> = res_tx.unbounded_send(Err(err));
                 }
             });
+        tracing::debug!("Started truthcoin");
         sleep(Duration::from_secs(1)).await;
         let rpc_client = jsonrpsee::http_client::HttpClient::builder()
             .build(format!("http://127.0.0.1:{}", reserved_ports.rpc.port()))?;
+        tracing::debug!("Generating mnemonic seed phrase");
         let mnemonic = rpc_client.generate_mnemonic().await?;
+        tracing::debug!("Setting mnemonic seed phrase");
         let () = rpc_client.set_seed_from_mnemonic(mnemonic).await?;
+        tracing::debug!("Generating deposit address");
         let deposit_address = rpc_client.get_new_address().await?;
-        tracing::debug!("Node initialized");
         Ok(Self {
-            _truthcoin_app_task: truthcoin_app_task,
+            _truthcoin_app_task: truthcoin_dc_app_task,
             rpc_client,
             deposit_address,
             reserved_ports,
@@ -233,12 +227,15 @@ impl Sidechain for PostSetup {
                     _ => false,
                 }
         };
-        const BMM_ATTEMPTS: usize = 3;
         let utxos = self.rpc_client.list_utxos().await?;
         if utxos.iter().any(is_expected) {
             return Ok(());
         }
+        // The market roundtrip deposits twice in a row, and the second
+        // deposit can need more than one BMM'd block.
+        const BMM_ATTEMPTS: usize = 3;
         for _ in 0..BMM_ATTEMPTS {
+            tracing::debug!("Deposit not found, BMM 1 block...");
             let () = self.bmm_single(post_setup).await?;
             let utxos = self.rpc_client.list_utxos().await?;
             if utxos.iter().any(is_expected) {
@@ -258,21 +255,15 @@ impl Sidechain for PostSetup {
         fee: bitcoin::Amount,
     ) -> Result<bip300301_enforcer_lib::types::M6id, Self::CreateWithdrawalError>
     {
-        {
-            let withdrawal_tx = self
-                .rpc_client
-                .create_withdrawal(
-                    receive_address.as_unchecked().clone(),
-                    value.to_sat(),
-                    0,
-                    fee.to_sat(),
-                )
-                .await?;
-            let _signed_withdrawal_tx = self
-                .rpc_client
-                .sign_transaction(withdrawal_tx, Some(true))
-                .await?;
-        }
+        let _txid = self
+            .rpc_client
+            .create_withdrawal(
+                receive_address.as_unchecked().clone(),
+                value.to_sat(),
+                0,
+                fee.to_sat(),
+            )
+            .await?;
         let blocks_to_mine = 'blocks_to_mine: {
             use truthcoin_dc::state::WITHDRAWAL_BUNDLE_FAILURE_GAP;
             let block_count = self.rpc_client.getblockcount().await?;
@@ -284,15 +275,13 @@ impl Sidechain for PostSetup {
                 .latest_failed_withdrawal_bundle_height()
                 .await?
                 .unwrap_or(0);
-            match WITHDRAWAL_BUNDLE_FAILURE_GAP.saturating_sub(
+            let blocks_to_mine = WITHDRAWAL_BUNDLE_FAILURE_GAP.saturating_sub(
                 block_height - latest_failed_withdrawal_bundle_height,
-            ) {
-                0 => WITHDRAWAL_BUNDLE_FAILURE_GAP + 1,
-                blocks_to_mine => blocks_to_mine,
-            }
+            );
+            std::cmp::max(1, blocks_to_mine)
         };
         tracing::debug!(
-            "Mining Truthcoin blocks until withdrawal bundle is broadcast"
+            "Mining truthcoin blocks until withdrawal bundle is broadcast"
         );
         let () = self.bmm(post_setup, blocks_to_mine).await?;
         let pending_withdrawal_bundle =

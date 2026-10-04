@@ -16,15 +16,17 @@ use futures::{
 };
 use tokio::time::sleep;
 use tracing::Instrument as _;
-use truthcoin_dc::{
+use truthcoin_dc::types::{
+    Address, GetAddress as _, GetValue as _, OutputContent,
     authorization::{Dst, Signature},
-    types::{Address, GetAddress as _, GetValue as _, OutputContent},
 };
 use truthcoin_dc_app_rpc_api::{
-    BallotItem, CreateTradeRequest, DecisionClaimItem, DecisionClaimRequest,
-    DecisionContentInfo, DecisionFilter, DecisionState, DimensionInput,
-    MarketBuyRequest, MarketCreateRequest, MarketSellRequest, MarketStatus,
-    VoteFilter,
+    markets::{
+        BallotItem, CreateTradeRequest, DecisionClaimItem,
+        DecisionClaimRequest, DecisionContentInfo, DecisionFilter,
+        DecisionState, DimensionInput, MarketBuyRequest, MarketCreateRequest,
+        MarketSellRequest, MarketStatus, VoteFilter,
+    },
     node::{PrivateRpcClient as _, RpcClient as _},
     wallet::RpcClient as _,
 };
@@ -183,7 +185,7 @@ mod expected_phase2 {
 
 /// Assertion helpers for test verification
 mod debug_helpers {
-    use truthcoin_dc_app_rpc_api::{MarketData, MarketStatus};
+    use truthcoin_dc_app_rpc_api::markets::{MarketData, MarketStatus};
 
     /// Log detailed market state for debugging (only called on assertion failures)
     fn log_market_detail(market: &MarketData, label: &str) {
@@ -354,7 +356,7 @@ impl TruthcoinNodes {
         let setup_single = |suffix: &str| {
             PostSetup::setup(
                 Init {
-                    truthcoin_app: truthcoin_app.clone(),
+                    truthcoin_dc_app: truthcoin_app.clone(),
                     data_dir_suffix: Some(suffix.to_owned()),
                 },
                 enforcer_post_setup,
@@ -728,7 +730,7 @@ async fn roundtrip_task_inner(
         &truthcoin_nodes.voter_2,
         &truthcoin_nodes.voter_3,
     ] {
-        let balance = voter.rpc_client.bitcoin_balance().await?;
+        let balance = voter.rpc_client.balance().await?;
         anyhow::ensure!(balance.total > bitcoin::Amount::ZERO);
     }
 

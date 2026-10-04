@@ -22,7 +22,7 @@ use futures::{
 };
 use tokio::time::sleep;
 use tracing::Instrument as _;
-use truthcoin_dc::{types::GetValue as _, wallet::TransferDests};
+use truthcoin_dc::types::{GetValue as _, wallet::TransferDests};
 use truthcoin_dc_app_rpc_api::{node::RpcClient as _, wallet::RpcClient as _};
 
 use crate::{
@@ -62,14 +62,14 @@ async fn transfer_many_task(
         setup(&bin_paths.others, res_tx.clone()).await?;
     let mut sidechain = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: None,
         },
         &enforcer_post_setup,
         res_tx,
     )
     .await?;
-    tracing::info!("Setup Truthcoin node successfully");
+    tracing::info!("Setup truthcoin node successfully");
 
     let deposit_address = sidechain.get_deposit_address().await?;
     let () = deposit(
@@ -89,7 +89,7 @@ async fn transfer_many_task(
     }
     let txid = sidechain
         .rpc_client
-        .transfer_many(TransferDests(dests.clone()), TRANSFER_FEE)
+        .create_transfer_many(TransferDests(dests.clone()), TRANSFER_FEE)
         .await?;
     tracing::info!(%txid, "Created a transfer to {} addresses", dests.len());
 
