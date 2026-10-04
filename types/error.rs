@@ -9,6 +9,26 @@ pub struct AmountOverflow;
 pub struct AmountUnderflow;
 
 #[derive(Debug, Error)]
+pub enum Authorization {
+    #[error("borsh serialization error")]
+    BorshSerialize(#[from] borsh::io::Error),
+    #[error("not enough authorizations")]
+    NotEnoughAuthorizations,
+    #[error("signature verification error")]
+    SignatureVerification(#[from] frost_ristretto255::Error),
+    #[error("too many authorizations")]
+    TooManyAuthorizations,
+    #[error(
+        "wrong key for address: address = {address},
+             hash(verifying_key) = {hash_verifying_key}"
+    )]
+    WrongKeyForAddress {
+        address: crate::Address,
+        hash_verifying_key: crate::Address,
+    },
+}
+
+#[derive(Debug, Error)]
 pub enum ComputeFee {
     #[error("underfunded (value in < value out)")]
     Underfunded,
@@ -25,9 +45,31 @@ pub struct InvalidDecisionId {
 }
 
 #[derive(Debug, Error)]
+pub enum ParseAddress {
+    #[error("bs58 error")]
+    Bs58(#[from] bitcoin::base58::InvalidCharacterError),
+    #[error("deposit address `{0}` has no checksum")]
+    MissingDepositChecksum(String),
+    #[error("deposit address `{0}` has no `s<slot>_` prefix")]
+    MissingDepositPrefix(String),
+    #[error("deposit address `{address}` has wrong checksum `{checksum}`")]
+    WrongDepositChecksum { address: String, checksum: String },
+    #[error("wrong address length {0} != 20")]
+    WrongLength(usize),
+}
+
+#[derive(Debug, Error)]
 #[error("utreexo error ({0})")]
 #[repr(transparent)]
 pub struct Utreexo(pub(crate) String);
+
+#[derive(Debug, Error)]
+pub enum ParsePeerAddress {
+    #[error("missing port")]
+    MissingPort,
+    #[error(transparent)]
+    Parse(#[from] url::ParseError),
+}
 
 pub mod compute_merkle_root {
     use thiserror::Error;

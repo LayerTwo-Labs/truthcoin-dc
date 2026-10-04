@@ -46,8 +46,12 @@ pub use transaction::{
 };
 pub mod tx_pow;
 mod util;
+pub mod wallet;
 
 pub const THIS_SIDECHAIN: u8 = 13;
+
+/// Duration of a voting period on a production network
+pub const SECONDS_PER_QUARTER: u64 = 3600 * 24 * 91;
 
 pub type UtreexoProof = rustreexo::accumulator::proof::Proof<UtreexoNodeHash>;
 
@@ -80,6 +84,17 @@ pub struct WithdrawalBundleEvent {
     pub status: WithdrawalBundleEventStatus,
 }
 
+pub static OP_DRIVECHAIN_SCRIPT: LazyLock<bitcoin::ScriptBuf> =
+    LazyLock::new(|| {
+        let mut script = bitcoin::ScriptBuf::new();
+        script.push_opcode(bitcoin::opcodes::all::OP_RETURN);
+        script.push_instruction(bitcoin::script::Instruction::PushBytes(
+            &bitcoin::script::PushBytesBuf::from([THIS_SIDECHAIN]),
+        ));
+        script.push_opcode(bitcoin::opcodes::OP_TRUE);
+        script
+    });
+
 /// Coin movements that a block body does not carry: a mainchain deposit, and
 /// the outputs a withdrawal bundle removed
 #[derive(
@@ -87,23 +102,16 @@ pub struct WithdrawalBundleEvent {
 )]
 pub struct BlockIndexEvents {
     /// Outputs that mainchain deposits created
-    pub deposits: Vec<(OutPoint, Output)>,
+    pub deposits: Vec<(transaction::OutPoint, transaction::Output)>,
     /// Outputs that a withdrawal bundle removed, with the bundle that took them
-    pub bundle_spends: Vec<(OutPoint, M6id)>,
-}
-
-impl BlockIndexEvents {
-    /// True when the block moved no coins outside its body
-    pub fn is_empty(&self) -> bool {
-        self.deposits.is_empty() && self.bundle_spends.is_empty()
-    }
+    pub bundle_spends: Vec<(transaction::OutPoint, M6id)>,
 }
 
 /// One transaction of a block, with the fields its body omits
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct BlockIndexTx {
     pub txid: Txid,
-    /// Borsh size in bytes
+    /// Canonical size in bytes
     pub size: u64,
     /// Borsh encoding, as hex
     pub raw: String,
@@ -112,14 +120,14 @@ pub struct BlockIndexTx {
 /// One output a mainchain deposit created
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct BlockIndexDeposit {
-    pub outpoint: OutPoint,
-    pub output: Output,
+    pub outpoint: transaction::OutPoint,
+    pub output: transaction::Output,
 }
 
 /// One output a withdrawal bundle removed, with the bundle that took it
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct BlockIndexSpend {
-    pub outpoint: OutPoint,
+    pub outpoint: transaction::OutPoint,
     pub m6id: M6id,
 }
 
@@ -135,23 +143,59 @@ pub struct BlockIndex {
     pub bundle_spends: Vec<BlockIndexSpend>,
 }
 
-pub static OP_DRIVECHAIN_SCRIPT: LazyLock<bitcoin::ScriptBuf> =
-    LazyLock::new(|| {
-        let mut script = bitcoin::ScriptBuf::new();
-        script.push_opcode(bitcoin::opcodes::all::OP_RETURN);
-        script.push_instruction(bitcoin::script::Instruction::PushBytes(
-            &bitcoin::script::PushBytesBuf::from([THIS_SIDECHAIN]),
-        ));
-        script.push_opcode(bitcoin::opcodes::OP_TRUE);
-        script
-    });
+/// One transaction the mempool holds
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MempoolTx {
+    /// Blake3 over the canonical encoding
+    pub txid: Txid,
+    /// Canonical size in bytes
+    pub size: u64,
+    /// Borsh encoding, as hex
+    pub raw: String,
+    pub tx: transaction::Transaction,
+}
+
+/// Step of the startup sync with the mainchain
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MainchainSyncPhase {
+    #[default]
+    Idle,
+    /// Fetch mainchain headers from the enforcer
+    Headers,
+    /// Write the fetched mainchain headers to the archive
+    Writing,
+    /// Connect mainchain blocks to the sidechain state
+    State,
+}
+
+/// Progress of the startup sync with the mainchain
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
+)]
+pub struct MainchainSyncProgress {
+    pub phase: MainchainSyncPhase,
+    pub done: u32,
+    pub total: u32,
+    /// Height of the mainchain tip that the sync moves to
+    pub tip_height: u32,
+}
+
+impl BlockIndexEvents {
+    /// True when the block moved no coins outside its body
+    pub fn is_empty(&self) -> bool {
+        self.deposits.is_empty() && self.bundle_spends.is_empty()
+    }
+}
 
 #[serde_as]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct WithdrawalBundle {
     #[schema(value_type = Vec<(transaction::OutPoint, transaction::Output)>)]
     #[serde_as(as = "serde_with::IfIsHumanReadable<serde_with::Seq<(_, _)>>")]
-    spend_utxos: BTreeMap<OutPoint, Output>,
+    spend_utxos: BTreeMap<transaction::OutPoint, transaction::Output>,
     #[schema(value_type = schema::BitcoinTransaction)]
     tx: bitcoin::Transaction,
 }
@@ -281,7 +325,7 @@ impl WithdrawalBundle {
     pub fn new(
         block_height: u32,
         fee: bitcoin::Amount,
-        spend_utxos: BTreeMap<OutPoint, Output>,
+        spend_utxos: BTreeMap<transaction::OutPoint, transaction::Output>,
         bundle_outputs: Vec<bitcoin::TxOut>,
     ) -> Result<Self, WithdrawalBundleError> {
         let inputs_commitment_txout = {
@@ -341,7 +385,9 @@ impl WithdrawalBundle {
         M6id(self.tx.compute_txid())
     }
 
-    pub fn spend_utxos(&self) -> &BTreeMap<OutPoint, Output> {
+    pub fn spend_utxos(
+        &self,
+    ) -> &BTreeMap<transaction::OutPoint, transaction::Output> {
         &self.spend_utxos
     }
 
@@ -352,10 +398,22 @@ impl WithdrawalBundle {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TwoWayPegData {
-    pub deposits: HashMap<OutPoint, Output>,
+    pub deposits: HashMap<transaction::OutPoint, transaction::Output>,
     pub deposit_block_hash: Option<bitcoin::BlockHash>,
     pub bundle_statuses: HashMap<M6id, WithdrawalBundleEvent>,
 }
+
+/*
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DisconnectData {
+    pub spent_utxos: HashMap<types::OutPoint, Output>,
+    pub deposits: Vec<types::OutPoint>,
+    pub pending_bundles: Vec<bitcoin::Txid>,
+    pub spent_bundles: HashMap<bitcoin::Txid, Vec<types::OutPoint>>,
+    pub spent_withdrawals: HashMap<types::OutPoint, Output>,
+    pub failed_withdrawals: Vec<bitcoin::Txid>,
+}
+*/
 
 #[derive(Eq, PartialEq, Clone, Debug)]
 pub struct AggregatedWithdrawal {
@@ -567,32 +625,6 @@ pub struct TxIn {
     pub idx: u32,
 }
 
-/// Step of the sync with the mainchain
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum MainchainSyncPhase {
-    #[default]
-    Idle,
-    /// Fetch mainchain headers from the enforcer
-    Headers,
-    /// Write the fetched mainchain headers to the archive
-    Writing,
-}
-
-/// Progress of the sync with the mainchain
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
-)]
-pub struct MainchainSyncProgress {
-    pub phase: MainchainSyncPhase,
-    pub done: u32,
-    pub total: u32,
-    /// Height of the mainchain block that the sync moves to
-    pub tip_height: u32,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BmmResult {
     Verified,
@@ -619,7 +651,11 @@ pub struct Tip {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-#[cfg_attr(feature = "clap", derive(clap::ValueEnum, strum::Display))]
+#[cfg_attr(
+    feature = "clap",
+    derive(clap::ValueEnum, strum::Display),
+    strum(serialize_all = "lowercase")
+)]
 pub enum Network {
     #[default]
     Betanet,
@@ -670,13 +706,13 @@ impl From<semver::Version> for Version {
         }
     }
 }
-pub const SECONDS_PER_QUARTER: u64 = 3600 * 24 * 91;
 
 #[cfg(test)]
 mod withdrawal_bundle_order_regression {
-    use super::{AggregatedWithdrawal, M6id, WithdrawalBundle};
-    use bitcoin::{Address, Amount, address::NetworkUnchecked};
+    use super::*;
     use std::collections::{BTreeMap, HashMap};
+
+    use bitcoin::{Address, Amount, address::NetworkUnchecked};
 
     fn aw(value: u64, main_fee: u64) -> AggregatedWithdrawal {
         // value/main_fee drive the comparison; one address is enough to expose it.

@@ -47,34 +47,7 @@ pub enum MarketError {
     DatabaseError(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MarketState {
-    Trading = 1,
-    Cancelled = 3,
-    Invalid = 4,
-    Settled = 5,
-}
-
-impl MarketState {
-    pub fn can_transition_to(&self, new_state: MarketState) -> bool {
-        use MarketState::*;
-        match (self, new_state) {
-            (Trading, Trading)
-            | (Cancelled, Cancelled)
-            | (Invalid, Invalid)
-            | (Settled, Settled) => true,
-            (Trading, Cancelled | Invalid | Settled) => true,
-            (Invalid, Settled) => true,
-            (Cancelled, Trading | Invalid | Settled) => false,
-            (Invalid, Trading | Cancelled) => false,
-            (Settled, Trading | Cancelled | Invalid) => false,
-        }
-    }
-
-    pub fn allows_trading(&self) -> bool {
-        matches!(self, MarketState::Trading)
-    }
-}
+pub use crate::types::market::MarketState;
 
 pub fn parse_dimensions(
     dimensions_str: &str,

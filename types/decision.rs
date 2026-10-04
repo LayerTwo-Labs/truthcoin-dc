@@ -182,3 +182,41 @@ impl Ord for DecisionType {
         }
     }
 }
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Serialize,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    utoipa::ToSchema,
+)]
+pub enum DecisionState {
+    Created,
+    Claimed,
+    Voting,
+    Resolved,
+    Invalid,
+}
+
+impl DecisionState {
+    pub fn can_transition_to(&self, new_state: DecisionState) -> bool {
+        use DecisionState::*;
+        matches!(
+            (self, new_state),
+            (Claimed, Voting) | (Voting, Resolved) | (_, Invalid)
+        )
+    }
+
+    pub fn allows_voting(&self) -> bool {
+        matches!(self, DecisionState::Voting)
+    }
+
+    pub fn has_consensus(&self) -> bool {
+        matches!(self, DecisionState::Resolved)
+    }
+}

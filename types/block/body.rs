@@ -113,9 +113,6 @@ pub struct Body {
 }
 
 impl Body {
-    /// Size limit in bytes
-    pub const MAX_SIZE: usize = 8 * 1024 * 1024;
-
     pub fn new(
         authorized_transactions: Vec<AuthorizedTransaction>,
         coinbase: Coinbase,
@@ -132,7 +129,7 @@ impl Body {
             Vec::with_capacity(authorized_transactions.len());
         for at in authorized_transactions.into_iter() {
             authorizations.extend(at.authorizations);
-            actor_proofs.push(at.actor_proof);
+            actor_proofs.push(at.actor_proof.map(|actor_proof| *actor_proof));
             transactions.push(at.transaction);
         }
         Self {
@@ -154,7 +151,8 @@ impl Body {
                     let auth = authorizations_iter.next().unwrap();
                     authorizations.push(auth.clone());
                 }
-                let actor_proof = actor_proofs_iter.next().cloned().flatten();
+                let actor_proof =
+                    actor_proofs_iter.next().cloned().flatten().map(Box::new);
                 AuthorizedTransaction {
                     transaction: tx.clone(),
                     authorizations,

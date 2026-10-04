@@ -554,7 +554,7 @@ pub struct Authorized<T> {
     /// Signature of the market actor (trader, voter or sender) when no input
     /// belongs to that actor
     #[serde(default)]
-    pub actor_proof: Option<Authorization>,
+    pub actor_proof: Option<Box<Authorization>>,
 }
 
 pub type AuthorizedTransaction = Authorized<Transaction>;

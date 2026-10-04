@@ -62,42 +62,4 @@ impl Header {
 pub struct Block {
     pub header: Header,
     pub body: Body,
-    pub height: u32,
-}
-
-#[cfg(test)]
-mod block_json_tests {
-    use bitcoin::hashes::Hash as _;
-
-    use super::{Block, Body, Coinbase, Header};
-    use crate::MerkleRoot;
-
-    #[test]
-    fn block_json_nests_the_header_and_the_body() {
-        let block = Block {
-            header: Header {
-                merkle_root: MerkleRoot::from([1; 32]),
-                prev_side_hash: None,
-                prev_main_hash: bitcoin::BlockHash::from_byte_array([2; 32]),
-                roots: Vec::new(),
-            },
-            body: Body {
-                coinbase: Coinbase::default(),
-                transactions: Vec::new(),
-                authorizations: Vec::new(),
-                actor_proofs: Vec::new(),
-            },
-            height: 7,
-        };
-        let json = serde_json::to_value(&block).unwrap();
-        assert_eq!(
-            json["header"]["prev_main_hash"],
-            serde_json::to_value(block.header.prev_main_hash).unwrap()
-        );
-        assert!(json["body"]["transactions"].is_array());
-        assert_eq!(json["height"], 7);
-        assert!(json.get("prev_main_hash").is_none());
-        let decoded: Block = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(serde_json::to_value(&decoded).unwrap(), json);
-    }
 }
