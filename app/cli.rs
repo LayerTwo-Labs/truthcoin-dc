@@ -379,12 +379,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_network_stays_signet() {
+    fn the_default_network_is_betanet() {
         let cli = Cli::try_parse_from([
             "truthcoin",
             "--datadir=/tmp/truthcoin-cli-test",
         ])
         .unwrap();
-        assert_eq!(cli.network, Network::Signet);
+        assert_eq!(cli.network, Network::Betanet);
     }
 }
