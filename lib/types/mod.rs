@@ -14,6 +14,8 @@ use utoipa::ToSchema;
 pub use crate::authorization::Authorization;
 
 mod address;
+#[cfg(test)]
+mod encoding_tests;
 pub mod hashes;
 pub mod keys;
 pub mod net;
