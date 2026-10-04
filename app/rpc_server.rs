@@ -9,7 +9,6 @@ use jsonrpsee::{
     server::Server,
     types::ErrorObject,
 };
-
 use tower_http::{
     cors::CorsLayer,
     request_id::{
@@ -18,31 +17,35 @@ use tower_http::{
     trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer},
 };
 use truthcoin_dc::{
-    authorization::{self, Dst, Signature},
     math::{
         safe_math::{self, Rounding},
         trading,
     },
-    net::Peer,
     node::Node,
     state::period_to_name,
     types::{
         Address, Authorization, AuthorizedTransaction, Block, BlockHash,
-        BlockIndex, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body,
-        EncryptionPubKey, M6id, MainchainSyncProgress, PointedOutput,
-        Transaction, Txid, VerifyingKey, WithdrawalBundle,
+        EncryptionPubKey, M6id, PointedOutput, SpentOutput, Txid, VerifyingKey,
+        WithdrawalBundle,
+        authorization::{self, Dst, Signature},
+        net::{Peer, PeerAddress},
+        wallet::{Balance, TransferDests},
     },
     validation::DecisionValidator,
-    wallet::{Balance, CreateMarketInput, DecisionClaimInput, TransferDests},
+    wallet::{CreateMarketInput, DecisionClaimInput},
 };
 use truthcoin_dc_app_rpc_api::{
-    self as rpc_api, ConsensusResults, CreateTradeRequest, CreateTradeResponse,
-    DecisionFilter, DecisionListItem, DecisionState, DecisionSummary,
-    GetBlockTemplateResponse, MarketAmplifyBetaRequest, MarketBuyRequest,
-    MarketBuyResponse, MarketDimension, MarketDimensionKind, MarketOutcome,
-    MarketSellRequest, MarketSellResponse, MarketStatus, MempoolTx,
-    ParticipationStats, PeriodStats, PointedSpentOutput, SubmitBallotRequest,
-    TxInfo, VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
+    self as rpc_api,
+    markets::{
+        ConsensusResults, CreateTradeRequest, CreateTradeResponse,
+        DecisionFilter, DecisionListItem, DecisionState, DecisionSummary,
+        MarketAmplifyBetaRequest, MarketBuyRequest, MarketBuyResponse,
+        MarketDimension, MarketDimensionKind, MarketOutcome, MarketSellRequest,
+        MarketSellResponse, MarketStatus, ParticipationStats, PeriodStats,
+        SubmitBallotRequest, VoteFilter, VoteInfo, VoterInfo, VoterInfoFull,
+        VotingPeriodFull,
+    },
+    node::TxInfo,
     typewit::const_marker::Bool,
 };
 
@@ -58,6 +61,12 @@ where
 {
     let error = anyhow::Error::from(error);
     custom_err_msg(format!("{error:#}"))
+}
+
+#[derive(Clone)]
+#[repr(transparent)]
+pub struct RpcServerImpl<const ENABLE_PRIVATE_API: bool> {
+    app: App,
 }
 
 fn market_dimension_data(
@@ -303,26 +312,6 @@ fn parse_market_id(
     Ok(truthcoin_dc::state::MarketId::new(id_array))
 }
 
-fn check_buy_limit(
-    buy_cost: &trading::BuyCost,
-    max_cost: u64,
-) -> RpcResult<()> {
-    if buy_cost.exceeds_limit(max_cost) {
-        return Err(custom_err_msg(format!(
-            "Share cost {} sats + miner fee {} sats exceeds maximum cost {max_cost} sats (slippage protection)",
-            buy_cost.total_cost_sats,
-            trading::TRADE_MINER_FEE_SATS,
-        )));
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-#[repr(transparent)]
-pub struct RpcServerImpl<const ENABLE_PRIVATE_API: bool> {
-    app: App,
-}
-
 impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
     #[inline(always)]
     fn node(&self) -> &Node {
@@ -331,7 +320,8 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
 
     async fn decisions_status(
         &self,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionPeriodStatus> {
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::markets::DecisionPeriodStatus>
+    {
         let config = self.node().get_decision_config();
         let is_testing_mode = config.is_blocks;
         let blocks_per_period =
@@ -342,7 +332,7 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
 
         let current_period_name = period_to_name(current_period);
 
-        Ok(truthcoin_dc_app_rpc_api::DecisionPeriodStatus {
+        Ok(truthcoin_dc_app_rpc_api::markets::DecisionPeriodStatus {
             is_testing_mode,
             blocks_per_period,
             current_period,
@@ -353,7 +343,8 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
     async fn get_decision_by_id(
         &self,
         decision_id_hex: String,
-    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::DecisionDetails>> {
+    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::markets::DecisionDetails>>
+    {
         let decision_id =
             DecisionValidator::parse_decision_id_from_hex(&decision_id_hex)
                 .map_err(custom_err)?;
@@ -364,14 +355,14 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
 
         let result = entry_opt.map(|entry| {
             let content = match entry.decision {
-                None => truthcoin_dc_app_rpc_api::DecisionContentInfo::Empty,
+                None => truthcoin_dc_app_rpc_api::markets::DecisionContentInfo::Empty,
                 Some(decision) => {
-                    truthcoin_dc_app_rpc_api::DecisionContentInfo::Decision({
+                    truthcoin_dc_app_rpc_api::markets::DecisionContentInfo::Decision({
                         let id = const_hex::encode(decision.id());
                         let mm = const_hex::encode(
                             decision.market_maker_pubkey_hash,
                         );
-                        truthcoin_dc_app_rpc_api::DecisionInfo {
+                        truthcoin_dc_app_rpc_api::markets::DecisionInfo {
                             id,
                             market_maker_pubkey_hash: mm,
                             is_standard: decision_id.is_standard(),
@@ -384,7 +375,7 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
                 }
             };
 
-            truthcoin_dc_app_rpc_api::DecisionDetails {
+            truthcoin_dc_app_rpc_api::markets::DecisionDetails {
                 decision_id_hex: decision_id.to_hex(),
                 period_index: decision_id.period_index(),
                 decision_index: decision_id.decision_index(),
@@ -398,7 +389,7 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
     async fn view_market(
         &self,
         market_id: String,
-    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::MarketData>> {
+    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::markets::MarketData>> {
         let market_id_struct = parse_market_id(&market_id)?;
 
         let (market, computed_state) = match self
@@ -463,7 +454,7 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
                         Err(_) => format!("Outcome {state_idx}"),
                     };
                     winning_outcomes.push(
-                        truthcoin_dc_app_rpc_api::WinningOutcome {
+                        truthcoin_dc_app_rpc_api::markets::WinningOutcome {
                             outcome_index: i,
                             label: name,
                             price: final_price,
@@ -484,7 +475,7 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
                 format!("Resolved: {}", names.join(", "))
             };
 
-            Some(truthcoin_dc_app_rpc_api::MarketResolution {
+            Some(truthcoin_dc_app_rpc_api::markets::MarketResolution {
                 winning_outcomes,
                 summary,
             })
@@ -497,7 +488,7 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
             .node
             .get_market_treasury_sats(&market_id_struct)
             .map_err(custom_err)?;
-        let market_data = truthcoin_dc_app_rpc_api::MarketData {
+        let market_data = truthcoin_dc_app_rpc_api::markets::MarketData {
             market_id,
             title: market.title.clone(),
             description: market.description.clone(),
@@ -525,7 +516,7 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
     async fn user_positions(
         &self,
         address: Address,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::UserHoldings> {
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::markets::UserHoldings> {
         let node = &self.node();
 
         let positions_data = node
@@ -575,17 +566,19 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
                     format!("Outcome {outcome_index}")
                 };
 
-                positions.push(truthcoin_dc_app_rpc_api::SharePosition {
-                    market_id: market_id.to_string(),
-                    outcome_index: outcome_index as usize,
-                    outcome_name,
-                    shares,
-                    avg_purchase_price: outcome_price,
-                    current_price: outcome_price,
-                    current_value,
-                    unrealized_pnl: 0.0,
-                    cost_basis: current_value,
-                });
+                positions.push(
+                    truthcoin_dc_app_rpc_api::markets::SharePosition {
+                        market_id: market_id.to_string(),
+                        outcome_index: outcome_index as usize,
+                        outcome_name,
+                        shares,
+                        avg_purchase_price: outcome_price,
+                        current_price: outcome_price,
+                        current_value,
+                        unrealized_pnl: 0.0,
+                        cost_basis: current_value,
+                    },
+                );
 
                 total_value += current_value;
                 total_cost_basis += current_value;
@@ -597,7 +590,7 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
 
         let total_unrealized_pnl = total_value - total_cost_basis;
 
-        Ok(truthcoin_dc_app_rpc_api::UserHoldings {
+        Ok(truthcoin_dc_app_rpc_api::markets::UserHoldings {
             address: address.to_string(),
             positions,
             total_value,
@@ -612,7 +605,7 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
         &self,
         address: Address,
         market_id: String,
-    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::SharePosition>> {
+    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::markets::SharePosition>> {
         let market_id_struct = parse_market_id(&market_id)?;
         let node = &self.node();
 
@@ -642,22 +635,38 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
                     format!("Outcome {outcome_index}")
                 };
 
-                positions.push(truthcoin_dc_app_rpc_api::SharePosition {
-                    market_id: market_id.clone(),
-                    outcome_index: outcome_index as usize,
-                    outcome_name,
-                    shares,
-                    avg_purchase_price: outcome_price,
-                    current_price: outcome_price,
-                    current_value,
-                    unrealized_pnl: 0.0,
-                    cost_basis: current_value,
-                });
+                positions.push(
+                    truthcoin_dc_app_rpc_api::markets::SharePosition {
+                        market_id: market_id.clone(),
+                        outcome_index: outcome_index as usize,
+                        outcome_name,
+                        shares,
+                        avg_purchase_price: outcome_price,
+                        current_price: outcome_price,
+                        current_value,
+                        unrealized_pnl: 0.0,
+                        cost_basis: current_value,
+                    },
+                );
             }
         }
 
         Ok(positions)
     }
+}
+
+fn check_buy_limit(
+    buy_cost: &trading::BuyCost,
+    max_cost: u64,
+) -> RpcResult<()> {
+    if buy_cost.exceeds_limit(max_cost) {
+        return Err(custom_err_msg(format!(
+            "Share cost {} sats + miner fee {} sats exceeds maximum cost {max_cost} sats (slippage protection)",
+            buy_cost.total_cost_sats,
+            trading::TRADE_MINER_FEE_SATS,
+        )));
+    }
+    Ok(())
 }
 
 pub struct PrivateOnlyRpcServerImpl;
@@ -685,27 +694,42 @@ impl rpc_api::open_api::RpcServer for RpcServerImpl<true> {
 
 #[async_trait]
 impl rpc_api::node::PrivateRpcServer for RpcServerImpl<true> {
-    async fn invalidate_block(&self, block_hash: BlockHash) -> RpcResult<()> {
-        self.node().invalidate_block(block_hash).map_err(custom_err)
+    async fn connect_peer(&self, addr: PeerAddress) -> RpcResult<()> {
+        let resolved_addr = truthcoin_dc::net::resolve_peer_address(
+            self.app.node.dns_resolver(),
+            addr,
+        )
+        .await
+        .map_err(custom_err)?;
+        self.app
+            .node
+            .connect_peer(resolved_addr)
+            .map_err(custom_err)
     }
 
-    async fn remove_from_mempool(&self, txid: Txid) -> RpcResult<()> {
-        self.node().remove_from_mempool(txid).map_err(custom_err)
-    }
-
-    async fn stop(&self) {
-        std::process::exit(0);
-    }
-
-    async fn connect_peer(&self, addr: SocketAddr) -> RpcResult<()> {
-        self.node().connect_peer(addr).map_err(custom_err)
-    }
-
-    async fn forget_peer(&self, addr: SocketAddr) -> RpcResult<()> {
+    async fn forget_peer(&self, addr: PeerAddress) -> RpcResult<()> {
         match self.app.node.forget_peer(&addr) {
             Ok(_) => Ok(()),
             Err(err) => Err(custom_err(err)),
         }
+    }
+
+    async fn invalidate_block(
+        &self,
+        block_hash: truthcoin_dc::types::BlockHash,
+    ) -> RpcResult<()> {
+        self.app
+            .node
+            .invalidate_block(block_hash)
+            .map_err(custom_err)
+    }
+
+    async fn remove_from_mempool(&self, txid: Txid) -> RpcResult<()> {
+        self.app.node.remove_from_mempool(txid).map_err(custom_err)
+    }
+
+    async fn stop(&self) {
+        std::process::exit(0);
     }
 
     async fn sync_to_tip(&self, block_hash: BlockHash) -> RpcResult<bool> {
@@ -723,10 +747,22 @@ impl<const ENABLE_PRIVATE_API: bool>
 {
     async fn get_block(
         &self,
-        block_hash: BlockHash,
+        block_hash: truthcoin_dc::types::BlockHash,
         _verbose: Bool<false>,
-    ) -> RpcResult<Option<Block>> {
-        self.node().try_get_block(block_hash).map_err(custom_err)
+    ) -> RpcResult<
+        Option<<Bool<false> as rpc_api::node::get_block::Verbosity>::Response>,
+    > {
+        let Some(header) = self
+            .app
+            .node
+            .try_get_header(block_hash)
+            .map_err(custom_err)?
+        else {
+            return Ok(None);
+        };
+        let body = self.app.node.get_body(block_hash).map_err(custom_err)?;
+        let block = truthcoin_dc::types::Block { header, body };
+        Ok(Some(block))
     }
 }
 
@@ -737,44 +773,47 @@ impl<const ENABLE_PRIVATE_API: bool>
 {
     async fn get_block(
         &self,
-        block_hash: BlockHash,
+        block_hash: truthcoin_dc::types::BlockHash,
         _verbose: Bool<true>,
-    ) -> RpcResult<Option<rpc_api::node::get_block::BlockVerbose>> {
-        let Some(Block {
-            header,
-            body:
-                Body {
-                    coinbase,
-                    transactions,
-                    authorizations,
-                    actor_proofs,
-                },
-            height,
-        }) = self.node().try_get_block(block_hash).map_err(custom_err)?
+    ) -> RpcResult<
+        Option<<Bool<true> as rpc_api::node::get_block::Verbosity>::Response>,
+    > {
+        let Some(header) = self
+            .app
+            .node
+            .try_get_header(block_hash)
+            .map_err(custom_err)?
         else {
             return Ok(None);
         };
-        let transactions = transactions
+        let truthcoin_dc::types::Body {
+            coinbase,
+            transactions,
+            authorizations,
+            actor_proofs,
+        } = self.app.node.get_body(block_hash).map_err(custom_err)?;
+        let transactions_verbose = transactions
             .into_iter()
             .map(|tx| {
-                Ok(rpc_api::node::TransactionVerbose {
+                Ok(truthcoin_dc_app_rpc_api::node::TransactionVerbose {
                     canonical_bytes: tx.canonical_bytes()?,
                     tx,
                 })
             })
             .collect::<std::io::Result<_>>()
             .map_err(custom_err)?;
-        let body = rpc_api::node::get_block::BodyVerbose {
+        let body = truthcoin_dc_app_rpc_api::node::get_block::BodyVerbose {
             coinbase,
-            transactions,
+            transactions: transactions_verbose,
             authorizations,
             actor_proofs,
         };
-        Ok(Some(rpc_api::node::get_block::BlockVerbose {
-            header,
-            body,
-            height,
-        }))
+        let block_verbose =
+            truthcoin_dc_app_rpc_api::node::get_block::BlockVerbose {
+                header,
+                body,
+            };
+        Ok(Some(block_verbose))
     }
 }
 
@@ -782,6 +821,254 @@ impl<const ENABLE_PRIVATE_API: bool>
 impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
     for RpcServerImpl<ENABLE_PRIVATE_API>
 {
+    async fn connect_block(
+        &self,
+        block: Block,
+        main_block_hash: bitcoin::BlockHash,
+    ) -> RpcResult<bool> {
+        self.app
+            .local_pool
+            .spawn_pinned({
+                let app = self.app.clone();
+                move || async move {
+                    app.connect_block(block, main_block_hash)
+                        .await
+                        .map_err(custom_err)
+                }
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn get_block_hash(
+        &self,
+        height: u32,
+    ) -> RpcResult<Option<truthcoin_dc::types::BlockHash>> {
+        self.app.node.try_get_block_hash(height).map_err(custom_err)
+    }
+
+    async fn get_best_sidechain_block_hash(
+        &self,
+    ) -> RpcResult<Option<truthcoin_dc::types::BlockHash>> {
+        self.app.node.try_get_tip().map_err(custom_err)
+    }
+
+    async fn get_best_mainchain_block_hash(
+        &self,
+    ) -> RpcResult<Option<bitcoin::BlockHash>> {
+        let Some(sidechain_hash) =
+            self.app.node.try_get_tip().map_err(custom_err)?
+        else {
+            // No sidechain tip, so no best mainchain block hash.
+            return Ok(None);
+        };
+        let block_hash = self
+            .app
+            .node
+            .get_best_main_verification(sidechain_hash)
+            .map_err(custom_err)?;
+        Ok(Some(block_hash))
+    }
+
+    async fn get_block_index(
+        &self,
+        block_hash: truthcoin_dc::types::BlockHash,
+    ) -> RpcResult<truthcoin_dc::types::BlockIndex> {
+        let body = self.app.node.get_body(block_hash).map_err(custom_err)?;
+        let txs = body
+            .transactions
+            .iter()
+            .map(|tx| {
+                Ok(truthcoin_dc::types::BlockIndexTx {
+                    txid: tx.txid(),
+                    size: tx.canonical_size()?,
+                    raw: const_hex::encode(tx.canonical_bytes()?),
+                })
+            })
+            .collect::<Result<_, std::io::Error>>()
+            .map_err(custom_err)?;
+        let events = self
+            .app
+            .node
+            .get_block_index_events(block_hash)
+            .map_err(custom_err)?;
+        Ok(truthcoin_dc::types::BlockIndex {
+            txs,
+            deposits: events
+                .deposits
+                .into_iter()
+                .map(|(outpoint, output)| {
+                    truthcoin_dc::types::BlockIndexDeposit { outpoint, output }
+                })
+                .collect(),
+            bundle_spends: events
+                .bundle_spends
+                .into_iter()
+                .map(|(outpoint, m6id)| truthcoin_dc::types::BlockIndexSpend {
+                    outpoint,
+                    m6id,
+                })
+                .collect(),
+        })
+    }
+
+    async fn get_bmm_inclusions(
+        &self,
+        block_hash: truthcoin_dc::types::BlockHash,
+    ) -> RpcResult<Vec<bitcoin::BlockHash>> {
+        self.app
+            .node
+            .get_bmm_inclusions(block_hash)
+            .map_err(custom_err)
+    }
+
+    async fn get_stxos(
+        &self,
+        addresses: HashSet<Address>,
+    ) -> RpcResult<Vec<PointedOutput<SpentOutput>>> {
+        let res = self
+            .app
+            .node
+            .get_stxos_by_addresses(&addresses)
+            .map_err(custom_err)?
+            .into_iter()
+            .map(|(outpoint, output)| PointedOutput { outpoint, output })
+            .collect();
+        Ok(res)
+    }
+
+    async fn get_transaction(
+        &self,
+        txid: Txid,
+    ) -> RpcResult<Option<rpc_api::node::GetTransactionResponse>> {
+        let res =
+            self.app
+                .node
+                .try_get_transaction(txid)
+                .map_err(custom_err)?
+                .map(|(tx, block_hash)| {
+                    rpc_api::node::GetTransactionResponse { tx, block_hash }
+                });
+        Ok(res)
+    }
+
+    async fn get_utxos(
+        &self,
+        addresses: HashSet<Address>,
+    ) -> RpcResult<Vec<PointedOutput>> {
+        let res = self
+            .app
+            .node
+            .get_utxos_by_addresses(&addresses)
+            .map_err(custom_err)?
+            .into_iter()
+            .map(|(outpoint, output)| PointedOutput { outpoint, output })
+            .collect();
+        Ok(res)
+    }
+
+    async fn get_withdrawal_bundle(
+        &self,
+        m6id: M6id,
+    ) -> RpcResult<Option<rpc_api::node::GetWithdrawalBundleResponse>> {
+        let Some((bundle_info, bundle_status)) = self
+            .app
+            .node
+            .try_get_withdrawal_bundle(&m6id)
+            .map_err(custom_err)?
+        else {
+            return Ok(None);
+        };
+        let response = rpc_api::node::GetWithdrawalBundleResponse {
+            info: bundle_info,
+            status: bundle_status,
+        };
+        Ok(Some(response))
+    }
+
+    async fn getblockcount(&self) -> RpcResult<u32> {
+        let height = self.app.node.try_get_height().map_err(custom_err)?;
+        let block_count = height.map_or(0, |height| height + 1);
+        Ok(block_count)
+    }
+
+    async fn latest_failed_withdrawal_bundle_height(
+        &self,
+    ) -> RpcResult<Option<u32>> {
+        let height = self
+            .app
+            .node
+            .get_latest_failed_withdrawal_bundle_height()
+            .map_err(custom_err)?;
+        Ok(height)
+    }
+
+    async fn list_peers(&self) -> RpcResult<Vec<Peer>> {
+        let peers = self.app.node.get_active_peers();
+        Ok(peers)
+    }
+
+    async fn list_mempool(
+        &self,
+    ) -> RpcResult<Vec<truthcoin_dc::types::MempoolTx>> {
+        let txs = self.app.node.get_all_transactions().map_err(custom_err)?;
+        let res = txs
+            .into_iter()
+            .map(|authorized| {
+                let tx = authorized.transaction;
+                Ok(truthcoin_dc::types::MempoolTx {
+                    txid: tx.txid(),
+                    size: tx.canonical_size()?,
+                    raw: const_hex::encode(tx.canonical_bytes()?),
+                    tx,
+                })
+            })
+            .collect::<Result<_, std::io::Error>>()
+            .map_err(custom_err)?;
+        Ok(res)
+    }
+
+    async fn list_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
+        let utxos = self.app.node.get_all_utxos().map_err(custom_err)?;
+        let res = utxos
+            .into_iter()
+            .map(|(outpoint, output)| PointedOutput { outpoint, output })
+            .collect();
+        Ok(res)
+    }
+
+    async fn mainchain_sync_progress(
+        &self,
+    ) -> RpcResult<truthcoin_dc::types::MainchainSyncProgress> {
+        Ok(self.app.node.mainchain_sync_progress())
+    }
+
+    async fn pending_withdrawal_bundle(
+        &self,
+    ) -> RpcResult<Option<WithdrawalBundle>> {
+        self.app
+            .node
+            .try_get_pending_withdrawal_bundle()
+            .map_err(custom_err)
+    }
+
+    async fn sidechain_wealth_sats(&self) -> RpcResult<u64> {
+        let sidechain_wealth =
+            self.app.node.get_sidechain_wealth().map_err(custom_err)?;
+        Ok(sidechain_wealth.to_sat())
+    }
+
+    async fn submit_transaction(
+        &self,
+        mut transaction: truthcoin_dc::types::AuthorizedTransaction,
+    ) -> RpcResult<Txid> {
+        let () = self
+            .app
+            .submit_transaction(&mut transaction)
+            .map_err(custom_err)?;
+        Ok(transaction.transaction.txid())
+    }
+
     async fn await_block_height(
         &self,
         target_height: u32,
@@ -796,7 +1083,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
             loop {
                 let current_height = self
                     .node()
-                    .try_get_tip_height()
+                    .try_get_height()
                     .map_err(custom_err)?
                     .unwrap_or(0);
 
@@ -818,7 +1105,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                 // Timeout - return current height
                 let current_height = self
                     .node()
-                    .try_get_tip_height()
+                    .try_get_height()
                     .map_err(custom_err)?
                     .unwrap_or(0);
                 Err(custom_err_msg(format!(
@@ -828,10 +1115,67 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         }
     }
 
+    async fn get_transaction_info(
+        &self,
+        txid: Txid,
+    ) -> RpcResult<Option<TxInfo>> {
+        let Some((filled_tx, txin)) = self
+            .app
+            .node
+            .try_get_filled_transaction(txid)
+            .map_err(custom_err)?
+        else {
+            return Ok(None);
+        };
+        let confirmations = match txin {
+            Some(txin) => {
+                let tip_height = self
+                    .app
+                    .node
+                    .try_get_height()
+                    .map_err(custom_err)?
+                    .expect("Height should exist for tip");
+                let height = self
+                    .app
+                    .node
+                    .get_height(txin.block_hash)
+                    .map_err(custom_err)?;
+                Some(tip_height - height)
+            }
+            None => None,
+        };
+        let fee_sats = filled_tx
+            .transaction
+            .get_fee()
+            .map_err(custom_err)?
+            .to_sat();
+        let res = TxInfo {
+            confirmations,
+            fee_sats,
+            txin,
+        };
+        Ok(Some(res))
+    }
+
+    async fn push_tx(&self, tx_hex: String) -> RpcResult<Txid> {
+        let bytes = const_hex::decode(&tx_hex)
+            .map_err(|e| custom_err_msg(format!("invalid hex: {e}")))?;
+        let tx: AuthorizedTransaction =
+            bincode::deserialize(&bytes).map_err(|e| {
+                custom_err_msg(format!(
+                    "failed to deserialize AuthorizedTransaction: {e}"
+                ))
+            })?;
+        let txid = tx.transaction.txid();
+        self.app.node.submit_transaction(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
     async fn calculate_initial_liquidity(
         &self,
-        request: truthcoin_dc_app_rpc_api::CalculateInitialLiquidityRequest,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::InitialLiquidityCalculation> {
+        request: truthcoin_dc_app_rpc_api::markets::CalculateInitialLiquidityRequest,
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::markets::InitialLiquidityCalculation>
+    {
         use truthcoin_dc::state::markets::{DimensionSpec, parse_dimensions};
 
         let beta = request.beta;
@@ -912,33 +1256,16 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
             custom_err_msg(format!("Liquidity calculation failed: {e}"))
         })?;
 
-        Ok(truthcoin_dc_app_rpc_api::InitialLiquidityCalculation {
-            beta,
-            num_outcomes,
-            initial_liquidity_sats,
-            min_treasury_sats: initial_liquidity_sats,
-            market_config,
-            outcome_breakdown,
-        })
-    }
-
-    async fn connect_block(
-        &self,
-        block: Block,
-        main_block_hash: bitcoin::BlockHash,
-    ) -> RpcResult<bool> {
-        self.app
-            .local_pool
-            .spawn_pinned({
-                let app = self.app.clone();
-                move || async move {
-                    app.connect_block(block, main_block_hash)
-                        .await
-                        .map_err(custom_err)
-                }
-            })
-            .await
-            .unwrap()
+        Ok(
+            truthcoin_dc_app_rpc_api::markets::InitialLiquidityCalculation {
+                beta,
+                num_outcomes,
+                initial_liquidity_sats,
+                min_treasury_sats: initial_liquidity_sats,
+                market_config,
+                outcome_breakdown,
+            },
+        )
     }
 
     async fn decision_fee_for_id(
@@ -956,7 +1283,8 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
     async fn decision_get(
         &self,
         decision_id: String,
-    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::DecisionDetails>> {
+    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::markets::DecisionDetails>>
+    {
         self.get_decision_by_id(decision_id).await
     }
 
@@ -1041,7 +1369,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                 let decision = entry.decision.map(|d| {
                     let id = const_hex::encode(d.id());
                     let mm = const_hex::encode(d.market_maker_pubkey_hash);
-                    truthcoin_dc_app_rpc_api::DecisionInfo {
+                    truthcoin_dc_app_rpc_api::markets::DecisionInfo {
                         id,
                         market_maker_pubkey_hash: mm,
                         is_standard: did.is_standard(),
@@ -1068,7 +1396,8 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
     async fn decision_listing_fee(
         &self,
         period: u32,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionListingFeeInfo> {
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::markets::DecisionListingFeeInfo>
+    {
         use truthcoin_dc::math::decisions as math_decisions;
         let pricing = self
             .node()
@@ -1078,7 +1407,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                 custom_err_msg(format!("no pricing record for period {period}"))
             })?;
 
-        Ok(truthcoin_dc_app_rpc_api::DecisionListingFeeInfo {
+        Ok(truthcoin_dc_app_rpc_api::markets::DecisionListingFeeInfo {
             p_period: pricing.p_period,
             p_floor: pricing.p_floor,
             mints: pricing.mints,
@@ -1091,221 +1420,18 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
 
     async fn decision_status(
         &self,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionPeriodStatus> {
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::markets::DecisionPeriodStatus>
+    {
         self.decisions_status().await
-    }
-
-    async fn get_best_mainchain_block_hash(
-        &self,
-    ) -> RpcResult<Option<bitcoin::BlockHash>> {
-        let Some(sidechain_hash) =
-            self.node().try_get_tip().map_err(custom_err)?
-        else {
-            return Ok(None);
-        };
-        let block_hash = self
-            .node()
-            .get_best_main_verification(sidechain_hash)
-            .map_err(custom_err)?;
-        Ok(Some(block_hash))
-    }
-
-    async fn get_best_sidechain_block_hash(
-        &self,
-    ) -> RpcResult<Option<BlockHash>> {
-        self.node().try_get_tip().map_err(custom_err)
-    }
-
-    async fn get_block_hash(
-        &self,
-        height: u32,
-    ) -> RpcResult<Option<BlockHash>> {
-        self.node().try_get_block_hash(height).map_err(custom_err)
-    }
-
-    async fn get_block_index(
-        &self,
-        block_hash: BlockHash,
-    ) -> RpcResult<BlockIndex> {
-        let body = self.node().get_body(block_hash).map_err(custom_err)?;
-        let txs = body
-            .transactions
-            .iter()
-            .map(|tx| {
-                let raw = borsh::to_vec(tx).map_err(custom_err)?;
-                Ok(BlockIndexTx {
-                    txid: tx.txid(),
-                    size: raw.len() as u64,
-                    raw: const_hex::encode(raw),
-                })
-            })
-            .collect::<RpcResult<_>>()?;
-        let events = self
-            .node()
-            .get_block_index_events(block_hash)
-            .map_err(custom_err)?;
-        Ok(BlockIndex {
-            txs,
-            deposits: events
-                .deposits
-                .into_iter()
-                .map(|(outpoint, output)| BlockIndexDeposit {
-                    outpoint,
-                    output,
-                })
-                .collect(),
-            bundle_spends: events
-                .bundle_spends
-                .into_iter()
-                .map(|(outpoint, m6id)| BlockIndexSpend { outpoint, m6id })
-                .collect(),
-        })
-    }
-
-    async fn get_bmm_inclusions(
-        &self,
-        block_hash: truthcoin_dc::types::BlockHash,
-    ) -> RpcResult<Vec<bitcoin::BlockHash>> {
-        self.app
-            .node
-            .get_bmm_inclusions(block_hash)
-            .map_err(custom_err)
-    }
-
-    async fn get_stxos(
-        &self,
-        addresses: HashSet<Address>,
-    ) -> RpcResult<Vec<PointedSpentOutput>> {
-        let res = self
-            .app
-            .node
-            .get_stxos_by_addresses(&addresses)
-            .map_err(custom_err)?
-            .into_iter()
-            .map(|(outpoint, output)| PointedSpentOutput { outpoint, output })
-            .collect();
-        Ok(res)
-    }
-
-    async fn get_transaction(
-        &self,
-        txid: Txid,
-    ) -> RpcResult<Option<Transaction>> {
-        self.node().try_get_transaction(txid).map_err(custom_err)
-    }
-
-    async fn get_transaction_info(
-        &self,
-        txid: Txid,
-    ) -> RpcResult<Option<TxInfo>> {
-        let Some((filled_tx, txin)) = self
-            .app
-            .node
-            .try_get_filled_transaction(txid)
-            .map_err(custom_err)?
-        else {
-            return Ok(None);
-        };
-        let confirmations = match txin {
-            Some(txin) => {
-                let tip_height = self
-                    .app
-                    .node
-                    .try_get_tip_height()
-                    .map_err(custom_err)?
-                    .expect("Height should exist for tip");
-                let height = self
-                    .app
-                    .node
-                    .get_height(txin.block_hash)
-                    .map_err(custom_err)?;
-                Some(tip_height - height)
-            }
-            None => None,
-        };
-        let fee_sats = filled_tx
-            .transaction
-            .get_fee()
-            .map_err(custom_err)?
-            .to_sat();
-        let res = TxInfo {
-            confirmations,
-            fee_sats,
-            txin,
-        };
-        Ok(Some(res))
-    }
-
-    async fn get_utxos(
-        &self,
-        addresses: HashSet<Address>,
-    ) -> RpcResult<Vec<PointedOutput>> {
-        let res = self
-            .app
-            .node
-            .get_utxos_by_addresses(&addresses)
-            .map_err(custom_err)?
-            .into_iter()
-            .map(|(outpoint, output)| PointedOutput { outpoint, output })
-            .collect();
-        Ok(res)
-    }
-
-    async fn getblockcount(&self) -> RpcResult<u32> {
-        let height = self.node().try_get_tip_height().map_err(custom_err)?;
-        Ok(height.map_or(0, |h| h + 1))
-    }
-
-    async fn get_withdrawal_bundle(
-        &self,
-        m6id: M6id,
-    ) -> RpcResult<Option<rpc_api::node::GetWithdrawalBundleResponse>> {
-        let Some((info, status)) = self
-            .node()
-            .try_get_withdrawal_bundle(&m6id)
-            .map_err(custom_err)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(rpc_api::node::GetWithdrawalBundleResponse {
-            info,
-            status,
-        }))
-    }
-
-    async fn latest_failed_withdrawal_bundle_height(
-        &self,
-    ) -> RpcResult<Option<u32>> {
-        let height = self
-            .app
-            .node
-            .get_latest_failed_bundle_height()
-            .map_err(custom_err)?;
-        Ok(height)
-    }
-
-    async fn list_mempool(&self) -> RpcResult<Vec<MempoolTx>> {
-        let txs = self.node().get_all_transactions().map_err(custom_err)?;
-        txs.into_iter()
-            .map(|authorized| {
-                let tx = authorized.transaction;
-                let raw = borsh::to_vec(&tx).map_err(custom_err)?;
-                Ok(MempoolTx {
-                    txid: tx.txid(),
-                    size: raw.len() as u64,
-                    tx,
-                    raw: const_hex::encode(raw),
-                })
-            })
-            .collect()
     }
 
     async fn list_open_periods_with_pricing(
         &self,
-    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::PeriodPricingSummary>> {
+    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::markets::PeriodPricingSummary>>
+    {
         use truthcoin_dc::math::decisions as math_decisions;
         use truthcoin_dc::state::voting::types::VotingPeriodId;
-        use truthcoin_dc_app_rpc_api::PeriodPricingSummary;
+        use truthcoin_dc_app_rpc_api::markets::PeriodPricingSummary;
 
         let current = self.app.node.get_current_period().map_err(custom_err)?;
 
@@ -1367,36 +1493,16 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         Ok(summaries)
     }
 
-    async fn list_peers(&self) -> RpcResult<Vec<Peer>> {
-        let peers = self.node().get_active_peers();
-        Ok(peers)
-    }
-
-    async fn list_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
-        let utxos = self.node().get_all_utxos().map_err(custom_err)?;
-        let res = utxos
-            .into_iter()
-            .map(|(outpoint, output)| PointedOutput { outpoint, output })
-            .collect();
-        Ok(res)
-    }
-
-    async fn mainchain_sync_progress(
-        &self,
-    ) -> RpcResult<MainchainSyncProgress> {
-        Ok(self.node().mainchain_sync_progress())
-    }
-
     async fn market_get(
         &self,
         market_id: String,
-    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::MarketData>> {
+    ) -> RpcResult<Option<truthcoin_dc_app_rpc_api::markets::MarketData>> {
         self.view_market(market_id).await
     }
 
     async fn market_list(
         &self,
-    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::MarketSummary>> {
+    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::markets::MarketSummary>> {
         let markets_with_states = self
             .app
             .node
@@ -1408,7 +1514,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
             .map(|(market, computed_state)| {
                 let market_id_hex = const_hex::encode(market.id.as_bytes());
 
-                truthcoin_dc_app_rpc_api::MarketSummary {
+                truthcoin_dc_app_rpc_api::markets::MarketSummary {
                     market_id: market_id_hex,
                     title: market.title.clone(),
                     description: if market.description.chars().count() > 100 {
@@ -1432,7 +1538,8 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
     async fn market_price_history(
         &self,
         market_id: String,
-    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::MarketPricePoint>> {
+    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::markets::MarketPricePoint>>
+    {
         let market_id = parse_market_id(&market_id)?;
         let points = self
             .app
@@ -1442,12 +1549,14 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
             .ok_or_else(|| custom_err_msg("Market not found"))?;
         Ok(points
             .into_iter()
-            .map(|point| truthcoin_dc_app_rpc_api::MarketPricePoint {
-                height: point.height,
-                block_hash: point.block_hash,
-                timestamp: point.mainchain_timestamp,
-                prices: point.prices,
-            })
+            .map(
+                |point| truthcoin_dc_app_rpc_api::markets::MarketPricePoint {
+                    height: point.height,
+                    block_hash: point.block_hash,
+                    timestamp: point.mainchain_timestamp,
+                    prices: point.prices,
+                },
+            )
             .collect())
     }
 
@@ -1455,7 +1564,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         &self,
         address: Address,
         market_id: Option<String>,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::UserHoldings> {
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::markets::UserHoldings> {
         if let Some(mid) = market_id {
             let positions = self.market_user_positions(address, mid).await?;
 
@@ -1464,7 +1573,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
             let total_cost_basis: f64 =
                 positions.iter().map(|p| p.cost_basis).sum();
 
-            Ok(truthcoin_dc_app_rpc_api::UserHoldings {
+            Ok(truthcoin_dc_app_rpc_api::markets::UserHoldings {
                 address: address.to_string(),
                 positions,
                 total_value,
@@ -1476,47 +1585,6 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         } else {
             self.user_positions(address).await
         }
-    }
-
-    async fn pending_withdrawal_bundle(
-        &self,
-    ) -> RpcResult<Option<WithdrawalBundle>> {
-        self.app
-            .node
-            .get_pending_withdrawal_bundle()
-            .map_err(custom_err)
-    }
-
-    async fn push_tx(&self, tx_hex: String) -> RpcResult<Txid> {
-        let bytes = const_hex::decode(&tx_hex)
-            .map_err(|e| custom_err_msg(format!("invalid hex: {e}")))?;
-        let tx: AuthorizedTransaction =
-            bincode::deserialize(&bytes).map_err(|e| {
-                custom_err_msg(format!(
-                    "failed to deserialize AuthorizedTransaction: {e}"
-                ))
-            })?;
-        let txid = tx.transaction.txid();
-        self.app.node.submit_transaction(tx).map_err(custom_err)?;
-        Ok(txid)
-    }
-
-    async fn sidechain_wealth_sats(&self) -> RpcResult<u64> {
-        let sidechain_wealth =
-            self.node().get_sidechain_wealth().map_err(custom_err)?;
-        Ok(sidechain_wealth.to_sat())
-    }
-
-    async fn submit_transaction(
-        &self,
-        transaction: AuthorizedTransaction,
-    ) -> RpcResult<Txid> {
-        let txid = transaction.transaction.txid();
-        let () = self
-            .app
-            .submit_transaction(transaction)
-            .map_err(custom_err)?;
-        Ok(txid)
     }
 
     async fn vote_list(&self, filter: VoteFilter) -> RpcResult<Vec<VoteInfo>> {
@@ -1676,7 +1744,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         // Gather config values BEFORE opening the main read transaction
         let current_height = self
             .node()
-            .try_get_tip_height()
+            .try_get_height()
             .map_err(custom_err)?
             .unwrap_or(0);
         let current_timestamp_for_period =
@@ -1855,7 +1923,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                     for (voter_id, (old_score, new_score)) in rep_changes {
                         score_changes.insert(
                             voter_id.to_string(),
-                            truthcoin_dc_app_rpc_api::ScoreChange {
+                            truthcoin_dc_app_rpc_api::markets::ScoreChange {
                                 old_score: *old_score,
                                 new_score: *new_score,
                             },
@@ -1904,7 +1972,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
             self.node().get_mainchain_timestamp().map_err(custom_err)?;
         let current_height = self
             .node()
-            .try_get_tip_height()
+            .try_get_height()
             .map_err(custom_err)?
             .unwrap_or(0);
         let config = self.node().get_decision_config();
@@ -2036,7 +2104,124 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
 
 #[async_trait]
 impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
-    async fn get_block_template(&self) -> RpcResult<GetBlockTemplateResponse> {
+    async fn balance(&self) -> RpcResult<Balance> {
+        self.app.wallet.get_balance().map_err(custom_err)
+    }
+
+    async fn create_deposit(
+        &self,
+        address: Address,
+        value_sats: u64,
+        fee_sats: u64,
+    ) -> RpcResult<bitcoin::Txid> {
+        let app = self.app.clone();
+        tokio::task::spawn_blocking(move || {
+            app.deposit_blocking(
+                address,
+                bitcoin::Amount::from_sat(value_sats),
+                bitcoin::Amount::from_sat(fee_sats),
+            )
+            .map_err(custom_err)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn create_transfer(
+        &self,
+        dest: Address,
+        value_sats: u64,
+        fee_sats: u64,
+    ) -> RpcResult<Txid> {
+        let accumulator =
+            self.app.node.get_tip_accumulator().map_err(custom_err)?;
+        let tx = self
+            .app
+            .wallet
+            .create_transaction(
+                &accumulator,
+                dest,
+                Amount::from_sat(value_sats),
+                Amount::from_sat(fee_sats),
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    async fn create_transfer_many(
+        &self,
+        dests: TransferDests,
+        fee_sats: u64,
+    ) -> RpcResult<Txid> {
+        let dests = dests
+            .0
+            .into_iter()
+            .map(|(address, value_sats)| {
+                (address, Amount::from_sat(value_sats))
+            })
+            .collect();
+        let accumulator =
+            self.app.node.get_tip_accumulator().map_err(custom_err)?;
+        let tx = self
+            .app
+            .wallet
+            .create_transaction_many(
+                &accumulator,
+                &dests,
+                Amount::from_sat(fee_sats),
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    async fn create_withdrawal(
+        &self,
+        mainchain_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
+        amount_sats: u64,
+        fee_sats: u64,
+        mainchain_fee_sats: u64,
+    ) -> RpcResult<Txid> {
+        let accumulator =
+            self.app.node.get_tip_accumulator().map_err(custom_err)?;
+        let tx = self
+            .app
+            .wallet
+            .create_withdrawal(
+                &accumulator,
+                mainchain_address,
+                Amount::from_sat(amount_sats),
+                Amount::from_sat(mainchain_fee_sats),
+                Amount::from_sat(fee_sats),
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    async fn format_deposit_address(
+        &self,
+        address: Address,
+    ) -> RpcResult<String> {
+        let deposit_address = address.format_for_deposit();
+        Ok(deposit_address)
+    }
+
+    async fn generate_mnemonic(&self) -> RpcResult<String> {
+        let mnemonic = bip39::Mnemonic::new(
+            bip39::MnemonicType::Words12,
+            bip39::Language::English,
+        );
+        Ok(mnemonic.to_string())
+    }
+
+    async fn get_block_template(
+        &self,
+    ) -> RpcResult<rpc_api::wallet::GetBlockTemplateResponse> {
         let template = self
             .app
             .local_pool
@@ -2048,12 +2233,11 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             })
             .await
             .unwrap()?;
-        Ok(GetBlockTemplateResponse {
+        Ok(rpc_api::wallet::GetBlockTemplateResponse {
             critical_hash: template.header.hash(),
             block: Block {
                 header: template.header,
                 body: template.body,
-                height: template.height,
             },
             fees_sats: template.fees.to_sat(),
         })
@@ -2061,18 +2245,6 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
 
     async fn get_new_address(&self) -> RpcResult<Address> {
         self.app.wallet.get_new_address().map_err(custom_err)
-    }
-
-    async fn get_voter_address(&self) -> RpcResult<Address> {
-        self.app.wallet.voter_address().map_err(custom_err)
-    }
-
-    async fn get_new_encryption_key(&self) -> RpcResult<EncryptionPubKey> {
-        self.app.wallet.get_new_encryption_key().map_err(custom_err)
-    }
-
-    async fn get_new_verifying_key(&self) -> RpcResult<VerifyingKey> {
-        self.app.wallet.get_new_verifying_key().map_err(custom_err)
     }
 
     async fn get_wallet_addresses(&self) -> RpcResult<Vec<Address>> {
@@ -2103,53 +2275,22 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .unwrap()
     }
 
-    async fn my_unconfirmed_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
-        let addresses = self.app.wallet.get_addresses().map_err(custom_err)?;
-        let utxos = self
-            .app
-            .node
-            .get_unconfirmed_utxos_by_addresses(&addresses)
-            .map_err(custom_err)?
-            .into_iter()
-            .map(|(outpoint, output)| PointedOutput { outpoint, output })
-            .collect();
-        Ok(utxos)
-    }
-
     async fn set_seed_from_mnemonic(&self, mnemonic: String) -> RpcResult<()> {
-        self.app
-            .wallet
-            .set_seed_from_mnemonic(mnemonic.as_str())
-            .map_err(custom_err)
-    }
-
-    async fn sign_arbitrary_msg(
-        &self,
-        verifying_key: VerifyingKey,
-        msg: String,
-    ) -> RpcResult<Signature> {
-        self.app
-            .wallet
-            .sign_arbitrary_msg(rand::rng(), &verifying_key, &msg)
-            .map_err(custom_err)
-    }
-
-    async fn sign_arbitrary_msg_as_addr(
-        &self,
-        address: Address,
-        msg: String,
-    ) -> RpcResult<Authorization> {
-        self.app
-            .wallet
-            .sign_arbitrary_msg_as_addr(rand::rng(), &address, &msg)
-            .map_err(custom_err)
+        let mnemonic =
+            bip39::Mnemonic::from_phrase(&mnemonic, bip39::Language::English)
+                .map_err(custom_err)?;
+        let seed = bip39::Seed::new(&mnemonic, "");
+        let seed_bytes: [u8; 64] = seed.as_bytes().try_into().map_err(
+            |err: <[u8; 64] as TryFrom<&[u8]>>::Error| custom_err(err),
+        )?;
+        self.app.wallet.set_seed(&seed_bytes).map_err(custom_err)
     }
 
     async fn sign_transaction(
         &self,
-        transaction: Transaction,
+        transaction: truthcoin_dc::types::Transaction,
         broadcast: Option<bool>,
-    ) -> RpcResult<AuthorizedTransaction> {
+    ) -> RpcResult<truthcoin_dc::types::AuthorizedTransaction> {
         let mut authorized = self
             .app
             .wallet
@@ -2162,127 +2303,6 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 .map_err(custom_err)?;
         }
         Ok(authorized)
-    }
-
-    async fn create_transfer(
-        &self,
-        dest: Address,
-        value_sats: u64,
-        fee_sats: u64,
-    ) -> RpcResult<Transaction> {
-        let tx = self
-            .app
-            .wallet
-            .create_transfer(
-                dest,
-                Amount::from_sat(value_sats),
-                Amount::from_sat(fee_sats),
-            )
-            .map_err(custom_err)?;
-        Ok(tx)
-    }
-
-    async fn transfer_many(
-        &self,
-        dests: TransferDests,
-        fee_sats: u64,
-    ) -> RpcResult<Txid> {
-        let dests = dests
-            .0
-            .into_iter()
-            .map(|(address, value_sats)| {
-                (address, Amount::from_sat(value_sats))
-            })
-            .collect();
-        let tx = self
-            .app
-            .wallet
-            .create_transfer_many(&dests, Amount::from_sat(fee_sats))
-            .map_err(custom_err)?;
-        let txid = tx.txid();
-        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(txid)
-    }
-
-    async fn transfer_votecoin(
-        &self,
-        dest: Address,
-        amount: f64,
-        fee_sats: u64,
-    ) -> RpcResult<Txid> {
-        let tx = self
-            .app
-            .wallet
-            .transfer_reputation(dest, amount, Amount::from_sat(fee_sats))
-            .map_err(custom_err)?;
-        let txid = tx.txid();
-        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(txid)
-    }
-
-    async fn verify_signature(
-        &self,
-        signature: Signature,
-        verifying_key: VerifyingKey,
-        dst: Dst,
-        msg: String,
-    ) -> RpcResult<bool> {
-        let res = authorization::verify(
-            signature,
-            &verifying_key,
-            dst,
-            msg.as_bytes(),
-        );
-        Ok(res)
-    }
-
-    async fn create_withdrawal(
-        &self,
-        mainchain_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
-        amount_sats: u64,
-        fee_sats: u64,
-        mainchain_fee_sats: u64,
-    ) -> RpcResult<Transaction> {
-        let tx = self
-            .app
-            .wallet
-            .create_withdrawal(
-                mainchain_address,
-                Amount::from_sat(amount_sats),
-                Amount::from_sat(mainchain_fee_sats),
-                Amount::from_sat(fee_sats),
-            )
-            .map_err(custom_err)?;
-        Ok(tx)
-    }
-
-    async fn bitcoin_balance(&self) -> RpcResult<Balance> {
-        self.app.wallet.get_bitcoin_balance().map_err(custom_err)
-    }
-
-    async fn create_deposit(
-        &self,
-        address: Address,
-        value_sats: u64,
-        fee_sats: u64,
-    ) -> RpcResult<bitcoin::Txid> {
-        let tx = self
-            .app
-            .wallet
-            .create_transfer(
-                address,
-                bitcoin::Amount::from_sat(value_sats),
-                bitcoin::Amount::from_sat(fee_sats),
-            )
-            .map_err(custom_err)?;
-
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-
-        let bitcoin_txid = bitcoin::Txid::from_raw_hash(
-            bitcoin::hashes::Hash::from_byte_array(txid.0),
-        );
-        Ok(bitcoin_txid)
     }
 
     async fn decrypt_msg(
@@ -2319,29 +2339,94 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         ))
     }
 
-    async fn format_deposit_address(
-        &self,
-        address: Address,
-    ) -> RpcResult<String> {
-        Ok(format!("{address}"))
+    async fn get_new_encryption_key(&self) -> RpcResult<EncryptionPubKey> {
+        self.app.wallet.get_new_encryption_key().map_err(custom_err)
     }
 
-    async fn generate_mnemonic(&self) -> RpcResult<String> {
-        let mnemonic = bip39::Mnemonic::new(
-            bip39::MnemonicType::Words12,
-            bip39::Language::English,
-        );
-        Ok(mnemonic.to_string())
+    async fn get_new_verifying_key(&self) -> RpcResult<VerifyingKey> {
+        self.app.wallet.get_new_verifying_key().map_err(custom_err)
+    }
+
+    async fn my_unconfirmed_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
+        let addresses = self.app.wallet.get_addresses().map_err(custom_err)?;
+        let utxos = self
+            .app
+            .node
+            .get_unconfirmed_utxos_by_addresses(&addresses)
+            .map_err(custom_err)?
+            .into_iter()
+            .map(|(outpoint, output)| PointedOutput { outpoint, output })
+            .collect();
+        Ok(utxos)
     }
 
     async fn refresh_wallet(&self) -> RpcResult<()> {
         self.app.update().map_err(custom_err)
     }
 
+    async fn sign_arbitrary_msg(
+        &self,
+        verifying_key: VerifyingKey,
+        msg: String,
+    ) -> RpcResult<Signature> {
+        self.app
+            .wallet
+            .sign_arbitrary_msg(rand::rng(), &verifying_key, &msg)
+            .map_err(custom_err)
+    }
+
+    async fn sign_arbitrary_msg_as_addr(
+        &self,
+        address: Address,
+        msg: String,
+    ) -> RpcResult<Authorization> {
+        self.app
+            .wallet
+            .sign_arbitrary_msg_as_addr(rand::rng(), &address, &msg)
+            .map_err(custom_err)
+    }
+
+    async fn verify_signature(
+        &self,
+        signature: Signature,
+        verifying_key: VerifyingKey,
+        dst: Dst,
+        msg: String,
+    ) -> RpcResult<bool> {
+        let res = authorization::verify(
+            signature,
+            &verifying_key,
+            dst,
+            msg.as_bytes(),
+        );
+        Ok(res)
+    }
+
+    async fn get_voter_address(&self) -> RpcResult<Address> {
+        self.app.wallet.voter_address().map_err(custom_err)
+    }
+
+    async fn transfer_votecoin(
+        &self,
+        dest: Address,
+        amount: f64,
+        fee_sats: u64,
+    ) -> RpcResult<Txid> {
+        let tx = self
+            .app
+            .wallet
+            .transfer_reputation(dest, amount, Amount::from_sat(fee_sats))
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
     async fn decision_claim(
         &self,
-        request: truthcoin_dc_app_rpc_api::DecisionClaimRequest,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::DecisionClaimResponse> {
+        request: truthcoin_dc_app_rpc_api::markets::DecisionClaimRequest,
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::markets::DecisionClaimResponse>
+    {
         use truthcoin_dc::state::decisions::DecisionType;
 
         let decision_type = match request.decision_type.as_str() {
@@ -2446,7 +2531,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
 
         let txid = tx.txid();
         self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(truthcoin_dc_app_rpc_api::DecisionClaimResponse {
+        Ok(truthcoin_dc_app_rpc_api::markets::DecisionClaimResponse {
             txid,
             decision_ids: decision_ids_hex,
             listing_fee_paid_sats,
@@ -2455,11 +2540,12 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
 
     async fn market_create(
         &self,
-        request: truthcoin_dc_app_rpc_api::MarketCreateRequest,
-    ) -> RpcResult<truthcoin_dc_app_rpc_api::MarketCreateResponse> {
+        request: truthcoin_dc_app_rpc_api::markets::MarketCreateRequest,
+    ) -> RpcResult<truthcoin_dc_app_rpc_api::markets::MarketCreateResponse>
+    {
         use truthcoin_dc::state::decisions::{DecisionId, DecisionType};
         use truthcoin_dc::types::ClaimDecisionPayload;
-        use truthcoin_dc_app_rpc_api::{
+        use truthcoin_dc_app_rpc_api::markets::{
             ClaimedDecisionInfo, DimensionInput, MarketCreateResponse,
         };
 
@@ -2946,7 +3032,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
 
     async fn vote_submit(
         &self,
-        votes: Vec<truthcoin_dc_app_rpc_api::BallotItem>,
+        votes: Vec<truthcoin_dc_app_rpc_api::markets::BallotItem>,
         fee_sats: u64,
     ) -> RpcResult<String> {
         use truthcoin_dc::types::BallotItem;
@@ -3110,9 +3196,11 @@ impl MakeRequestId for RequestIdMaker {
         _: &http::Request<B>,
     ) -> Option<RequestId> {
         use uuid::Uuid;
+        // the 'simple' format renders the UUID with no dashes, which
+        // makes for easier copy/pasting.
         let id = Uuid::new_v4();
         let id = id.as_simple();
-        let id = format!("req_{id}");
+        let id = format!("req_{id}"); // prefix all IDs with "req_", to make them easier to identify
 
         let Ok(header_value) = http::HeaderValue::from_str(&id) else {
             return None;
@@ -3122,18 +3210,20 @@ impl MakeRequestId for RequestIdMaker {
     }
 }
 
-pub struct ServerAddresses {
-    _rpc_addr: SocketAddr,
-    _private_rpc_addr: SocketAddr,
+pub struct ServerAddesses {
+    pub _rpc_addr: SocketAddr,
+    pub _private_rpc_addr: SocketAddr,
 }
 
 pub async fn run_server(
     app: App,
-    private_rpc_url: url::Url,
-    rpc_url: url::Url,
-) -> anyhow::Result<ServerAddresses> {
+    private_rpc_addr: SocketAddr,
+    rpc_addr: SocketAddr,
+) -> anyhow::Result<ServerAddesses> {
     const REQUEST_ID_HEADER: &str = "x-request-id";
 
+    // Ordering here matters! Order here is from official docs on request IDs tracings
+    // https://docs.rs/tower-http/latest/tower_http/request_id/index.html#using-trace
     let tracer = || {
         tower::ServiceBuilder::new()
             .layer(SetRequestIdLayer::new(
@@ -3156,7 +3246,7 @@ pub async fn run_server(
                             "request",
                             method = %request.method(),
                             uri = %request.uri(),
-                            request_id,
+                            request_id , // this is needed for the record call below to work
                         )
                     })
                     .on_request(())
@@ -3173,6 +3263,7 @@ pub async fn run_server(
             )))
             .into_inner()
     };
+
     let http_middleware = || {
         tower::ServiceBuilder::new()
             .layer(tracer())
@@ -3183,17 +3274,18 @@ pub async fn run_server(
     let server = Server::builder()
         .set_http_middleware(http_middleware())
         .set_rpc_middleware(rpc_middleware())
-        .build(rpc_url.socket_addrs(|| None)?.as_slice())
+        .build(rpc_addr)
         .await?;
     let rpc_server_addr = server.local_addr()?;
 
-    let server_addrs = if private_rpc_url != rpc_url {
+    let (_task_handle, server_addrs) = if private_rpc_addr != rpc_addr {
         let private_rpc_server = Server::builder()
             .set_http_middleware(http_middleware())
             .set_rpc_middleware(rpc_middleware())
-            .build(private_rpc_url.socket_addrs(|| None)?.as_slice())
+            .build(private_rpc_addr)
             .await?;
         let private_rpc_server_addr = private_rpc_server.local_addr()?;
+
         let rpc_server_handle = {
             let rpc_server_impl = RpcServerImpl::<false> { app: app.clone() };
             let mut rpc_module =
@@ -3207,11 +3299,16 @@ pub async fn run_server(
                 .merge(rpc_api::node::RpcServer::into_rpc(rpc_server_impl))?;
             server.start(rpc_module)
         };
-        let private_rpc_server_handle = {
+        let private_only_rpc_server_handle = {
             let rpc_server_impl = RpcServerImpl::<true> { app };
             let mut rpc_module = rpc_api::open_api::RpcServer::into_rpc(
                 PrivateOnlyRpcServerImpl,
             );
+            rpc_module.merge(
+                rpc_api::node::get_block::untyped::RpcServer::into_rpc(
+                    rpc_server_impl.clone(),
+                ),
+            )?;
             rpc_module.merge(rpc_api::node::PrivateRpcServer::into_rpc(
                 rpc_server_impl.clone(),
             ))?;
@@ -3219,16 +3316,17 @@ pub async fn run_server(
                 .merge(rpc_api::wallet::RpcServer::into_rpc(rpc_server_impl))?;
             private_rpc_server.start(rpc_module)
         };
-        tokio::spawn(async {
-            tokio::select! {
-                () = rpc_server_handle.stopped() => (),
-                () = private_rpc_server_handle.stopped() => (),
-            }
-        });
-        ServerAddresses {
+        let server_addrs = ServerAddesses {
             _rpc_addr: rpc_server_addr,
             _private_rpc_addr: private_rpc_server_addr,
-        }
+        };
+        let task_handle = tokio::spawn(async {
+            tokio::select! {
+                () = rpc_server_handle.stopped() => (),
+                () = private_only_rpc_server_handle.stopped() => (),
+            }
+        });
+        (task_handle, server_addrs)
     } else {
         let rpc_server_impl = RpcServerImpl::<true> { app };
         let mut rpc_module =
@@ -3246,12 +3344,14 @@ pub async fn run_server(
         ))?;
         rpc_module
             .merge(rpc_api::wallet::RpcServer::into_rpc(rpc_server_impl))?;
-        let handle = server.start(rpc_module);
-        tokio::spawn(handle.stopped());
-        ServerAddresses {
+
+        let server_addrs = ServerAddesses {
             _rpc_addr: rpc_server_addr,
             _private_rpc_addr: rpc_server_addr,
-        }
+        };
+        let handle = server.start(rpc_module);
+        let task_handle = tokio::spawn(handle.stopped());
+        (task_handle, server_addrs)
     };
     Ok(server_addrs)
 }
@@ -3268,7 +3368,7 @@ mod tests {
         markets::DimensionSpec,
     };
     use truthcoin_dc::types::Address;
-    use truthcoin_dc_app_rpc_api::MarketDimensionKind;
+    use truthcoin_dc_app_rpc_api::markets::MarketDimensionKind;
 
     #[test]
     fn market_buy_limit_counts_the_miner_fee() -> anyhow::Result<()> {

@@ -1,9 +1,13 @@
+//! Schemas for OpenAPI
+
 use std::marker::PhantomData;
 
 use utoipa::{
     PartialSchema, ToSchema,
     openapi::{self, RefOr, Schema},
 };
+
+pub use truthcoin_dc_types::schema::*;
 
 pub struct BitcoinTxid;
 
@@ -29,6 +33,7 @@ impl PartialSchema for OpenApi {
     }
 }
 
+/// Optional `T`
 pub struct Optional<T>(PhantomData<T>);
 
 impl<T> PartialSchema for Optional<T>
