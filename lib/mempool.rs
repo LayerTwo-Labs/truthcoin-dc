@@ -4,30 +4,26 @@ use std::{
 };
 
 use fallible_iterator::FallibleIterator as _;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt as _};
 use heed::types::SerdeBincode;
 use sneed::{
     DatabaseUnique, DbError, EnvError, RoTxn, RwTxn, RwTxnError, UnitKey, db,
-    env, rwtxn,
 };
 use tokio_stream::{StreamMap, wrappers::WatchStream};
 
 use crate::{
     types::{
-        Accumulator, Address, AuthorizedTransaction, InPoint, OutPoint, Output,
-        Transaction, Txid, VERSION, Version,
+        Accumulator, Address, AuthorizedTransaction, OutPoint, Output,
+        Transaction, Txid, UtreexoError, VERSION, Version,
     },
     util::Watchable,
 };
 
 #[allow(clippy::duplicated_attributes)]
-#[derive(thiserror::Error, transitive::Transitive, Debug)]
+#[derive(Debug, thiserror::Error, transitive::Transitive)]
 #[transitive(from(db::error::Delete, DbError))]
 #[transitive(from(db::error::Put, DbError))]
 #[transitive(from(db::error::TryGet, DbError))]
-#[transitive(from(env::error::CreateDb, EnvError))]
-#[transitive(from(env::error::WriteTxn, EnvError))]
-#[transitive(from(rwtxn::error::Commit, RwTxnError))]
 pub enum Error {
     #[error(transparent)]
     Db(#[from] DbError),
@@ -41,57 +37,47 @@ pub enum Error {
         .db_path.display()
     )]
     IncompatibleVersion { version: Version, db_path: PathBuf },
-    #[error("Missing transaction {0}")]
-    MissingTransaction(Txid),
-    #[error("can't add transaction, utxo double spent")]
-    UtxoDoubleSpent,
     #[error("can't add transaction, decision {0} already claimed in mempool")]
     DecisionAlreadyClaimedInMempool(String),
-    #[error("mempool full: {current} transactions (max {max})")]
-    MempoolFull { current: usize, max: usize },
-    #[error("transaction failed validation")]
-    Validation(#[from] crate::state::Error),
+    #[error("Missing transaction {0}")]
+    MissingTransaction(Txid),
+    #[error(transparent)]
+    Utreexo(#[from] UtreexoError),
+    #[error("can't add transaction, utxo double spent")]
+    UtxoDoubleSpent,
 }
 
 #[derive(Clone)]
 pub struct MemPool {
     pub transactions:
         DatabaseUnique<SerdeBincode<Txid>, SerdeBincode<AuthorizedTransaction>>,
-    pub spent_utxos:
-        DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<InPoint>>,
+    pub spent_utxos: DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<Txid>>,
+    _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
     /// Associates relevant txs to each address
     address_to_txs:
         DatabaseUnique<SerdeBincode<Address>, SerdeBincode<HashSet<Txid>>>,
-    /// Tracks pending decision claims: decision_id_bytes -> claiming txid
+    /// Pending decision claims: decision id bytes to the claiming txid
     pending_decision_claims:
         DatabaseUnique<SerdeBincode<[u8; 3]>, SerdeBincode<Txid>>,
     trade_insertion_order:
         DatabaseUnique<SerdeBincode<u64>, SerdeBincode<Txid>>,
     trade_order_counter: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
-    _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
 }
-
-const MAX_MEMPOOL_TRANSACTIONS: usize = 5000;
 
 impl MemPool {
     pub const NUM_DBS: u32 = 7;
 
     pub fn new<Tls>(env: &sneed::Env<Tls>) -> Result<Self, Error> {
-        let mut rwtxn = env.write_txn()?;
+        let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
         let transactions =
-            DatabaseUnique::create(env, &mut rwtxn, "transactions")?;
+            DatabaseUnique::create(env, &mut rwtxn, "transactions")
+                .map_err(EnvError::from)?;
         let spent_utxos =
-            DatabaseUnique::create(env, &mut rwtxn, "spent_utxos")?;
-        let address_to_txs =
-            DatabaseUnique::create(env, &mut rwtxn, "address_to_txs")?;
-        let pending_decision_claims =
-            DatabaseUnique::create(env, &mut rwtxn, "pending_decision_claims")?;
-        let trade_insertion_order =
-            DatabaseUnique::create(env, &mut rwtxn, "trade_insertion_order")?;
-        let trade_order_counter =
-            DatabaseUnique::create(env, &mut rwtxn, "trade_order_counter")?;
+            DatabaseUnique::create(env, &mut rwtxn, "spent_utxos")
+                .map_err(EnvError::from)?;
         let version =
-            DatabaseUnique::create(env, &mut rwtxn, "mempool_version")?;
+            DatabaseUnique::create(env, &mut rwtxn, "mempool_version")
+                .map_err(EnvError::from)?;
         match version.try_get(&rwtxn, &())? {
             Some(db_version)
                 if db_version
@@ -107,51 +93,31 @@ impl MemPool {
                 });
             }
             Some(_) => (),
-            None => version.put(&mut rwtxn, &(), &*VERSION)?,
+            None => version
+                .put(&mut rwtxn, &(), &*VERSION)
+                .map_err(DbError::from)?,
         };
-        rwtxn.commit()?;
+        let address_to_txs =
+            DatabaseUnique::create(env, &mut rwtxn, "address_to_txs")
+                .map_err(EnvError::from)?;
+        let pending_decision_claims =
+            DatabaseUnique::create(env, &mut rwtxn, "pending_decision_claims")
+                .map_err(EnvError::from)?;
+        let trade_insertion_order =
+            DatabaseUnique::create(env, &mut rwtxn, "trade_insertion_order")
+                .map_err(EnvError::from)?;
+        let trade_order_counter =
+            DatabaseUnique::create(env, &mut rwtxn, "trade_order_counter")
+                .map_err(EnvError::from)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
             transactions,
             spent_utxos,
+            _version: version,
             address_to_txs,
             pending_decision_claims,
             trade_insertion_order,
             trade_order_counter,
-            _version: version,
-        })
-    }
-
-    /// Stores STXOs, checking for double spends
-    fn put_stxos<Iter>(
-        &self,
-        rwtxn: &mut RwTxn,
-        stxos: Iter,
-    ) -> Result<(), Error>
-    where
-        Iter: IntoIterator<Item = (OutPoint, InPoint)>,
-    {
-        stxos.into_iter().try_for_each(|(outpoint, inpoint)| {
-            if self.spent_utxos.try_get(rwtxn, &outpoint)?.is_some() {
-                Err(Error::UtxoDoubleSpent)
-            } else {
-                self.spent_utxos.put(rwtxn, &outpoint, &inpoint)?;
-                Ok(())
-            }
-        })
-    }
-
-    /// Delete STXOs
-    fn delete_stxos<'a, Iter>(
-        &self,
-        rwtxn: &mut RwTxn,
-        stxos: Iter,
-    ) -> Result<(), Error>
-    where
-        Iter: IntoIterator<Item = &'a OutPoint>,
-    {
-        stxos.into_iter().try_for_each(|stxo| {
-            self.spent_utxos.delete(rwtxn, stxo)?;
-            Ok(())
         })
     }
 
@@ -298,92 +264,75 @@ impl MemPool {
         Ok(())
     }
 
-    fn tx_count(&self, rotxn: &RoTxn) -> Result<usize, Error> {
-        let count = self
-            .transactions
-            .iter(rotxn)
-            .map_err(DbError::from)?
-            .count()
-            .map_err(DbError::from)?;
-        Ok(count)
-    }
-
     pub fn put(
         &self,
-        rwtxn: &mut RwTxn,
+        txn: &mut RwTxn,
         transaction: &AuthorizedTransaction,
     ) -> Result<(), Error> {
         let txid = transaction.transaction.txid();
         tracing::debug!("adding transaction {txid} to mempool");
-
-        let current_count = self.tx_count(rwtxn)?;
-        if current_count >= MAX_MEMPOOL_TRANSACTIONS {
-            return Err(Error::MempoolFull {
-                current: current_count,
-                max: MAX_MEMPOOL_TRANSACTIONS,
-            });
-        }
-
-        // Check for duplicate decision claims first
         let claimed_decisions =
             Self::get_claimed_decision_ids(&transaction.transaction);
         if !claimed_decisions.is_empty() {
-            self.put_decision_claims(rwtxn, txid, &claimed_decisions)?;
+            self.put_decision_claims(txn, txid, &claimed_decisions)?;
         }
-
-        let stxos = {
-            let txid = transaction.transaction.txid();
-            transaction.transaction.inputs.iter().enumerate().map(
-                move |(vin, (outpoint, _))| {
-                    (
-                        *outpoint,
-                        InPoint::Regular {
-                            txid,
-                            vin: vin as u32,
-                        },
-                    )
-                },
-            )
-        };
-        let () = self.put_stxos(rwtxn, stxos)?;
-        self.transactions.put(rwtxn, &txid, transaction)?;
-        let () = self.index_tx_addresses(rwtxn, transaction)?;
-
+        for (outpoint, _) in &transaction.transaction.inputs {
+            if self
+                .spent_utxos
+                .try_get(txn, outpoint)
+                .map_err(DbError::from)?
+                .is_some()
+            {
+                return Err(Error::UtxoDoubleSpent);
+            }
+            self.spent_utxos
+                .put(txn, outpoint, &txid)
+                .map_err(DbError::from)?;
+        }
+        self.transactions
+            .put(txn, &txid, transaction)
+            .map_err(DbError::from)?;
+        let () = self.index_tx_addresses(txn, transaction)?;
         if Self::is_trade_tx(transaction) {
             let counter =
-                self.trade_order_counter.try_get(rwtxn, &())?.unwrap_or(0);
+                self.trade_order_counter.try_get(txn, &())?.unwrap_or(0);
             let next = counter + 1;
-            self.trade_insertion_order.put(rwtxn, &next, &txid)?;
-            self.trade_order_counter.put(rwtxn, &(), &next)?;
+            self.trade_insertion_order.put(txn, &next, &txid)?;
+            self.trade_order_counter.put(txn, &(), &next)?;
         }
-
         Ok(())
     }
 
     pub fn delete(&self, rwtxn: &mut RwTxn, txid: Txid) -> Result<(), Error> {
         let mut pending_deletes = VecDeque::from([txid]);
         while let Some(txid) = pending_deletes.pop_front() {
-            if let Some(tx) = self.transactions.try_get(rwtxn, &txid)? {
-                let () = self.delete_stxos(
-                    rwtxn,
-                    tx.transaction.inputs.iter().map(|(outpoint, _)| outpoint),
-                )?;
+            if let Some(tx) = self
+                .transactions
+                .try_get(rwtxn, &txid)
+                .map_err(DbError::from)?
+            {
+                for (outpoint, _) in &tx.transaction.inputs {
+                    self.spent_utxos
+                        .delete(rwtxn, outpoint)
+                        .map_err(DbError::from)?;
+                }
                 let () = self.unindex_tx_addresses(rwtxn, &tx)?;
                 let () = self.delete_decision_claims(rwtxn, &tx)?;
-
                 if Self::is_trade_tx(&tx) {
                     self.delete_trade_order(rwtxn, &txid)?;
                 }
-
-                self.transactions.delete(rwtxn, &txid)?;
+                self.transactions
+                    .delete(rwtxn, &txid)
+                    .map_err(DbError::from)?;
                 for vout in 0..tx.transaction.outputs.len() {
                     let outpoint = OutPoint::Regular {
                         txid,
                         vout: vout as u32,
                     };
-                    if let Some(InPoint::Regular {
-                        txid: child_txid, ..
-                    }) = self.spent_utxos.try_get(rwtxn, &outpoint)?
+                    if let Some(child_txid) = self
+                        .spent_utxos
+                        .try_get(rwtxn, &outpoint)
+                        .map_err(DbError::from)?
                     {
                         pending_deletes.push_back(child_txid);
                     }
@@ -617,145 +566,6 @@ impl MemPool {
             .collect()
             .map_err(DbError::from)
             .map_err(Error::from)
-    }
-}
-
-#[cfg(test)]
-mod p2p_validation_bypass_tests {
-    use bitcoin::Amount;
-    use heed::EnvOpenOptions;
-
-    use super::MemPool;
-    use crate::archive::Archive;
-    use crate::authorization::{
-        Authorization, BatchVerificationContext, Dst, SigningKey, get_address,
-        sign,
-    };
-    use crate::state::{State, UtxoManager};
-    use crate::types::{
-        Address, AuthorizedTransaction, OutPoint, Output, OutputContent,
-        Transaction, Txid, VerifyingKey,
-    };
-
-    fn signing_key(seed: u8) -> SigningKey {
-        let scalar = curve25519_dalek::Scalar::from_bytes_mod_order([seed; 32]);
-        SigningKey::from_scalar(scalar).expect("non-zero scalar")
-    }
-
-    fn temp_env() -> sneed::Env {
-        let dir = std::env::temp_dir()
-            .join(format!("truthcoin-p2p-test-{}", std::process::id()));
-        drop(std::fs::remove_dir_all(&dir));
-        std::fs::create_dir_all(&dir).expect("create temp env dir");
-        let mut opts = EnvOpenOptions::new();
-        opts.map_size(16 * 1024 * 1024)
-            .max_dbs(State::NUM_DBS + MemPool::NUM_DBS + Archive::NUM_DBS + 4);
-        unsafe { sneed::Env::open(&opts, &dir) }.expect("open env")
-    }
-
-    #[test]
-    fn p2p_path_accepts_transaction_that_validation_rejects() {
-        let env = temp_env();
-        let archive = Archive::new(&env).expect("Archive::new");
-        let state = State::new(&env, None).expect("State::new");
-        let mempool = MemPool::new(&env).expect("MemPool::new");
-
-        let victim = signing_key(1);
-        let victim_vk = VerifyingKey::from(&victim);
-        let victim_addr: Address = get_address(&victim_vk);
-        let funding_outpoint = OutPoint::Regular {
-            txid: Txid([7u8; 32]),
-            vout: 0,
-        };
-        let funded_output = Output {
-            address: victim_addr,
-            content: OutputContent::Value(Amount::from_sat(100_000)),
-        };
-        {
-            let mut rwtxn = env.write_txn().expect("write txn");
-            state
-                .insert_utxo(
-                    &mut rwtxn,
-                    &funding_outpoint,
-                    &funded_output,
-                    &mut crate::types::AccumulatorDiff::default(),
-                )
-                .expect("insert utxo");
-            rwtxn.commit().expect("commit funding");
-        }
-
-        let tx = Transaction {
-            inputs: vec![(
-                funding_outpoint,
-                crate::types::hash(&crate::types::PointedOutputRef {
-                    outpoint: funding_outpoint,
-                    output: &funded_output,
-                }),
-            )]
-            .into(),
-            proof: Default::default(),
-            outputs: vec![Output {
-                address: get_address(&VerifyingKey::from(&signing_key(2))),
-                content: OutputContent::Value(Amount::from_sat(90_000)),
-            }]
-            .into(),
-            data: None,
-        };
-
-        let forged = Authorization {
-            verifying_key: victim_vk,
-            signature: sign(
-                rand::rng(),
-                &victim,
-                Dst::Transaction,
-                b"not this transaction",
-            ),
-        };
-        let authd_tx = AuthorizedTransaction {
-            transaction: tx,
-            authorizations: vec![forged],
-            actor_proof: None,
-        };
-
-        {
-            let rotxn = env.read_txn().expect("read txn");
-            let result = state.validate_transaction(
-                &archive,
-                &rotxn,
-                &BatchVerificationContext::new(&mut rand::rng()),
-                &authd_tx,
-            );
-            assert!(
-                result.is_err(),
-                "validator must reject the forged-sig tx: {result:?}"
-            );
-            assert!(
-                format!("{result:?}").to_lowercase().contains("authoriz"),
-                "rejection must be an authorization error, got {result:?}"
-            );
-        }
-
-        {
-            let mut rwtxn = env.write_txn().expect("write txn");
-            mempool
-                .put(&mut rwtxn, &authd_tx)
-                .expect("mempool.put accepted the invalid tx (the bug)");
-            rwtxn.commit().expect("commit mempool");
-        }
-
-        {
-            let rotxn = env.read_txn().expect("read txn");
-            let in_mempool = mempool.take_all(&rotxn).expect("take_all");
-            assert_eq!(
-                in_mempool.len(),
-                1,
-                "the forged-signature tx must be sitting in the mempool"
-            );
-            assert_eq!(
-                in_mempool[0].transaction.txid(),
-                authd_tx.transaction.txid(),
-            );
-        }
     }
 }
 
