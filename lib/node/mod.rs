@@ -75,6 +75,8 @@ pub enum Error {
     MainchainAncestors(#[source] mainchain_task::ResponseError),
     #[error("malformed body")]
     MalformedBody(#[from] crate::types::MalformedBodyError),
+    #[error("market price history error")]
+    MarketPriceHistory(#[from] state::markets::price_history::Error),
     #[error("mempool error")]
     MemPool(#[from] mempool::Error),
     #[error("net error")]
@@ -1427,6 +1429,22 @@ where
         } else {
             Ok(None)
         }
+    }
+
+    pub fn try_get_market_price_history(
+        &self,
+        market_id: &MarketId,
+    ) -> Result<
+        Option<Vec<state::markets::price_history::MarketPricePoint>>,
+        Error,
+    > {
+        let rotxn = self.env.read_txn()?;
+        Ok(state::markets::price_history::try_get_market_price_history(
+            &self.state,
+            &self.archive,
+            &rotxn,
+            market_id,
+        )?)
     }
 
     pub fn get_markets_batch(

@@ -534,6 +534,10 @@ pub enum Command {
     #[command(name = "market-get")]
     MarketGet { market_id: String },
 
+    /// Get the price history of a market
+    #[command(name = "market-price-history")]
+    MarketPriceHistory { market_id: String },
+
     /// Buy shares in a market
     #[command(name = "market-buy", alias = "buy")]
     MarketBuy {
@@ -1266,6 +1270,10 @@ where
         Command::MarketGet { market_id } => {
             let market = rpc_client.market_get(market_id).await?;
             json_response(&market)?
+        }
+        Command::MarketPriceHistory { market_id } => {
+            let points = rpc_client.market_price_history(market_id).await?;
+            json_response(&points)?
         }
         Command::MarketBuy {
             market_id,

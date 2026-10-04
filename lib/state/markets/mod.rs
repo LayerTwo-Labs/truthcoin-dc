@@ -1,6 +1,7 @@
 pub mod database;
 pub mod market;
 pub mod payouts;
+pub mod price_history;
 pub mod types;
 
 #[cfg(test)]
