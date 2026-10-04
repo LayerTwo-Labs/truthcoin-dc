@@ -3,10 +3,8 @@ use std::{
     path::Path,
 };
 
-use bitcoin::{
-    Amount,
-    bip32::{ChildNumber, DerivationPath, Xpriv},
-};
+use bip32ish::U31;
+use bitcoin::Amount;
 use fallible_iterator::FallibleIterator as _;
 use futures::{Stream, StreamExt};
 use heed::{
@@ -35,8 +33,10 @@ use crate::{
     types::{
         Address, AmountOverflowError, AmountUnderflowError,
         AuthorizedTransaction, EncryptionPubKey, GetValue, Hash, InPoint,
-        OutPoint, Output, OutputContent, PointedOutput, SpentOutput,
-        Transaction, TxData, VERSION, VerifyingKey, Version, hash, keys::Ecies,
+        OutPoint, OutPointKey, Output, OutputContent, PointedOutput,
+        SpentOutput, THIS_SIDECHAIN, Transaction, TxData, VERSION, VerifyingKey,
+        Version, hash,
+        keys::Ecies,
     },
     util::Watchable,
 };
@@ -63,11 +63,15 @@ fn new_tx(inputs: Vec<(OutPoint, Hash)>, outputs: Vec<Output>) -> Transaction {
     }
 }
 
-/// Reinterpret 32 bip32 secret bytes as a Ristretto255 signing key.
-fn signing_key_from_secret_bytes(bytes: [u8; 32]) -> SigningKey {
-    let scalar = curve25519_dalek::Scalar::from_bytes_mod_order(bytes);
-    SigningKey::from_scalar(scalar)
-        .expect("expected secret scalar to be non-zero")
+pub mod bip32;
+
+/// Purpose (third path component) of each kind of wallet key
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum KeyPurpose {
+    TxSigning = 0,
+    Encryption = 1,
+    MessageSigning = 2,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +148,8 @@ pub struct VkDoesNotExistError {
 
 #[allow(clippy::duplicated_attributes)]
 #[derive(transitive::Transitive, Debug, Error)]
+#[transitive(from(bip32::HardenedDeriveError, bip32::Error))]
+#[transitive(from(bip32::NonHardenedDeriveError, bip32::Error))]
 #[transitive(from(db::error::Delete, DbError))]
 #[transitive(from(db::error::IterInit, DbError))]
 #[transitive(from(db::error::IterItem, DbError))]
@@ -166,7 +172,7 @@ pub enum Error {
     #[error("authorization error")]
     Authorization(#[from] crate::authorization::Error),
     #[error("bip32 error")]
-    Bip32(#[from] bitcoin::bip32::Error),
+    Bip32(#[from] bip32::Error),
     #[error(transparent)]
     Db(#[from] DbError),
     #[error("Database env error")]
@@ -226,12 +232,11 @@ pub struct Wallet {
         DatabaseUnique<U32<BigEndian>, SerdeBincode<EncryptionPubKey>>,
     /// Map each signing key index to a verifying key
     index_to_vk: DatabaseUnique<U32<BigEndian>, SerdeBincode<VerifyingKey>>,
-    unconfirmed_utxos:
-        DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<Output>>,
-    utxos: DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<Output>>,
-    stxos: DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<SpentOutput>>,
+    unconfirmed_utxos: DatabaseUnique<OutPointKey, SerdeBincode<Output>>,
+    utxos: DatabaseUnique<OutPointKey, SerdeBincode<Output>>,
+    stxos: DatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>>,
     spent_unconfirmed_utxos:
-        DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<SpentOutput>>,
+        DatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>>,
     /// Map each verifying key to it's index
     vk_to_index: DatabaseUnique<SerdeBincode<VerifyingKey>, U32<BigEndian>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
@@ -314,10 +319,45 @@ impl Wallet {
         })
     }
 
-    fn get_master_xpriv(&self, rotxn: &RoTxn) -> Result<Xpriv, Error> {
-        let seed_bytes = self.seed.try_get(rotxn, &0)?.ok_or(Error::NoSeed)?;
-        let res = Xpriv::new_master(bitcoin::NetworkKind::Test, seed_bytes)?;
-        Ok(res)
+    /// Derive the xpriv at
+    /// m/43'/1899'/<purpose>'/<SIDECHAIN_NUMBER>'/0'/index
+    /// (m / bip43 purpose / eCash Token / purpose / sidechain number /
+    /// account / index)
+    fn get_xpriv(
+        &self,
+        rotxn: &RoTxn,
+        purpose: KeyPurpose,
+        index: u32,
+    ) -> Result<bip32::Xpriv, Error> {
+        let seed = self.seed.try_get(rotxn, &0)?.ok_or(Error::NoSeed)?;
+        let mut xpriv = bip32::new_master_xpriv(seed);
+        xpriv = xpriv.derive_hardened(U31::new(43).unwrap())?;
+        xpriv = xpriv.derive_hardened(U31::new(1899).unwrap())?;
+        xpriv = xpriv.derive_hardened(U31::new(purpose as u32).unwrap())?;
+        xpriv =
+            xpriv.derive_hardened(U31::new(THIS_SIDECHAIN as u32).unwrap())?;
+        xpriv = xpriv.derive_hardened(U31::new(0).unwrap())?;
+        match bip32ish::ChildIndex::from(index) {
+            bip32ish::ChildIndex::Hardened { index } => {
+                xpriv = xpriv.derive_hardened(index)?;
+            }
+            bip32ish::ChildIndex::NonHardened { index } => {
+                xpriv = xpriv.derive_non_hardened(index)?;
+            }
+        }
+        Ok(xpriv)
+    }
+
+    fn get_signing_key(
+        &self,
+        rotxn: &RoTxn,
+        purpose: KeyPurpose,
+        index: u32,
+    ) -> Result<SigningKey, Error> {
+        let xpriv = self.get_xpriv(rotxn, purpose, index)?;
+        let sk = SigningKey::from_scalar(xpriv.secret_scalar)
+            .expect("expected secret scalar to be non-zero");
+        Ok(sk)
     }
 
     fn get_encryption_secret(
@@ -325,13 +365,8 @@ impl Wallet {
         rotxn: &RoTxn,
         index: u32,
     ) -> Result<x25519_dalek::StaticSecret, Error> {
-        let master_xpriv = self.get_master_xpriv(rotxn)?;
-        let derivation_path = DerivationPath::master()
-            .child(ChildNumber::Hardened { index: 1 })
-            .child(ChildNumber::Normal { index });
-        let xpriv = master_xpriv
-            .derive_priv(&bitcoin::key::Secp256k1::new(), &derivation_path)?;
-        let secret = xpriv.private_key.secret_bytes().into();
+        let xpriv = self.get_xpriv(rotxn, KeyPurpose::Encryption, index)?;
+        let secret = xpriv.secret_scalar.to_bytes().into();
         Ok(secret)
     }
 
@@ -357,15 +392,7 @@ impl Wallet {
         rotxn: &RoTxn,
         index: u32,
     ) -> Result<SigningKey, Error> {
-        let master_xpriv = self.get_master_xpriv(rotxn)?;
-        let derivation_path = DerivationPath::master()
-            .child(ChildNumber::Hardened { index: 0 })
-            .child(ChildNumber::Normal { index });
-        let xpriv = master_xpriv
-            .derive_priv(&bitcoin::key::Secp256k1::new(), &derivation_path)?;
-        let signing_key =
-            signing_key_from_secret_bytes(xpriv.private_key.secret_bytes());
-        Ok(signing_key)
+        self.get_signing_key(rotxn, KeyPurpose::TxSigning, index)
     }
 
     /// Get the tx signing key that corresponds to the provided address
@@ -389,15 +416,7 @@ impl Wallet {
         rotxn: &RoTxn,
         index: u32,
     ) -> Result<SigningKey, Error> {
-        let master_xpriv = self.get_master_xpriv(rotxn)?;
-        let derivation_path = DerivationPath::master()
-            .child(ChildNumber::Hardened { index: 2 })
-            .child(ChildNumber::Normal { index });
-        let xpriv = master_xpriv
-            .derive_priv(&bitcoin::key::Secp256k1::new(), &derivation_path)?;
-        let signing_key =
-            signing_key_from_secret_bytes(xpriv.private_key.secret_bytes());
-        Ok(signing_key)
+        self.get_signing_key(rotxn, KeyPurpose::MessageSigning, index)
     }
 
     /// Get the tx signing key that corresponds to the provided verifying key
@@ -713,7 +732,7 @@ impl Wallet {
             if output.content.is_value()
                 && output.get_value() > bitcoin::Amount::ZERO
             {
-                bitcoin_utxos.push((outpoint, output));
+                bitcoin_utxos.push((OutPoint::from(outpoint), output));
             }
         }
 
@@ -1039,32 +1058,29 @@ impl Wallet {
     ) -> Result<(), Error> {
         let mut rwtxn = self.env.write_txn()?;
         for (outpoint, inpoint) in spent {
-            if let Some(output) = self
-                .utxos
-                .try_get(&rwtxn, outpoint)
-                .map_err(DbError::from)?
+            let key = OutPointKey::from(outpoint);
+            if let Some(output) =
+                self.utxos.try_get(&rwtxn, &key).map_err(DbError::from)?
             {
-                self.utxos
-                    .delete(&mut rwtxn, outpoint)
-                    .map_err(DbError::from)?;
+                self.utxos.delete(&mut rwtxn, &key).map_err(DbError::from)?;
                 let spent_output = SpentOutput {
                     output,
                     inpoint: *inpoint,
                 };
                 self.stxos
-                    .put(&mut rwtxn, outpoint, &spent_output)
+                    .put(&mut rwtxn, &key, &spent_output)
                     .map_err(DbError::from)?;
             } else if let Some(output) =
-                self.unconfirmed_utxos.try_get(&rwtxn, outpoint)?
+                self.unconfirmed_utxos.try_get(&rwtxn, &key)?
             {
-                self.unconfirmed_utxos.delete(&mut rwtxn, outpoint)?;
+                self.unconfirmed_utxos.delete(&mut rwtxn, &key)?;
                 let spent_output = SpentOutput {
                     output,
                     inpoint: *inpoint,
                 };
                 self.spent_unconfirmed_utxos.put(
                     &mut rwtxn,
-                    outpoint,
+                    &key,
                     &spent_output,
                 )?;
             } else {
@@ -1081,7 +1097,8 @@ impl Wallet {
     ) -> Result<(), Error> {
         let mut txn = self.env.write_txn()?;
         for (outpoint, output) in utxos {
-            self.unconfirmed_utxos.put(&mut txn, outpoint, output)?;
+            let key = OutPointKey::from(outpoint);
+            self.unconfirmed_utxos.put(&mut txn, &key, output)?;
         }
         txn.commit()?;
         Ok(())
@@ -1093,8 +1110,9 @@ impl Wallet {
     ) -> Result<(), Error> {
         let mut rwtxn = self.env.write_txn()?;
         for (outpoint, output) in utxos {
+            let key = OutPointKey::from(outpoint);
             self.utxos
-                .put(&mut rwtxn, outpoint, output)
+                .put(&mut rwtxn, &key, output)
                 .map_err(DbError::from)?;
         }
         rwtxn.commit()?;
@@ -1128,13 +1146,13 @@ impl Wallet {
 
     pub fn get_utxos(&self) -> Result<HashMap<OutPoint, Output>, Error> {
         let rotxn = self.env.read_txn()?;
-        let utxos: HashMap<_, _> = self
+        let utxos: HashMap<OutPoint, Output> = self
             .utxos
             .iter(&rotxn)
             .map_err(DbError::from)?
+            .map(|(key, output)| Ok((key.into(), output)))
             .collect()
             .map_err(DbError::from)?;
-
         Ok(utxos)
     }
 
@@ -1142,13 +1160,21 @@ impl Wallet {
         &self,
     ) -> Result<HashMap<OutPoint, Output>, Error> {
         let rotxn = self.env.read_txn()?;
-        let utxos = self.unconfirmed_utxos.iter(&rotxn)?.collect()?;
+        let utxos = self
+            .unconfirmed_utxos
+            .iter(&rotxn)?
+            .map(|(key, output)| Ok((key.into(), output)))
+            .collect()?;
         Ok(utxos)
     }
 
     pub fn get_stxos(&self) -> Result<HashMap<OutPoint, SpentOutput>, Error> {
         let rotxn = self.env.read_txn()?;
-        let stxos = self.stxos.iter(&rotxn)?.collect()?;
+        let stxos = self
+            .stxos
+            .iter(&rotxn)?
+            .map(|(key, stxo)| Ok((key.into(), stxo)))
+            .collect()?;
         Ok(stxos)
     }
 
@@ -1179,14 +1205,15 @@ impl Wallet {
         let mut input_addresses = std::collections::HashSet::new();
 
         for (input, _) in &transaction.inputs {
+            let key = OutPointKey::from(input);
             let spent_utxo: Output = if let Some(utxo) =
-                self.utxos.try_get(&rotxn, input).map_err(DbError::from)?
+                self.utxos.try_get(&rotxn, &key).map_err(DbError::from)?
             {
                 utxo
             } else {
                 if let Some(_unconfirmed_utxo) = self
                     .unconfirmed_utxos
-                    .try_get(&rotxn, input)
+                    .try_get(&rotxn, &key)
                     .map_err(DbError::from)?
                 {
                     tracing::error!(
@@ -1424,7 +1451,7 @@ impl Wallet {
                 && output.content.is_value()
                 && output.get_value() > bitcoin::Amount::ZERO
             {
-                bitcoin_utxos.push((outpoint, output));
+                bitcoin_utxos.push((OutPoint::from(outpoint), output));
             }
         }
 
