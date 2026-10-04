@@ -1,10 +1,4 @@
-[package]
-name = "truthcoin_dc_types"
-authors.workspace = true
-edition.workspace = true
-license.workspace = true
-publish.workspace = true
-version.workspace = true
+[build-dependencies]
 
 [dependencies]
 bech32 = { workspace = true }
@@ -13,41 +7,50 @@ blake3 = { workspace = true }
 borsh = { workspace = true, features = ["derive"] }
 clap = { workspace = true, features = ["derive"], optional = true }
 const-hex = { workspace = true, features = ["serde"] }
+curve25519-dalek = { workspace = true, features = ["serde"] }
 frost-core = { workspace = true, features = ["internals"] }
 frost-ristretto255 = { workspace = true, features = ["serde"] }
-hashlink = { workspace = true }
+hashlink = { workspace = true, features = ["serde_impl"] }
 heed = { workspace = true, optional = true }
 libes = { workspace = true }
 merkle-cbt = { workspace = true }
-nonempty = { workspace = true, features = ["serialize"] }
+nonempty = { workspace = true }
 rand = { workspace = true, features = ["chacha"] }
 rayon = { workspace = true }
 rustreexo = { workspace = true, features = ["with-serde"] }
 semver = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_with = { workspace = true, features = ["alloc", "macros"] }
+serde_with = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
-strum = { workspace = true, features = ["derive"] }
+strum = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-url = { workspace = true }
+url = { workspace = true, features = ["serde"] }
 utoipa = { workspace = true, features = ["macros", "non_strict_integers"] }
 x25519-dalek = { workspace = true, features = ["serde", "static_secrets"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }
-curve25519-dalek = { workspace = true, features = ["group", "serde"] }
 rand = { workspace = true, features = ["thread_rng"] }
 
 [features]
 clap = ["dep:clap"]
+default = []
 heed = ["dep:heed"]
-
-[lints]
-workspace = true
 
 [lib]
 name = "truthcoin_dc_types"
 path = "lib.rs"
+
+[lints]
+workspace = true
+
+[package]
+name = "truthcoin_dc_types"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true

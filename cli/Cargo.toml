@@ -13,18 +13,20 @@ clap = { workspace = true, features = ["derive"] }
 const-hex = { workspace = true }
 http = { workspace = true }
 jsonrpsee = { workspace = true, features = ["http-client"] }
-regex = { workspace = true }
 serde = { workspace = true }
-truthcoin_dc = { path = "../lib", features = ["clap"] }
-truthcoin_dc_app_rpc_api = { path = "../rpc-api" }
 serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
+truthcoin_dc_app_rpc_api = { path = "../rpc-api" }
+truthcoin_dc_types = { path = "../types", features = ["clap"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+
+[lints]
+workspace = true
 
 [lib]
 name = "truthcoin_dc_app_cli_lib"

@@ -13,35 +13,33 @@ bincode = { workspace = true }
 bitcoin = { workspace = true, features = ["serde"] }
 blake3 = { workspace = true }
 borsh = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+const-hex = { workspace = true }
 dirs = { workspace = true }
-eframe = { workspace = true }
 either = { workspace = true }
 fallible-iterator = { workspace = true }
-fraction = { workspace = true, features = ["with-serde-support"] }
 futures = { workspace = true }
-const-hex = { workspace = true }
 http = { workspace = true }
 human-size = { workspace = true }
-itertools = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server"] }
+libes = { workspace = true }
 mimalloc = { workspace = true, features = ["v3"] }
 parking_lot = { workspace = true }
+poll-promise = { workspace = true, features = ["tokio"] }
 rand = { workspace = true, features = ["thread_rng"] }
+rustreexo = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+shlex = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
 truthcoin_dc = { path = "../lib", features = ["clap"] }
 truthcoin_dc_app_cli = { path = "../cli" }
 truthcoin_dc_app_rpc_api = { path = "../rpc-api" }
-poll-promise = { workspace = true, features = ["tokio"] }
-serde = { workspace = true, features = ["derive"] }
-shlex = { workspace = true }
-strum = {  workspace = true, features = ["derive"] }
-thiserror = { workspace = true }
 tiny-bip39 = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
+# needs to line up with jsonrpsee tower version...
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "request-id", "trace"] }
 tracing = { workspace = true }
@@ -49,17 +47,17 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 url = { workspace = true }
 utoipa = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true }
 
-[dependencies.libes]
+[dependencies.eframe]
 workspace = true
+
+[dependencies.tokio]
+workspace = true
+features = ["macros", "rt-multi-thread", "signal"]
 
 [dev-dependencies]
 reserve-port = { workspace = true }
-
-[features]
-default = ["zmq"]
-zmq = ["truthcoin_dc/zmq"]
 
 [lints]
 workspace = true
