@@ -1,5 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 
+/// Exported for convenience
+pub use typewit;
+
 use std::net::SocketAddr;
 
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};

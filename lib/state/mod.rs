@@ -1,11 +1,10 @@
 //! Sidechain state as of the current sidechain tip
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
 use fallible_iterator::FallibleIterator;
 use heed::types::SerdeBincode;
-use serde::{Deserialize, Serialize};
 use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
 
 use crate::{
@@ -16,7 +15,7 @@ use crate::{
         GetAddress as _, GetBitcoinValue as _, Header, InPoint, M6id,
         MerkleRoot, OutPoint, OutPointKey, SpentOutput, Transaction, VERSION,
         Version, WithdrawalBundle, WithdrawalBundleStatus,
-        proto::mainchain::TwoWayPegData,
+        proto::mainchain::TwoWayPegData, state::WithdrawalBundleInfo,
     },
     util::Watchable,
     validation::DecisionValidationInterface,
@@ -66,15 +65,6 @@ pub struct PrevalidatedBlock {
     pub computed_merkle_root: MerkleRoot,
     pub coinbase_value: bitcoin::Amount,
     pub next_height: u32,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-enum WithdrawalBundleInfo {
-    Known(WithdrawalBundle),
-    Unknown,
-    UnknownConfirmed {
-        spend_utxos: BTreeMap<OutPoint, FilledOutput>,
-    },
 }
 
 type WithdrawalBundlesDb = DatabaseUnique<
@@ -649,6 +639,20 @@ impl State {
             authorizations,
             actor_proof: transaction.actor_proof,
         })
+    }
+
+    pub fn try_get_withdrawal_bundle(
+        &self,
+        rotxn: &RoTxn,
+        m6id: &M6id,
+    ) -> Result<Option<(WithdrawalBundleInfo, WithdrawalBundleStatus)>, Error>
+    {
+        let Some((bundle_info, bundle_status)) =
+            self.withdrawal_bundles.try_get(rotxn, m6id)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((bundle_info, bundle_status.latest().value)))
     }
 
     pub fn get_pending_withdrawal_bundle(

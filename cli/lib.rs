@@ -13,13 +13,14 @@ use truthcoin_dc::{
     authorization::{Dst, Signature},
     math::trading,
     types::{
-        Address, AuthorizedTransaction, BlockHash, EncryptionPubKey,
+        Address, AuthorizedTransaction, BlockHash, EncryptionPubKey, M6id,
         THIS_SIDECHAIN, Transaction, Txid, VerifyingKey,
     },
     wallet::TransferDests,
 };
 use truthcoin_dc_app_rpc_api::{
-    node::{PrivateRpcClient as _, RpcClient as _},
+    node::{PrivateRpcClient as _, RpcClient as _, get_block::RpcClient as _},
+    typewit::const_marker::Bool,
     wallet::RpcClient as _,
 };
 use url::{Host, Url};
@@ -262,7 +263,10 @@ pub enum Command {
 
     /// Get block data
     #[command(name = "get-block")]
-    GetBlock { block_hash: BlockHash },
+    GetBlock {
+        block_hash: BlockHash,
+        verbose: Option<bool>,
+    },
 
     /// Get the block hash at the specified height, if it exists
     #[command(name = "get-block-hash")]
@@ -309,6 +313,10 @@ pub enum Command {
         #[arg(required = true)]
         addresses: Vec<Address>,
     },
+
+    /// Get withdrawal bundle by M6id
+    #[command(name = "get-withdrawal-bundle")]
+    GetWithdrawalBundle { m6id: M6id },
 
     /// Get pending withdrawal bundle
     #[command(name = "pending-withdrawal-bundle")]
@@ -890,10 +898,21 @@ where
             let blockcount = rpc_client.getblockcount().await?;
             format!("{blockcount}")
         }
-        Command::GetBlock { block_hash } => {
-            let block = rpc_client.get_block(block_hash).await?;
-            json_response(&block)?
-        }
+        Command::GetBlock {
+            block_hash,
+            verbose,
+        } => match verbose {
+            Some(true) => {
+                let block =
+                    rpc_client.get_block(block_hash, Bool::<true>).await?;
+                json_response(&block)?
+            }
+            Some(false) | None => {
+                let block =
+                    rpc_client.get_block(block_hash, Bool::<false>).await?;
+                json_response(&block)?
+            }
+        },
         Command::GetBlockHash { height } => {
             let block_hash = rpc_client.get_block_hash(height).await?;
             json_response(&block_hash)?
@@ -936,6 +955,11 @@ where
             let addresses = addresses.into_iter().collect();
             let utxos = rpc_client.get_utxos(addresses).await?;
             json_response(&utxos)?
+        }
+        Command::GetWithdrawalBundle { m6id } => {
+            let withdrawal_bundle =
+                rpc_client.get_withdrawal_bundle(m6id).await?;
+            json_response(&withdrawal_bundle)?
         }
         Command::PendingWithdrawalBundle => {
             let withdrawal_bundle =

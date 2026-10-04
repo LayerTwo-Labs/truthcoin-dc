@@ -6,7 +6,6 @@ use sneed::{RoTxn, RwTxn};
 use crate::{
     state::{
         Error, State, UtxoManager, WITHDRAWAL_BUNDLE_FAILURE_GAP,
-        WithdrawalBundleInfo,
         rollback::{HeightStamped, RollBack},
     },
     types::{
@@ -16,6 +15,7 @@ use crate::{
         WithdrawalBundleEventStatus, WithdrawalBundleStatus,
         WithdrawalOutputContent,
         proto::mainchain::{BlockEvent, TwoWayPegData},
+        state::WithdrawalBundleInfo,
     },
 };
 

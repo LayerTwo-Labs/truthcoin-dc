@@ -319,6 +319,14 @@ impl std::fmt::Display for M6id {
     }
 }
 
+impl FromStr for M6id {
+    type Err = <bitcoin::Txid as FromStr>::Err;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let inner = bitcoin::Txid::from_str(s)?;
+        Ok(Self(inner))
+    }
+}
+
 impl utoipa::PartialSchema for M6id {
     fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
         let obj =

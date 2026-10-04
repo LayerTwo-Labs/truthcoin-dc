@@ -26,11 +26,13 @@ use crate::{
     types::{
         Address, AmountOverflowError, AmountUnderflowError, Authorized,
         AuthorizedTransaction, Block, BlockHash, BlockIndexEvents, BmmResult,
-        Body, FilledOutput, FilledTransaction, Header, InPoint,
+        Body, FilledOutput, FilledTransaction, Header, InPoint, M6id,
         MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
         SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
+        WithdrawalBundleStatus,
         net::SeedAddress,
         proto::{self, mainchain},
+        state::WithdrawalBundleInfo,
     },
     util::Watchable,
 };
@@ -838,6 +840,14 @@ where
         Ok(bmm_inclusions)
     }
 
+    pub fn try_get_block(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<Block>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.archive.try_get_block(&rotxn, block_hash)?)
+    }
+
     pub fn get_block(&self, block_hash: BlockHash) -> Result<Block, Error> {
         let rotxn = self.env.read_txn()?;
         Ok(self.archive.get_block(&rotxn, block_hash)?)
@@ -1039,6 +1049,16 @@ where
         } else {
             Ok(None)
         }
+    }
+
+    pub fn try_get_withdrawal_bundle(
+        &self,
+        m6id: &M6id,
+    ) -> Result<Option<(WithdrawalBundleInfo, WithdrawalBundleStatus)>, Error>
+    {
+        let rotxn = self.env.read_txn()?;
+        let res = self.state.try_get_withdrawal_bundle(&rotxn, m6id)?;
+        Ok(res)
     }
 
     pub fn get_pending_withdrawal_bundle(

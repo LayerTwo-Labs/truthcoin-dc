@@ -28,8 +28,8 @@ use truthcoin_dc::{
     state::period_to_name,
     types::{
         Address, Authorization, AuthorizedTransaction, Block, BlockHash,
-        BlockIndex, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx,
-        EncryptionPubKey, FilledOutputContent, MainchainSyncProgress,
+        BlockIndex, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body,
+        EncryptionPubKey, FilledOutputContent, M6id, MainchainSyncProgress,
         PointedOutput, Transaction, Txid, VerifyingKey, WithdrawalBundle,
     },
     validation::DecisionValidator,
@@ -43,6 +43,7 @@ use truthcoin_dc_app_rpc_api::{
     MarketSellRequest, MarketSellResponse, MarketStatus, MempoolTx,
     ParticipationStats, PeriodStats, PointedSpentOutput, SubmitBallotRequest,
     TxInfo, VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
+    typewit::const_marker::Bool,
 };
 
 use crate::app::App;
@@ -716,6 +717,68 @@ impl rpc_api::node::PrivateRpcServer for RpcServerImpl<true> {
 }
 
 #[async_trait]
+impl<const ENABLE_PRIVATE_API: bool>
+    rpc_api::node::get_block::RpcServer<Bool<false>>
+    for RpcServerImpl<ENABLE_PRIVATE_API>
+{
+    async fn get_block(
+        &self,
+        block_hash: BlockHash,
+        _verbose: Bool<false>,
+    ) -> RpcResult<Option<Block>> {
+        self.node().try_get_block(block_hash).map_err(custom_err)
+    }
+}
+
+#[async_trait]
+impl<const ENABLE_PRIVATE_API: bool>
+    rpc_api::node::get_block::RpcServer<Bool<true>>
+    for RpcServerImpl<ENABLE_PRIVATE_API>
+{
+    async fn get_block(
+        &self,
+        block_hash: BlockHash,
+        _verbose: Bool<true>,
+    ) -> RpcResult<Option<rpc_api::node::get_block::BlockVerbose>> {
+        let Some(Block {
+            header,
+            body:
+                Body {
+                    coinbase,
+                    transactions,
+                    authorizations,
+                    actor_proofs,
+                },
+            height,
+        }) = self.node().try_get_block(block_hash).map_err(custom_err)?
+        else {
+            return Ok(None);
+        };
+        let transactions = transactions
+            .into_iter()
+            .map(|tx| {
+                Ok(rpc_api::node::TransactionVerbose {
+                    canonical_bytes: tx.canonical_bytes()?,
+                    tx,
+                })
+            })
+            .collect::<std::io::Result<_>>()
+            .map_err(custom_err)?;
+        let body = rpc_api::node::get_block::BodyVerbose {
+            coinbase,
+            transactions,
+            authorizations,
+            actor_proofs,
+        };
+        Ok(Some(rpc_api::node::get_block::BlockVerbose {
+            header,
+            body,
+            height,
+        }))
+    }
+}
+
+#[async_trait]
 impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
     for RpcServerImpl<ENABLE_PRIVATE_API>
 {
@@ -1053,11 +1116,6 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         self.node().try_get_tip().map_err(custom_err)
     }
 
-    async fn get_block(&self, block_hash: BlockHash) -> RpcResult<Block> {
-        let block = self.node().get_block(block_hash).map_err(custom_err)?;
-        Ok(block)
-    }
-
     async fn get_block_hash(
         &self,
         height: u32,
@@ -1197,6 +1255,23 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
     async fn getblockcount(&self) -> RpcResult<u32> {
         let height = self.node().try_get_tip_height().map_err(custom_err)?;
         Ok(height.map_or(0, |h| h + 1))
+    }
+
+    async fn get_withdrawal_bundle(
+        &self,
+        m6id: M6id,
+    ) -> RpcResult<Option<rpc_api::node::GetWithdrawalBundleResponse>> {
+        let Some((info, status)) = self
+            .node()
+            .try_get_withdrawal_bundle(&m6id)
+            .map_err(custom_err)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(rpc_api::node::GetWithdrawalBundleResponse {
+            info,
+            status,
+        }))
     }
 
     async fn latest_failed_withdrawal_bundle_height(
@@ -3149,6 +3224,11 @@ pub async fn run_server(
             let rpc_server_impl = RpcServerImpl::<false> { app: app.clone() };
             let mut rpc_module =
                 rpc_api::open_api::RpcServer::into_rpc(rpc_server_impl.clone());
+            rpc_module.merge(
+                rpc_api::node::get_block::untyped::RpcServer::into_rpc(
+                    rpc_server_impl.clone(),
+                ),
+            )?;
             rpc_module
                 .merge(rpc_api::node::RpcServer::into_rpc(rpc_server_impl))?;
             server.start(rpc_module)
@@ -3182,6 +3262,11 @@ pub async fn run_server(
         rpc_module.merge(rpc_api::node::PrivateRpcServer::into_rpc(
             rpc_server_impl.clone(),
         ))?;
+        rpc_module.merge(
+            rpc_api::node::get_block::untyped::RpcServer::into_rpc(
+                rpc_server_impl.clone(),
+            ),
+        )?;
         rpc_module.merge(rpc_api::node::RpcServer::into_rpc(
             rpc_server_impl.clone(),
         ))?;

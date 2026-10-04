@@ -309,6 +309,10 @@ fn check_schemas_inner() -> anyhow::Result<()> {
     use utoipa::OpenApi as _;
     let docs = [
         ("node::PrivateRpcDoc", crate::node::PrivateRpcDoc::openapi()),
+        (
+            "node::get_block::RpcDoc",
+            crate::node::get_block::RpcDoc::openapi(),
+        ),
         ("node::RpcDoc", crate::node::RpcDoc::openapi()),
         ("wallet::RpcDoc", crate::wallet::RpcDoc::openapi()),
     ];

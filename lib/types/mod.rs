@@ -19,6 +19,7 @@ pub mod keys;
 pub mod net;
 pub mod proto;
 pub mod schema;
+pub mod state;
 mod transaction;
 pub mod tx_pow;
 
@@ -183,7 +184,9 @@ pub enum WithdrawalBundleEventStatus {
     Submitted,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema,
+)]
 pub enum WithdrawalBundleStatus {
     Confirmed,
     Dropped,
