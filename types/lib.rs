@@ -8,13 +8,18 @@ use bitcoin::amount::CheckedSum as _;
 use borsh::BorshSerialize;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
-use thiserror::Error;
 use utoipa::ToSchema;
 
 mod address;
 pub mod authorization;
 pub mod decision;
 pub mod error;
+pub use error::{
+    AmountOverflow as AmountOverflowError,
+    AmountUnderflow as AmountUnderflowError,
+    Bech32mDecode as Bech32mDecodeError, MalformedBody as MalformedBodyError,
+    WithdrawalBundle as WithdrawalBundleError,
+};
 pub mod hashes;
 pub mod keys;
 pub mod market;
@@ -40,18 +45,6 @@ pub use transaction::{
 };
 
 pub const THIS_SIDECHAIN: u8 = 13;
-
-#[derive(Debug, Error)]
-#[error("Bitcoin amount overflow")]
-pub struct AmountOverflowError;
-
-#[derive(Debug, Error)]
-#[error("Bitcoin amount underflow")]
-pub struct AmountUnderflowError;
-
-#[derive(Debug, Error)]
-#[error("body has fewer authorizations than transaction inputs")]
-pub struct MalformedBodyError;
 
 /// (de)serialize as Display/FromStr for human-readable forms like json,
 /// and default serialization for non human-readable forms like bincode
@@ -127,20 +120,6 @@ pub trait GetAddress {
 pub trait GetBitcoinValue {
     /// Bitcoin value in sats
     fn get_bitcoin_value(&self) -> bitcoin::Amount;
-}
-
-#[derive(Debug, Error)]
-pub enum Bech32mDecodeError {
-    #[error(transparent)]
-    Bech32m(#[from] bech32::DecodeError),
-    #[error(
-        "Wrong Bech32 HRP. Perhaps this key is being used somewhere it shouldn't be."
-    )]
-    WrongHrp,
-    #[error("Wrong decoded byte length. Must decode to 32 bytes of data.")]
-    WrongSize,
-    #[error("Wrong Bech32 variant. Only Bech32m is accepted.")]
-    WrongVariant,
 }
 
 fn borsh_serialize_bitcoin_block_hash<W>(
@@ -269,16 +248,6 @@ pub static OP_DRIVECHAIN_SCRIPT: LazyLock<bitcoin::ScriptBuf> =
         script.push_opcode(bitcoin::opcodes::OP_TRUE);
         script
     });
-
-#[derive(Debug, Error)]
-enum WithdrawalBundleErrorInner {
-    #[error("bundle too heavy: weight `{weight}` > max weight `{max_weight}`")]
-    BundleTooHeavy { weight: u64, max_weight: u64 },
-}
-
-#[derive(Debug, Error)]
-#[error("Withdrawal bundle error")]
-pub struct WithdrawalBundleError(#[from] WithdrawalBundleErrorInner);
 
 #[serde_as]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -466,7 +435,7 @@ impl WithdrawalBundle {
         };
         if tx.weight().to_wu() > bitcoin::policy::MAX_STANDARD_TX_WEIGHT as u64
         {
-            Err(WithdrawalBundleErrorInner::BundleTooHeavy {
+            Err(error::withdrawal_bundle::Inner::BundleTooHeavy {
                 weight: tx.weight().to_wu(),
                 max_weight: bitcoin::policy::MAX_STANDARD_TX_WEIGHT as u64,
             })?;
