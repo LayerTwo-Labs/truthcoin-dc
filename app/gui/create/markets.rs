@@ -6,7 +6,7 @@ use truthcoin_dc::state::markets::DEFAULT_TRADING_FEE;
 use truthcoin_dc::state::voting::types::VotingPeriodId;
 use truthcoin_dc::types::ClaimDecisionPayload;
 use truthcoin_dc::wallet::CreateMarketInput;
-use truthcoin_dc_app_rpc_api::PeriodPricingSummary;
+use truthcoin_dc_app_rpc_api::markets::PeriodPricingSummary;
 
 use crate::app::App;
 use crate::rpc_server::{SlotRequest, allocate_decision_slots};

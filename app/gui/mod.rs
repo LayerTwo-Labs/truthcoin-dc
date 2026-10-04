@@ -254,8 +254,7 @@ impl EguiApp {
         app: Option<App>,
         cc: &eframe::CreationContext<'_>,
         logs_capture: LineBuffer,
-        rpc_host: url::Host,
-        rpc_port: u16,
+        rpc_addr: url::Url,
         network: Network,
     ) -> Self {
         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
@@ -282,7 +281,7 @@ impl EguiApp {
         let activity = Activity::new(app.as_ref());
         let bottom_panel = BottomPanel::new(app.clone());
         let coins = Coins::new(app.as_ref());
-        let console_logs = ConsoleLogs::new(logs_capture, rpc_host, rpc_port);
+        let console_logs = ConsoleLogs::new(logs_capture, rpc_addr);
         let create = Create::default();
         let markets = Markets::new(app.as_ref());
         let parent_chain = ParentChain::new(app.as_ref());

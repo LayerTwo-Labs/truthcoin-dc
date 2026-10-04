@@ -29,22 +29,16 @@ pub struct ConsoleCommand {
 pub struct ConsoleLogs {
     line_buffer: LineBuffer,
     command_input: String,
-    rpc_host: url::Host,
-    rpc_port: u16,
+    rpc_addr: url::Url,
     running_command: Arc<AtomicBool>,
 }
 
 impl ConsoleLogs {
-    pub fn new(
-        line_buffer: LineBuffer,
-        rpc_host: url::Host,
-        rpc_port: u16,
-    ) -> Self {
+    pub fn new(line_buffer: LineBuffer, rpc_addr: url::Url) -> Self {
         Self {
             line_buffer,
             command_input: String::new(),
-            rpc_host,
-            rpc_port,
+            rpc_addr,
             running_command: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -73,13 +67,12 @@ impl ConsoleLogs {
                 return;
             }
         };
-        let cli = truthcoin_dc_app_cli_lib::Cli::new(
+        let cli = truthcoin_dc_app_cli_lib::Cli {
+            rpc_url: self.rpc_addr.clone(),
+            timeout: None,
             command,
-            Some(self.rpc_host.clone()),
-            Some(self.rpc_port),
-            None,
-            None,
-        );
+            verbose: false,
+        };
         app.runtime.spawn({
             let running_command = self.running_command.clone();
             running_command.store(true, atomic::Ordering::SeqCst);

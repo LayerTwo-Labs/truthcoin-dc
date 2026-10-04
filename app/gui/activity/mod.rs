@@ -34,7 +34,7 @@ impl Activity {
     pub fn new(app: Option<&App>) -> Self {
         let height = app
             .as_ref()
-            .and_then(|app| app.node.try_get_tip_height().ok().flatten())
+            .and_then(|app| app.node.try_get_height().ok().flatten())
             .unwrap_or(0);
         Self {
             block_explorer: BlockExplorer::new(height),

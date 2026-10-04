@@ -57,8 +57,9 @@ impl Default for Ballot {
 impl Ballot {
     fn ensure_subscribed(&mut self, app: &App) {
         if self.node_updated.is_none() {
-            let stream: Pin<Box<dyn Stream<Item = ()> + Send>> =
-                Box::pin(app.node.watch_state());
+            let stream: Pin<Box<dyn Stream<Item = ()> + Send>> = Box::pin(
+                truthcoin_dc::util::Watchable::watch(app.node.state()),
+            );
             self.node_updated =
                 Some(PromiseStream::new(stream, app.runtime.handle().clone()));
         }

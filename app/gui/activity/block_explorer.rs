@@ -16,7 +16,7 @@ impl BlockExplorer {
 
     pub fn show(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
         let max_height = app
-            .and_then(|app| app.node.try_get_tip_height().ok().flatten())
+            .and_then(|app| app.node.try_get_height().ok().flatten())
             .unwrap_or(0);
         let block: Option<(Header, Body)> = {
             if let Some(app) = app
