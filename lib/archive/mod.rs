@@ -7,11 +7,11 @@ use bitcoin::{self, hashes::Hash as _};
 use fallible_iterator::{FallibleIterator, IteratorExt};
 use heed::types::SerdeBincode;
 use sneed::{
-    DatabaseUnique, RoTxn, RwTxn, UnitKey, db::error::Error as DbError,
+    DatabaseUnique, DbError, EnvError, RoTxn, RwTxn, RwTxnError, UnitKey,
 };
 
 use crate::types::{
-    Accumulator, Block, BlockHash, BmmResult, Body, Header, Tip, Txid, VERSION,
+    Accumulator, BlockHash, BmmResult, Body, Header, Tip, Txid, VERSION,
     Version,
     proto::mainchain::{self, BlockHeaderInfo},
 };
@@ -57,10 +57,13 @@ pub struct Archive {
         SerdeBincode<bitcoin::BlockHash>,
         SerdeBincode<Vec<bitcoin::BlockHash>>,
     >,
-    /// Sidechain headers. All ancestors of any header should always be present.
-    /// A known invalid block is not present here. It is in `invalid_blocks`.
+    /// Sidechain headers.
+    /// All ancestors of any header should always be present.
+    /// Blocks that are known to be invalid should not be present, and should
+    /// exist in `invalid_blocks`.
     headers: DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<Header>>,
-    /// Invalidated blocks. They are not in `headers` or `bodies`.
+    /// Blocks that have been invalidated.
+    /// Should not exist in `headers` or `bodies`.
     invalid_blocks: DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<()>>,
     main_block_hash_to_height:
         DatabaseUnique<SerdeBincode<bitcoin::BlockHash>, SerdeBincode<u32>>,
@@ -110,10 +113,11 @@ impl Archive {
     pub const NUM_DBS: u32 = SideTips::NUM_DBS + 16;
 
     pub fn new<Tls>(env: &sneed::Env<Tls>) -> Result<Self, Error> {
-        let mut rwtxn = env.write_txn()?;
+        let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
         let version =
-            DatabaseUnique::create(env, &mut rwtxn, "archive_version")?;
-        match version.try_get(&rwtxn, &())? {
+            DatabaseUnique::create(env, &mut rwtxn, "archive_version")
+                .map_err(EnvError::from)?;
+        match version.try_get(&rwtxn, &()).map_err(DbError::from)? {
             Some(db_version)
                 if db_version
                     < Version {
@@ -128,33 +132,47 @@ impl Archive {
                 });
             }
             Some(_) => (),
-            None => version.put(&mut rwtxn, &(), &*VERSION)?,
+            None => version
+                .put(&mut rwtxn, &(), &*VERSION)
+                .map_err(DbError::from)?,
         }
         let accumulators =
-            DatabaseUnique::create(env, &mut rwtxn, "accumulators")?;
+            DatabaseUnique::create(env, &mut rwtxn, "accumulators")
+                .map_err(EnvError::from)?;
         let block_hash_to_height =
-            DatabaseUnique::create(env, &mut rwtxn, "hash_to_height")?;
+            DatabaseUnique::create(env, &mut rwtxn, "hash_to_height")
+                .map_err(EnvError::from)?;
         let bmm_results =
-            DatabaseUnique::create(env, &mut rwtxn, "bmm_results")?;
-        let bodies = DatabaseUnique::create(env, &mut rwtxn, "bodies")?;
+            DatabaseUnique::create(env, &mut rwtxn, "bmm_results")
+                .map_err(EnvError::from)?;
+        let bodies = DatabaseUnique::create(env, &mut rwtxn, "bodies")
+            .map_err(EnvError::from)?;
         let exponential_ancestors =
-            DatabaseUnique::create(env, &mut rwtxn, "exponential_ancestors")?;
+            DatabaseUnique::create(env, &mut rwtxn, "exponential_ancestors")
+                .map_err(EnvError::from)?;
         let exponential_main_ancestors = DatabaseUnique::create(
             env,
             &mut rwtxn,
             "exponential_main_ancestors",
-        )?;
-        let headers = DatabaseUnique::create(env, &mut rwtxn, "headers")?;
+        )
+        .map_err(EnvError::from)?;
+        let headers = DatabaseUnique::create(env, &mut rwtxn, "headers")
+            .map_err(EnvError::from)?;
         let invalid_blocks =
-            DatabaseUnique::create(env, &mut rwtxn, "invalid_blocks")?;
+            DatabaseUnique::create(env, &mut rwtxn, "invalid_blocks")
+                .map_err(EnvError::from)?;
         let main_block_hash_to_height =
-            DatabaseUnique::create(env, &mut rwtxn, "main_hash_to_height")?;
+            DatabaseUnique::create(env, &mut rwtxn, "main_hash_to_height")
+                .map_err(EnvError::from)?;
         let main_block_infos =
-            DatabaseUnique::create(env, &mut rwtxn, "main_block_infos")?;
+            DatabaseUnique::create(env, &mut rwtxn, "main_block_infos")
+                .map_err(EnvError::from)?;
         let main_header_infos =
-            DatabaseUnique::create(env, &mut rwtxn, "main_header_infos")?;
+            DatabaseUnique::create(env, &mut rwtxn, "main_header_infos")
+                .map_err(EnvError::from)?;
         let main_successors =
-            DatabaseUnique::create(env, &mut rwtxn, "main_successors")?;
+            DatabaseUnique::create(env, &mut rwtxn, "main_successors")
+                .map_err(EnvError::from)?;
         if main_successors
             .try_get(&rwtxn, &bitcoin::BlockHash::all_zeros())
             .map_err(DbError::from)?
@@ -170,7 +188,8 @@ impl Archive {
         }
         let side_tips = SideTips::create(env, &mut rwtxn)
             .map_err(side_tips::Error::from)?;
-        let successors = DatabaseUnique::create(env, &mut rwtxn, "successors")?;
+        let successors = DatabaseUnique::create(env, &mut rwtxn, "successors")
+            .map_err(EnvError::from)?;
         if successors
             .try_get(&rwtxn, &None)
             .map_err(DbError::from)?
@@ -180,10 +199,11 @@ impl Archive {
                 .put(&mut rwtxn, &None, &HashSet::new())
                 .map_err(DbError::from)?;
         }
-        let total_work = DatabaseUnique::create(env, &mut rwtxn, "total_work")?;
+        let total_work = DatabaseUnique::create(env, &mut rwtxn, "total_work")
+            .map_err(EnvError::from)?;
         let txid_to_inclusions =
             DatabaseUnique::create(env, &mut rwtxn, "txid_to_inclusions")?;
-        rwtxn.commit()?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
             accumulators,
             block_hash_to_height,
@@ -193,8 +213,8 @@ impl Archive {
             exponential_main_ancestors,
             headers,
             invalid_blocks,
-            main_block_hash_to_height,
             main_block_infos,
+            main_block_hash_to_height,
             main_header_infos,
             main_successors,
             side_tips,
@@ -214,7 +234,10 @@ impl Archive {
         rotxn: &RoTxn,
         block_hash: BlockHash,
     ) -> Result<Option<Accumulator>, Error> {
-        let accumulator = self.accumulators.try_get(rotxn, &block_hash)?;
+        let accumulator = self
+            .accumulators
+            .try_get(rotxn, &block_hash)
+            .map_err(DbError::from)?;
         Ok(accumulator)
     }
 
@@ -227,8 +250,6 @@ impl Archive {
             .ok_or(Error::NoAccumulator(block_hash))
     }
 
-    /** Get the height of a block from it's hash.
-     *  Returns [`None`] if no block with the specified hash exists. */
     pub fn try_get_height(
         &self,
         rotxn: &RoTxn,
@@ -239,8 +260,6 @@ impl Archive {
             .map_err(|err| DbError::from(err).into())
     }
 
-    /** Get the height of a block from it's hash.
-     *  Returns an error if no block with the specified hash exists. */
     pub fn get_height(
         &self,
         rotxn: &RoTxn,
@@ -313,22 +332,15 @@ impl Archive {
             .ok_or(Error::NoBody(block_hash))
     }
 
-    /// Returns `true` if the block is invalidated.
-    pub fn invalidated_block(
-        &self,
-        rotxn: &RoTxn,
-        block_hash: &BlockHash,
-    ) -> Result<bool, Error> {
-        let res = self.invalid_blocks.contains_key(rotxn, block_hash)?;
-        Ok(res)
-    }
-
     pub fn try_get_header(
         &self,
         rotxn: &RoTxn,
         block_hash: BlockHash,
     ) -> Result<Option<Header>, Error> {
-        let header = self.headers.try_get(rotxn, &block_hash)?;
+        let header = self
+            .headers
+            .try_get(rotxn, &block_hash)
+            .map_err(DbError::from)?;
         Ok(header)
     }
 
@@ -341,31 +353,14 @@ impl Archive {
             .ok_or(Error::NoHeader(block_hash))
     }
 
-    pub fn try_get_block(
+    /// Check if a block has been invalidated.
+    pub fn invalidated_block(
         &self,
         rotxn: &RoTxn,
-        block_hash: BlockHash,
-    ) -> Result<Option<Block>, Error> {
-        let Some(body) = self.try_get_body(rotxn, block_hash)? else {
-            return Ok(None);
-        };
-        let header = self.get_header(rotxn, block_hash)?;
-        let height = self.get_height(rotxn, block_hash)?;
-        let block = Block {
-            header,
-            body,
-            height,
-        };
-        Ok(Some(block))
-    }
-
-    pub fn get_block(
-        &self,
-        rotxn: &RoTxn,
-        block_hash: BlockHash,
-    ) -> Result<Block, Error> {
-        self.try_get_block(rotxn, block_hash)?
-            .ok_or(Error::NoBlock(block_hash))
+        block_hash: &BlockHash,
+    ) -> Result<bool, Error> {
+        let res = self.invalid_blocks.contains_key(rotxn, block_hash)?;
+        Ok(res)
     }
 
     pub fn try_get_main_block_info(
@@ -427,6 +422,87 @@ impl Archive {
     ) -> Result<mainchain::BlockHeaderInfo, Error> {
         self.try_get_main_header_info(rotxn, block_hash)?
             .ok_or_else(|| Error::NoMainHeaderInfo(*block_hash))
+    }
+
+    pub fn try_get_main_successors(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: bitcoin::BlockHash,
+    ) -> Result<Option<HashSet<bitcoin::BlockHash>>, Error> {
+        let successors = self
+            .main_successors
+            .try_get(rotxn, &block_hash)
+            .map_err(DbError::from)?;
+        Ok(successors)
+    }
+
+    pub fn get_main_successors(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: bitcoin::BlockHash,
+    ) -> Result<HashSet<bitcoin::BlockHash>, Error> {
+        self.try_get_main_successors(rotxn, block_hash)?
+            .ok_or(Error::NoMainBlockHash(block_hash))
+    }
+
+    /// If block_hash is None, get genesis blocks
+    pub fn try_get_successors(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: Option<BlockHash>,
+    ) -> Result<Option<HashSet<BlockHash>>, Error> {
+        let successors = self
+            .successors
+            .try_get(rotxn, &block_hash)
+            .map_err(DbError::from)?;
+        Ok(successors)
+    }
+
+    /// If block_hash is None, get genesis blocks
+    pub fn get_successors(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: Option<BlockHash>,
+    ) -> Result<HashSet<BlockHash>, Error> {
+        self.try_get_successors(rotxn, block_hash)?.ok_or_else(|| {
+            Error::NoBlockHash(
+                block_hash.expect("Successors to None should always be known"),
+            )
+        })
+    }
+
+    pub fn try_get_total_work(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: bitcoin::BlockHash,
+    ) -> Result<Option<bitcoin::Work>, Error> {
+        let total_work = self
+            .total_work
+            .try_get(rotxn, &block_hash)
+            .map_err(DbError::from)?;
+        Ok(total_work)
+    }
+
+    pub fn get_total_work(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: bitcoin::BlockHash,
+    ) -> Result<bitcoin::Work, Error> {
+        self.try_get_total_work(rotxn, block_hash)?
+            .ok_or(Error::NoMainHeaderInfo(block_hash))
+    }
+
+    /// Get blocks in which a tx was included, and tx index within each block
+    pub fn get_tx_inclusions(
+        &self,
+        rotxn: &RoTxn,
+        txid: Txid,
+    ) -> Result<BTreeMap<BlockHash, u32>, Error> {
+        let inclusions = self
+            .txid_to_inclusions
+            .try_get(rotxn, &txid)?
+            .unwrap_or_default();
+        Ok(inclusions)
     }
 
     /// Try to get the best valid mainchain verification for the specified block.
@@ -599,85 +675,16 @@ impl Archive {
         Ok(res)
     }
 
-    pub fn try_get_main_successors(
-        &self,
-        rotxn: &RoTxn,
-        block_hash: bitcoin::BlockHash,
-    ) -> Result<Option<HashSet<bitcoin::BlockHash>>, Error> {
-        let successors = self.main_successors.try_get(rotxn, &block_hash)?;
-        Ok(successors)
-    }
-
-    pub fn get_main_successors(
-        &self,
-        rotxn: &RoTxn,
-        block_hash: bitcoin::BlockHash,
-    ) -> Result<HashSet<bitcoin::BlockHash>, Error> {
-        self.try_get_main_successors(rotxn, block_hash)?
-            .ok_or(Error::NoMainBlockHash(block_hash))
-    }
-
-    /// If block_hash is None, get genesis blocks
-    pub fn try_get_successors(
-        &self,
-        rotxn: &RoTxn,
-        block_hash: Option<BlockHash>,
-    ) -> Result<Option<HashSet<BlockHash>>, Error> {
-        let successors = self.successors.try_get(rotxn, &block_hash)?;
-        Ok(successors)
-    }
-
-    /// If block_hash is None, get genesis blocks
-    pub fn get_successors(
-        &self,
-        rotxn: &RoTxn,
-        block_hash: Option<BlockHash>,
-    ) -> Result<HashSet<BlockHash>, Error> {
-        self.try_get_successors(rotxn, block_hash)?.ok_or_else(|| {
-            Error::NoBlockHash(
-                block_hash.expect("Successors to None should always be known"),
-            )
-        })
-    }
-
-    pub fn try_get_total_work(
-        &self,
-        rotxn: &RoTxn,
-        block_hash: bitcoin::BlockHash,
-    ) -> Result<Option<bitcoin::Work>, Error> {
-        let total_work = self.total_work.try_get(rotxn, &block_hash)?;
-        Ok(total_work)
-    }
-
-    pub fn get_total_work(
-        &self,
-        rotxn: &RoTxn,
-        block_hash: bitcoin::BlockHash,
-    ) -> Result<bitcoin::Work, Error> {
-        self.try_get_total_work(rotxn, block_hash)?
-            .ok_or(Error::NoMainHeaderInfo(block_hash))
-    }
-
-    /// Get blocks in which a tx was included, and tx index within each block
-    pub fn get_tx_inclusions(
-        &self,
-        rotxn: &RoTxn,
-        txid: Txid,
-    ) -> Result<BTreeMap<BlockHash, u32>, Error> {
-        let inclusions = self
-            .txid_to_inclusions
-            .try_get(rotxn, &txid)?
-            .unwrap_or_default();
-        Ok(inclusions)
-    }
-
+    /// Store a block body. The header must already exist.
     pub fn put_accumulator(
         &self,
         rwtxn: &mut RwTxn,
         block_hash: BlockHash,
         accumulator: &Accumulator,
     ) -> Result<(), Error> {
-        self.accumulators.put(rwtxn, &block_hash, accumulator)?;
+        self.accumulators
+            .put(rwtxn, &block_hash, accumulator)
+            .map_err(DbError::from)?;
         Ok(())
     }
 
@@ -689,7 +696,9 @@ impl Archive {
         body: &Body,
     ) -> Result<(), Error> {
         let header = self.get_header(rwtxn, block_hash)?;
-        self.bodies.put(rwtxn, &block_hash, body)?;
+        self.bodies
+            .put(rwtxn, &block_hash, body)
+            .map_err(DbError::from)?;
         body.transactions
             .iter()
             .enumerate()
@@ -810,8 +819,10 @@ impl Archive {
         Ok(())
     }
 
-    /// Invalidate a block and its descendants. Delete each header and body,
-    /// and mark each block invalid. The BMM results stay the same.
+    /// Invalidate a block.
+    /// This will delete the header and body, and mark invalid, the specified
+    /// block and any descendants.
+    /// BMM results are not updated.
     pub fn invalidate_block(
         &self,
         rwtxn: &mut RwTxn,
@@ -870,8 +881,8 @@ impl Archive {
     /// The following predicates MUST be met before calling this function:
     /// * Ancestor headers MUST be stored
     /// * BMM commitments MUST be stored for mainchain header where
-    ///   `main_header.prev_blockhash == header.prev_main_hash`
-    /// * The block MUST NOT be in `invalid_blocks`
+    ///   `main_header.prev_blockhash == header.prev_main_hash`.
+    /// * The block MUST not have been invalidated.
     pub fn put_header(
         &self,
         rwtxn: &mut RwTxn,
@@ -915,22 +926,15 @@ impl Archive {
         if height >= 2 {
             let grandparent = self.get_nth_ancestor(
                 rwtxn,
-                header
-                    .prev_side_hash
-                    .expect("header at height >= 2 must have prev_side_hash"),
+                header.prev_side_hash.unwrap(),
                 1,
             )?;
             exponential_ancestors.push(grandparent);
             let mut next_exponential_ancestor_depth = 4u64;
             while height as u64 >= next_exponential_ancestor_depth {
-                let last =
-                    *exponential_ancestors.last().ok_or(Error::NoAncestor {
-                        block_hash,
-                        depth: next_exponential_ancestor_depth as u32,
-                    })?;
                 let next_exponential_ancestor = self.get_nth_ancestor(
                     rwtxn,
-                    last,
+                    *exponential_ancestors.last().unwrap(),
                     next_exponential_ancestor_depth as u32 / 2,
                 )?;
                 exponential_ancestors.push(next_exponential_ancestor);
@@ -1020,9 +1024,14 @@ impl Archive {
     ) -> Result<(), Error> {
         let main_header_info = self.get_main_header_info(rwtxn, &main_hash)?;
         if main_header_info.prev_block_hash != bitcoin::BlockHash::all_zeros() {
-            self.get_main_block_info(rwtxn, &main_header_info.prev_block_hash)?;
+            let _parent_info = self.get_main_block_info(
+                rwtxn,
+                &main_header_info.prev_block_hash,
+            )?;
         }
-        self.main_block_infos.put(rwtxn, &main_hash, block_info)?;
+        self.main_block_infos
+            .put(rwtxn, &main_hash, block_info)
+            .map_err(DbError::from)?;
         let Some(commitment) = block_info.bmm_commitment else {
             return Ok(());
         };
@@ -1059,7 +1068,9 @@ impl Archive {
         };
         let mut bmm_results = self.get_bmm_results(rwtxn, commitment)?;
         bmm_results.insert(main_hash, bmm_result);
-        self.bmm_results.put(rwtxn, &commitment, &bmm_results)?;
+        self.bmm_results
+            .put(rwtxn, &commitment, &bmm_results)
+            .map_err(DbError::from)?;
         Ok(())
     }
 
@@ -1130,15 +1141,9 @@ impl Archive {
             exponential_ancestors.push(grandparent);
             let mut next_exponential_ancestor_depth = 4u64;
             while height as u64 >= next_exponential_ancestor_depth {
-                let last = *exponential_ancestors.last().ok_or(
-                    Error::NoMainAncestor {
-                        block_hash: header_info.block_hash,
-                        depth: next_exponential_ancestor_depth as u32,
-                    },
-                )?;
                 let next_exponential_ancestor = self.get_nth_main_ancestor(
                     rwtxn,
-                    last,
+                    *exponential_ancestors.last().unwrap(),
                     next_exponential_ancestor_depth as u32 / 2,
                 )?;
                 exponential_ancestors.push(next_exponential_ancestor);
@@ -1670,10 +1675,14 @@ pub(crate) mod test {
 
     pub(crate) fn temp_env(
         test_name: &str,
-    ) -> anyhow::Result<(tempfile::TempDir, sneed::Env)> {
-        let temp_dir = tempfile::Builder::new()
-            .prefix(&format!("truthcoin-{test_name}-"))
-            .tempdir()?;
+    ) -> anyhow::Result<(temp_dir::TempDir, sneed::Env)> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let temp_dir = temp_dir::TempDir::with_prefix(format!(
+            "thunder-{test_name}-{}-{nanos}",
+            std::process::id()
+        ))?;
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(64 * 1024 * 1024).max_dbs(Archive::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, temp_dir.path()) }?;
@@ -1681,22 +1690,21 @@ pub(crate) mod test {
     }
 
     pub(crate) fn main_header_info(height: u32) -> BlockHeaderInfo {
-        let block_hash = {
+        let block_hash = |height: u32| {
             let mut bytes = [0u8; 32];
             bytes[0] = 0xff;
             bytes[1..5].copy_from_slice(&height.to_le_bytes());
             bitcoin::BlockHash::from_byte_array(bytes)
         };
-        let prev_block_hash = if height == 0 {
-            bitcoin::BlockHash::all_zeros()
-        } else {
-            main_header_info(height - 1).block_hash
+        let prev_block_hash = match height.checked_sub(1) {
+            Some(prev_height) => block_hash(prev_height),
+            None => bitcoin::BlockHash::all_zeros(),
         };
         BlockHeaderInfo {
-            block_hash,
+            block_hash: block_hash(height),
             prev_block_hash,
             height,
-            work: bitcoin::Work::from_le_bytes([1; 32]),
+            work: bitcoin::Target::MAX.to_work(),
             timestamp: 0,
         }
     }

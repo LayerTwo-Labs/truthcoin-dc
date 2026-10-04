@@ -1,51 +1,52 @@
 use std::path::PathBuf;
 
-use sneed::{
-    EnvError, RwTxnError,
-    db::{self, error::Error as DbError},
-    env, rwtxn,
-};
+use sneed::{db::error as db, env::error as env, rwtxn::error as rwtxn};
+use thiserror::Error;
+use transitive::Transitive;
 
 use crate::{
     archive::side_tips::error as side_tips,
-    types::{BlockHash, Txid, Version},
+    types::{BlockHash, Version},
 };
 
 #[allow(clippy::duplicated_attributes)]
-#[derive(thiserror::Error, transitive::Transitive, Debug)]
-#[transitive(from(db::error::Delete, DbError))]
-#[transitive(from(db::error::Get, DbError))]
-#[transitive(from(db::error::Last, DbError))]
-#[transitive(from(db::error::Put, DbError))]
-#[transitive(from(db::error::TryGet, DbError))]
-#[transitive(from(env::error::CreateDb, EnvError))]
-#[transitive(from(env::error::WriteTxn, EnvError))]
-#[transitive(from(rwtxn::error::Commit, RwTxnError))]
-#[transitive(from(side_tips::DisconnectMainchainTip, side_tips::Error))]
-#[transitive(from(side_tips::DisconnectSidechainTip, side_tips::Error))]
+#[derive(Debug, Error, Transitive)]
+#[transitive(
+    from(db::Delete, db::Error),
+    from(db::Get, db::Error),
+    from(db::Last, db::Error),
+    from(db::Put, db::Error),
+    from(db::TryGet, db::Error),
+    from(env::CreateDb, env::Error),
+    from(side_tips::DisconnectMainchainTip, side_tips::Error),
+    from(side_tips::DisconnectSidechainTip, side_tips::Error)
+)]
 pub enum Error {
     #[error(transparent)]
-    Db(#[from] DbError),
+    Db(#[from] db::Error),
     #[error("Database env error")]
-    DbEnv(#[from] EnvError),
+    DbEnv(#[from] env::Error),
     #[error("Database write error")]
-    DbWrite(#[from] RwTxnError),
+    DbWrite(#[from] rwtxn::Error),
     #[error(
         "Incompatible DB version ({}). Please clear the DB (`{}`) and re-sync",
         .version,
         .db_path.display()
     )]
     IncompatibleVersion { version: Version, db_path: PathBuf },
-    #[error("invalid previous side hash")]
-    InvalidPrevSideHash,
     #[error("invalid merkle root")]
     InvalidMerkleRoot,
+    #[error("invalid previous side hash")]
+    InvalidPrevSideHash,
     #[error("no accumulator for block {0}")]
     NoAccumulator(BlockHash),
     #[error("no ancestor with depth {depth} for block {block_hash}")]
     NoAncestor { block_hash: BlockHash, depth: u32 },
-    #[error("no block with hash {0}")]
-    NoBlock(BlockHash),
+    #[error("no mainchain ancestor with depth {depth} for block {block_hash}")]
+    NoMainAncestor {
+        block_hash: bitcoin::BlockHash,
+        depth: u32,
+    },
     #[error("unknown block hash: {0}")]
     NoBlockHash(BlockHash),
     #[error("no BMM result with block {0}")]
@@ -58,11 +59,6 @@ pub enum Error {
     NoHeader(BlockHash),
     #[error("no height info for block hash {0}")]
     NoHeight(BlockHash),
-    #[error("no mainchain ancestor with depth {depth} for block {block_hash}")]
-    NoMainAncestor {
-        block_hash: bitcoin::BlockHash,
-        depth: u32,
-    },
     #[error("unknown mainchain block hash: {0}")]
     NoMainBlockHash(bitcoin::BlockHash),
     #[error("no mainchain block info for block hash {0}")]
@@ -71,8 +67,6 @@ pub enum Error {
     NoMainHeaderInfo(bitcoin::BlockHash),
     #[error("no height info for mainchain block hash {0}")]
     NoMainHeight(bitcoin::BlockHash),
-    #[error("no tx with txid {0}")]
-    NoTx(Txid),
     #[error(transparent)]
     SideTips(#[from] side_tips::Error),
 }
