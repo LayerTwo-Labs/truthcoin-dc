@@ -40,11 +40,23 @@ jobs:
           toolchain: nightly
           components: rustfmt, clippy
 
-      - name: Rust Cache
+      - name: Restore Rust cache
+        id: restore-rust-cache
         uses: Swatinem/rust-cache@v2.9.1
         with:
-          cache-bin: false
-          shared-key: x86_64-unknown-linux-gnu
+          cache-all-crates: "true"
+          prefix-key: "v0-rust-nightly"
+          save-if: "false"
+          shared-key: debug-x86_64-unknown-linux-gnu
+
+      - name: Save Rust cache
+        if: steps.restore-rust-cache.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          cache-all-crates: "true"
+          lookup-only: "true"
+          prefix-key: "v0-rust-nightly"
+          shared-key: debug-x86_64-unknown-linux-gnu
 
       - name: Rustfmt
         run: cargo fmt --all -- --check
@@ -107,21 +119,21 @@ jobs:
           mv electrs-latest-x86_64-unknown-linux-gnu electrs
           chmod +x electrs
           popd
+      - uses: actions/checkout@v6
+        with:
+          submodules: "recursive"
       - name: Install latest nightly toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-          target: x86_64-pc-windows-gnu
-      - uses: actions/checkout@v6
-        with:
-          submodules: "recursive"
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2.9.1
         with:
-          cache-bin: false
-          shared-key: x86_64-unknown-linux-gnu
+          cache-all-crates: "true"
+          prefix-key: "v0-rust-nightly"
+          shared-key: debug-x86_64-unknown-linux-gnu
       - name: Build (debug)
-        run: cargo build
+        run: cargo build --bin truthcoin_dc_app --example integration_tests
       - name: Run integration tests
         id: runIntegrationTests
         run: |
@@ -130,7 +142,7 @@ jobs:
           export BITCOIN_CLI='../bitcoin-patched-bins/bitcoin-cli'
           export ELECTRS='../electrs'
           export TRUTHCOIN_APP='target/debug/truthcoin_dc_app'
-          cargo run --example integration_tests
+          target/debug/examples/integration_tests
 
   test-build-release:
     strategy:
@@ -159,6 +171,10 @@ jobs:
       contents: write
     timeout-minutes: 20
     steps:
+      - name: Install windows-specific deps
+        run: sudo apt install mingw-w64
+        if: ${{ matrix.name == 'x86_64-pc-windows-gnu' }}
+
       - uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -172,12 +188,9 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2.9.1
         with:
-          cache-bin: false
-          key: ${{ matrix.name }}
-
-      - name: Install windows-specific deps
-        run: sudo apt install mingw-w64
-        if: ${{ matrix.name == 'x86_64-pc-windows-gnu' }}
+          cache-all-crates: "true"
+          prefix-key: "v0-rust-nightly"
+          shared-key: ${{ matrix.name }}
 
       - name: Test
         run: cargo test --tests
