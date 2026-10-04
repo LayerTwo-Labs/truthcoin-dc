@@ -209,9 +209,10 @@ pub enum Command {
     #[command(name = "mainchain-sync-progress")]
     MainchainSyncProgress,
 
-    /// Transfer funds to address
-    #[command(name = "transfer", alias = "send")]
-    Transfer {
+    /// Create a tx that transfers funds to the specified address,
+    /// without signing it
+    #[command(name = "create-transfer")]
+    CreateTransfer {
         dest: Address,
         #[arg(long)]
         value_sats: u64,
@@ -219,9 +220,10 @@ pub enum Command {
         fee_sats: u64,
     },
 
-    /// Initiate withdrawal to mainchain
-    #[command(name = "withdraw")]
-    Withdraw {
+    /// Creates a tx that initiates a withdrawal to the specified mainchain
+    /// address, without signing it
+    #[command(name = "create-withdrawal")]
+    CreateWithdrawal {
         mainchain_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
         #[arg(long)]
         amount_sats: u64,
@@ -841,35 +843,35 @@ where
             let progress = rpc_client.mainchain_sync_progress().await?;
             json_response(&progress)?
         }
-        Command::Transfer {
+        Command::CreateTransfer {
             dest,
             value_sats,
             fee_sats,
         } => {
-            let txid = rpc_client
-                .transfer(dest, value_sats, fee_sats, None)
+            let tx = rpc_client
+                .create_transfer(dest, value_sats, fee_sats, None)
                 .await?;
-            format_tx_success("Transfer", None, &txid.to_string())
+            json_response(&tx)?
         }
         Command::TransferMany { dests, fee_sats } => {
             let txid = rpc_client.transfer_many(dests, fee_sats).await?;
             format_tx_success("Transfer", None, &txid.to_string())
         }
-        Command::Withdraw {
+        Command::CreateWithdrawal {
             mainchain_address,
             amount_sats,
             fee_sats,
             mainchain_fee_sats,
         } => {
-            let txid = rpc_client
-                .withdraw(
+            let tx = rpc_client
+                .create_withdrawal(
                     mainchain_address,
                     amount_sats,
                     fee_sats,
                     mainchain_fee_sats,
                 )
                 .await?;
-            format_tx_success("Withdrawal initiated", None, &txid.to_string())
+            json_response(&tx)?
         }
         Command::CreateDeposit {
             address,

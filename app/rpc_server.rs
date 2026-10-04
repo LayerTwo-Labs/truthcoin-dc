@@ -2168,13 +2168,13 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         Ok(authorized)
     }
 
-    async fn transfer(
+    async fn create_transfer(
         &self,
         dest: Address,
         value_sats: u64,
         fee_sats: u64,
         memo: Option<String>,
-    ) -> RpcResult<Txid> {
+    ) -> RpcResult<Transaction> {
         let memo = match memo {
             None => None,
             Some(memo) => {
@@ -2192,9 +2192,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 memo,
             )
             .map_err(custom_err)?;
-        let txid = tx.txid();
-        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(txid)
+        Ok(tx)
     }
 
     async fn transfer_many(
@@ -2259,13 +2257,13 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         Ok(res)
     }
 
-    async fn withdraw(
+    async fn create_withdrawal(
         &self,
         mainchain_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
         amount_sats: u64,
         fee_sats: u64,
         mainchain_fee_sats: u64,
-    ) -> RpcResult<Txid> {
+    ) -> RpcResult<Transaction> {
         let tx = self
             .app
             .wallet
@@ -2276,9 +2274,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 Amount::from_sat(fee_sats),
             )
             .map_err(custom_err)?;
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
-        Ok(txid)
+        Ok(tx)
     }
 
     async fn bitcoin_balance(&self) -> RpcResult<Balance> {

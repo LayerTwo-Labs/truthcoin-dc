@@ -636,6 +636,35 @@ pub mod wallet {
         #[method(name = "bitcoin_balance")]
         async fn bitcoin_balance(&self) -> RpcResult<Balance>;
 
+        /// Create a tx that transfers funds to the specified address,
+        /// without signing it
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "create_transfer")]
+        async fn create_transfer(
+            &self,
+            dest: Address,
+            value_sats: u64,
+            fee_sats: u64,
+            memo: Option<String>,
+        ) -> RpcResult<Transaction>;
+
+        /// Creates a tx that initiates a withdrawal to the specified mainchain
+        /// address, without signing it
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "create_withdrawal")]
+        async fn create_withdrawal(
+            &self,
+            #[open_api_method_arg(schema(
+                PartialSchema = "truthcoin_schema::BitcoinAddr"
+            ))]
+            mainchain_address: bitcoin::Address<
+                bitcoin::address::NetworkUnchecked,
+            >,
+            amount_sats: u64,
+            fee_sats: u64,
+            mainchain_fee_sats: u64,
+        ) -> RpcResult<Transaction>;
+
         #[open_api_method(output_schema(
             PartialSchema = "schema::BitcoinTxid"
         ))]
@@ -747,16 +776,6 @@ pub mod wallet {
             broadcast: Option<bool>,
         ) -> RpcResult<Authorized<Transaction>>;
 
-        /// Transfer funds to the specified address
-        #[method(name = "transfer")]
-        async fn transfer(
-            &self,
-            dest: Address,
-            value: u64,
-            fee: u64,
-            memo: Option<String>,
-        ) -> RpcResult<Txid>;
-
         /// Transfer funds to each address in `dests`, which maps an address to a
         /// value in sats
         #[method(name = "transfer_many")]
@@ -786,21 +805,6 @@ pub mod wallet {
             dst: Dst,
             msg: String,
         ) -> RpcResult<bool>;
-
-        /// Initiate a withdrawal to the specified mainchain address
-        #[method(name = "withdraw")]
-        async fn withdraw(
-            &self,
-            #[open_api_method_arg(schema(
-                PartialSchema = "truthcoin_schema::BitcoinAddr"
-            ))]
-            mainchain_address: bitcoin::Address<
-                bitcoin::address::NetworkUnchecked,
-            >,
-            amount_sats: u64,
-            fee_sats: u64,
-            mainchain_fee_sats: u64,
-        ) -> RpcResult<Txid>;
 
         #[open_api_method(output_schema(ToSchema))]
         #[method(name = "refresh_wallet")]

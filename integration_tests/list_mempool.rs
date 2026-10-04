@@ -82,10 +82,16 @@ async fn list_mempool_task(
     anyhow::ensure!(sidechain.rpc_client.list_mempool().await?.is_empty());
 
     let dest = sidechain.rpc_client.get_new_address().await?;
+    let transfer_tx = sidechain
+        .rpc_client
+        .create_transfer(dest, TRANSFER_AMOUNT, TRANSFER_FEE, None)
+        .await?;
     let txid = sidechain
         .rpc_client
-        .transfer(dest, TRANSFER_AMOUNT, TRANSFER_FEE, None)
-        .await?;
+        .sign_transaction(transfer_tx, Some(true))
+        .await?
+        .transaction
+        .txid();
     tracing::info!(%txid, "Created a transfer");
 
     tracing::debug!("Checking that the mempool holds the transfer");
