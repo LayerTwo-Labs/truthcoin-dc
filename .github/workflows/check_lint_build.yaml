@@ -1,3 +1,4 @@
+
 on:
   pull_request:
   push:
@@ -24,6 +25,8 @@ name: Check, Lint, Build
 
 env:
   CARGO_TERM_COLOR: always
+  ELECTRS_VERSION: v3.2.0
+  BITCOIND_UNPATCHED_VERSION: "30.2"
 
 jobs:
   check-lint:
@@ -33,29 +36,16 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+      
+      - name: Install pinned Rust toolchain
+        # Channel and components come from rust-toolchain.toml, which is the
+        # single source of truth for the Rust version.
+        run: rustup toolchain install
 
-      - name: Install latest nightly toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
-          components: rustfmt, clippy
-
-      - name: Restore Rust cache
-        id: restore-rust-cache
+      - name: Rust Cache
         uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-all-crates: "true"
-          prefix-key: "v0-rust-nightly"
-          save-if: "false"
-          shared-key: debug-x86_64-unknown-linux-gnu
-
-      - name: Save Rust cache
-        if: steps.restore-rust-cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@v2.9.1
-        with:
-          cache-all-crates: "true"
-          lookup-only: "true"
-          prefix-key: "v0-rust-nightly"
           shared-key: debug-x86_64-unknown-linux-gnu
 
       - name: Rustfmt
@@ -84,11 +74,39 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.cargo_deny_check == 'force-run') ||
           (github.event_name == 'workflow_dispatch' && inputs.cargo_deny_check == 'auto' && (steps.changed-files.outputs.cargo_lock == 'true' || steps.changed-files.outputs.deny_toml == 'true'))
         uses: EmbarkStudios/cargo-deny-action@v2
-  
+
+  cache-electrs:
+    name: Build electrs if not cached
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check cache
+        id: check-cache
+        uses: actions/cache/restore@v6
+        with:
+          lookup-only: true
+          path: ${{ runner.temp }}/electrs/target/release/electrs
+          key: electrs-${{ env.ELECTRS_VERSION }}
+
+      - name: Build electrs
+        if: steps.check-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch ${{ env.ELECTRS_VERSION }} --depth 1 https://github.com/mempool/electrs.git ${{ runner.temp }}/electrs
+          pushd ${{ runner.temp }}/electrs
+          cargo build --locked --release
+          popd
+
+      - name: Save cache
+        if: steps.check-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/electrs/target/release/electrs
+          key: electrs-${{ env.ELECTRS_VERSION }}
+
+
   integration-test:
     name: Integration test
     runs-on: ubuntu-latest
-    needs: [check-lint]
+    needs: [cache-electrs, check-lint]
     steps:
       # The `-latest-` artifacts are republished in place, so there is no
       # version to key a cache on. Key on the server's ETag instead: a hit means
@@ -103,7 +121,7 @@ jobs:
               | awk 'tolower($1) == "etag:" { gsub(/"/, "", $2); print $2 }' \
               | tail -1
           }
-          for dep in patched:"$BITCOIN_PATCHED_URL" enforcer:"$ENFORCER_URL" electrs:"$ELECTRS_URL"; do
+          for dep in patched:"$BITCOIN_PATCHED_URL" enforcer:"$ENFORCER_URL"; do
             name="${dep%%:*}"
             tag="$(etag "${dep#*:}" || true)"
             if [ -z "$tag" ]; then
@@ -115,7 +133,6 @@ jobs:
         env:
           BITCOIN_PATCHED_URL: https://releases.drivechain.info/L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
           ENFORCER_URL: https://releases.drivechain.info/bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip
-          ELECTRS_URL: https://releases.drivechain.info/electrs-latest-x86_64-unknown-linux-gnu.zip
 
       - name: Cache bitcoin-patched
         id: cache-bitcoin-patched
@@ -135,6 +152,27 @@ jobs:
           rm -rf deps/bitcoin-patched
           mv L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu deps/bitcoin-patched
           chmod +x deps/bitcoin-patched/bitcoind deps/bitcoin-patched/bitcoin-cli
+
+      - name: Cache bitcoin unpatched
+        id: cache-bitcoin-unpatched
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/deps/bitcoin-unpatched
+          key: bitcoin-unpatched-x86_64-linux-${{ env.BITCOIND_UNPATCHED_VERSION }}
+
+      - name: Download bitcoin unpatched
+        if: steps.cache-bitcoin-unpatched.outputs.cache-hit != 'true'
+        run: |
+          cd "${{ runner.temp }}"
+          VERSION='${{ env.BITCOIND_UNPATCHED_VERSION }}'
+          TARBALL="bitcoin-${VERSION}-x86_64-linux-gnu.tar.gz"
+          wget -q "https://bitcoincore.org/bin/bitcoin-core-${VERSION}/${TARBALL}"
+          tar -xf "${TARBALL}"
+          rm "${TARBALL}"
+          mkdir -p deps
+          rm -rf deps/bitcoin-unpatched
+          mv "bitcoin-${VERSION}/bin" deps/bitcoin-unpatched
+          rm -r "bitcoin-${VERSION}"
 
       - name: Cache bip300301_enforcer
         id: cache-enforcer
@@ -156,47 +194,38 @@ jobs:
           rm -r bip300301-enforcer-latest-x86_64-unknown-linux-gnu
           chmod +x deps/bip300301-enforcer
 
-      - name: Cache electrs
-        id: cache-electrs
-        uses: actions/cache@v6
+      - name: Restore electrs from cache
+        uses: actions/cache/restore@v6
         with:
-          path: ${{ runner.temp }}/deps/electrs
-          key: electrs-x86_64-linux-${{ steps.dep-keys.outputs.electrs }}
-
-      - name: Download electrs
-        if: steps.cache-electrs.outputs.cache-hit != 'true'
-        run: |
-          cd "${{ runner.temp }}"
-          wget -q https://releases.drivechain.info/electrs-latest-x86_64-unknown-linux-gnu.zip
-          unzip -q electrs-latest-x86_64-unknown-linux-gnu.zip
-          rm electrs-latest-x86_64-unknown-linux-gnu.zip
-          mkdir -p deps
-          rm -f deps/electrs
-          mv electrs-latest-x86_64-unknown-linux-gnu deps/electrs
-          chmod +x deps/electrs
+          fail-on-cache-miss: true
+          path: ${{ runner.temp }}/electrs/target/release/electrs
+          key: electrs-${{ env.ELECTRS_VERSION }}
 
       - uses: actions/checkout@v6
         with:
           submodules: "recursive"
-      - name: Install latest nightly toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
+
+      - name: Install pinned Rust toolchain
+        # Channel comes from rust-toolchain.toml.
+        run: rustup toolchain install
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-all-crates: "true"
-          prefix-key: "v0-rust-nightly"
           shared-key: debug-x86_64-unknown-linux-gnu
+
       - name: Build (debug)
         run: cargo build --bin truthcoin_dc_app --example integration_tests
+
       - name: Run integration tests
         id: runIntegrationTests
         run: |
           export BIP300301_ENFORCER='${{ runner.temp }}/deps/bip300301-enforcer'
           export BITCOIND='${{ runner.temp }}/deps/bitcoin-patched/bitcoind'
+          export BITCOIND_UNPATCHED='${{ runner.temp }}/deps/bitcoin-unpatched/bitcoind'
           export BITCOIN_CLI='${{ runner.temp }}/deps/bitcoin-patched/bitcoin-cli'
-          export ELECTRS='${{ runner.temp }}/deps/electrs'
+          export ELECTRS='${{ runner.temp }}/electrs/target/release/electrs'
           export TRUTHCOIN_APP='target/debug/truthcoin_dc_app'
           target/debug/examples/integration_tests
 
@@ -209,7 +238,9 @@ jobs:
             name: x86_64-unknown-linux-gnu
             binary-suffix: ""
             rustflags: ""
-          - os: macos-latest-large
+          # An Apple Silicon runner cross-compiles this target, and the
+          # larger Intel runner is not available on every account.
+          - os: macos-latest
             name: x86_64-apple-darwin
             binary-suffix: ""
             rustflags: ""
@@ -234,18 +265,18 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-
-      - name: Install latest nightly toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
-          target: ${{ matrix.name }}
+      
+      - name: Install pinned Rust toolchain
+        # Channel comes from rust-toolchain.toml; the cross-compilation
+        # target comes from the build matrix.
+        run: |
+          rustup toolchain install
+          rustup target add '${{ matrix.name }}'
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-all-crates: "true"
-          prefix-key: "v0-rust-nightly"
           shared-key: ${{ matrix.name }}
 
       - name: Test
@@ -262,15 +293,30 @@ jobs:
             jq -er '.packages | map(select(.name == "truthcoin_dc_app") | .version) | .[0]')
           TRUTHCOIN_APP_FILENAME="truthcoin-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
           TRUTHCOIN_CLI_FILENAME="truthcoin-cli-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
+          TRUTHCOIN_ZIP_FILENAME="truthcoin-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}.zip"
           echo "TRUTHCOIN_APP_VERSION=$TRUTHCOIN_APP_VERSION" >> "$GITHUB_ENV"
           echo "TRUTHCOIN_APP_FILENAME=$TRUTHCOIN_APP_FILENAME" >> "$GITHUB_ENV"
           echo "TRUTHCOIN_CLI_FILENAME=$TRUTHCOIN_CLI_FILENAME" >> "$GITHUB_ENV"
+          echo "TRUTHCOIN_ZIP_FILENAME=$TRUTHCOIN_ZIP_FILENAME" >> "$GITHUB_ENV"
 
       - name: 'Set filenames for release binaries'
         run: |
           pushd "target/${{ matrix.name }}/release/"
           ln -fs "truthcoin_dc_app${{ matrix.binary-suffix }}" "${TRUTHCOIN_APP_FILENAME}"
           ln -fs "truthcoin_dc_app_cli${{ matrix.binary-suffix }}" "${TRUTHCOIN_CLI_FILENAME}"
+          popd
+
+      - name: 'Pack the release zip'
+        # BitWindow downloads one archive per platform and takes the daemon and
+        # its CLI from it. The names inside are bare, which is what its
+        # extractor looks for.
+        run: |
+          pushd "target/${{ matrix.name }}/release/"
+          cp "truthcoin_dc_app${{ matrix.binary-suffix }}" "truthcoin${{ matrix.binary-suffix }}"
+          cp "truthcoin_dc_app_cli${{ matrix.binary-suffix }}" "truthcoin-cli${{ matrix.binary-suffix }}"
+          zip -j "${TRUTHCOIN_ZIP_FILENAME}" \
+            "truthcoin${{ matrix.binary-suffix }}" \
+            "truthcoin-cli${{ matrix.binary-suffix }}"
           popd
 
       - name: 'Upload Artifacts (truthcoin)'
@@ -282,6 +328,19 @@ jobs:
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_APP_FILENAME }}
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_CLI_FILENAME }}
 
+      - name: Extract Git tag name
+        id: git-tag-name
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "git_tag_name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Parse Git tag name as semver
+        uses: madhead/semver-utils@v5.0.0
+        if: startsWith(github.ref, 'refs/tags/')
+        id: parse-git-tag-name-semver
+        with:
+          version: ${{ steps.git-tag-name.outputs.git_tag_name }}
+
       - name: Release
         uses: softprops/action-gh-release@v3.0.1
         if: startsWith(github.ref, 'refs/tags/')
@@ -289,50 +348,6 @@ jobs:
           files: |
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_APP_FILENAME }}
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_CLI_FILENAME }}
+            target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_ZIP_FILENAME }}
           fail_on_unmatched_files: true
-
-  upload-releases-to-releases-drivechain-info:
-    name: Upload releases to releases.drivechain.info
-    runs-on: ubuntu-latest
-    needs: [integration-test, test-build-release]
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Download release assets
-        uses: robinraju/release-downloader@v1.13
-        with:
-          fileName: '*'
-          tag: ${{ github.ref_name }}
-
-      - name: Create zip files for releases.drivechain.info
-        run: |
-          shopt -s extglob
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-latest-x86_64-apple-darwin
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-cli-latest-x86_64-apple-darwin
-          zip L2-S13-Truthcoin-latest-x86_64-apple-darwin.zip \
-            truthcoin-latest-x86_64-apple-darwin \
-            truthcoin-cli-latest-x86_64-apple-darwin
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-aarch64-apple-darwin truthcoin-latest-aarch64-apple-darwin
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-aarch64-apple-darwin truthcoin-cli-latest-aarch64-apple-darwin
-          zip L2-S13-Truthcoin-latest-aarch64-apple-darwin.zip \
-            truthcoin-latest-aarch64-apple-darwin \
-            truthcoin-cli-latest-aarch64-apple-darwin
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-latest-x86_64-pc-windows-gnu.exe
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
-          zip L2-S13-Truthcoin-latest-x86_64-pc-windows-gnu.zip \
-            truthcoin-latest-x86_64-pc-windows-gnu.exe \
-            truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-latest-x86_64-unknown-linux-gnu
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-cli-latest-x86_64-unknown-linux-gnu
-          zip L2-S13-Truthcoin-latest-x86_64-unknown-linux-gnu.zip \
-            truthcoin-latest-x86_64-unknown-linux-gnu \
-            truthcoin-cli-latest-x86_64-unknown-linux-gnu
-
-      - name: Upload release assets to releases.drivechain.info
-        uses: appleboy/scp-action@v1
-        with:
-          host: 45.33.96.47
-          username: root
-          password: ${{ secrets.RELEASES_SERVER_PW }}
-          port: 22
-          source: 'L2-S13-Truthcoin-latest-*.zip'
-          target: '/var/www/html/'
+          prerelease: ${{ steps.parse-git-tag-name-semver.outputs.prerelease != '' }}
