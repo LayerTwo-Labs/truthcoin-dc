@@ -23,7 +23,9 @@ mod transaction;
 pub mod tx_pow;
 
 pub use address::Address;
-pub use hashes::{AssetId, BlockHash, Hash, M6id, MerkleRoot, Txid};
+pub use hashes::{
+    AssetId, BlockHash, Hash, M6id, MerkleRoot, NonZeroBitcoinBlockHash, Txid,
+};
 pub use keys::{EncryptionPubKey, VerifyingKey};
 pub use transaction::{
     AssetOutput, AssetOutputContent, Authorized, AuthorizedTransaction,
