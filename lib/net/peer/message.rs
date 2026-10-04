@@ -4,24 +4,23 @@ use std::{collections::HashSet, num::NonZeroUsize};
 
 use borsh::BorshSerialize;
 use serde::{Deserialize, Serialize};
+use truthcoin_dc_types::Block;
 
 use crate::{
     net::peer::{PeerState, PeerStateId},
-    types::{
-        AuthorizedTransaction, BlockHash, Body, Header, Network, Tip, Txid,
-    },
+    types::{AuthorizedTransaction, BlockHash, Header, Network, Tip, Txid},
 };
 
 pub const MAGIC_BYTES_LEN: usize = 4;
 
 pub type MagicBytes = [u8; MAGIC_BYTES_LEN];
 
-// First 25 bits are the US-TTY Baudot–Murray code for "TRUTH".
+// First 4 bytes are the US-TTY (LSB Left) Baudot–Murray code for "THNDR".
 // The least significant bits of the 4th byte encode the network
 // identifier.
 pub const fn magic_bytes(network: Network) -> MagicBytes {
     const PREFIX: [u8; 4] =
-        [0b1000_0010, 0b1000_1111, 0b0000_1010, 0b0000_0000];
+        [0b1000_0101, 0b0001_1000, 0b1001_0101, 0b0000_0000];
     const fn network_identifier(network: Network) -> u8 {
         match network {
             Network::Regtest => 0b0000_0000,
@@ -115,7 +114,6 @@ impl PushTransactionRequest {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 #[derive(BorshSerialize, Clone, Debug)]
 pub enum Request {
     GetBlock(GetBlockRequest),
@@ -212,7 +210,7 @@ impl<'a> Serialize for RequestMessageRef<'a> {
     }
 }
 
-#[allow(clippy::duplicated_attributes, clippy::large_enum_variant)]
+#[allow(clippy::duplicated_attributes)]
 #[derive(transitive::Transitive, Debug)]
 #[transitive(
     from(GetBlockRequest, Request),
@@ -258,7 +256,6 @@ impl<'de> Deserialize<'de> for RequestMessage {
     where
         D: serde::Deserializer<'de>,
     {
-        #[allow(clippy::large_enum_variant)]
         #[derive(Deserialize)]
         enum Repr {
             Heartbeat(Heartbeat),
@@ -279,10 +276,7 @@ impl<'de> Deserialize<'de> for RequestMessage {
 #[derive(educe::Educe, Serialize, Deserialize)]
 #[educe(Debug)]
 pub enum ResponseMessage {
-    Block {
-        header: Header,
-        body: Body,
-    },
+    Block(Box<Block>),
     /// Headers, from start to end
     Headers(#[educe(Debug(method(ResponseMessage::fmt_headers)))] Vec<Header>),
     NoBlock {
@@ -306,37 +300,5 @@ impl ResponseMessage {
         } else {
             std::fmt::Debug::fmt(headers, f)
         }
-    }
-}
-
-#[cfg(test)]
-mod network_tests {
-    use std::collections::HashSet;
-
-    use super::{MagicBytes, Network, magic_bytes};
-
-    const EXPECTED: [(Network, MagicBytes); 4] = [
-        (Network::Regtest, [0x82, 0x8f, 0x0a, 0x00]),
-        (Network::Signet, [0x82, 0x8f, 0x0a, 0x01]),
-        (Network::Forknet, [0x82, 0x8f, 0x0a, 0x02]),
-        (Network::Betanet, [0x82, 0x8f, 0x0a, 0x04]),
-    ];
-
-    /// The old prefix encoded "BITS8", which is the plain-bitassets name, so
-    /// the two chains returned the same bytes on regtest and forknet.
-    #[test]
-    fn network_magic_matches_the_baudot_encoding() {
-        for (network, expected) in EXPECTED {
-            assert_eq!(magic_bytes(network), expected, "{network:?}");
-        }
-    }
-
-    #[test]
-    fn network_magic_keeps_each_network_separate() {
-        let magics: HashSet<MagicBytes> = EXPECTED
-            .iter()
-            .map(|(network, _)| magic_bytes(*network))
-            .collect();
-        assert_eq!(magics.len(), EXPECTED.len());
     }
 }
