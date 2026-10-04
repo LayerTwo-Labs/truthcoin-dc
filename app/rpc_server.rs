@@ -1343,6 +1343,28 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         Ok(market_summaries)
     }
 
+    async fn market_price_history(
+        &self,
+        market_id: String,
+    ) -> RpcResult<Vec<truthcoin_dc_app_rpc_api::MarketPricePoint>> {
+        let market_id = parse_market_id(&market_id)?;
+        let points = self
+            .app
+            .node
+            .try_get_market_price_history(&market_id)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Market not found"))?;
+        Ok(points
+            .into_iter()
+            .map(|point| truthcoin_dc_app_rpc_api::MarketPricePoint {
+                height: point.height,
+                block_hash: point.block_hash,
+                timestamp: point.mainchain_timestamp,
+                prices: point.prices,
+            })
+            .collect())
+    }
+
     async fn market_positions(
         &self,
         address: Address,

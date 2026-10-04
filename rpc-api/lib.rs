@@ -502,6 +502,17 @@ pub struct MarketSummary {
     pub created_at_height: u32,
 }
 
+/// Outcome prices of a market after a block of the active chain.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketPricePoint {
+    pub height: u32,
+    pub block_hash: BlockHash,
+    /// Unix time of the mainchain block that holds the BMM commitment.
+    pub timestamp: u64,
+    /// Price of each tradeable outcome, by outcome index.
+    pub prices: Vec<f64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct SharePosition {
     pub market_id: String,

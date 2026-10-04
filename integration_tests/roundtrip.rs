@@ -3617,6 +3617,30 @@ async fn roundtrip_task_inner(
             (price_sum - 1.0).abs() < expected::PRICE_SUM_TOLERANCE,
             "LMSR invariant violated for market {market_name}: prices sum to {price_sum}"
         );
+
+        let price_history = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .market_price_history(market_id.clone())
+            .await?;
+        let (first_point, last_point) =
+            price_history.first().zip(price_history.last()).ok_or_else(
+                || anyhow::anyhow!("Market {market_name} has no price history"),
+            )?;
+        anyhow::ensure!(
+            first_point.height == market_data.created_at_height,
+            "Market {market_name} price history starts at block {}, not at creation block {}",
+            first_point.height,
+            market_data.created_at_height
+        );
+        anyhow::ensure!(
+            last_point.prices.len() == market_data.outcomes.len()
+                && last_point.prices.iter().zip(&market_data.outcomes).all(
+                    |(price, outcome)| (price - outcome.price).abs() < 1e-9
+                ),
+            "Market {market_name} price history ends at {:?}, not at the market_get prices",
+            last_point.prices
+        );
     }
 
     tracing::info!("✓ Phase 11: Trading completed");

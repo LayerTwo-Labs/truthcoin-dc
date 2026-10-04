@@ -27,13 +27,13 @@ pub mod node {
         FilledOutputContent, Header, InPoint, InitialLiquidityCalculation,
         M6id, MainchainSyncPhase, MainchainSyncProgress, MarketData,
         MarketDimension, MarketDimensionKind, MarketId, MarketOutcome,
-        MarketResolution, MarketStatus, MarketSummary, MempoolTx, MerkleRoot,
-        OutPoint, Output, OutputContent, ParticipationStats, Peer,
-        PeerConnectionStatus, PeriodPricingSummary, PeriodStats, PointedOutput,
-        PointedSpentOutput, RpcResult, ScoreChange, SharePosition, Signature,
-        SocketAddr, SpentOutput, Transaction, TxData, TxIn, TxInfo, Txid,
-        UserHoldings, VoteFilter, VoteInfo, VoterInfo, VoterInfoFull,
-        VotingPeriodFull, WinningOutcome, WithdrawalBundle,
+        MarketPricePoint, MarketResolution, MarketStatus, MarketSummary,
+        MempoolTx, MerkleRoot, OutPoint, Output, OutputContent,
+        ParticipationStats, Peer, PeerConnectionStatus, PeriodPricingSummary,
+        PeriodStats, PointedOutput, PointedSpentOutput, RpcResult, ScoreChange,
+        SharePosition, Signature, SocketAddr, SpentOutput, Transaction, TxData,
+        TxIn, TxInfo, Txid, UserHoldings, VoteFilter, VoteInfo, VoterInfo,
+        VoterInfoFull, VotingPeriodFull, WinningOutcome, WithdrawalBundle,
         WithdrawalOutputContent, rpc, schema, truthcoin_schema,
     };
 
@@ -310,6 +310,16 @@ pub mod node {
         #[open_api_method(output_schema(ToSchema = "Vec<MarketSummary>"))]
         #[method(name = "market_list")]
         async fn market_list(&self) -> RpcResult<Vec<MarketSummary>>;
+
+        /// Get the price history of a market from the active chain: one point
+        /// for the creation block and one for each block that changed its
+        /// prices, oldest first
+        #[open_api_method(output_schema(ToSchema = "Vec<MarketPricePoint>"))]
+        #[method(name = "market_price_history")]
+        async fn market_price_history(
+            &self,
+            market_id: String,
+        ) -> RpcResult<Vec<MarketPricePoint>>;
 
         /// Get share positions for an address (optionally filtered by market)
         #[open_api_method(output_schema(ToSchema))]
