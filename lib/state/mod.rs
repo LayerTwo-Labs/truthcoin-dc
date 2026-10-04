@@ -11,10 +11,10 @@ use crate::{
     authorization::BatchVerificationContext,
     types::{
         Address, AmountOverflowError, Authorized, AuthorizedTransaction,
-        BlockHash, BlockIndexEvents, Body, FilledOutput, FilledTransaction,
-        GetAddress as _, GetBitcoinValue as _, Header, InPoint, M6id,
-        MerkleRoot, OutPoint, OutPointKey, SpentOutput, Transaction, VERSION,
-        Version, WithdrawalBundle, WithdrawalBundleStatus,
+        BlockHash, BlockIndexEvents, Body, FilledTransaction, GetAddress as _,
+        GetValue as _, Header, InPoint, M6id, MerkleRoot, OutPoint,
+        OutPointKey, Output, SpentOutput, Transaction, VERSION, Version,
+        WithdrawalBundle, WithdrawalBundleStatus,
         proto::mainchain::TwoWayPegData, state::WithdrawalBundleInfo,
     },
     util::Watchable,
@@ -26,7 +26,7 @@ pub trait UtxoManager {
         &self,
         rwtxn: &mut RwTxn,
         outpoint: &OutPoint,
-        filled_output: &FilledOutput,
+        output: &Output,
     ) -> Result<(), Error>;
     fn delete_utxo(
         &self,
@@ -85,7 +85,7 @@ pub struct State {
     decisions: decisions::Dbs,
     markets: MarketsDatabase,
     voting: VotingSystem,
-    utxos: DatabaseUnique<OutPointKey, SerdeBincode<FilledOutput>>,
+    utxos: DatabaseUnique<OutPointKey, SerdeBincode<Output>>,
     utxos_by_address:
         DatabaseUnique<SerdeBincode<(Address, OutPoint)>, SerdeBincode<()>>,
     stxos: DatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>>,
@@ -407,11 +407,11 @@ impl State {
     pub fn get_utxos(
         &self,
         rotxn: &RoTxn,
-    ) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
-        let utxos: HashMap<OutPoint, FilledOutput> = self
+    ) -> Result<HashMap<OutPoint, Output>, Error> {
+        let utxos: HashMap<OutPoint, Output> = self
             .utxos
             .iter(rotxn)?
-            .map(|(key, output)| Ok((key.to_outpoint(), output)))
+            .map(|(key, output)| Ok((key.into(), output)))
             .collect()?;
         Ok(utxos)
     }
@@ -425,7 +425,7 @@ impl State {
             .stxos
             .iter(rotxn)?
             .filter(|(_, stxo)| Ok(addresses.contains(&stxo.output.address)))
-            .map(|(key, stxo)| Ok((key.to_outpoint(), stxo)))
+            .map(|(key, stxo)| Ok((key.into(), stxo)))
             .collect()?;
         Ok(stxos)
     }
@@ -434,17 +434,16 @@ impl State {
         &self,
         rotxn: &RoTxn,
         addresses: &HashSet<Address>,
-    ) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
+    ) -> Result<HashMap<OutPoint, Output>, Error> {
         let mut result = HashMap::with_capacity(addresses.len() * 4);
 
         let mut iter = self.utxos_by_address.iter(rotxn)?;
         while let Some(((addr, outpoint), _)) = iter.next()? {
             if addresses.contains(&addr)
-                && let Some(filled_output) = self
-                    .utxos
-                    .try_get(rotxn, &OutPointKey::from_outpoint(&outpoint))?
+                && let Some(output) =
+                    self.utxos.try_get(rotxn, &OutPointKey::from(&outpoint))?
             {
-                result.insert(outpoint, filled_output);
+                result.insert(outpoint, output);
             }
         }
 
@@ -457,15 +456,12 @@ impl UtxoManager for State {
         &self,
         rwtxn: &mut RwTxn,
         outpoint: &OutPoint,
-        filled_output: &FilledOutput,
+        output: &Output,
     ) -> Result<(), Error> {
-        let key = OutPointKey::from_outpoint(outpoint);
-        self.utxos.put(rwtxn, &key, filled_output)?;
-        self.utxos_by_address.put(
-            rwtxn,
-            &(filled_output.address, *outpoint),
-            &(),
-        )?;
+        let key = OutPointKey::from(outpoint);
+        self.utxos.put(rwtxn, &key, output)?;
+        self.utxos_by_address
+            .put(rwtxn, &(output.address, *outpoint), &())?;
         Ok(())
     }
 
@@ -474,16 +470,15 @@ impl UtxoManager for State {
         rwtxn: &mut RwTxn,
         outpoint: &OutPoint,
     ) -> Result<bool, Error> {
-        let key = OutPointKey::from_outpoint(outpoint);
-        let filled_output =
-            if let Some(output) = self.utxos.try_get(rwtxn, &key)? {
-                output
-            } else {
-                return Ok(false);
-            };
+        let key = OutPointKey::from(outpoint);
+        let output = if let Some(output) = self.utxos.try_get(rwtxn, &key)? {
+            output
+        } else {
+            return Ok(false);
+        };
 
         self.utxos_by_address
-            .delete(rwtxn, &(filled_output.address, *outpoint))?;
+            .delete(rwtxn, &(output.address, *outpoint))?;
 
         let deleted = self.utxos.delete(rwtxn, &key)?;
 
@@ -491,7 +486,7 @@ impl UtxoManager for State {
             // Restore address index
             self.utxos_by_address.put(
                 rwtxn,
-                &(filled_output.address, *outpoint),
+                &(output.address, *outpoint),
                 &(),
             )?;
             return Ok(false);
@@ -577,12 +572,12 @@ impl State {
         transaction: &Transaction,
     ) -> Result<FilledTransaction, Error> {
         let mut spent_utxos = Vec::with_capacity(transaction.inputs.len());
-        for input in &transaction.inputs {
-            let key = OutPointKey::from_outpoint(input);
-            let utxo = self
-                .utxos
-                .try_get(rotxn, &key)?
-                .ok_or(Error::NoUtxo { outpoint: *input })?;
+        for (outpoint, _) in &transaction.inputs {
+            let key = OutPointKey::from(outpoint);
+            let utxo =
+                self.utxos.try_get(rotxn, &key)?.ok_or(Error::NoUtxo {
+                    outpoint: *outpoint,
+                })?;
             spent_utxos.push(utxo);
         }
         Ok(FilledTransaction {
@@ -599,12 +594,12 @@ impl State {
     ) -> Result<FilledTransaction, Error> {
         let txid = tx.txid();
         let mut spent_utxos = Vec::with_capacity(tx.inputs.len());
-        for (vin, input) in tx.inputs.iter().enumerate().rev() {
-            let key = OutPointKey::from_outpoint(input);
-            let stxo = self
-                .stxos
-                .try_get(rotxn, &key)?
-                .ok_or(Error::NoStxo { outpoint: *input })?;
+        for (vin, (outpoint, _)) in tx.inputs.iter().enumerate().rev() {
+            let key = OutPointKey::from(outpoint);
+            let stxo =
+                self.stxos.try_get(rotxn, &key)?.ok_or(Error::NoStxo {
+                    outpoint: *outpoint,
+                })?;
             assert_eq!(
                 stxo.inpoint,
                 InPoint::Regular {
@@ -746,11 +741,10 @@ impl State {
     ) -> Result<u64, Error> {
         let mut total = 0u64;
         let mut iter = self.utxos.iter(rotxn)?;
-        while let Some((outpoint_key, filled_output)) = iter.next()? {
-            let outpoint = outpoint_key.to_outpoint();
+        while let Some((outpoint_key, output)) = iter.next()? {
+            let outpoint = OutPoint::from(outpoint_key);
             if matches!(outpoint, OutPoint::Deposit(_)) {
-                total = total
-                    .saturating_add(filled_output.get_bitcoin_value().to_sat());
+                total = total.saturating_add(output.get_value().to_sat());
             }
         }
         Ok(total)
@@ -764,11 +758,10 @@ impl State {
         let mut total = 0u64;
         let mut iter = self.stxos.iter(rotxn)?;
         while let Some((outpoint_key, spent_output)) = iter.next()? {
-            let outpoint = outpoint_key.to_outpoint();
+            let outpoint = OutPoint::from(outpoint_key);
             if matches!(outpoint, OutPoint::Deposit(_)) {
-                total = total.saturating_add(
-                    spent_output.output.get_bitcoin_value().to_sat(),
-                );
+                total = total
+                    .saturating_add(spent_output.output.get_value().to_sat());
             }
         }
         Ok(total)
@@ -783,9 +776,8 @@ impl State {
         let mut iter = self.stxos.iter(rotxn)?;
         while let Some((_outpoint_key, spent_output)) = iter.next()? {
             if matches!(spent_output.inpoint, InPoint::Withdrawal { .. }) {
-                total = total.saturating_add(
-                    spent_output.output.get_bitcoin_value().to_sat(),
-                );
+                total = total
+                    .saturating_add(spent_output.output.get_value().to_sat());
             }
         }
         Ok(total)
@@ -1051,15 +1043,11 @@ mod tests {
     fn sidechain_wealth() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
-        use crate::types::{BitcoinOutputContent, FilledOutputContent, Txid};
+        use crate::types::{OutputContent, Txid};
 
-        let value_output = |sats: u64| {
-            FilledOutput::new(
-                Address::ALL_ZEROS,
-                FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(sats),
-                )),
-            )
+        let value_output = |sats: u64| Output {
+            address: Address::ALL_ZEROS,
+            content: OutputContent::Value(bitcoin::Amount::from_sat(sats)),
         };
         let dir = tempfile::tempdir()?;
         let mut opts = heed::EnvOpenOptions::new();

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{FilledOutput, OutPoint, WithdrawalBundle};
+use crate::{OutPoint, Output, WithdrawalBundle};
 
 /// Information we have regarding a withdrawal bundle
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -15,6 +15,6 @@ pub enum WithdrawalBundleInfo {
     /// If an unknown withdrawal bundle is confirmed, ALL UTXOs are
     /// considered spent.
     UnknownConfirmed {
-        spend_utxos: BTreeMap<OutPoint, FilledOutput>,
+        spend_utxos: BTreeMap<OutPoint, Output>,
     },
 }

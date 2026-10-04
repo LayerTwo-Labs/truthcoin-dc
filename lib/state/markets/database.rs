@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use crate::state::Error;
 use crate::state::UtxoManager;
 use crate::state::decisions::{Decision, DecisionId};
-use crate::types::{Address, GetBitcoinValue, OutPoint, OutPointKey};
+use crate::types::{Address, GetValue, OutPoint, OutPointKey};
 
 use super::market::Market;
 use super::payouts::{
@@ -428,7 +428,7 @@ impl MarketsDatabase {
                 {
                     state
                         .utxos
-                        .try_get(txn, &OutPointKey::from_outpoint(&outpoint))?
+                        .try_get(txn, &OutPointKey::from(&outpoint))?
                         .map(|output| (outpoint, output))
                 } else {
                     None
@@ -438,7 +438,7 @@ impl MarketsDatabase {
                 {
                     state
                         .utxos
-                        .try_get(txn, &OutPointKey::from_outpoint(&outpoint))?
+                        .try_get(txn, &OutPointKey::from(&outpoint))?
                         .map(|output| (outpoint, output))
                 } else {
                     None
@@ -971,9 +971,7 @@ impl MarketsDatabase {
         payout_summary: &MarketPayoutSummary,
         block_height: u32,
     ) -> Result<(), Error> {
-        use crate::types::{
-            BitcoinOutputContent, FilledOutput, FilledOutputContent,
-        };
+        use crate::types::{Output, OutputContent};
 
         let mut sequence = 0u32;
 
@@ -986,14 +984,11 @@ impl MarketsDatabase {
                     sequence,
                 );
 
-                let output = FilledOutput {
+                let output = Output {
                     address: payout.address,
-                    content: FilledOutputContent::Bitcoin(
-                        BitcoinOutputContent(bitcoin::Amount::from_sat(
-                            payout.payout_sats,
-                        )),
-                    ),
-                    memo: vec![],
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        payout.payout_sats,
+                    )),
                 };
 
                 state.insert_utxo(txn, &outpoint, &output)?;
@@ -1019,12 +1014,11 @@ impl MarketsDatabase {
                 sequence,
             );
 
-            let fee_output = FilledOutput {
+            let fee_output = Output {
                 address: fee_payout.address,
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(fee_payout.amount_sats),
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    fee_payout.amount_sats,
                 )),
-                memo: vec![],
             };
 
             state.insert_utxo(txn, &fee_outpoint, &fee_output)?;
@@ -1038,12 +1032,11 @@ impl MarketsDatabase {
                 block_height,
                 sequence,
             );
-            let refund_output = FilledOutput {
+            let refund_output = Output {
                 address: refund.address,
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(refund.amount_sats),
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    refund.amount_sats,
                 )),
-                memo: vec![],
             };
             state.insert_utxo(txn, &refund_outpoint, &refund_output)?;
         }
@@ -1184,9 +1177,9 @@ impl MarketsDatabase {
             Some(outpoint) => {
                 let utxo = state
                     .utxos
-                    .try_get(txn, &OutPointKey::from_outpoint(&outpoint))?
+                    .try_get(txn, &OutPointKey::from(&outpoint))?
                     .ok_or(Error::NoUtxo { outpoint })?;
-                Ok(utxo.get_bitcoin_value().to_sat())
+                Ok(utxo.get_value().to_sat())
             }
             None => Ok(0),
         }

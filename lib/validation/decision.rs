@@ -189,12 +189,7 @@ impl DecisionValidator {
         )?;
 
         if total_listing_fee > 0 {
-            let tx_fee = tx
-                .bitcoin_fee()
-                .map_err(|_| Error::InvalidTransaction {
-                    reason: "Failed to compute tx fee".to_string(),
-                })?
-                .ok_or(Error::NotEnoughValueIn)?;
+            let tx_fee = crate::validation::block::tx_fee(tx)?;
             if tx_fee.to_sat() < total_listing_fee {
                 return Err(Error::InvalidTransaction {
                     reason: format!(

@@ -23,24 +23,23 @@ pub mod node {
     use utoipa::ToSchema;
 
     use crate::{
-        Address, Authorization, Authorized, BallotItem, BitcoinOutputContent,
-        Block, BlockHash, BlockIndex, BlockIndexDeposit, BlockIndexSpend,
-        BlockIndexTx, Body, CalculateInitialLiquidityRequest,
-        ClaimDecisionPayload, ConsensusResults, DecisionClaimEntry,
+        Address, Authorization, Authorized, BallotItem, Block, BlockHash,
+        BlockIndex, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body,
+        CalculateInitialLiquidityRequest, ClaimDecisionPayload, Coinbase,
+        CoinbaseTxid, ConsensusResults, DecisionClaimEntry,
         DecisionContentInfo, DecisionDetails, DecisionFilter, DecisionInfo,
         DecisionListItem, DecisionListingFeeInfo, DecisionPeriodStatus,
-        DecisionState, DecisionSummary, DecisionType, FilledOutput,
-        FilledOutputContent, Header, InPoint, InitialLiquidityCalculation,
-        M6id, MainchainSyncPhase, MainchainSyncProgress, MarketData,
-        MarketDimension, MarketDimensionKind, MarketId, MarketOutcome,
-        MarketPricePoint, MarketResolution, MarketStatus, MarketSummary,
-        MempoolTx, MerkleRoot, OutPoint, Output, OutputContent,
-        ParticipationStats, Peer, PeerConnectionStatus, PeriodPricingSummary,
-        PeriodStats, PointedOutput, PointedSpentOutput, RpcResult, ScoreChange,
-        SharePosition, Signature, SocketAddr, SpentOutput, Transaction, TxData,
-        TxIn, TxInfo, Txid, UserHoldings, VoteFilter, VoteInfo, VoterInfo,
-        VoterInfoFull, VotingPeriodFull, WinningOutcome, WithdrawalBundle,
-        WithdrawalOutputContent, rpc, schema, truthcoin_schema,
+        DecisionState, DecisionSummary, DecisionType, Header, InPoint,
+        InitialLiquidityCalculation, M6id, MainchainSyncPhase,
+        MainchainSyncProgress, MarketData, MarketDimension,
+        MarketDimensionKind, MarketId, MarketOutcome, MarketPricePoint, MarketResolution,
+        MarketStatus, MarketSummary, MempoolTx, MerkleRoot, OutPoint, Output,
+        OutputContent, Outputs, ParticipationStats, Peer, PeerConnectionStatus,
+        PeriodPricingSummary, PeriodStats, PointedOutput, PointedSpentOutput,
+        RpcResult, ScoreChange, SharePosition, Signature, SocketAddr,
+        SpentOutput, Transaction, TxData, TxIn, TxInfo, Txid, UserHoldings,
+        VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
+        WinningOutcome, WithdrawalBundle, rpc, schema, truthcoin_schema,
     };
 
     #[open_api]
@@ -104,13 +103,13 @@ pub mod node {
         use utoipa::ToSchema;
 
         use crate::{
-            Authorization, BlockHash, Header, Output, RpcResult,
+            Authorization, BlockHash, Coinbase, Header, RpcResult,
             node::TransactionVerbose, rpc,
         };
 
         #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
         pub struct BodyVerbose {
-            pub coinbase: Vec<Output>,
+            pub coinbase: Coinbase,
             pub transactions: Vec<TransactionVerbose>,
             pub authorizations: Vec<Authorization>,
             pub actor_proofs: Vec<Option<Authorization>>,
@@ -180,11 +179,11 @@ pub mod node {
             use utoipa::ToSchema;
 
             use crate::{
-                Address, Authorization, BallotItem, BitcoinOutputContent,
-                Block, BlockHash, Body, ClaimDecisionPayload,
+                Address, Authorization, BallotItem, Block, BlockHash, Body,
+                ClaimDecisionPayload, Coinbase, CoinbaseTxid,
                 DecisionClaimEntry, Header, MarketId, MerkleRoot, Output,
-                OutputContent, RpcResult, Signature, Transaction, TxData, Txid,
-                WithdrawalOutputContent,
+                OutputContent, Outputs, RpcResult, Signature, Transaction,
+                TxData, Txid,
                 node::{
                     TransactionVerbose,
                     get_block::{
@@ -213,15 +212,8 @@ pub mod node {
             /// This trait exists only as a bound, and should not be implemented
             /// manually
             #[open_api(ref_schemas[
-                truthcoin_schema::BitcoinAddr,
-                truthcoin_schema::BitcoinBlockHash,
-                truthcoin_schema::BitcoinOutPoint, Address, Authorization,
-                BallotItem, BitcoinOutputContent, Block, BlockHash,
-                BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload,
-                DecisionClaimEntry, Header, MarketId, MerkleRoot, Output,
-                OutputContent, Signature, Transaction, TransactionVerbose,
-                TxData, Txid, WithdrawalOutputContent,
-            ])]
+truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_schema::BitcoinOutPoint, Address, Authorization, BallotItem, Block, BlockHash, BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, DecisionClaimEntry, Header, MarketId, MerkleRoot, Output, OutputContent, Signature, Transaction, TransactionVerbose, TxData, Txid, CoinbaseTxid, Outputs, Coinbase,
+])]
             #[rpc(server, server_bounds(Self: private::Sealed))]
             pub trait Rpc {
                 /// Get block data. Set `verbose` to also get the canonical
@@ -279,22 +271,8 @@ pub mod node {
     #[open_api(
         merge_apis[get_block::RpcDoc],
         ref_schemas[
-            truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash,
-            truthcoin_schema::BitcoinOutPoint,
-            truthcoin_schema::BitcoinTransaction, truthcoin_schema::SocketAddr,
-            Address, Authorization, BallotItem, BitcoinOutputContent, BlockHash,
-            BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body,
-            ClaimDecisionPayload, ConsensusResults, DecisionClaimEntry,
-            DecisionContentInfo, DecisionInfo, DecisionState, DecisionSummary,
-            DecisionType, FilledOutput, FilledOutputContent, Header, InPoint,
-            M6id, MainchainSyncPhase, MarketDimension, MarketDimensionKind,
-            MarketId, MarketOutcome, MarketResolution, MarketStatus, MerkleRoot,
-            OutPoint, Output, OutputContent, ParticipationStats,
-            PeerConnectionStatus, PeriodStats, ScoreChange, SharePosition,
-            Signature, SpentOutput, Transaction, TxData, TxIn, Txid,
-            WinningOutcome, WithdrawalBundle, WithdrawalBundleInfo,
-            WithdrawalBundleStatus, WithdrawalOutputContent,
-        ],
+truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_schema::BitcoinOutPoint, truthcoin_schema::BitcoinTransaction, truthcoin_schema::SocketAddr, Address, Authorization, BallotItem, BlockHash, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body, ClaimDecisionPayload, ConsensusResults, DecisionClaimEntry, DecisionContentInfo, DecisionInfo, DecisionState, DecisionSummary, DecisionType, Output, OutputContent, Header, InPoint, M6id, MainchainSyncPhase, MarketDimension, MarketDimensionKind, MarketId, MarketOutcome, MarketResolution, MarketStatus, MerkleRoot, OutPoint, ParticipationStats, PeerConnectionStatus, PeriodStats, ScoreChange, SharePosition, Signature, SpentOutput, Transaction, TxData, TxIn, Txid, WinningOutcome, WithdrawalBundle, WithdrawalBundleInfo, WithdrawalBundleStatus, CoinbaseTxid, Outputs, Coinbase,
+],
     )]
     #[rpc(
         client,
@@ -453,7 +431,7 @@ pub mod node {
         async fn get_utxos(
             &self,
             addresses: std::collections::HashSet<Address>,
-        ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>>;
+        ) -> RpcResult<Vec<PointedOutput>>;
 
         /// Get the current block count
         #[method(name = "getblockcount")]
@@ -492,13 +470,9 @@ pub mod node {
         async fn list_peers(&self) -> RpcResult<Vec<Peer>>;
 
         /// List all UTXOs
-        #[open_api_method(output_schema(
-            ToSchema = "Vec<PointedOutput<FilledOutputContent>>"
-        ))]
+        #[open_api_method(output_schema(ToSchema = "Vec<PointedOutput>"))]
         #[method(name = "list_utxos")]
-        async fn list_utxos(
-            &self,
-        ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>>;
+        async fn list_utxos(&self) -> RpcResult<Vec<PointedOutput>>;
 
         /// Get the progress of the sync with the mainchain
         #[open_api_method(output_schema(ToSchema))]
@@ -607,29 +581,22 @@ pub mod wallet {
     use l2l_openapi::open_api;
 
     use crate::{
-        Address, Authorization, Authorized, Balance, BallotItem,
-        BitcoinOutputContent, Block, BlockHash, Body, ClaimDecisionPayload,
-        ClaimedDecisionInfo, CreateTradeRequest, CreateTradeResponse,
+        Address, Authorization, Authorized, Balance, BallotItem, Block,
+        BlockHash, Body, ClaimDecisionPayload, ClaimedDecisionInfo, Coinbase,
+        CoinbaseTxid, CreateTradeRequest, CreateTradeResponse,
         DecisionClaimEntry, DecisionClaimItem, DecisionClaimRequest,
         DecisionClaimResponse, DimensionInput, Dst, EncryptionPubKey,
-        FilledOutput, FilledOutputContent, GetBlockTemplateResponse, Header,
-        MarketAmplifyBetaRequest, MarketBuyRequest, MarketBuyResponse,
-        MarketCreateRequest, MarketCreateResponse, MarketId, MarketSellRequest,
-        MarketSellResponse, MerkleRoot, OutPoint, Output, OutputContent,
-        PointedOutput, RpcResult, Signature, Transaction, TransferDests,
-        TxData, Txid, VerifyingKey, WithdrawalOutputContent, rpc, schema,
-        truthcoin_schema,
+        GetBlockTemplateResponse, Header, MarketAmplifyBetaRequest,
+        MarketBuyRequest, MarketBuyResponse, MarketCreateRequest,
+        MarketCreateResponse, MarketId, MarketSellRequest, MarketSellResponse,
+        MerkleRoot, OutPoint, Output, OutputContent, Outputs, PointedOutput,
+        RpcResult, Signature, Transaction, TransferDests, TxData, Txid,
+        VerifyingKey, rpc, schema, truthcoin_schema,
     };
 
     #[open_api(ref_schemas[
-        truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash,
-        truthcoin_schema::BitcoinOutPoint, Address, Authorization, BallotItem,
-        BitcoinOutputContent, Block, BlockHash, Body, ClaimDecisionPayload,
-        ClaimedDecisionInfo, DecisionClaimEntry, DecisionClaimItem,
-        DimensionInput, FilledOutput, Header, MarketId, MerkleRoot, OutPoint,
-        Output, OutputContent, Signature, Transaction, TxData, Txid,
-        WithdrawalOutputContent,
-    ])]
+truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_schema::BitcoinOutPoint, Address, Authorization, BallotItem, Block, BlockHash, Body, ClaimDecisionPayload, ClaimedDecisionInfo, DecisionClaimEntry, DecisionClaimItem, DimensionInput, Output, Header, MarketId, MerkleRoot, OutPoint, OutputContent, Signature, Transaction, TxData, Txid, CoinbaseTxid, Outputs, Coinbase,
+])]
     #[rpc(client, server, server_bounds(Self: super::open_api::RpcServer))]
     pub trait Rpc {
         #[open_api_method(output_schema(ToSchema))]
@@ -645,7 +612,6 @@ pub mod wallet {
             dest: Address,
             value_sats: u64,
             fee_sats: u64,
-            memo: Option<String>,
         ) -> RpcResult<Transaction>;
 
         /// Creates a tx that initiates a withdrawal to the specified mainchain
@@ -731,9 +697,7 @@ pub mod wallet {
 
         /// Get wallet UTXOs
         #[method(name = "get_wallet_utxos")]
-        async fn get_wallet_utxos(
-            &self,
-        ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>>;
+        async fn get_wallet_utxos(&self) -> RpcResult<Vec<PointedOutput>>;
 
         /// Attempt to mine a sidechain block
         #[open_api_method(output_schema(ToSchema))]
@@ -792,7 +756,6 @@ pub mod wallet {
             dest: Address,
             amount: f64,
             fee_sats: u64,
-            memo: Option<String>,
         ) -> RpcResult<Txid>;
 
         /// Verify a signature on a message against the specified verifying key.

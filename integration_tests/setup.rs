@@ -14,7 +14,7 @@ use futures::{TryFutureExt as _, channel::mpsc, future};
 use reserve_port::ReservedPort;
 use thiserror::Error;
 use tokio::time::sleep;
-use truthcoin_dc::types::{FilledOutputContent, PointedOutput};
+use truthcoin_dc::types::{OutputContent, PointedOutput};
 use truthcoin_dc_app_rpc_api::{node::RpcClient as _, wallet::RpcClient as _};
 
 use crate::util::TruthcoinApp;
@@ -219,14 +219,12 @@ impl Sidechain for PostSetup {
         value: bitcoin::Amount,
         txid: bitcoin::Txid,
     ) -> Result<(), Self::ConfirmDepositError> {
-        let is_expected = |utxo: &PointedOutput<FilledOutputContent>| {
+        let is_expected = |utxo: &PointedOutput| {
             utxo.output.address.to_string() == address
                 && match utxo.output.content {
-                    FilledOutputContent::Bitcoin(utxo_value) => {
-                        utxo_value.0 == value
-                    }
-                    FilledOutputContent::BitcoinWithdrawal { .. }
-                    | FilledOutputContent::MarketFunds { .. } => false,
+                    OutputContent::Value(utxo_value) => utxo_value == value,
+                    OutputContent::Withdrawal { .. }
+                    | OutputContent::MarketFunds { .. } => false,
                 }
                 && match utxo.outpoint {
                     truthcoin_dc::types::OutPoint::Deposit(outpoint) => {

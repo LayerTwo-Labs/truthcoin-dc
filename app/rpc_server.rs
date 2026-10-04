@@ -29,7 +29,7 @@ use truthcoin_dc::{
     types::{
         Address, Authorization, AuthorizedTransaction, Block, BlockHash,
         BlockIndex, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body,
-        EncryptionPubKey, FilledOutputContent, M6id, MainchainSyncProgress,
+        EncryptionPubKey, M6id, MainchainSyncProgress, OutputContent,
         PointedOutput, Transaction, Txid, VerifyingKey, WithdrawalBundle,
     },
     validation::DecisionValidator,
@@ -1225,9 +1225,8 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         };
         let fee_sats = filled_tx
             .transaction
-            .bitcoin_fee()
+            .get_fee()
             .map_err(custom_err)?
-            .unwrap()
             .to_sat();
         let res = TxInfo {
             confirmations,
@@ -1240,7 +1239,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
     async fn get_utxos(
         &self,
         addresses: HashSet<Address>,
-    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>> {
+    ) -> RpcResult<Vec<PointedOutput>> {
         let res = self
             .app
             .node
@@ -1373,9 +1372,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         Ok(peers)
     }
 
-    async fn list_utxos(
-        &self,
-    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>> {
+    async fn list_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
         let utxos = self.node().get_all_utxos().map_err(custom_err)?;
         let res = utxos
             .into_iter()
@@ -2084,9 +2081,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         Ok(res)
     }
 
-    async fn get_wallet_utxos(
-        &self,
-    ) -> RpcResult<Vec<PointedOutput<FilledOutputContent>>> {
+    async fn get_wallet_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
         let utxos = self.app.wallet.get_utxos().map_err(custom_err)?;
         let utxos = utxos
             .into_iter()
@@ -2173,15 +2168,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         dest: Address,
         value_sats: u64,
         fee_sats: u64,
-        memo: Option<String>,
     ) -> RpcResult<Transaction> {
-        let memo = match memo {
-            None => None,
-            Some(memo) => {
-                let hex = const_hex::decode(memo).map_err(custom_err)?;
-                Some(hex)
-            }
-        };
         let tx = self
             .app
             .wallet
@@ -2189,7 +2176,6 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 dest,
                 Amount::from_sat(value_sats),
                 Amount::from_sat(fee_sats),
-                memo,
             )
             .map_err(custom_err)?;
         Ok(tx)
@@ -2222,19 +2208,11 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         dest: Address,
         amount: f64,
         fee_sats: u64,
-        memo: Option<String>,
     ) -> RpcResult<Txid> {
-        let memo = match memo {
-            None => None,
-            Some(memo) => {
-                let hex = const_hex::decode(memo).map_err(custom_err)?;
-                Some(hex)
-            }
-        };
         let tx = self
             .app
             .wallet
-            .transfer_reputation(dest, amount, Amount::from_sat(fee_sats), memo)
+            .transfer_reputation(dest, amount, Amount::from_sat(fee_sats))
             .map_err(custom_err)?;
         let txid = tx.txid();
         let () = self.app.sign_and_send(tx).map_err(custom_err)?;
@@ -2294,7 +2272,6 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 address,
                 bitcoin::Amount::from_sat(value_sats),
                 bitcoin::Amount::from_sat(fee_sats),
-                None,
             )
             .map_err(custom_err)?;
 

@@ -2,7 +2,7 @@ use std::{pin::Pin, task::Poll};
 
 use eframe::egui::{self, Color32, RichText};
 use futures::Stream;
-use truthcoin_dc::types::{GetBitcoinValue, Network};
+use truthcoin_dc::types::{GetValue, Network};
 
 use crate::{app::App, line_buffer::LineBuffer, util::PromiseStream};
 
@@ -107,12 +107,12 @@ impl BottomPanel {
             };
 
         let confirmed_total: bitcoin::Amount =
-            utxos.values().map(|utxo| utxo.get_bitcoin_value()).sum();
+            utxos.values().map(|utxo| utxo.get_value()).sum();
 
         let pending_spent: bitcoin::Amount = spent_in_mempool
             .iter()
             .filter_map(|(outpoint, _inpoint)| {
-                utxos.get(outpoint).map(|utxo| utxo.get_bitcoin_value())
+                utxos.get(outpoint).map(|utxo| utxo.get_value())
             })
             .sum();
 

@@ -1,171 +1,16 @@
 use std::collections::HashSet;
 
 use eframe::egui;
-use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
 use truthcoin_dc::types::{
-    AssetId, AssetOutputContent, BitcoinOutput, BitcoinOutputContent,
-    FilledOutput, OutPoint, Output, Transaction,
+    GetValue, OutPoint, Output, PointedOutput, Transaction, hash,
 };
 
-use crate::{app::App, gui::util::UiExt};
-
-#[derive(
-    Clone, Copy, Debug, Default, EnumIter, Eq, IntoStaticStr, PartialEq,
-)]
-pub enum AssetKind {
-    #[default]
-    Bitcoin,
-}
+use crate::app::App;
 
 #[derive(Debug, Default)]
-pub struct AssetInput {
-    asset_kind: AssetKind,
-}
-
-impl PartialEq for AssetInput {
-    fn eq(&self, other: &Self) -> bool {
-        self.asset_kind == other.asset_kind
-    }
-}
-
-impl Eq for AssetInput {}
-
-impl AssetInput {
-    pub fn asset_id(&self) -> anyhow::Result<AssetId> {
-        match self.asset_kind {
-            AssetKind::Bitcoin => Ok(AssetId::Bitcoin),
-        }
-    }
-
-    pub fn show(&mut self, ui: &mut egui::Ui) {
-        egui::ComboBox::from_id_salt("asset_kind")
-            .selected_text(<&'static str>::from(self.asset_kind))
-            .show_ui(ui, |ui| {
-                for asset_kind in AssetKind::iter() {
-                    ui.selectable_value(
-                        &mut self.asset_kind,
-                        asset_kind,
-                        <&'static str>::from(asset_kind),
-                    );
-                }
-            });
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct UtxoSelector {
-    asset_input: AssetInput,
-}
+pub struct UtxoSelector;
 
 impl UtxoSelector {
-    fn show_utxos(
-        app: Option<&App>,
-        ui: &mut egui::Ui,
-        tx: &mut Transaction,
-        asset_id: AssetId,
-    ) {
-        let selected: HashSet<_> = tx.inputs.iter().cloned().collect();
-        let (mut unconfirmed_utxos, mut utxos): (
-            Vec<(OutPoint, BitcoinOutput)>,
-            Vec<_>,
-        ) = app
-            .map(|app| {
-                let unconfirmed_utxos = app
-                    .unconfirmed_utxos
-                    .read()
-                    .iter()
-                    .filter_map(|(outpoint, output)| {
-                        if !selected.contains(outpoint)
-                            && asset_id == AssetId::Bitcoin
-                        {
-                            let output =
-                                Option::<BitcoinOutput>::from(output.clone())?;
-                            Some((*outpoint, output))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                let utxos = app
-                    .utxos
-                    .read()
-                    .iter()
-                    .filter_map(|(outpoint, output)| {
-                        if !selected.contains(outpoint)
-                            && output.asset_value().is_some_and(
-                                |(output_asset_id, _)| {
-                                    output_asset_id == asset_id
-                                },
-                            )
-                        {
-                            Some((*outpoint, output.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                (unconfirmed_utxos, utxos)
-            })
-            .unwrap_or_default();
-        let total_confirmed_value: u64 = utxos
-            .iter()
-            .filter_map(|(_, output)| {
-                output.asset_value().map(|(_, value)| value)
-            })
-            .sum();
-        let total_unconfirmed_value: bitcoin::Amount = unconfirmed_utxos
-            .iter()
-            .map(|(_, output)| output.content.0)
-            .sum();
-        unconfirmed_utxos.sort_by_key(|(outpoint, _)| format!("{outpoint}"));
-        utxos.sort_by_key(|(outpoint, _)| format!("{outpoint}"));
-        ui.separator();
-        if total_unconfirmed_value > bitcoin::Amount::ZERO {
-            let total_value: bitcoin::Amount =
-                bitcoin::Amount::from_sat(total_confirmed_value)
-                    + total_unconfirmed_value;
-            ui.monospace(format!(
-                "Total: ₿{total_value} (₿{total_unconfirmed_value} unconfirmed)",
-            ));
-        } else {
-            ui.monospace(format!(
-                "Total: ₿{}",
-                bitcoin::Amount::from_sat(total_confirmed_value),
-            ));
-        }
-        ui.separator();
-        egui::Grid::new("utxos")
-            .striped(true)
-            .num_columns(3)
-            .show(ui, |ui| {
-                ui.monospace_selectable_singleline(false, "Kind");
-                ui.monospace_selectable_singleline(false, "Outpoint");
-                ui.monospace_selectable_singleline(false, "Value");
-                ui.end_row();
-                for (outpoint, output) in utxos {
-                    show_utxo(ui, &outpoint, &output, false);
-
-                    if ui.button("spend").clicked() {
-                        tx.inputs.push(outpoint);
-                    }
-                    ui.end_row();
-                }
-                for (outpoint, output) in unconfirmed_utxos {
-                    show_unconfirmed_utxo(
-                        ui,
-                        &outpoint,
-                        &output.map_content(BitcoinOutputContent::into),
-                        false,
-                    );
-
-                    if ui.button("spend").clicked() {
-                        tx.inputs.push(outpoint);
-                    }
-                    ui.end_row();
-                }
-            });
-    }
-
     pub fn show(
         &mut self,
         app: Option<&App>,
@@ -173,22 +18,73 @@ impl UtxoSelector {
         tx: &mut Transaction,
     ) {
         ui.heading("Spend UTXO");
-        self.asset_input.show(ui);
-        match self.asset_input.asset_id() {
-            Ok(asset_id) => Self::show_utxos(app, ui, tx, asset_id),
-            Err(err) => {
-                ui.monospace_selectable_multiline(format!("{err:#}"));
+        let selected: HashSet<_> =
+            tx.inputs.iter().map(|(outpoint, _)| *outpoint).collect();
+        let (total, utxos, unconfirmed_utxos): (
+            bitcoin::Amount,
+            Vec<_>,
+            Vec<_>,
+        ) = app
+            .map(|app| {
+                let utxos_read = app.utxos.read();
+                let total: bitcoin::Amount = utxos_read
+                    .iter()
+                    .filter(|(outpoint, _)| !selected.contains(outpoint))
+                    .map(|(_, output)| output.get_value())
+                    .sum();
+                let mut utxos: Vec<_> =
+                    (*utxos_read).clone().into_iter().collect();
+                drop(utxos_read);
+                utxos.sort_by_key(|(outpoint, _)| {
+                    truthcoin_dc::types::OutPointKey::from(outpoint)
+                });
+                let mut unconfirmed_utxos: Vec<_> =
+                    app.unconfirmed_utxos.read().clone().into_iter().collect();
+                unconfirmed_utxos.sort_by_key(|(outpoint, _)| {
+                    truthcoin_dc::types::OutPointKey::from(outpoint)
+                });
+                (total, utxos, unconfirmed_utxos)
+            })
+            .unwrap_or_default();
+        ui.separator();
+        ui.monospace(format!("Total: {total}"));
+        ui.separator();
+        egui::Grid::new("utxos").striped(true).show(ui, |ui| {
+            ui.monospace("kind");
+            ui.monospace("outpoint");
+            ui.monospace("value");
+            ui.end_row();
+            for (outpoint, output) in utxos {
+                if selected.contains(&outpoint) {
+                    continue;
+                }
+                show_utxo(ui, &outpoint, &output);
+
+                if ui
+                    .add_enabled(
+                        !selected.contains(&outpoint),
+                        egui::Button::new("spend"),
+                    )
+                    .clicked()
+                {
+                    let utxo_hash = hash(&PointedOutput {
+                        outpoint,
+                        output: output.clone(),
+                    });
+                    tx.inputs.push((outpoint, utxo_hash));
+                }
+                ui.end_row();
             }
-        }
+            for (outpoint, output) in unconfirmed_utxos {
+                show_utxo(ui, &outpoint, &output);
+                ui.monospace("unconfirmed");
+                ui.end_row();
+            }
+        });
     }
 }
 
-pub fn show_utxo(
-    ui: &mut egui::Ui,
-    outpoint: &OutPoint,
-    output: &FilledOutput,
-    show_asset_id: bool,
-) {
+pub fn show_utxo(ui: &mut egui::Ui, outpoint: &OutPoint, output: &Output) {
     let (kind, hash, vout) = match outpoint {
         OutPoint::Regular { txid, vout } => {
             ("regular", format!("{txid}"), *vout)
@@ -196,8 +92,8 @@ pub fn show_utxo(
         OutPoint::Deposit(outpoint) => {
             ("deposit", format!("{}", outpoint.txid), outpoint.vout)
         }
-        OutPoint::Coinbase { merkle_root, vout } => {
-            ("coinbase", format!("{merkle_root}"), *vout)
+        OutPoint::Coinbase { txid, vout } => {
+            ("coinbase", format!("{txid}"), *vout)
         }
         OutPoint::MarketFunds {
             market_id,
@@ -211,85 +107,10 @@ pub fn show_utxo(
         OutPoint::Payout { hash, vout } => ("payout", format!("{hash}"), *vout),
     };
     let hash = &hash[0..8];
-    ui.monospace_selectable_singleline(false, kind.to_string());
-    ui.monospace_selectable_singleline(true, format!("{hash}:{vout}",));
-    match output.asset_value() {
-        None => (),
-        Some((asset_id @ AssetId::Bitcoin, bitcoin_value)) => {
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Max),
-                |ui| {
-                    let bitcoin_amount =
-                        bitcoin::Amount::from_sat(bitcoin_value);
-                    if show_asset_id {
-                        ui.monospace_selectable_singleline(
-                            true,
-                            format!("{asset_id}"),
-                        );
-                    }
-                    ui.monospace_selectable_singleline(
-                        false,
-                        format!("₿{bitcoin_amount}"),
-                    );
-                },
-            );
-        }
-    }
-}
-
-pub fn show_unconfirmed_utxo(
-    ui: &mut egui::Ui,
-    outpoint: &OutPoint,
-    output: &Output,
-    show_asset_id: bool,
-) {
-    let (kind, hash, vout) = match outpoint {
-        OutPoint::Regular { txid, vout } => {
-            ("regular", format!("{txid}"), *vout)
-        }
-        OutPoint::Deposit(outpoint) => {
-            ("deposit", format!("{}", outpoint.txid), outpoint.vout)
-        }
-        OutPoint::Coinbase { merkle_root, vout } => {
-            ("coinbase", format!("{merkle_root}"), *vout)
-        }
-        OutPoint::MarketFunds {
-            market_id,
-            block_height,
-            is_fee,
-        } => (
-            if *is_fee { "author_fee" } else { "market" },
-            const_hex::encode(market_id),
-            *block_height,
-        ),
-        OutPoint::Payout { hash, vout } => ("payout", format!("{hash}"), *vout),
-    };
-    let hash = &hash[0..8];
-    ui.monospace_selectable_singleline(false, kind.to_string());
-    ui.monospace_selectable_singleline(true, format!("{hash}:{vout}",));
-    match output.content.clone().as_asset() {
-        None => (),
-        Some(
-            AssetOutputContent::Bitcoin(BitcoinOutputContent(value))
-            | AssetOutputContent::Withdrawal(
-                truthcoin_dc::types::WithdrawalOutputContent { value, .. },
-            ),
-        ) => {
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Max),
-                |ui| {
-                    if show_asset_id {
-                        ui.monospace_selectable_singleline(
-                            true,
-                            format!("{}", AssetId::Bitcoin),
-                        );
-                    }
-                    ui.monospace_selectable_singleline(
-                        false,
-                        format!("₿{value} (unconfirmed)"),
-                    );
-                },
-            );
-        }
-    }
+    let value = output.get_value();
+    ui.monospace(kind.to_string());
+    ui.monospace(format!("{hash}:{vout}",));
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
+        ui.monospace(format!("{value}"));
+    });
 }

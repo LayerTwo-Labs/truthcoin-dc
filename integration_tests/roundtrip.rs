@@ -18,9 +18,7 @@ use tokio::time::sleep;
 use tracing::Instrument as _;
 use truthcoin_dc::{
     authorization::{Dst, Signature},
-    types::{
-        Address, FilledOutputContent, GetAddress as _, GetBitcoinValue as _,
-    },
+    types::{Address, GetAddress as _, GetValue as _, OutputContent},
 };
 use truthcoin_dc_app_rpc_api::{
     BallotItem, CreateTradeRequest, DecisionClaimItem, DecisionClaimRequest,
@@ -281,17 +279,17 @@ mod debug_helpers {
 /// Helper functions for verifying market UTXO state transitions
 mod utxo_verification {
     use std::collections::HashMap;
-    use truthcoin_dc::types::{FilledOutputContent, OutPoint, PointedOutput};
+    use truthcoin_dc::types::{OutPoint, OutputContent, PointedOutput};
 
     /// Extract market treasury UTXOs from a list of all UTXOs
     /// Returns a map of market_id (hex) -> (outpoint, amount_sats)
     pub fn get_market_treasury_utxos(
-        utxos: &[PointedOutput<FilledOutputContent>],
+        utxos: &[PointedOutput],
     ) -> HashMap<String, (OutPoint, u64)> {
         utxos
             .iter()
             .filter_map(|pointed| {
-                if let FilledOutputContent::MarketFunds {
+                if let OutputContent::MarketFunds {
                     market_id,
                     amount,
                     is_fee: false,
@@ -299,7 +297,7 @@ mod utxo_verification {
                 {
                     Some((
                         const_hex::encode(market_id),
-                        (pointed.outpoint, amount.0.to_sat()),
+                        (pointed.outpoint, amount.to_sat()),
                     ))
                 } else {
                     None
@@ -311,12 +309,12 @@ mod utxo_verification {
     /// Extract market author fee UTXOs from a list of all UTXOs
     /// Returns a map of market_id (hex) -> (outpoint, amount_sats)
     pub fn get_market_author_fee_utxos(
-        utxos: &[PointedOutput<FilledOutputContent>],
+        utxos: &[PointedOutput],
     ) -> HashMap<String, (OutPoint, u64)> {
         utxos
             .iter()
             .filter_map(|pointed| {
-                if let FilledOutputContent::MarketFunds {
+                if let OutputContent::MarketFunds {
                     market_id,
                     amount,
                     is_fee: true,
@@ -324,7 +322,7 @@ mod utxo_verification {
                 {
                     Some((
                         const_hex::encode(market_id),
-                        (pointed.outpoint, amount.0.to_sat()),
+                        (pointed.outpoint, amount.to_sat()),
                     ))
                 } else {
                     None
@@ -514,7 +512,7 @@ async fn roundtrip_task_inner(
         truthcoin_nodes
             .issuer
             .rpc_client
-            .transfer_votecoin(voter_addr, VOTER_ALLOCATION, 1000, None)
+            .transfer_votecoin(voter_addr, VOTER_ALLOCATION, 1000)
             .await?;
 
         truthcoin_nodes
@@ -912,7 +910,7 @@ async fn roundtrip_task_inner(
     let voter_0_chain_bitcoin_utxos: Vec<_> = chain_utxos
         .iter()
         .filter(|utxo| {
-            matches!(utxo.output.content, FilledOutputContent::Bitcoin(_))
+            matches!(utxo.output.content, OutputContent::Value(_))
                 && voter_0_addresses.contains(&utxo.output.address)
         })
         .collect();
@@ -2058,7 +2056,7 @@ async fn roundtrip_task_inner(
         post_settlement_utxos.iter().any(|p| {
             matches!(p.outpoint, truthcoin_dc::types::OutPoint::Payout { .. })
                 && address.map(|a| p.output.address == *a).unwrap_or(true)
-                && p.output.get_bitcoin_value().to_sat() == amount
+                && p.output.get_value().to_sat() == amount
         })
     };
 

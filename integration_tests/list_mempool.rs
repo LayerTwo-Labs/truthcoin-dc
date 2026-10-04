@@ -84,7 +84,7 @@ async fn list_mempool_task(
     let dest = sidechain.rpc_client.get_new_address().await?;
     let transfer_tx = sidechain
         .rpc_client
-        .create_transfer(dest, TRANSFER_AMOUNT, TRANSFER_FEE, None)
+        .create_transfer(dest, TRANSFER_AMOUNT, TRANSFER_FEE)
         .await?;
     let txid = sidechain
         .rpc_client

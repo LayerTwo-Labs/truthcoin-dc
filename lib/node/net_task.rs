@@ -77,8 +77,6 @@ pub enum Error {
     DbWrite(#[from] RwTxnError),
     #[error("Forward mainchain task request failed")]
     ForwardMainchainTaskRequest,
-    #[error("malformed body")]
-    MalformedBody(#[from] crate::types::MalformedBodyError),
     #[error("mempool error")]
     MemPool(#[from] mempool::Error),
     #[error("Net error")]
@@ -310,7 +308,7 @@ pub(in crate::node) fn disconnect_tip_(
     };
     let () = state.disconnect_two_way_peg_data(rwtxn, &two_way_peg_data)?;
     let () = state.disconnect_tip(rwtxn, &tip_header, &tip_body)?;
-    for transaction in tip_body.authorized_transactions()?.iter().rev() {
+    for transaction in tip_body.authorized_transactions().iter().rev() {
         match mempool.put(rwtxn, transaction) {
             Ok(()) => {}
             Err(mempool::Error::DecisionAlreadyClaimedInMempool(_)) => {
@@ -1858,7 +1856,7 @@ mod test {
 
         let main_hash = bitcoin::BlockHash::from_byte_array([1; 32]);
         let body = Body {
-            coinbase: Vec::new(),
+            coinbase: Default::default(),
             transactions: Vec::new(),
             authorizations: Vec::new(),
             actor_proofs: Vec::new(),

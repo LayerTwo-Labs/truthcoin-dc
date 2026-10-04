@@ -13,8 +13,8 @@ use truthcoin_dc::{
     miner::{self, Miner},
     node::{self, Node},
     types::{
-        self, Address, AmountOverflowError, BitcoinOutputContent, Body,
-        FilledOutput, InPoint, OutPoint, Output, Transaction,
+        self, Address, AmountOverflowError, Body, Coinbase, InPoint, OutPoint,
+        Output, Transaction,
         proto::mainchain::{
             self,
             generated::{
@@ -116,7 +116,7 @@ fn update_wallet(node: &Node, wallet: &Wallet) -> Result<(), Error> {
 
 fn update(
     node: &Node,
-    utxos: &mut HashMap<OutPoint, FilledOutput>,
+    utxos: &mut HashMap<OutPoint, Output>,
     unconfirmed_utxos: &mut HashMap<OutPoint, Output>,
     wallet: &Wallet,
 ) -> Result<(), Error> {
@@ -152,7 +152,7 @@ pub struct App {
     pub node: Arc<Node>,
     pub wallet: Wallet,
     pub miner: Option<Arc<TokioRwLock<Miner>>>,
-    pub utxos: Arc<RwLock<HashMap<OutPoint, FilledOutput>>>,
+    pub utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
     pub unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
     pub runtime: Arc<tokio::runtime::Runtime>,
     _task: Arc<AbortOnDrop>,
@@ -162,7 +162,7 @@ pub struct App {
 impl App {
     async fn task(
         node: Arc<Node>,
-        utxos: Arc<RwLock<HashMap<OutPoint, FilledOutput>>>,
+        utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         wallet: Wallet,
     ) -> Result<(), Error> {
@@ -180,7 +180,7 @@ impl App {
 
     fn spawn_task(
         node: Arc<Node>,
-        utxos: Arc<RwLock<HashMap<OutPoint, FilledOutput>>>,
+        utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         wallet: Wallet,
     ) -> JoinHandle<()> {
@@ -350,7 +350,7 @@ impl App {
             let mut unconfirmed_utxos = wallet.get_unconfirmed_utxos()?;
             let transactions = node.get_all_transactions()?;
             for transaction in &transactions {
-                for input in &transaction.transaction.inputs {
+                for (input, _) in &transaction.transaction.inputs {
                     utxos.remove(input);
                     unconfirmed_utxos.remove(input);
                 }
@@ -516,17 +516,22 @@ impl App {
                 // away, so it must not derive an address each time.
                 self.wallet.get_receive_address()?
             };
-            let coinbase =
-                if tx_fees > bitcoin::Amount::ZERO || new_block_height == 0 {
-                    vec![types::Output::new(
-                        coinbase_address,
-                        types::OutputContent::Bitcoin(BitcoinOutputContent(
-                            tx_fees,
-                        )),
-                    )]
+            let coinbase = {
+                let outputs = if tx_fees > bitcoin::Amount::ZERO
+                    || new_block_height == 0
+                {
+                    vec![types::Output {
+                        address: coinbase_address,
+                        content: types::OutputContent::Value(tx_fees),
+                    }]
                 } else {
                     Vec::new()
                 };
+                Coinbase {
+                    memo: Vec::new(),
+                    outputs: outputs.into(),
+                }
+            };
             if new_block_height == 0 {
                 tracing::info!(
                     "Genesis block: Reputation initialized during \
@@ -557,7 +562,7 @@ impl App {
             });
             (bribe, header, body, tx_fees)
         } else {
-            let coinbase = Vec::new();
+            let coinbase = Coinbase::default();
             let merkle_root = Body::compute_merkle_root(&coinbase, &[]);
             let body = Body::new(Vec::new(), coinbase);
             let header = types::Header {

@@ -26,27 +26,6 @@ pub enum InvalidHeader {
     },
 }
 
-#[derive(Debug)]
-pub struct FillTxOutputContents(pub Box<crate::types::FilledTransaction>);
-
-impl std::fmt::Display for FillTxOutputContents {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let txid = self.0.txid();
-        write!(
-            f,
-            "failed to fill tx output contents ({txid}): invalid transaction"
-        )?;
-        if f.alternate() {
-            let tx_json = serde_json::to_string(&self.0)
-                .unwrap_or_else(|_| "<unserializable>".to_owned());
-            write!(f, " ({tx_json})")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for FillTxOutputContents {}
-
 #[allow(clippy::duplicated_attributes)]
 #[derive(Debug, Error, Transitive)]
 #[transitive(from(db::Clear, db::Error))]
@@ -107,8 +86,6 @@ pub enum Error {
     Db(Box<sneed::Error>),
     #[error(transparent)]
     Archive(Box<crate::archive::Error>),
-    #[error(transparent)]
-    FillTxOutputContents(#[from] FillTxOutputContents),
     #[error(
         "invalid body: expected merkle root {expected}, but computed {computed}"
     )]
@@ -168,6 +145,17 @@ pub enum Error {
     },
     #[error("utxo double spent")]
     UtxoDoubleSpent,
+    #[error(
+        "Computed Utxo hash ({}) for input ({}) does not match input hash ({})",
+        const_hex::encode(.computed),
+        .outpoint,
+        const_hex::encode(.input_hash),
+    )]
+    UtxoHashMismatch {
+        computed: crate::types::Hash,
+        outpoint: OutPoint,
+        input_hash: crate::types::Hash,
+    },
     #[error("duplicate decision claim in block: {0:?}")]
     DuplicateDecisionClaim([u8; 3]),
     #[error(transparent)]

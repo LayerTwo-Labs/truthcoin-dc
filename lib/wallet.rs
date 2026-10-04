@@ -34,18 +34,32 @@ use crate::{
     },
     types::{
         Address, AmountOverflowError, AmountUnderflowError,
-        AuthorizedTransaction, BitcoinOutputContent, EncryptionPubKey,
-        FilledOutput, GetBitcoinValue, InPoint, OutPoint, Output,
-        OutputContent, SpentOutput, Transaction, TxData, VERSION, VerifyingKey,
-        Version, WithdrawalOutputContent, keys::Ecies,
+        AuthorizedTransaction, EncryptionPubKey, GetValue, Hash, InPoint,
+        OutPoint, Output, OutputContent, PointedOutput, SpentOutput,
+        Transaction, TxData, VERSION, VerifyingKey, Version, hash, keys::Ecies,
     },
     util::Watchable,
 };
 
-fn sorted_outpoints(utxos: HashMap<OutPoint, Output>) -> Vec<OutPoint> {
-    let mut pairs: Vec<_> = utxos.into_iter().collect();
-    pairs.sort_by_key(|(outpoint, _)| *outpoint);
-    pairs.into_iter().map(|(outpoint, _)| outpoint).collect()
+/// Inputs that spend `coins` in outpoint order, each with its utxo hash
+fn spend_inputs(coins: HashMap<OutPoint, Output>) -> Vec<(OutPoint, Hash)> {
+    let mut inputs: Vec<_> = coins
+        .into_iter()
+        .map(|(outpoint, output)| {
+            let utxo_hash = hash(&PointedOutput { outpoint, output });
+            (outpoint, utxo_hash)
+        })
+        .collect();
+    inputs.sort_by_key(|(outpoint, _)| *outpoint);
+    inputs
+}
+
+fn new_tx(inputs: Vec<(OutPoint, Hash)>, outputs: Vec<Output>) -> Transaction {
+    Transaction {
+        inputs: inputs.into(),
+        outputs: outputs.into(),
+        data: None,
+    }
 }
 
 /// Reinterpret 32 bip32 secret bytes as a Ristretto255 signing key.
@@ -213,12 +227,10 @@ pub struct Wallet {
     index_to_vk: DatabaseUnique<U32<BigEndian>, SerdeBincode<VerifyingKey>>,
     unconfirmed_utxos:
         DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<Output>>,
-    utxos: DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<FilledOutput>>,
+    utxos: DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<Output>>,
     stxos: DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<SpentOutput>>,
-    spent_unconfirmed_utxos: DatabaseUnique<
-        SerdeBincode<OutPoint>,
-        SerdeBincode<SpentOutput<OutputContent>>,
-    >,
+    spent_unconfirmed_utxos:
+        DatabaseUnique<SerdeBincode<OutPoint>, SerdeBincode<SpentOutput>>,
     /// Map each verifying key to it's index
     vk_to_index: DatabaseUnique<SerdeBincode<VerifyingKey>, U32<BigEndian>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
@@ -614,17 +626,17 @@ impl Wallet {
                 .ok_or(AmountOverflowError)?,
         )?;
         let change = total - value - fee - main_fee;
-        let inputs = coins.into_keys().collect();
-        let mut outputs = vec![Output::new(
-            self.get_new_address()?,
-            OutputContent::Withdrawal(WithdrawalOutputContent {
+        let inputs = spend_inputs(coins);
+        let mut outputs = vec![Output {
+            address: self.get_new_address()?,
+            content: OutputContent::Withdrawal {
                 value,
                 main_fee,
                 main_address,
-            }),
-        )];
+            },
+        }];
         self.push_bitcoin_change(&mut outputs, change)?;
-        Ok(Transaction::new(inputs, outputs))
+        Ok(new_tx(inputs, outputs))
     }
 
     pub fn create_transfer(
@@ -632,13 +644,11 @@ impl Wallet {
         address: Address,
         value: bitcoin::Amount,
         fee: bitcoin::Amount,
-        memo: Option<Vec<u8>>,
     ) -> Result<Transaction, Error> {
         self.create_transfer_to(
             vec![Output {
                 address,
-                content: OutputContent::Bitcoin(BitcoinOutputContent(value)),
-                memo: memo.unwrap_or_default(),
+                content: OutputContent::Value(value),
             }],
             fee,
         )
@@ -655,11 +665,9 @@ impl Wallet {
         }
         let outputs = dests
             .iter()
-            .map(|(address, value)| {
-                Output::new(
-                    *address,
-                    OutputContent::Bitcoin(BitcoinOutputContent(*value)),
-                )
+            .map(|(address, value)| Output {
+                address: *address,
+                content: OutputContent::Value(*value),
             })
             .collect();
         self.create_transfer_to(outputs, fee)
@@ -674,16 +682,16 @@ impl Wallet {
         let value = outputs
             .iter()
             .try_fold(bitcoin::Amount::ZERO, |total, output| {
-                total.checked_add(output.get_bitcoin_value())
+                total.checked_add(output.get_value())
             })
             .ok_or(AmountOverflowError)?;
         let (total, coins) = self.select_bitcoins(
             value.checked_add(fee).ok_or(AmountOverflowError)?,
         )?;
         let change = total - value - fee;
-        let inputs = coins.into_keys().collect();
+        let inputs = spend_inputs(coins);
         self.push_bitcoin_change(&mut outputs, change)?;
-        Ok(Transaction::new(inputs, outputs))
+        Ok(new_tx(inputs, outputs))
     }
 
     /// Select confirmed Bitcoin UTXOs only, following Bitcoin Hivemind's requirement
@@ -698,21 +706,19 @@ impl Wallet {
         let mut bitcoin_utxos = Vec::with_capacity(64);
 
         let mut iter = self.utxos.iter(&rotxn).map_err(DbError::from)?;
-        while let Some((outpoint, filled_output)) =
+        while let Some((outpoint, output)) =
             iter.next().map_err(DbError::from)?
         {
-            if filled_output.is_bitcoin()
-                && !filled_output.content.is_withdrawal()
-                && filled_output.get_bitcoin_value() > bitcoin::Amount::ZERO
+            if output.content.is_value()
+                && output.get_value() > bitcoin::Amount::ZERO
             {
-                let output: Output = filled_output.into();
                 bitcoin_utxos.push((outpoint, output));
             }
         }
 
         bitcoin_utxos.sort_unstable_by_key(
             |(_, output): &(OutPoint, Output)| {
-                std::cmp::Reverse(output.get_bitcoin_value())
+                std::cmp::Reverse(output.get_value())
             },
         );
 
@@ -721,7 +727,7 @@ impl Wallet {
 
         for (outpoint, output) in &bitcoin_utxos {
             total = total
-                .checked_add(output.get_bitcoin_value())
+                .checked_add(output.get_value())
                 .ok_or(AmountOverflowError)?;
             selected.insert(*outpoint, output.clone());
 
@@ -739,10 +745,10 @@ impl Wallet {
         change: bitcoin::Amount,
     ) -> Result<(), Error> {
         if change > bitcoin::Amount::ZERO {
-            outputs.push(Output::new(
-                self.get_new_address()?,
-                OutputContent::Bitcoin(BitcoinOutputContent(change)),
-            ));
+            outputs.push(Output {
+                address: self.get_new_address()?,
+                content: OutputContent::Value(change),
+            });
         }
         Ok(())
     }
@@ -761,12 +767,12 @@ impl Wallet {
 
         let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
         let change = total_bitcoin - fee;
-        let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
+        let inputs = spend_inputs(bitcoin_utxos);
 
         let mut outputs = Vec::new();
         self.push_bitcoin_change(&mut outputs, change)?;
 
-        let mut tx = Transaction::new(inputs, outputs);
+        let mut tx = new_tx(inputs, outputs);
         tx.data =
             Some(TxData::ClaimDecision(crate::types::ClaimDecisionPayload {
                 decision_type,
@@ -877,9 +883,10 @@ impl Wallet {
         // Collect inputs first so creator_address matches the first
         // transaction input, consistent with extract_creator_address
         // in block validation (which uses spent_utxos.first())
-        let inputs: Vec<_> = bitcoin_utxos.keys().copied().collect();
+        let inputs = spend_inputs(bitcoin_utxos.clone());
+        let (first_input, _) = inputs.first().ok_or(Error::NotEnoughFunds)?;
         let creator_address = bitcoin_utxos
-            .get(inputs.first().ok_or(Error::NotEnoughFunds)?)
+            .get(first_input)
             .ok_or(Error::NotEnoughFunds)?
             .address;
 
@@ -907,21 +914,19 @@ impl Wallet {
         // Create explicit MarketFunds (treasury) output with treasury funding
         if treasury_sats > 0 {
             let treasury_address = generate_market_treasury_address(&market_id);
-            outputs.push(Output::new(
-                treasury_address,
-                OutputContent::MarketFunds {
+            outputs.push(Output {
+                address: treasury_address,
+                content: OutputContent::MarketFunds {
                     market_id: market_id_bytes,
-                    amount: BitcoinOutputContent(bitcoin::Amount::from_sat(
-                        treasury_sats,
-                    )),
+                    amount: bitcoin::Amount::from_sat(treasury_sats),
                     is_fee: false,
                 },
-            ));
+            });
         }
 
         self.push_bitcoin_change(&mut outputs, change)?;
 
-        let mut tx = Transaction::new(inputs, outputs);
+        let mut tx = new_tx(inputs, outputs);
         tx.data = Some(tx_data);
 
         Ok((tx, market_id))
@@ -943,13 +948,13 @@ impl Wallet {
         let inputs = if is_buy {
             let (_total_bitcoin, bitcoin_utxos) =
                 self.select_bitcoins(bitcoin::Amount::from_sat(limit_sats))?;
-            sorted_outpoints(bitcoin_utxos)
+            spend_inputs(bitcoin_utxos)
         } else {
             let min_fee =
                 bitcoin::Amount::from_sat(trading::TRADE_MINER_FEE_SATS);
             let (_total_bitcoin, bitcoin_utxos) =
                 self.select_bitcoins(min_fee)?;
-            sorted_outpoints(bitcoin_utxos)
+            spend_inputs(bitcoin_utxos)
         };
 
         let outputs = Vec::new();
@@ -969,7 +974,7 @@ impl Wallet {
             _ => None,
         };
 
-        let mut tx = Transaction::new(inputs, outputs);
+        let mut tx = new_tx(inputs, outputs);
         tx.data = Some(TxData::Trade {
             market_id: MarketId::new(*market_id.as_bytes()),
             outcome_index: outcome_index as u32,
@@ -1015,9 +1020,9 @@ impl Wallet {
             return Err(Error::NotEnoughFunds);
         }
 
-        let inputs = sorted_outpoints(bitcoin_utxos);
+        let inputs = spend_inputs(bitcoin_utxos);
 
-        let mut tx = Transaction::new(inputs, Vec::new());
+        let mut tx = new_tx(inputs, Vec::new());
         tx.data = Some(TxData::AmplifyBeta {
             market_id: MarketId::new(*market_id.as_bytes()),
             amount,
@@ -1083,7 +1088,7 @@ impl Wallet {
 
     pub fn put_utxos(
         &self,
-        utxos: &HashMap<OutPoint, FilledOutput>,
+        utxos: &HashMap<OutPoint, Output>,
     ) -> Result<(), Error> {
         let mut rwtxn = self.env.write_txn()?;
         for (outpoint, output) in utxos {
@@ -1104,7 +1109,7 @@ impl Wallet {
             .map_err(DbError::from)?
             .map_err(|err| DbError::from(err).into())
             .for_each(|(_, utxo)| {
-                let value = utxo.get_bitcoin_value();
+                let value = utxo.get_value();
                 balance.total = balance
                     .total
                     .checked_add(value)
@@ -1120,7 +1125,7 @@ impl Wallet {
         Ok(balance)
     }
 
-    pub fn get_utxos(&self) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
+    pub fn get_utxos(&self) -> Result<HashMap<OutPoint, Output>, Error> {
         let rotxn = self.env.read_txn()?;
         let utxos: HashMap<_, _> = self
             .utxos
@@ -1172,11 +1177,11 @@ impl Wallet {
         let mut authorizations = vec![];
         let mut input_addresses = std::collections::HashSet::new();
 
-        for input in &transaction.inputs {
-            let spent_utxo: Output = if let Some(filled_utxo) =
+        for (input, _) in &transaction.inputs {
+            let spent_utxo: Output = if let Some(utxo) =
                 self.utxos.try_get(&rotxn, input).map_err(DbError::from)?
             {
-                filled_utxo.into()
+                utxo
             } else {
                 if let Some(_unconfirmed_utxo) = self
                     .unconfirmed_utxos
@@ -1360,11 +1365,11 @@ impl Wallet {
         let (total_bitcoin, bitcoin_utxos) = self.select_bitcoins(fee)?;
         let change_bitcoin = total_bitcoin - fee;
 
-        let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
+        let inputs = spend_inputs(bitcoin_utxos);
         let mut outputs = Vec::new();
         self.push_bitcoin_change(&mut outputs, change_bitcoin)?;
 
-        let mut tx = Transaction::new(inputs, outputs);
+        let mut tx = new_tx(inputs, outputs);
         tx.data = Some(tx_data);
 
         Ok(tx)
@@ -1375,7 +1380,6 @@ impl Wallet {
         dest: Address,
         amount: f64,
         fee: bitcoin::Amount,
-        memo: Option<Vec<u8>>,
     ) -> Result<Transaction, Error> {
         let voter_addr = self.voter_address()?;
         let tx_data = crate::types::TransactionData::TransferReputation {
@@ -1388,18 +1392,17 @@ impl Wallet {
             self.select_bitcoins_from_address(fee, voter_addr)?;
         let change_bitcoin = total_bitcoin - fee;
 
-        let inputs: Vec<_> = bitcoin_utxos.into_keys().collect();
+        let inputs = spend_inputs(bitcoin_utxos);
         let mut outputs = Vec::new();
         if change_bitcoin > bitcoin::Amount::ZERO {
-            outputs.push(Output::new(
-                voter_addr,
-                OutputContent::Bitcoin(BitcoinOutputContent(change_bitcoin)),
-            ));
+            outputs.push(Output {
+                address: voter_addr,
+                content: OutputContent::Value(change_bitcoin),
+            });
         }
 
-        let mut tx = Transaction::new(inputs, outputs);
+        let mut tx = new_tx(inputs, outputs);
         tx.data = Some(tx_data);
-        tx.memo = memo.unwrap_or_default();
 
         Ok(tx)
     }
@@ -1413,22 +1416,20 @@ impl Wallet {
 
         let mut bitcoin_utxos = Vec::with_capacity(16);
         let mut iter = self.utxos.iter(&rotxn).map_err(DbError::from)?;
-        while let Some((outpoint, filled_output)) =
+        while let Some((outpoint, output)) =
             iter.next().map_err(DbError::from)?
         {
-            if filled_output.address == address
-                && filled_output.is_bitcoin()
-                && !filled_output.content.is_withdrawal()
-                && filled_output.get_bitcoin_value() > bitcoin::Amount::ZERO
+            if output.address == address
+                && output.content.is_value()
+                && output.get_value() > bitcoin::Amount::ZERO
             {
-                let output: Output = filled_output.into();
                 bitcoin_utxos.push((outpoint, output));
             }
         }
 
         bitcoin_utxos.sort_unstable_by_key(
             |(_, output): &(OutPoint, Output)| {
-                std::cmp::Reverse(output.get_bitcoin_value())
+                std::cmp::Reverse(output.get_value())
             },
         );
 
@@ -1436,7 +1437,7 @@ impl Wallet {
         let mut total = bitcoin::Amount::ZERO;
         for (outpoint, output) in &bitcoin_utxos {
             total = total
-                .checked_add(output.get_bitcoin_value())
+                .checked_add(output.get_value())
                 .ok_or(AmountOverflowError)?;
             selected.insert(*outpoint, output.clone());
             if total >= value {
@@ -1498,10 +1499,7 @@ mod test {
     use std::collections::{BTreeMap, HashMap};
 
     use crate::{
-        types::{
-            Address, BitcoinOutputContent, FilledOutput, FilledOutputContent,
-            GetBitcoinValue as _, OutPoint, Output,
-        },
+        types::{Address, GetValue as _, OutPoint, Output, OutputContent},
         wallet::{Error, Wallet},
     };
 
@@ -1536,12 +1534,9 @@ mod test {
             txid: [0; 32].into(),
             vout: 0,
         };
-        let output = FilledOutput {
+        let output = Output {
             address: wallet.get_receive_address()?,
-            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                bitcoin::Amount::from_sat(1000),
-            )),
-            memo: Vec::new(),
+            content: OutputContent::Value(bitcoin::Amount::from_sat(1000)),
         };
         wallet.put_utxos(&HashMap::from([(outpoint, output)]))?;
         let second = wallet.get_receive_address()?;
@@ -1621,12 +1616,11 @@ mod test {
                 txid: [index as u8; 32].into(),
                 vout: 0,
             };
-            let output = FilledOutput {
+            let output = Output {
                 address: wallet.get_new_address()?,
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(*value_sats),
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    *value_sats,
                 )),
-                memo: Vec::new(),
             };
             utxos.insert(outpoint, output);
         }
@@ -1635,7 +1629,7 @@ mod test {
     }
 
     fn value_of(output: &Output) -> u64 {
-        output.get_bitcoin_value().to_sat()
+        output.get_value().to_sat()
     }
 
     #[test]
@@ -1652,10 +1646,10 @@ mod test {
 
         assert_eq!(tx.outputs.len(), 4);
         for (index, (address, value)) in dests.iter().enumerate() {
-            assert_eq!(tx.outputs[index].address, *address);
-            assert_eq!(value_of(&tx.outputs[index]), value.to_sat());
+            assert_eq!(tx.outputs.0[index].address, *address);
+            assert_eq!(value_of(&tx.outputs.0[index]), value.to_sat());
         }
-        let change = &tx.outputs[3];
+        let change = &tx.outputs.0[3];
         assert_eq!(value_of(change), 10_000 - 1000 - 2000 - 3000 - 500);
         assert!(wallet.get_addresses()?.contains(&change.address));
 
@@ -1673,15 +1667,13 @@ mod test {
             dest,
             bitcoin::Amount::from_sat(1000),
             bitcoin::Amount::from_sat(500),
-            Some(vec![0xab]),
         )?;
 
         assert_eq!(tx.outputs.len(), 2);
-        assert_eq!(tx.outputs[0].address, dest);
-        assert_eq!(value_of(&tx.outputs[0]), 1000);
-        assert_eq!(tx.outputs[0].memo, [0xab]);
-        assert_eq!(value_of(&tx.outputs[1]), 10_000 - 1000 - 500);
-        assert!(wallet.get_addresses()?.contains(&tx.outputs[1].address));
+        assert_eq!(tx.outputs.0[0].address, dest);
+        assert_eq!(value_of(&tx.outputs.0[0]), 1000);
+        assert_eq!(value_of(&tx.outputs.0[1]), 10_000 - 1000 - 500);
+        assert!(wallet.get_addresses()?.contains(&tx.outputs.0[1].address));
 
         let _unused = std::fs::remove_dir_all(&test_dir);
         Ok(())
@@ -1731,7 +1723,7 @@ mod test {
         let tx = wallet
             .create_transfer_many(&dests, bitcoin::Amount::from_sat(100))?;
         assert_eq!(tx.inputs.len(), 2);
-        assert_eq!(value_of(&tx.outputs[2]), 100);
+        assert_eq!(value_of(&tx.outputs.0[2]), 100);
 
         let result = wallet
             .create_transfer_many(&dests, bitcoin::Amount::from_sat(1000));

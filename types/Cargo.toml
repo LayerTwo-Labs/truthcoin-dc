@@ -16,7 +16,6 @@ const-hex = { workspace = true, features = ["serde"] }
 frost-core = { workspace = true, features = ["internals"] }
 frost-ristretto255 = { workspace = true, features = ["serde"] }
 heed = { workspace = true, optional = true }
-itertools = { workspace = true }
 libes = { workspace = true }
 nonempty = { workspace = true, features = ["serialize"] }
 rand = { workspace = true, features = ["chacha"] }

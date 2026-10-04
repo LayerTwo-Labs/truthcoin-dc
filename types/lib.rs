@@ -10,129 +10,41 @@ use serde_with::serde_as;
 use utoipa::ToSchema;
 
 mod address;
+pub use address::Address;
 pub mod authorization;
+pub use authorization::Authorization;
 pub mod block;
-pub use block::{Block, Body, Header};
+pub use block::{Block, Body, Coinbase, Header};
 pub mod decision;
 pub mod error;
 pub use error::{
     AmountOverflow as AmountOverflowError,
-    AmountUnderflow as AmountUnderflowError,
-    Bech32mDecode as Bech32mDecodeError, MalformedBody as MalformedBodyError,
+    AmountUnderflow as AmountUnderflowError, ComputeFee as ComputeFeeError,
     WithdrawalBundle as WithdrawalBundleError,
 };
 pub mod hashes;
+pub use hashes::{
+    BlockHash, CoinbaseTxid, Hash, M6id, MerkleRoot, NonZeroBitcoinBlockHash,
+    Txid, hash, hash_with_scratch_buffer,
+};
 pub mod keys;
+pub use keys::{EncryptionPubKey, VerifyingKey};
 pub mod market;
 pub mod net;
 pub mod schema;
 pub mod state;
-mod transaction;
-pub mod tx_pow;
-
-pub use address::Address;
-pub use authorization::Authorization;
-pub use hashes::{
-    AssetId, BlockHash, Hash, M6id, MerkleRoot, NonZeroBitcoinBlockHash, Txid,
-};
-pub use keys::{EncryptionPubKey, VerifyingKey};
+pub mod transaction;
 pub use transaction::{
-    AssetOutput, AssetOutputContent, Authorized, AuthorizedTransaction,
-    BallotItem, BitcoinOutput, BitcoinOutputContent, ClaimDecisionPayload,
-    DecisionClaimEntry, FilledOutput, FilledOutputContent, FilledTransaction,
-    InPoint, MarketCreationView, OutPoint, OutPointKey, Output, OutputContent,
-    PointedOutput, SpentOutput, Transaction, TransactionData, TxData, TxInputs,
-    WithdrawalOutputContent,
+    Authorized, AuthorizedTransaction, BallotItem, ClaimDecisionPayload,
+    DecisionClaimEntry, FilledTransaction, GetAddress, GetValue, InPoint,
+    MarketCreationView, OutPoint, OutPointKey, Output, OutputContent,
+    PointedOutput, PointedOutputRef, SpentOutput, Transaction, TransactionData,
+    TxData,
 };
+pub mod tx_pow;
+mod util;
 
 pub const THIS_SIDECHAIN: u8 = 13;
-
-/// (de)serialize as Display/FromStr for human-readable forms like json,
-/// and default serialization for non human-readable forms like bincode
-mod serde_display_fromstr_human_readable {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use serde_with::{DeserializeAs, DisplayFromStr, SerializeAs};
-    use std::{fmt::Display, str::FromStr};
-
-    pub fn serialize<S, T>(data: T, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: Serialize + Display,
-    {
-        if serializer.is_human_readable() {
-            DisplayFromStr::serialize_as(&data, serializer)
-        } else {
-            data.serialize(serializer)
-        }
-    }
-
-    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: Deserialize<'de> + FromStr,
-        <T as FromStr>::Err: Display,
-    {
-        if deserializer.is_human_readable() {
-            DisplayFromStr::deserialize_as(deserializer)
-        } else {
-            T::deserialize(deserializer)
-        }
-    }
-}
-
-/// Optimized (de)serialize as hex strings for human-readable forms like json,
-/// and default serialization for non human-readable formats like bincode
-mod serde_hexstr_human_readable {
-    use const_hex::{FromHex, ToHexExt};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    #[inline]
-    pub fn serialize<S, T>(data: T, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: Serialize + ToHexExt,
-    {
-        if serializer.is_human_readable() {
-            data.encode_hex().serialize(serializer)
-        } else {
-            data.serialize(serializer)
-        }
-    }
-
-    #[inline]
-    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: Deserialize<'de> + FromHex,
-        <T as FromHex>::Error: std::fmt::Display,
-    {
-        if deserializer.is_human_readable() {
-            const_hex::serde::deserialize(deserializer)
-        } else {
-            T::deserialize(deserializer)
-        }
-    }
-}
-
-pub trait GetAddress {
-    fn get_address(&self) -> Address;
-}
-
-pub trait GetBitcoinValue {
-    /// Bitcoin value in sats
-    fn get_bitcoin_value(&self) -> bitcoin::Amount;
-}
-
-pub(crate) fn borsh_serialize_bitcoin_block_hash<W>(
-    block_hash: &bitcoin::BlockHash,
-    writer: &mut W,
-) -> borsh::io::Result<()>
-where
-    W: borsh::io::Write,
-{
-    let bytes: &[u8; 32] = block_hash.as_ref();
-    borsh::BorshSerialize::serialize(bytes, writer)
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum WithdrawalBundleEventStatus {
@@ -146,10 +58,14 @@ pub enum WithdrawalBundleEventStatus {
 )]
 pub enum WithdrawalBundleStatus {
     Confirmed,
+    /// Formerly pending bundle
     Dropped,
     Failed,
     Pending,
     Submitted,
+    /// Submitted, but unexpected due to previously being dropped or failing.
+    /// It may not be possible to account for this withdrawal bundle, if it
+    /// double-spends UTXOs.
     SubmittedUnexpected,
 }
 
@@ -166,7 +82,7 @@ pub struct WithdrawalBundleEvent {
 )]
 pub struct BlockIndexEvents {
     /// Outputs that mainchain deposits created
-    pub deposits: Vec<(OutPoint, FilledOutput)>,
+    pub deposits: Vec<(OutPoint, Output)>,
     /// Outputs that a withdrawal bundle removed, with the bundle that took them
     pub bundle_spends: Vec<(OutPoint, M6id)>,
 }
@@ -192,7 +108,7 @@ pub struct BlockIndexTx {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct BlockIndexDeposit {
     pub outpoint: OutPoint,
-    pub output: FilledOutput,
+    pub output: Output,
 }
 
 /// One output a withdrawal bundle removed, with the bundle that took it
@@ -228,12 +144,9 @@ pub static OP_DRIVECHAIN_SCRIPT: LazyLock<bitcoin::ScriptBuf> =
 #[serde_as]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct WithdrawalBundle {
-    #[schema(value_type = Vec<(
-        transaction::OutPoint,
-        transaction::FilledOutput)>
-    )]
+    #[schema(value_type = Vec<(transaction::OutPoint, transaction::Output)>)]
     #[serde_as(as = "serde_with::IfIsHumanReadable<serde_with::Seq<(_, _)>>")]
-    spend_utxos: BTreeMap<OutPoint, FilledOutput>,
+    spend_utxos: BTreeMap<OutPoint, Output>,
     #[schema(value_type = schema::BitcoinTransaction)]
     tx: bitcoin::Transaction,
 }
@@ -363,7 +276,7 @@ impl WithdrawalBundle {
     pub fn new(
         block_height: u32,
         fee: bitcoin::Amount,
-        spend_utxos: BTreeMap<OutPoint, FilledOutput>,
+        spend_utxos: BTreeMap<OutPoint, Output>,
         bundle_outputs: Vec<bitcoin::TxOut>,
     ) -> Result<Self, WithdrawalBundleError> {
         let inputs_commitment_txout = {
@@ -378,7 +291,7 @@ impl WithdrawalBundle {
                 }],
             ]
             .concat();
-            let commitment = hashes::hash_with_scratch_buffer(&inputs);
+            let commitment = hash(&inputs);
             let script_pubkey = bitcoin::script::Builder::new()
                 .push_opcode(bitcoin::opcodes::all::OP_RETURN)
                 .push_slice(commitment)
@@ -423,7 +336,7 @@ impl WithdrawalBundle {
         M6id(self.tx.compute_txid())
     }
 
-    pub fn spend_utxos(&self) -> &BTreeMap<OutPoint, FilledOutput> {
+    pub fn spend_utxos(&self) -> &BTreeMap<OutPoint, Output> {
         &self.spend_utxos
     }
 
@@ -439,17 +352,9 @@ pub struct TwoWayPegData {
     pub bundle_statuses: HashMap<M6id, WithdrawalBundleEvent>,
 }
 
-pub trait Verify {
-    type Error;
-    fn verify_transaction(
-        transaction: &AuthorizedTransaction,
-    ) -> Result<(), Self::Error>;
-    fn verify_body(body: &Body) -> Result<(), Self::Error>;
-}
-
 #[derive(Eq, PartialEq, Clone, Debug)]
 pub struct AggregatedWithdrawal {
-    pub spend_utxos: HashMap<OutPoint, FilledOutput>,
+    pub spend_utxos: HashMap<OutPoint, transaction::Output>,
     pub main_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
     pub value: bitcoin::Amount,
     pub main_fee: bitcoin::Amount,
@@ -530,7 +435,7 @@ pub enum BmmResult {
 )]
 pub struct Tip {
     pub block_hash: BlockHash,
-    #[borsh(serialize_with = "borsh_serialize_bitcoin_block_hash")]
+    #[borsh(serialize_with = "util::borsh::serialize::bitcoin_block_hash")]
     pub main_block_hash: bitcoin::BlockHash,
 }
 

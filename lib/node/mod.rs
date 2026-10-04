@@ -26,10 +26,9 @@ use crate::{
     types::{
         Address, AmountOverflowError, AmountUnderflowError, Authorized,
         AuthorizedTransaction, Block, BlockHash, BlockIndexEvents, BmmResult,
-        Body, FilledOutput, FilledTransaction, Header, InPoint, M6id,
-        MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
-        SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
-        WithdrawalBundleStatus,
+        Body, FilledTransaction, Header, InPoint, M6id, MainchainSyncProgress,
+        Network, OutPoint, OutPointKey, Output, SpentOutput, Tip, Transaction,
+        TxIn, Txid, WithdrawalBundle, WithdrawalBundleStatus,
         net::SeedAddress,
         proto::{self, mainchain},
         state::WithdrawalBundleInfo,
@@ -75,8 +74,6 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("error requesting mainchain ancestors")]
     MainchainAncestors(#[source] mainchain_task::ResponseError),
-    #[error("malformed body")]
-    MalformedBody(#[from] crate::types::MalformedBodyError),
     #[error("market price history error")]
     MarketPriceHistory(#[from] state::markets::price_history::Error),
     #[error("mempool error")]
@@ -620,9 +617,7 @@ where
         self.derive_market_beta(market)
     }
 
-    pub fn get_all_utxos(
-        &self,
-    ) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
+    pub fn get_all_utxos(&self) -> Result<HashMap<OutPoint, Output>, Error> {
         let rotxn = self.env.read_txn()?;
         self.state.get_utxos(&rotxn).map_err(Error::from)
     }
@@ -645,7 +640,7 @@ where
         let rotxn = self.env.read_txn()?;
         let mut spent = vec![];
         for outpoint in outpoints {
-            let outpoint_key = OutPointKey::from_outpoint(outpoint);
+            let outpoint_key = OutPointKey::from(outpoint);
             if let Some(output) = self
                 .state
                 .stxos()
@@ -706,7 +701,7 @@ where
     pub fn get_utxos_by_addresses(
         &self,
         addresses: &HashSet<Address>,
-    ) -> Result<HashMap<OutPoint, FilledOutput>, Error> {
+    ) -> Result<HashMap<OutPoint, Output>, Error> {
         let rotxn = self.env.read_txn()?;
         let utxos = self.state.get_utxos_by_addresses(&rotxn, addresses)?;
         Ok(utxos)
@@ -718,10 +713,8 @@ where
     pub fn get_utxos_with_mempool_status(
         &self,
         addresses: &HashSet<Address>,
-    ) -> Result<
-        (HashMap<OutPoint, FilledOutput>, Vec<(OutPoint, InPoint)>),
-        Error,
-    > {
+    ) -> Result<(HashMap<OutPoint, Output>, Vec<(OutPoint, InPoint)>), Error>
+    {
         let rotxn = self.env.read_txn()?;
 
         // Get confirmed UTXOs from state
@@ -897,8 +890,12 @@ where
         for transaction in combined_txs {
             let txid = transaction.transaction.txid();
 
-            let inputs: HashSet<_> =
-                transaction.transaction.inputs.iter().copied().collect();
+            let inputs: HashSet<_> = transaction
+                .transaction
+                .inputs
+                .iter()
+                .map(|(outpoint, _)| *outpoint)
+                .collect();
             if !spent_utxos.is_disjoint(&inputs) {
                 self.mempool.delete(&mut rwtxn, txid)?;
                 continue;
@@ -947,7 +944,12 @@ where
             let tx_fee = block_template_fee(&filled_transaction.transaction)?;
 
             fee = fee.checked_add(tx_fee).ok_or(AmountUnderflowError)?;
-            spent_utxos.extend(filled_transaction.transaction.inputs());
+            spent_utxos.extend(
+                filled_transaction
+                    .transaction
+                    .inputs()
+                    .map(|(outpoint, _, _)| *outpoint),
+            );
             returned_transactions.push(filled_transaction);
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
@@ -1010,7 +1012,7 @@ where
             })?
         {
             let body = self.archive.get_body(&rotxn, block_hash)?;
-            let auth_txs = body.authorized_transactions()?;
+            let auth_txs = body.authorized_transactions();
             let auth_tx =
                 auth_txs.into_iter().nth(idx as usize).ok_or_else(|| {
                     Error::State(Box::new(state::Error::InvalidTransaction {
@@ -1659,7 +1661,7 @@ where
 mod tests {
     use super::*;
     use crate::math::trading::TRADE_MINER_FEE_SATS;
-    use crate::types::{BitcoinOutputContent, FilledOutputContent, TxData};
+    use crate::types::{OutputContent, TxData};
 
     #[test]
     fn block_template_fee_excludes_amplify_beta_deposit() {
@@ -1673,12 +1675,11 @@ mod tests {
                 }),
                 ..Transaction::default()
             },
-            spent_utxos: vec![FilledOutput {
+            spent_utxos: vec![Output {
                 address: Address::ALL_ZEROS,
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(amount + TRADE_MINER_FEE_SATS),
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    amount + TRADE_MINER_FEE_SATS,
                 )),
-                memo: vec![],
             }],
             actor_address: None,
         };

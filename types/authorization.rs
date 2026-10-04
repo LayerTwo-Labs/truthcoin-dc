@@ -179,13 +179,7 @@ pub fn verify_body(
     body: &Body,
 ) -> Result<(), Error> {
     verify_authorizations(ctxt, body)?;
-    let authorized_txs = body.authorized_transactions().map_err(|_| {
-        Error::SignatureCountMismatch {
-            expected: 0,
-            actual: 0,
-        }
-    })?;
-    for tx in &authorized_txs {
+    for tx in &body.authorized_transactions() {
         verify_actor_proof(tx)?;
     }
     Ok(())
@@ -470,10 +464,14 @@ mod tests {
 
     fn one_input_tx() -> Transaction {
         Transaction {
-            inputs: vec![crate::OutPoint::Regular {
-                txid: crate::Txid::from([3; 32]),
-                vout: 0,
-            }],
+            inputs: vec![(
+                crate::OutPoint::Regular {
+                    txid: crate::Txid::from([3; 32]),
+                    vout: 0,
+                },
+                [4; 32],
+            )]
+            .into(),
             ..Default::default()
         }
     }

@@ -1,9 +1,9 @@
 use crate::authorization::{self, BatchVerificationContext};
 use crate::state::{Error, PrevalidatedBlock};
 use crate::types::{
-    AmountOverflowError, AuthorizedTransaction, Body, FilledTransaction,
-    GetAddress as _, GetBitcoinValue as _, Header, OutPointKey, OutputContent,
-    TransactionData,
+    AmountOverflowError, AuthorizedTransaction, Body, ComputeFeeError,
+    FilledTransaction, GetAddress as _, GetValue as _, Header, OutPointKey,
+    OutputContent, PointedOutputRef, TransactionData,
 };
 use rayon::prelude::*;
 use sneed::RoTxn;
@@ -12,6 +12,15 @@ use std::collections::HashSet;
 use super::{DecisionValidator, MarketValidator, VoteValidator};
 
 pub struct BlockValidator;
+
+/// Value in minus value out
+pub(crate) fn tx_fee(tx: &FilledTransaction) -> Result<bitcoin::Amount, Error> {
+    tx.get_fee().map_err(|err| match err {
+        ComputeFeeError::Underfunded => Error::NotEnoughValueIn,
+        ComputeFeeError::ValueInOverflow(err)
+        | ComputeFeeError::ValueOutOverflow(err) => err.into(),
+    })
+}
 
 impl BlockValidator {
     /// Prevalidate a block: perform all read-only checks and return
@@ -54,9 +63,9 @@ impl BlockValidator {
             state.try_get_height(rotxn)?.map_or(0, |height| height + 1);
 
         let mut coinbase_value = bitcoin::Amount::ZERO;
-        for output in &body.coinbase {
+        for output in &body.coinbase.outputs {
             coinbase_value = coinbase_value
-                .checked_add(output.get_bitcoin_value())
+                .checked_add(output.get_value())
                 .ok_or(AmountOverflowError)?;
         }
 
@@ -80,8 +89,8 @@ impl BlockValidator {
             body.transactions.iter().map(|t| t.inputs.len()).sum();
         let mut all_input_keys = Vec::with_capacity(total_inputs);
         for filled_tx in &filled_txs {
-            for input in &filled_tx.transaction.inputs {
-                all_input_keys.push(OutPointKey::from_outpoint(input));
+            for (outpoint, _) in &filled_tx.transaction.inputs {
+                all_input_keys.push(OutPointKey::from(outpoint));
             }
         }
 
@@ -164,10 +173,11 @@ impl BlockValidator {
     ) -> Result<bitcoin::Amount, Error> {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
 
-        for (outpoint, output) in tx.spent_inputs() {
+        Self::validate_utxo_hashes(tx)?;
+        for (outpoint, _, output) in tx.inputs() {
             // a withdrawal output is committed to a bundle and can only be
             // spent by the bundle, never by a transaction
-            if output.is_withdrawal() {
+            if output.content.is_withdrawal() {
                 return Err(Error::SpendWithdrawalOutput {
                     outpoint: *outpoint,
                 });
@@ -235,7 +245,26 @@ impl BlockValidator {
             )?;
         }
 
-        tx.bitcoin_fee()?.ok_or(Error::NotEnoughValueIn)
+        tx_fee(tx)
+    }
+
+    fn validate_utxo_hashes(
+        transaction: &FilledTransaction,
+    ) -> Result<(), Error> {
+        for (outpoint, utxo_hash, output) in transaction.inputs() {
+            let outpoint = *outpoint;
+            let utxo_hash = *utxo_hash;
+            let computed_utxo_hash =
+                crate::types::hash(&PointedOutputRef { outpoint, output });
+            if utxo_hash != computed_utxo_hash {
+                return Err(Error::UtxoHashMismatch {
+                    computed: computed_utxo_hash,
+                    outpoint,
+                    input_hash: utxo_hash,
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_transaction(
@@ -289,7 +318,7 @@ impl BlockValidator {
     ) -> Result<(), Error> {
         for output in coinbase {
             match &output.content {
-                OutputContent::Bitcoin(_) | OutputContent::Withdrawal(_) => {}
+                OutputContent::Value(_) | OutputContent::Withdrawal { .. } => {}
                 OutputContent::MarketFunds { .. } => {
                     return Err(Error::BadCoinbaseOutputContent);
                 }
@@ -307,7 +336,7 @@ impl BlockValidator {
         if filled_tx.is_trade() || filled_tx.is_amplify_beta() {
             return Ok(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS));
         }
-        filled_tx.bitcoin_fee()?.ok_or(Error::NotEnoughValueIn)
+        tx_fee(filled_tx)
     }
 
     pub fn validate_fees(
@@ -336,15 +365,12 @@ impl BlockValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Address, BitcoinOutputContent, Output, OutputContent};
+    use crate::types::{Address, Output, OutputContent};
 
     fn bitcoin_output(sats: u64) -> Output {
         Output {
             address: Address::ALL_ZEROS,
-            content: OutputContent::Bitcoin(BitcoinOutputContent(
-                bitcoin::Amount::from_sat(sats),
-            )),
-            memo: vec![],
+            content: OutputContent::Value(bitcoin::Amount::from_sat(sats)),
         }
     }
 
@@ -363,10 +389,9 @@ mod tests {
             address: Address::ALL_ZEROS,
             content: OutputContent::MarketFunds {
                 market_id: [0u8; 6],
-                amount: BitcoinOutputContent(bitcoin::Amount::from_sat(1000)),
+                amount: bitcoin::Amount::from_sat(1000),
                 is_fee: false,
             },
-            memo: vec![],
         }];
         assert!(
             BlockValidator::validate_coinbase_outputs(&outputs, 0).is_err()
@@ -446,13 +471,10 @@ mod tests {
         let rotxn = env.read_txn().unwrap();
 
         let body = Body {
-            coinbase: vec![Output {
-                address: Address::ALL_ZEROS,
-                content: OutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::ZERO,
-                )),
+            coinbase: crate::types::Coinbase {
                 memo: vec![0u8; Body::MAX_SIZE + 1],
-            }],
+                outputs: Vec::new().into(),
+            },
             transactions: Vec::new(),
             authorizations: Vec::new(),
             actor_proofs: Vec::new(),
@@ -489,8 +511,8 @@ mod tests {
             archive::Archive,
             state::State,
             types::{
-                FilledOutput, FilledOutputContent, OutPoint, Transaction, Txid,
-                WithdrawalOutputContent, hashes::Hash,
+                OutPoint, Output, OutputContent, Transaction, Txid,
+                hashes::Hash,
             },
         };
 
@@ -510,24 +532,25 @@ mod tests {
             bitcoin::Address::p2pkh(pkh, bitcoin::NetworkKind::Test)
                 .into_unchecked()
         };
-        let withdrawal = FilledOutput {
+        let withdrawal = Output {
             address: Address::ALL_ZEROS,
-            content: FilledOutputContent::BitcoinWithdrawal(
-                WithdrawalOutputContent {
-                    value: bitcoin::Amount::from_sat(1000),
-                    main_fee: bitcoin::Amount::from_sat(300),
-                    main_address,
-                },
-            ),
-            memo: vec![],
+            content: OutputContent::Withdrawal {
+                value: bitcoin::Amount::from_sat(1000),
+                main_fee: bitcoin::Amount::from_sat(300),
+                main_address,
+            },
         };
         let outpoint = OutPoint::Regular {
             txid: Txid(Hash::from([1u8; 32])),
             vout: 0,
         };
+        let utxo_hash = crate::types::hash(&PointedOutputRef {
+            outpoint,
+            output: &withdrawal,
+        });
         let tx = FilledTransaction {
             transaction: Transaction {
-                inputs: vec![outpoint],
+                inputs: vec![(outpoint, utxo_hash)].into(),
                 ..Transaction::default()
             },
             spent_utxos: vec![withdrawal],

@@ -1,21 +1,26 @@
 use std::collections::HashMap;
 
-use bitcoin::amount::CheckedSum as _;
 use borsh::BorshSerialize;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    AmountOverflowError, Authorization, AuthorizedTransaction,
-    GetBitcoinValue as _, MalformedBodyError, OutPoint, Output, Transaction,
-    hashes::{self, Hash, MerkleRoot},
+    authorization::Authorization,
+    block::coinbase::Coinbase,
+    error,
+    hashes::{self, CoinbaseTxid, Hash, MerkleRoot},
+    transaction::{
+        AuthorizedTransaction, FilledTransaction, GetValue, OutPoint, Output,
+        Transaction,
+    },
 };
 
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct Body {
-    pub coinbase: Vec<Output>,
+    pub coinbase: Coinbase,
     pub transactions: Vec<Transaction>,
     pub authorizations: Vec<Authorization>,
+    /// One optional actor proof per transaction
     #[serde(default)]
     pub actor_proofs: Vec<Option<Authorization>>,
 }
@@ -26,7 +31,7 @@ impl Body {
 
     pub fn new(
         authorized_transactions: Vec<AuthorizedTransaction>,
-        coinbase: Vec<Output>,
+        coinbase: Coinbase,
     ) -> Self {
         let mut authorizations = Vec::with_capacity(
             authorized_transactions
@@ -51,9 +56,7 @@ impl Body {
         }
     }
 
-    pub fn authorized_transactions(
-        &self,
-    ) -> Result<Vec<AuthorizedTransaction>, MalformedBodyError> {
+    pub fn authorized_transactions(&self) -> Vec<AuthorizedTransaction> {
         let mut authorizations_iter = self.authorizations.iter();
         let mut actor_proofs_iter = self.actor_proofs.iter();
         self.transactions
@@ -61,22 +64,21 @@ impl Body {
             .map(|tx| {
                 let mut authorizations = Vec::with_capacity(tx.inputs.len());
                 for _ in 0..tx.inputs.len() {
-                    let auth =
-                        authorizations_iter.next().ok_or(MalformedBodyError)?;
+                    let auth = authorizations_iter.next().unwrap();
                     authorizations.push(auth.clone());
                 }
                 let actor_proof = actor_proofs_iter.next().cloned().flatten();
-                Ok(AuthorizedTransaction {
+                AuthorizedTransaction {
                     transaction: tx.clone(),
                     authorizations,
                     actor_proof,
-                })
+                }
             })
             .collect()
     }
 
     pub fn compute_merkle_root(
-        coinbase: &[Output],
+        coinbase: &Coinbase,
         txs: &[Transaction],
     ) -> MerkleRoot {
         let coinbase_hash: Hash = hashes::hash_with_scratch_buffer(coinbase);
@@ -105,38 +107,50 @@ impl Body {
     pub fn get_inputs(&self) -> Vec<OutPoint> {
         self.transactions
             .iter()
-            .flat_map(|tx| tx.inputs.iter())
+            .flat_map(|tx| tx.inputs.iter().map(|(outpoint, _)| outpoint))
             .copied()
             .collect()
     }
 
-    pub fn get_outputs(&self) -> HashMap<OutPoint, Output> {
-        let mut outputs = HashMap::new();
-        let merkle_root =
-            Body::compute_merkle_root(&self.coinbase, &self.transactions);
-        for (vout, output) in self.coinbase.iter().enumerate() {
+    pub fn get_outputs(
+        coinbase_txid: CoinbaseTxid,
+        coinbase: &Coinbase,
+        txs: &[FilledTransaction],
+    ) -> HashMap<OutPoint, Output> {
+        let mut res = HashMap::new();
+        for (vout, output) in coinbase.outputs.iter().enumerate() {
             let vout = vout as u32;
-            let outpoint = OutPoint::Coinbase { merkle_root, vout };
-            outputs.insert(outpoint, output.clone());
+            let outpoint = OutPoint::Coinbase {
+                txid: coinbase_txid,
+                vout,
+            };
+            res.insert(outpoint, output.clone());
         }
-        for transaction in &self.transactions {
-            let txid = transaction.txid();
-            for (vout, output) in transaction.outputs.iter().enumerate() {
+        for tx in txs {
+            let txid = tx.transaction.txid();
+            for (vout, output) in tx.transaction.outputs.iter().enumerate() {
                 let vout = vout as u32;
                 let outpoint = OutPoint::Regular { txid, vout };
-                outputs.insert(outpoint, output.clone());
+                res.insert(outpoint, output.clone());
             }
         }
-        outputs
+        res
     }
 
     pub fn get_coinbase_value(
         &self,
-    ) -> Result<bitcoin::Amount, AmountOverflowError> {
+    ) -> Result<bitcoin::Amount, error::AmountOverflow> {
+        use bitcoin::amount::CheckedSum as _;
         self.coinbase
+            .outputs
             .iter()
-            .map(|output| output.get_bitcoin_value())
+            .map(|output| output.get_value())
             .checked_sum()
-            .ok_or(AmountOverflowError)
+            .ok_or(error::AmountOverflow)
+    }
+
+    /// Calculate total number of inputs across all transactions in a block body
+    pub fn inputs_len(&self) -> usize {
+        self.transactions.iter().map(|t| t.inputs.len()).sum()
     }
 }

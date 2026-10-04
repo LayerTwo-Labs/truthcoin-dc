@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error("Bitcoin amount overflow")]
 pub struct AmountOverflow;
 
@@ -9,17 +9,13 @@ pub struct AmountOverflow;
 pub struct AmountUnderflow;
 
 #[derive(Debug, Error)]
-pub enum Bech32mDecode {
-    #[error(transparent)]
-    Bech32m(#[from] bech32::DecodeError),
-    #[error(
-        "Wrong Bech32 HRP. Perhaps this key is being used somewhere it shouldn't be."
-    )]
-    WrongHrp,
-    #[error("Wrong decoded byte length. Must decode to 32 bytes of data.")]
-    WrongSize,
-    #[error("Wrong Bech32 variant. Only Bech32m is accepted.")]
-    WrongVariant,
+pub enum ComputeFee {
+    #[error("underfunded (value in < value out)")]
+    Underfunded,
+    #[error("value in overflow")]
+    ValueInOverflow(#[source] AmountOverflow),
+    #[error("value out overflow")]
+    ValueOutOverflow(#[source] AmountOverflow),
 }
 
 #[derive(Debug, Error)]
@@ -27,10 +23,6 @@ pub enum Bech32mDecode {
 pub struct InvalidDecisionId {
     pub reason: String,
 }
-
-#[derive(Debug, Error)]
-#[error("body has fewer authorizations than transaction inputs")]
-pub struct MalformedBody;
 
 pub mod withdrawal_bundle {
     use thiserror::Error;

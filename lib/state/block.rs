@@ -6,9 +6,9 @@ use crate::{
     math::trading,
     state::{Error, State, UtxoManager, error, markets::MarketId},
     types::{
-        Address, Body, FilledOutput, FilledOutputContent, FilledTransaction,
-        GetBitcoinValue as _, Header, InPoint, MerkleRoot, OutPoint,
-        OutPointKey, OutputContent, SpentOutput, TxData,
+        Address, Body, FilledTransaction, GetValue as _, Header, InPoint,
+        MerkleRoot, OutPoint, OutPointKey, Output, OutputContent, SpentOutput,
+        TxData,
     },
 };
 
@@ -378,7 +378,7 @@ impl StateUpdate {
             generate_market_author_fee_address,
             generate_market_treasury_address,
         };
-        use crate::types::{BitcoinOutputContent, FilledOutput, OutPoint};
+        use crate::types::{OutPoint, Output};
         use std::collections::HashSet;
 
         let sell_payout_markets: HashSet<[u8; 6]> =
@@ -419,23 +419,21 @@ impl StateUpdate {
             let mut old_fee_utxos_with_outputs = Vec::new();
 
             if let Some(existing_outpoint) = old_treasury_pointer
-                && let Some(utxo) = state.utxos.try_get(
-                    rwtxn,
-                    &OutPointKey::from_outpoint(&existing_outpoint),
-                )?
+                && let Some(utxo) = state
+                    .utxos
+                    .try_get(rwtxn, &OutPointKey::from(&existing_outpoint))?
             {
-                treasury_total += utxo.get_bitcoin_value().to_sat();
+                treasury_total += utxo.get_value().to_sat();
                 old_treasury_utxos_with_outputs.push((existing_outpoint, utxo));
                 treasury_utxos_to_consume.push(existing_outpoint);
             }
 
             if let Some(existing_outpoint) = old_fee_pointer
-                && let Some(utxo) = state.utxos.try_get(
-                    rwtxn,
-                    &OutPointKey::from_outpoint(&existing_outpoint),
-                )?
+                && let Some(utxo) = state
+                    .utxos
+                    .try_get(rwtxn, &OutPointKey::from(&existing_outpoint))?
             {
-                fee_total += utxo.get_bitcoin_value().to_sat();
+                fee_total += utxo.get_value().to_sat();
                 old_fee_utxos_with_outputs.push((existing_outpoint, utxo));
                 fee_utxos_to_consume.push(existing_outpoint);
             }
@@ -499,14 +497,11 @@ impl StateUpdate {
                         &payout.seller_address,
                         payout.transaction_id,
                     );
-                    let payout_output = FilledOutput {
+                    let payout_output = Output {
                         address: payout.seller_address,
-                        content: FilledOutputContent::Bitcoin(
-                            BitcoinOutputContent(bitcoin::Amount::from_sat(
-                                payout.payout_sats,
-                            )),
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(payout.payout_sats),
                         ),
-                        memo: vec![],
                     };
                     state.insert_utxo(
                         rwtxn,
@@ -539,14 +534,11 @@ impl StateUpdate {
                                 &settlement.trader_address,
                                 settlement.transaction_id,
                             );
-                        let change_output = FilledOutput {
+                        let change_output = Output {
                             address: settlement.trader_address,
-                            content: FilledOutputContent::Bitcoin(
-                                BitcoinOutputContent(
-                                    bitcoin::Amount::from_sat(change),
-                                ),
+                            content: OutputContent::Value(
+                                bitcoin::Amount::from_sat(change),
                             ),
-                            memo: vec![],
                         };
                         state.insert_utxo(
                             rwtxn,
@@ -577,16 +569,16 @@ impl StateUpdate {
                         block_height: height,
                         is_fee: false,
                     };
-                    let new_output = FilledOutput::new(
-                        treasury_address,
-                        FilledOutputContent::MarketFunds {
+                    let new_output = Output {
+                        address: treasury_address,
+                        content: OutputContent::MarketFunds {
                             market_id: *market_id_bytes,
-                            amount: BitcoinOutputContent(
-                                bitcoin::Amount::from_sat(remaining_treasury),
+                            amount: bitcoin::Amount::from_sat(
+                                remaining_treasury,
                             ),
                             is_fee: false,
                         },
-                    );
+                    };
                     state.insert_utxo(rwtxn, &new_outpoint, &new_output)?;
                     state.markets().set_market_funds_utxo(
                         rwtxn,
@@ -617,16 +609,14 @@ impl StateUpdate {
                     block_height: height,
                     is_fee: true,
                 };
-                let new_output = FilledOutput::new(
-                    fee_address,
-                    FilledOutputContent::MarketFunds {
+                let new_output = Output {
+                    address: fee_address,
+                    content: OutputContent::MarketFunds {
                         market_id: *market_id_bytes,
-                        amount: BitcoinOutputContent(
-                            bitcoin::Amount::from_sat(fee_total),
-                        ),
+                        amount: bitcoin::Amount::from_sat(fee_total),
                         is_fee: true,
                     },
-                );
+                };
                 state.insert_utxo(rwtxn, &new_outpoint, &new_output)?;
                 state.markets().set_market_funds_utxo(
                     rwtxn,
@@ -655,14 +645,11 @@ impl StateUpdate {
             if *change_sats > 0 {
                 let change_outpoint =
                     Self::generate_sell_input_change_outpoint(address, *tx_id);
-                let change_output = FilledOutput {
+                let change_output = Output {
                     address: *address,
-                    content: FilledOutputContent::Bitcoin(
-                        BitcoinOutputContent(bitcoin::Amount::from_sat(
-                            *change_sats,
-                        )),
-                    ),
-                    memo: vec![],
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        *change_sats,
+                    )),
                 };
                 state.insert_utxo(rwtxn, &change_outpoint, &change_output)?;
                 sell_input_change_utxos.push(change_outpoint);
@@ -735,7 +722,7 @@ pub fn connect_prevalidated(
         state
             .genesis_timestamp
             .put(rwtxn, &(), &mainchain_timestamp)?;
-        if let Some(first_coinbase) = body.coinbase.first() {
+        if let Some(first_coinbase) = body.coinbase.outputs.iter().next() {
             state.reputation().set_reputation(
                 rwtxn,
                 &first_coinbase.address,
@@ -781,34 +768,17 @@ pub fn connect_prevalidated(
     }
 
     crate::validation::BlockValidator::validate_coinbase_outputs(
-        &body.coinbase,
+        body.coinbase.outputs.as_slice(),
         height,
     )?;
 
-    for (vout, output) in body.coinbase.iter().enumerate() {
+    let coinbase_txid = header.compute_coinbase_txid();
+    for (vout, output) in body.coinbase.outputs.iter().enumerate() {
         let outpoint = OutPoint::Coinbase {
-            merkle_root: header.merkle_root,
+            txid: coinbase_txid,
             vout: vout as u32,
         };
-        let filled_content = match output.content.clone() {
-            OutputContent::Bitcoin(value) => {
-                FilledOutputContent::Bitcoin(value)
-            }
-            OutputContent::Withdrawal(withdrawal) => {
-                FilledOutputContent::BitcoinWithdrawal(withdrawal)
-            }
-            OutputContent::MarketFunds { .. } => {
-                unreachable!(
-                    "validated by BlockValidator::validate_coinbase_outputs"
-                )
-            }
-        };
-        let filled_output = FilledOutput {
-            address: output.address,
-            content: filled_content,
-            memo: output.memo.clone(),
-        };
-        state.insert_utxo(rwtxn, &outpoint, &filled_output)?;
+        state.insert_utxo(rwtxn, &outpoint, output)?;
     }
     let mut state_update = StateUpdate::new();
     let mut skipped_tx_indices: HashSet<usize> = HashSet::new();
@@ -1123,8 +1093,8 @@ pub fn disconnect_tip(
                 }
             },
         )?;
-        tx.inputs.iter().rev().try_for_each(|outpoint| {
-            let outpoint_key = OutPointKey::from_outpoint(outpoint);
+        tx.inputs.iter().rev().try_for_each(|(outpoint, _)| {
+            let outpoint_key = OutPointKey::from(outpoint);
             if let Some(spent_output) =
                 state.stxos.try_get(rwtxn, &outpoint_key)?
             {
@@ -1204,10 +1174,15 @@ pub fn disconnect_tip(
     }
 
     // 6. Revert coinbase UTXOs
-    body.coinbase.iter().enumerate().rev().try_for_each(
-        |(vout, _output)| {
+    let coinbase_txid = header.compute_coinbase_txid();
+    body.coinbase
+        .outputs
+        .iter()
+        .enumerate()
+        .rev()
+        .try_for_each(|(vout, _output)| {
             let outpoint = OutPoint::Coinbase {
-                merkle_root: header.merkle_root,
+                txid: coinbase_txid,
                 vout: vout as u32,
             };
             if state.delete_utxo(rwtxn, &outpoint)? {
@@ -1215,8 +1190,7 @@ pub fn disconnect_tip(
             } else {
                 Err(Error::NoUtxo { outpoint })
             }
-        },
-    )?;
+        })?;
 
     // 7. Rollback decision states (Claimed → Voting transitions)
     if height > 0 {
@@ -1799,12 +1773,15 @@ fn apply_utxo_changes(
 ) -> Result<(), Error> {
     let txid = filled_tx.txid();
 
-    for (vin, input) in filled_tx.inputs().iter().enumerate() {
-        let input_key = OutPointKey::from_outpoint(input);
-        let spent_output = state
-            .utxos
-            .try_get(rwtxn, &input_key)?
-            .ok_or(Error::NoUtxo { outpoint: *input })?;
+    for (vin, (outpoint, _, _)) in filled_tx.inputs().enumerate() {
+        let input_key = OutPointKey::from(outpoint);
+        let spent_output =
+            state
+                .utxos
+                .try_get(rwtxn, &input_key)?
+                .ok_or(Error::NoUtxo {
+                    outpoint: *outpoint,
+                })?;
 
         let spent_output = SpentOutput {
             output: spent_output,
@@ -1813,22 +1790,16 @@ fn apply_utxo_changes(
                 vin: vin as u32,
             },
         };
-        state.delete_utxo(rwtxn, input)?;
+        state.delete_utxo(rwtxn, outpoint)?;
         state.stxos.put(rwtxn, &input_key, &spent_output)?;
     }
 
-    let Some(filled_outputs) = filled_tx.filled_outputs() else {
-        let err = error::FillTxOutputContents(Box::new(filled_tx.clone()));
-        return Err(err.into());
-    };
-
-    for (vout, filled_output) in filled_outputs.iter().enumerate() {
+    for (vout, output) in filled_tx.transaction.outputs.iter().enumerate() {
         let outpoint = OutPoint::Regular {
             txid,
             vout: vout as u32,
         };
-
-        state.insert_utxo(rwtxn, &outpoint, filled_output)?;
+        state.insert_utxo(rwtxn, &outpoint, output)?;
     }
 
     Ok(())
@@ -1912,7 +1883,7 @@ fn apply_trade(
     }
 
     let input_value_sats = filled_tx
-        .spent_bitcoin_value()
+        .get_value_in()
         .map_err(|_| Error::InvalidTransaction {
             reason: "Failed to compute input value".to_string(),
         })?
@@ -2168,7 +2139,7 @@ fn apply_market_creation(
     let txid = filled_tx.txid();
     let treasury_address = generate_market_treasury_address(&market_id);
 
-    for (vout, output) in filled_tx.outputs().iter().enumerate() {
+    for (vout, output) in filled_tx.transaction.outputs.iter().enumerate() {
         if let OutputContent::MarketFunds {
             market_id: output_market_id,
             amount,
@@ -2185,12 +2156,12 @@ fn apply_market_creation(
                 .markets()
                 .set_market_funds_utxo(rwtxn, &market_id, false, &outpoint)?;
 
-            market.liquidity_base_sats = amount.0.to_sat();
+            market.liquidity_base_sats = amount.to_sat();
 
             tracing::debug!(
                 "Registered MarketFunds (treasury) UTXO for market {:?} with {} sats at {:?}",
                 market_id,
-                amount.0.to_sat(),
+                amount.to_sat(),
                 outpoint
             );
             break;
@@ -2216,7 +2187,7 @@ fn apply_amplify_beta(
             })?;
 
     let input_value_sats = filled_tx
-        .spent_bitcoin_value()
+        .get_value_in()
         .map_err(|_| Error::InvalidTransaction {
             reason: "Failed to compute input value".to_string(),
         })?
@@ -2553,25 +2524,24 @@ fn apply_transfer_reputation(
 mod tests {
     use super::*;
 
-    fn bitcoin_input(sats: u64) -> FilledOutput {
-        FilledOutput {
+    fn bitcoin_input(sats: u64) -> Output {
+        Output {
             address: Address::ALL_ZEROS,
-            content: FilledOutputContent::Bitcoin(
-                crate::types::BitcoinOutputContent(bitcoin::Amount::from_sat(
-                    sats,
-                )),
-            ),
-            memo: vec![],
+            content: OutputContent::Value(bitcoin::Amount::from_sat(sats)),
         }
     }
 
     fn filled_tx(data: TxData, input_sats: u64) -> FilledTransaction {
         FilledTransaction {
             transaction: crate::types::Transaction {
-                inputs: vec![OutPoint::Regular {
-                    txid: crate::types::Txid([0; 32]),
-                    vout: 0,
-                }],
+                inputs: vec![(
+                    OutPoint::Regular {
+                        txid: crate::types::Txid([0; 32]),
+                        vout: 0,
+                    },
+                    [0; 32],
+                )]
+                .into(),
                 data: Some(data),
                 ..Default::default()
             },

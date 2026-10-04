@@ -9,11 +9,10 @@ use crate::{
         rollback::{HeightStamped, RollBack},
     },
     types::{
-        AggregatedWithdrawal, AmountOverflowError, BlockIndexEvents,
-        FilledOutput, FilledOutputContent, InPoint, M6id, OutPoint,
-        OutPointKey, SpentOutput, WithdrawalBundle, WithdrawalBundleEvent,
-        WithdrawalBundleEventStatus, WithdrawalBundleStatus,
-        WithdrawalOutputContent,
+        AggregatedWithdrawal, AmountOverflowError, BlockIndexEvents, InPoint,
+        M6id, OutPoint, OutPointKey, Output, OutputContent, SpentOutput,
+        WithdrawalBundle, WithdrawalBundleEvent, WithdrawalBundleEventStatus,
+        WithdrawalBundleStatus,
         proto::mainchain::{BlockEvent, TwoWayPegData},
         state::WithdrawalBundleInfo,
     },
@@ -30,13 +29,11 @@ fn collect_withdrawal_bundle(
     >::new();
     state.utxos.iter(txn)?.map_err(Error::from).for_each(
         |(outpoint, output)| {
-            if let FilledOutputContent::BitcoinWithdrawal(
-                WithdrawalOutputContent {
-                    value,
-                    ref main_address,
-                    main_fee,
-                },
-            ) = output.content
+            if let OutputContent::Withdrawal {
+                value,
+                ref main_address,
+                main_fee,
+            } = output.content
             {
                 let aggregated = address_to_aggregated_withdrawal
                     .entry(main_address.clone())
@@ -56,7 +53,7 @@ fn collect_withdrawal_bundle(
                     .ok_or(AmountOverflowError)?;
                 aggregated
                     .spend_utxos
-                    .insert(outpoint.to_outpoint(), output);
+                    .insert(OutPoint::from(outpoint), output);
             }
             Ok(())
         },
@@ -68,7 +65,7 @@ fn collect_withdrawal_bundle(
         address_to_aggregated_withdrawal.into_values().collect();
     aggregated_withdrawals.sort_by_key(|a| std::cmp::Reverse(a.clone()));
     let mut fee = bitcoin::Amount::ZERO;
-    let mut spend_utxos = BTreeMap::<OutPoint, FilledOutput>::new();
+    let mut spend_utxos = BTreeMap::<OutPoint, Output>::new();
     let mut bundle_outputs = Vec::new();
     let mut bundle_txouts_size: u32 = 0;
     for aggregated in &aggregated_withdrawals {
@@ -154,7 +151,7 @@ fn connect_withdrawal_bundle_submitted(
             }
         };
         for (outpoint, spend_output) in bundle.spend_utxos() {
-            let outpoint_key = OutPointKey::from_outpoint(outpoint);
+            let outpoint_key = OutPointKey::from(outpoint);
             if !state.delete_utxo(rwtxn, outpoint)? {
                 return Err(Error::NoUtxo {
                     outpoint: *outpoint,
@@ -336,7 +333,7 @@ fn connect_withdrawal_bundle_confirmed(
                     state.utxos.iter(rwtxn)?.collect()?;
                 let mut utxos = BTreeMap::new();
                 for (outpoint_key, output) in &utxos_keys {
-                    let outpoint = outpoint_key.to_outpoint();
+                    let outpoint = OutPoint::from(outpoint_key);
                     let spent_output = SpentOutput {
                         output: output.clone(),
                         inpoint: InPoint::Withdrawal { m6id },
@@ -369,7 +366,7 @@ fn connect_withdrawal_bundle_confirmed(
                     "Unexpected withdrawal bundle confirmed, marking bundle UTXOs as spent"
                 );
                 for (outpoint, output) in bundle.spend_utxos() {
-                    let outpoint_key = OutPointKey::from_outpoint(outpoint);
+                    let outpoint_key = OutPointKey::from(outpoint);
                     if !state.delete_utxo(rwtxn, outpoint)? {
                         return Err(
                             Error::UnexpectedWithdrawalBundleInsolvency {
@@ -435,7 +432,7 @@ fn connect_withdrawal_bundle_failed(
                 break 'known;
             }
             for (outpoint, output) in bundle.spend_utxos() {
-                let outpoint_key = OutPointKey::from_outpoint(outpoint);
+                let outpoint_key = OutPointKey::from(outpoint);
                 state.stxos.delete(rwtxn, &outpoint_key)?;
                 state.insert_utxo(rwtxn, outpoint, output)?;
             }
@@ -688,7 +685,7 @@ fn disconnect_withdrawal_bundle_submitted(
                     == WithdrawalBundleStatus::Pending
             {
                 for (outpoint, output) in bundle.spend_utxos().iter().rev() {
-                    let outpoint_key = OutPointKey::from_outpoint(outpoint);
+                    let outpoint_key = OutPointKey::from(outpoint);
                     if !state.stxos.delete(rwtxn, &outpoint_key)? {
                         return Err(Error::NoStxo {
                             outpoint: *outpoint,
@@ -762,7 +759,7 @@ fn disconnect_withdrawal_bundle_confirmed(
                 WithdrawalBundleStatus::SubmittedUnexpected
             ) {
                 for (outpoint, output) in known.spend_utxos() {
-                    let outpoint_key = OutPointKey::from_outpoint(outpoint);
+                    let outpoint_key = OutPointKey::from(outpoint);
                     state.insert_utxo(rwtxn, outpoint, output)?;
                     if !state.stxos.delete(rwtxn, &outpoint_key)? {
                         return Err(Error::NoStxo {
@@ -774,7 +771,7 @@ fn disconnect_withdrawal_bundle_confirmed(
         }
         WithdrawalBundleInfo::UnknownConfirmed { spend_utxos } => {
             for (outpoint, output) in spend_utxos {
-                let outpoint_key = OutPointKey::from_outpoint(outpoint);
+                let outpoint_key = OutPointKey::from(outpoint);
                 state.insert_utxo(rwtxn, outpoint, output)?;
                 if !state.stxos.delete(rwtxn, &outpoint_key)? {
                     return Err(Error::NoStxo {
@@ -843,7 +840,7 @@ fn disconnect_withdrawal_bundle_failed(
                 break 'known;
             }
             for (outpoint, output) in bundle.spend_utxos().iter().rev() {
-                let outpoint_key = OutPointKey::from_outpoint(outpoint);
+                let outpoint_key = OutPointKey::from(outpoint);
                 let spent_output = SpentOutput {
                     output: output.clone(),
                     inpoint: InPoint::Withdrawal { m6id },
@@ -1112,11 +1109,10 @@ mod tests {
             },
         },
         types::{
-            Address, BitcoinOutputContent, BlockIndexEvents, FilledOutput,
-            FilledOutputContent, Hash, InPoint, M6id, OutPoint, OutPointKey,
-            Txid, WithdrawalBundle, WithdrawalBundleEvent,
-            WithdrawalBundleEventStatus, WithdrawalBundleStatus,
-            WithdrawalOutputContent,
+            Address, BlockIndexEvents, Hash, InPoint, M6id, OutPoint,
+            OutPointKey, Output, OutputContent, Txid, WithdrawalBundle,
+            WithdrawalBundleEvent, WithdrawalBundleEventStatus,
+            WithdrawalBundleStatus,
             proto::mainchain::{BlockEvent, BlockInfo, TwoWayPegData},
         },
     };
@@ -1143,14 +1139,11 @@ mod tests {
             txid: Txid(Hash::from([1; 32])),
             vout: 0,
         };
-        let output = FilledOutput {
+        let output = Output {
             address: Address::ALL_ZEROS,
-            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                bitcoin::Amount::from_sat(1000),
-            )),
-            memo: Vec::new(),
+            content: OutputContent::Value(bitcoin::Amount::from_sat(1000)),
         };
-        let key = OutPointKey::from_outpoint(&outpoint);
+        let key = OutPointKey::from(&outpoint);
 
         let m6id = {
             let mut spend_utxos = BTreeMap::new();
@@ -1315,20 +1308,17 @@ mod tests {
                 txid: Txid(Hash::from(txid_bytes)),
                 vout: 0,
             };
-            let output = FilledOutput {
+            let output = Output {
                 address: Address::ALL_ZEROS,
-                content: FilledOutputContent::BitcoinWithdrawal(
-                    WithdrawalOutputContent {
-                        value: bitcoin::Amount::from_sat(1_000),
-                        main_fee: bitcoin::Amount::ZERO,
-                        main_address: main_address(idx),
-                    },
-                ),
-                memo: Vec::new(),
+                content: OutputContent::Withdrawal {
+                    value: bitcoin::Amount::from_sat(1_000),
+                    main_fee: bitcoin::Amount::ZERO,
+                    main_address: main_address(idx),
+                },
             };
             state.utxos.put(
                 &mut rwtxn,
-                &OutPointKey::from_outpoint(&outpoint),
+                &OutPointKey::from(&outpoint),
                 &output,
             )?;
         }
@@ -1377,7 +1367,7 @@ mod tests {
             BatchVerificationContext::new(&mut rand::rng());
 
         let empty_body = Body {
-            coinbase: Vec::new(),
+            coinbase: Default::default(),
             transactions: Vec::new(),
             authorizations: Vec::new(),
             actor_proofs: Vec::new(),
@@ -1422,7 +1412,7 @@ mod tests {
             vout: 0,
         };
         let deposit_key =
-            OutPointKey::from_outpoint(&OutPoint::Deposit(deposit_outpoint));
+            OutPointKey::from(&OutPoint::Deposit(deposit_outpoint));
         let deposit_twpd = {
             let mut block_info = LinkedHashMap::new();
             block_info.insert(
@@ -1432,14 +1422,11 @@ mod tests {
                     events: vec![BlockEvent::Deposit(Deposit {
                         tx_index: 0,
                         outpoint: deposit_outpoint,
-                        output: FilledOutput {
+                        output: Output {
                             address: Address::ALL_ZEROS,
-                            content: FilledOutputContent::Bitcoin(
-                                BitcoinOutputContent(
-                                    bitcoin::Amount::from_sat(1000),
-                                ),
+                            content: OutputContent::Value(
+                                bitcoin::Amount::from_sat(1000),
                             ),
-                            memo: Vec::new(),
                         },
                     })],
                 },
@@ -1497,12 +1484,11 @@ mod tests {
                     txid: bitcoin::Txid::from_byte_array([salt; 32]),
                     vout: 0,
                 },
-                output: FilledOutput {
+                output: Output {
                     address: Address::ALL_ZEROS,
-                    content: FilledOutputContent::Bitcoin(
-                        BitcoinOutputContent(bitcoin::Amount::from_sat(1000)),
-                    ),
-                    memo: Vec::new(),
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        1000,
+                    )),
                 },
             };
             (
@@ -1547,12 +1533,11 @@ mod tests {
         let events = BlockIndexEvents {
             deposits: vec![(
                 deposit_outpoint(1),
-                FilledOutput {
+                Output {
                     address: Address::ALL_ZEROS,
-                    content: FilledOutputContent::Bitcoin(
-                        BitcoinOutputContent(bitcoin::Amount::from_sat(5000)),
-                    ),
-                    memo: Vec::new(),
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        5000,
+                    )),
                 },
             )],
             bundle_spends: vec![(

@@ -26,7 +26,7 @@ fn create_bitcoin_transfer(
     amount: bitcoin::Amount,
     fee: bitcoin::Amount,
 ) -> anyhow::Result<()> {
-    let tx = app.wallet.create_transfer(dest, amount, fee, None)?;
+    let tx = app.wallet.create_transfer(dest, amount, fee)?;
     app.sign_and_send(tx)?;
     Ok(())
 }

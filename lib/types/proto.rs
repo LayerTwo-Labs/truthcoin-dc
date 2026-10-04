@@ -292,10 +292,7 @@ pub mod mainchain {
     use thiserror::Error;
 
     use super::common::{ConsensusHex, ReverseHex};
-    use crate::types::{
-        BitcoinOutputContent, FilledOutput, FilledOutputContent, M6id,
-        THIS_SIDECHAIN,
-    };
+    use crate::types::{M6id, Output, OutputContent, THIS_SIDECHAIN};
 
     #[allow(clippy::double_must_use)]
     pub mod generated {
@@ -444,7 +441,7 @@ pub mod mainchain {
         }
     }
 
-    impl TryFrom<generated::deposit::Output> for FilledOutput {
+    impl TryFrom<generated::deposit::Output> for Output {
         type Error = super::Error;
 
         fn try_from(
@@ -501,10 +498,7 @@ pub mod mainchain {
                 .map(bitcoin::Amount::from_sat)?;
             Ok(Self {
                 address,
-                memo: Vec::new(),
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    value,
-                )),
+                content: OutputContent::Value(value),
             })
         }
     }
@@ -528,7 +522,7 @@ pub mod mainchain {
         /// Position of this transaction within the block that included it
         pub tx_index: u64,
         pub outpoint: OutPoint,
-        pub output: FilledOutput,
+        pub output: Output,
     }
 
     impl TryFrom<generated::Deposit> for Deposit {

@@ -22,7 +22,7 @@ use futures::{
 };
 use tokio::time::sleep;
 use tracing::Instrument as _;
-use truthcoin_dc::{types::GetBitcoinValue as _, wallet::TransferDests};
+use truthcoin_dc::{types::GetValue as _, wallet::TransferDests};
 use truthcoin_dc_app_rpc_api::{node::RpcClient as _, wallet::RpcClient as _};
 
 use crate::{
@@ -102,9 +102,7 @@ async fn transfer_many_task(
     anyhow::ensure!(entry.tx.outputs.len() == dests.len() + 1);
     for (output, (address, value_sats)) in entry.tx.outputs.iter().zip(&dests) {
         anyhow::ensure!(output.address == *address);
-        anyhow::ensure!(
-            output.get_bitcoin_value() == Amount::from_sat(*value_sats)
-        );
+        anyhow::ensure!(output.get_value() == Amount::from_sat(*value_sats));
     }
 
     tracing::debug!("Checking that a block accepts the transfer");
@@ -116,8 +114,7 @@ async fn transfer_many_task(
     for (address, value_sats) in &dests {
         anyhow::ensure!(utxos.iter().any(|utxo| {
             utxo.output.address == *address
-                && utxo.output.get_bitcoin_value()
-                    == Amount::from_sat(*value_sats)
+                && utxo.output.get_value() == Amount::from_sat(*value_sats)
         }));
     }
 

@@ -849,7 +849,7 @@ where
             fee_sats,
         } => {
             let tx = rpc_client
-                .create_transfer(dest, value_sats, fee_sats, None)
+                .create_transfer(dest, value_sats, fee_sats)
                 .await?;
             json_response(&tx)?
         }
@@ -1536,9 +1536,8 @@ where
             amount,
             fee_sats,
         } => {
-            let txid = rpc_client
-                .transfer_votecoin(dest, amount, fee_sats, None)
-                .await?;
+            let txid =
+                rpc_client.transfer_votecoin(dest, amount, fee_sats).await?;
             format!("Votecoin transferred: {txid}")
         }
         Command::VotecoinBalance { address } => {

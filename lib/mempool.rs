@@ -311,7 +311,7 @@ impl MemPool {
         let stxos = {
             let txid = transaction.transaction.txid();
             transaction.transaction.inputs.iter().enumerate().map(
-                move |(vin, outpoint)| {
+                move |(vin, (outpoint, _))| {
                     (
                         *outpoint,
                         InPoint::Regular {
@@ -341,7 +341,10 @@ impl MemPool {
         let mut pending_deletes = VecDeque::from([txid]);
         while let Some(txid) = pending_deletes.pop_front() {
             if let Some(tx) = self.transactions.try_get(rwtxn, &txid)? {
-                let () = self.delete_stxos(rwtxn, &tx.transaction.inputs)?;
+                let () = self.delete_stxos(
+                    rwtxn,
+                    tx.transaction.inputs.iter().map(|(outpoint, _)| outpoint),
+                )?;
                 let () = self.unindex_tx_addresses(rwtxn, &tx)?;
                 let () = self.delete_decision_claims(rwtxn, &tx)?;
 
@@ -554,8 +557,8 @@ mod p2p_validation_bypass_tests {
     };
     use crate::state::{State, UtxoManager};
     use crate::types::{
-        Address, AuthorizedTransaction, FilledOutput, FilledOutputContent,
-        OutPoint, Output, OutputContent, Transaction, Txid, VerifyingKey,
+        Address, AuthorizedTransaction, OutPoint, Output, OutputContent,
+        Transaction, Txid, VerifyingKey,
     };
 
     fn signing_key(seed: u8) -> SigningKey {
@@ -588,12 +591,9 @@ mod p2p_validation_bypass_tests {
             txid: Txid([7u8; 32]),
             vout: 0,
         };
-        let funded_output = FilledOutput {
+        let funded_output = Output {
             address: victim_addr,
-            content: FilledOutputContent::Bitcoin(
-                crate::types::BitcoinOutputContent(Amount::from_sat(100_000)),
-            ),
-            memo: vec![],
+            content: OutputContent::Value(Amount::from_sat(100_000)),
         };
         {
             let mut rwtxn = env.write_txn().expect("write txn");
@@ -604,17 +604,19 @@ mod p2p_validation_bypass_tests {
         }
 
         let tx = Transaction {
-            inputs: vec![funding_outpoint],
+            inputs: vec![(
+                funding_outpoint,
+                crate::types::hash(&crate::types::PointedOutputRef {
+                    outpoint: funding_outpoint,
+                    output: &funded_output,
+                }),
+            )]
+            .into(),
             outputs: vec![Output {
                 address: get_address(&VerifyingKey::from(&signing_key(2))),
-                content: OutputContent::Bitcoin(
-                    crate::types::BitcoinOutputContent(Amount::from_sat(
-                        90_000,
-                    )),
-                ),
-                memo: vec![],
-            }],
-            memo: vec![],
+                content: OutputContent::Value(Amount::from_sat(90_000)),
+            }]
+            .into(),
             data: None,
         };
 
@@ -744,9 +746,8 @@ mod tests {
         let entries: Vec<DecisionClaimEntry> =
             decision_ids.iter().copied().map(claim_entry).collect();
         let tx = Transaction {
-            inputs: vec![input_outpoint(input_seed)],
-            outputs: vec![],
-            memo: Vec::new(),
+            inputs: vec![(input_outpoint(input_seed), [0; 32])].into(),
+            outputs: vec![].into(),
             data: Some(TransactionData::ClaimDecision(
                 crate::types::ClaimDecisionPayload {
                     decision_type: DecisionType::Binary,
@@ -763,9 +764,8 @@ mod tests {
 
     fn regular_tx(input_seed: u8) -> AuthorizedTransaction {
         let tx = Transaction {
-            inputs: vec![input_outpoint(input_seed)],
-            outputs: vec![],
-            memo: Vec::new(),
+            inputs: vec![(input_outpoint(input_seed), [0; 32])].into(),
+            outputs: vec![].into(),
             data: None,
         };
         Authorized {

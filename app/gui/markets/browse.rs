@@ -915,14 +915,14 @@ impl Browse {
                 Err(_) => return,
             };
 
-        use truthcoin_dc::types::GetBitcoinValue;
+        use truthcoin_dc::types::GetValue;
         let confirmed_total: bitcoin::Amount =
-            utxos.values().map(|utxo| utxo.get_bitcoin_value()).sum();
+            utxos.values().map(|utxo| utxo.get_value()).sum();
 
         let pending_spent: bitcoin::Amount = spent_in_mempool
             .iter()
             .filter_map(|(outpoint, _)| {
-                utxos.get(outpoint).map(|utxo| utxo.get_bitcoin_value())
+                utxos.get(outpoint).map(|utxo| utxo.get_value())
             })
             .sum();
 

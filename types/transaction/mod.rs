@@ -1,34 +1,38 @@
-use std::{
-    borrow::Borrow,
-    collections::{HashMap, HashSet},
-};
+use std::{borrow::Borrow, collections::HashSet};
 
-use bitcoin::amount::CheckedSum as _;
+use bitcoin::amount::CheckedSum;
 use borsh::{self, BorshSerialize};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use utoipa::{PartialSchema, ToSchema};
+use utoipa::ToSchema;
 
 use crate::{
-    AmountOverflowError, GetAddress, GetBitcoinValue,
     address::Address,
     authorization::Authorization,
     decision::DecisionType,
-    hashes::{self, AssetId, M6id, Txid},
+    error,
+    hashes::{self, Hash, M6id, Txid, hash_with_scratch_buffer},
     market::{DimensionSpec, MarketId},
-    serde_hexstr_human_readable,
 };
 
+pub mod inputs;
+pub use inputs::Inputs;
 pub mod outpoint;
 pub use outpoint::{OutPoint, OutPointKey};
-mod output;
+pub mod output;
 pub use output::{
-    AssetContent as AssetOutputContent, AssetOutput,
-    BitcoinContent as BitcoinOutputContent, BitcoinOutput,
-    Content as OutputContent, FilledContent as FilledOutputContent,
-    FilledOutput, Output, Pointed as PointedOutput, SpentOutput,
-    WithdrawalContent as WithdrawalOutputContent,
+    Content as OutputContent, Output, Pointed as PointedOutput,
+    PointedOutputRef,
 };
+pub mod outputs;
+pub use outputs::Outputs;
+
+pub trait GetAddress {
+    fn get_address(&self) -> Address;
+}
+
+pub trait GetValue {
+    fn get_value(&self) -> bitcoin::Amount;
+}
 
 /// Reference to a tx input.
 #[derive(
@@ -45,13 +49,9 @@ pub enum InPoint {
     Withdrawal {
         m6id: M6id,
     },
-    /// Consumed by system operations (wallet sync for stale UTXOs)
+    /// Removed from the state without a spend (wallet sync for stale UTXOs)
     Redistribution,
 }
-
-pub type TxInputs = Vec<OutPoint>;
-
-pub type TxOutputs = Vec<Output>;
 
 /// Struct representing a single vote in a batch vote transaction
 #[derive(
@@ -267,44 +267,15 @@ pub struct AmplifyBeta {
     BorshSerialize, Clone, Debug, Default, Deserialize, Serialize, ToSchema,
 )]
 pub struct Transaction {
-    #[schema(schema_with = TxInputs::schema)]
-    pub inputs: TxInputs,
-    #[schema(schema_with = TxOutputs::schema)]
-    pub outputs: TxOutputs,
-    #[serde(with = "serde_hexstr_human_readable")]
-    #[schema(value_type = String)]
-    pub memo: Vec<u8>,
+    #[schema(value_type = Vec<(OutPoint, String)>)]
+    pub inputs: Inputs<(OutPoint, Hash)>,
+    pub outputs: Outputs,
     pub data: Option<TransactionData>,
 }
 
 impl Transaction {
-    pub fn new(inputs: TxInputs, outputs: TxOutputs) -> Self {
-        Self {
-            inputs,
-            outputs,
-            memo: Vec::new(),
-            data: None,
-        }
-    }
-
-    /// Return an iterator over asset outputs with index
-    pub fn indexed_asset_outputs(
-        &self,
-    ) -> impl Iterator<Item = (usize, AssetOutput)> + '_ {
-        self.outputs.iter().enumerate().filter_map(|(idx, output)| {
-            let asset_output: AssetOutput =
-                Option::<AssetOutput>::from(output.clone())?;
-            Some((idx, asset_output))
-        })
-    }
-
-    /// `true` if the tx data corresponds to a regular tx
-    pub fn is_regular(&self) -> bool {
-        self.data.is_none()
-    }
-
     pub fn txid(&self) -> Txid {
-        hashes::hash_with_scratch_buffer(self).into()
+        hash_with_scratch_buffer(self).into()
     }
 
     /// Canonical encoding as bytes. The canonical encoding is used for hashing,
@@ -312,65 +283,113 @@ impl Transaction {
     pub fn canonical_bytes(&self) -> borsh::io::Result<Vec<u8>> {
         borsh::to_vec(&self)
     }
+
+    /// Canonical size in bytes. The canonical encoding is used for hashing,
+    /// but other encodings may be used at eg. networking, rpc levels.
+    #[inline(always)]
+    pub fn canonical_size(&self) -> borsh::io::Result<u64> {
+        borsh::object_length(self).map(|size| size as u64)
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Representation of a spent output
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct SpentOutput {
+    pub output: Output,
+    pub inpoint: InPoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilledTransaction {
     pub transaction: Transaction,
-    pub spent_utxos: Vec<FilledOutput>,
+    pub spent_utxos: Vec<Output>,
+    /// Address proven by the actor proof, if any
     #[serde(default)]
     pub actor_address: Option<Address>,
 }
 
 impl FilledTransaction {
+    pub fn get_value_in(
+        &self,
+    ) -> Result<bitcoin::Amount, error::AmountOverflow> {
+        self.spent_utxos
+            .iter()
+            .map(GetValue::get_value)
+            .checked_sum()
+            .ok_or(error::AmountOverflow)
+    }
+
+    pub fn get_value_out(
+        &self,
+    ) -> Result<bitcoin::Amount, error::AmountOverflow> {
+        self.transaction
+            .outputs
+            .iter()
+            .map(GetValue::get_value)
+            .checked_sum()
+            .ok_or(error::AmountOverflow)
+    }
+
+    pub fn get_fee(&self) -> Result<bitcoin::Amount, error::ComputeFee> {
+        let value_in = self
+            .get_value_in()
+            .map_err(error::ComputeFee::ValueInOverflow)?;
+        let value_out = self
+            .get_value_out()
+            .map_err(error::ComputeFee::ValueOutOverflow)?;
+        if value_in < value_out {
+            Err(error::ComputeFee::Underfunded)
+        } else {
+            Ok(value_in - value_out)
+        }
+    }
+
+    pub fn inputs(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (&OutPoint, &Hash, &Output)> {
+        self.transaction.inputs.iter().zip(&self.spent_utxos).map(
+            |((outpoint, utxo_hash), output)| (outpoint, utxo_hash, output),
+        )
+    }
+
     /// Accessor for tx data
     pub fn data(&self) -> &Option<TxData> {
         &self.transaction.data
     }
 
-    /// Accessor for tx inputs
-    pub fn inputs(&self) -> &TxInputs {
-        &self.transaction.inputs
-    }
-
-    /// Accessor for tx outputs
-    pub fn outputs(&self) -> &TxOutputs {
-        &self.transaction.outputs
+    /// Accessor for txid
+    pub fn txid(&self) -> Txid {
+        self.transaction.txid()
     }
 
     pub fn is_claim_decision(&self) -> bool {
-        match &self.transaction.data {
-            Some(tx_data) => tx_data.is_claim_decision(),
-            None => false,
-        }
+        self.data().as_ref().is_some_and(TxData::is_claim_decision)
     }
 
     pub fn is_create_market(&self) -> bool {
-        match &self.transaction.data {
-            Some(tx_data) => tx_data.is_create_market(),
-            None => false,
-        }
+        self.data().as_ref().is_some_and(TxData::is_create_market)
+    }
+
+    pub fn is_trade(&self) -> bool {
+        self.data().as_ref().is_some_and(TxData::is_trade)
     }
 
     pub fn is_submit_vote(&self) -> bool {
-        match &self.transaction.data {
-            Some(tx_data) => tx_data.is_submit_vote(),
-            None => false,
-        }
+        self.data().as_ref().is_some_and(TxData::is_submit_vote)
     }
 
     pub fn is_submit_ballot(&self) -> bool {
-        match &self.transaction.data {
-            Some(tx_data) => tx_data.is_submit_ballot(),
-            None => false,
-        }
+        self.data().as_ref().is_some_and(TxData::is_submit_ballot)
     }
 
     pub fn is_transfer_reputation(&self) -> bool {
-        match &self.transaction.data {
-            Some(tx_data) => tx_data.is_transfer_reputation(),
-            None => false,
-        }
+        self.data()
+            .as_ref()
+            .is_some_and(TxData::is_transfer_reputation)
+    }
+
+    pub fn is_amplify_beta(&self) -> bool {
+        self.data().as_ref().is_some_and(TxData::is_amplify_beta)
     }
 
     pub fn claim_decision(&self) -> Option<&ClaimDecisionPayload> {
@@ -430,13 +449,6 @@ impl FilledTransaction {
         }
     }
 
-    pub fn is_trade(&self) -> bool {
-        match &self.transaction.data {
-            Some(tx_data) => tx_data.is_trade(),
-            None => false,
-        }
-    }
-
     /// If the tx is a vote submission, returns the corresponding [`SubmitVote`].
     pub fn submit_vote(&self) -> Option<SubmitVote> {
         match &self.transaction.data {
@@ -485,13 +497,6 @@ impl FilledTransaction {
         }
     }
 
-    pub fn is_amplify_beta(&self) -> bool {
-        match &self.transaction.data {
-            Some(tx_data) => tx_data.is_amplify_beta(),
-            None => false,
-        }
-    }
-
     pub fn amplify_beta(&self) -> Option<AmplifyBeta> {
         match &self.transaction.data {
             Some(TransactionData::AmplifyBeta {
@@ -506,154 +511,6 @@ impl FilledTransaction {
             _ => None,
         }
     }
-
-    /// Accessor for txid
-    pub fn txid(&self) -> Txid {
-        self.transaction.txid()
-    }
-
-    /// Return an iterator over spent outpoints/outputs
-    pub fn spent_inputs(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
-        self.inputs().iter().zip(self.spent_utxos.iter())
-    }
-
-    /// Returns the total Bitcoin value spent
-    pub fn spent_bitcoin_value(
-        &self,
-    ) -> Result<bitcoin::Amount, AmountOverflowError> {
-        self.spent_utxos
-            .iter()
-            .map(GetBitcoinValue::get_bitcoin_value)
-            .checked_sum()
-            .ok_or(AmountOverflowError)
-    }
-
-    /// Returns the total Bitcoin value in the outputs
-    pub fn bitcoin_value_out(
-        &self,
-    ) -> Result<bitcoin::Amount, AmountOverflowError> {
-        self.outputs()
-            .iter()
-            .map(GetBitcoinValue::get_bitcoin_value)
-            .checked_sum()
-            .ok_or(AmountOverflowError)
-    }
-
-    /// Returns the difference between the value spent and value out, if it is
-    /// non-negative.
-    pub fn bitcoin_fee(
-        &self,
-    ) -> Result<Option<bitcoin::Amount>, AmountOverflowError> {
-        let spent_value = self.spent_bitcoin_value()?;
-        let value_out = self.bitcoin_value_out()?;
-        if spent_value < value_out {
-            Ok(None)
-        } else {
-            Ok(Some(spent_value - value_out))
-        }
-    }
-
-    pub fn spent_assets(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = (&OutPoint, &FilledOutput)> {
-        self.spent_inputs()
-            .filter(|(_, filled_output)| filled_output.is_bitcoin())
-    }
-
-    /** Return a vector of pairs consisting of an [`AssetId`] and the combined
-     *  input value for that asset.
-     *  The vector is ordered such that assets occur in the same order
-     *  as they first occur in the inputs. */
-    pub fn unique_spent_assets(&self) -> Vec<(AssetId, u64)> {
-        let mut combined_value = HashMap::<AssetId, u64>::new();
-        let spent_asset_values = || {
-            self.spent_assets()
-                .filter_map(|(_, output)| output.asset_value())
-        };
-        spent_asset_values().for_each(|(asset, value)| {
-            *combined_value.entry(asset).or_default() += value;
-        });
-        spent_asset_values()
-            .unique_by(|(asset, _)| *asset)
-            .map(|(asset, _)| (asset, combined_value[&asset]))
-            .collect()
-    }
-
-    /** Returns an iterator over total value for each asset that must
-     *  appear in the outputs, in order.
-     *  The total output value can possibly over/underflow in a transaction,
-     *  so the total output values are [`Option<u64>`],
-     *  where `None` indicates over/underflow. */
-    fn output_asset_total_values(
-        &self,
-    ) -> impl Iterator<Item = (AssetId, Option<u64>)> + '_ {
-        self.unique_spent_assets()
-            .into_iter()
-            .map(|(asset, total_value)| (asset, Some(total_value)))
-            .filter(|(_, amount)| *amount != Some(0))
-    }
-
-    /** Returns the max value of Bitcoin that can occur in the outputs.
-     *  The total output value can possibly over/underflow in a transaction,
-     *  so the total output values are [`Option<bitcoin::Amount>`],
-     *  where `None` indicates over/underflow. */
-    fn output_bitcoin_max_value(&self) -> Option<bitcoin::Amount> {
-        self.output_asset_total_values()
-            .map(|(asset_id, value)| match asset_id {
-                AssetId::Bitcoin => value.map(bitcoin::Amount::from_sat),
-            })
-            .next()
-            .unwrap_or(Some(bitcoin::Amount::ZERO))
-    }
-
-    /// Compute the filled outputs.
-    /// Returns None if the outputs cannot be filled because the tx is invalid.
-    ///
-    /// Transaction validation ensures that all iterators over expected output amounts
-    /// are fully consumed during processing. If any iterator has remaining unconsumed
-    /// elements after processing all outputs, the transaction is considered invalid
-    /// per Bitcoin Hivemind transaction consistency requirements.
-    pub fn filled_outputs(&self) -> Option<Vec<FilledOutput>> {
-        let mut output_bitcoin_max_value = self.output_bitcoin_max_value()?;
-
-        self.outputs()
-            .iter()
-            .map(|output| {
-                let content = match output.content.clone() {
-                    OutputContent::Bitcoin(value) => {
-                        let new_max =
-                            output_bitcoin_max_value.checked_sub(value.0)?;
-                        output_bitcoin_max_value = new_max;
-                        FilledOutputContent::Bitcoin(value)
-                    }
-                    OutputContent::Withdrawal(withdrawal) => {
-                        FilledOutputContent::BitcoinWithdrawal(withdrawal)
-                    }
-                    OutputContent::MarketFunds {
-                        market_id,
-                        amount,
-                        is_fee,
-                    } => {
-                        let new_max =
-                            output_bitcoin_max_value.checked_sub(amount.0)?;
-                        output_bitcoin_max_value = new_max;
-                        FilledOutputContent::MarketFunds {
-                            market_id,
-                            amount,
-                            is_fee,
-                        }
-                    }
-                };
-                Some(FilledOutput {
-                    address: output.address,
-                    content,
-                    memo: output.memo.clone(),
-                })
-            })
-            .collect()
-    }
 }
 
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -661,6 +518,8 @@ pub struct Authorized<T> {
     pub transaction: T,
     /// Authorizations are called witnesses in Bitcoin.
     pub authorizations: Vec<Authorization>,
+    /// Signature of the market actor (trader, voter or sender) when no input
+    /// belongs to that actor
     #[serde(default)]
     pub actor_proof: Option<Authorization>,
 }
@@ -697,46 +556,41 @@ impl From<Authorized<FilledTransaction>> for AuthorizedTransaction {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        BitcoinOutputContent, FilledOutput, FilledOutputContent,
-        FilledTransaction, OutPoint, OutPointKey, Output, OutputContent,
-        Transaction, WithdrawalOutputContent, outpoint::OUTPOINT_KEY_SIZE,
+mod test {
+    use crate::{
+        address::Address,
+        transaction::{
+            FilledTransaction, GetValue, Output, OutputContent, Outputs,
+            Transaction,
+        },
     };
-    use crate::{Address, GetBitcoinValue as _};
-    use bitcoin::hashes::Hash as _;
 
     // a withdrawal output must be funded for both its payout and its mainchain
     // fee, since both leave the treasury
     #[test]
-    fn withdrawal_value_includes_main_fee() -> anyhow::Result<()> {
+    fn withdrawal_value_includes_main_fee() {
         let value = bitcoin::Amount::from_sat(1000);
         let main_fee = bitcoin::Amount::from_sat(300);
         let main_address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
-            .parse::<bitcoin::Address<
-            bitcoin::address::NetworkUnchecked,
-        >>()?;
+            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .unwrap();
         let withdrawal = Output {
             address: Address::ALL_ZEROS,
-            content: OutputContent::Withdrawal(WithdrawalOutputContent {
+            content: OutputContent::Withdrawal {
                 value,
                 main_fee,
                 main_address,
-            }),
-            memo: Vec::new(),
+            },
         };
-        anyhow::ensure!(
-            withdrawal.content.get_bitcoin_value() == value + main_fee
-        );
+        assert_eq!(withdrawal.get_value(), value + main_fee);
 
-        let value_output = |amount| FilledOutput {
+        let value_output = |amount| Output {
             address: Address::ALL_ZEROS,
-            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(amount)),
-            memo: Vec::new(),
+            content: OutputContent::Value(amount),
         };
         let withdrawal_tx = |funding| FilledTransaction {
             transaction: Transaction {
-                outputs: vec![withdrawal.clone()],
+                outputs: Outputs(vec![withdrawal.clone()]),
                 ..Default::default()
             },
             spent_utxos: vec![value_output(funding)],
@@ -744,85 +598,22 @@ mod tests {
         };
 
         // inputs covering only the payout are insufficient
-        anyhow::ensure!(withdrawal_tx(value).bitcoin_fee()?.is_none());
+        assert!(withdrawal_tx(value).get_fee().is_err());
         // inputs covering payout plus mainchain fee fully fund it
-        anyhow::ensure!(
-            withdrawal_tx(value + main_fee).bitcoin_fee()?
-                == Some(bitcoin::Amount::ZERO)
+        assert_eq!(
+            withdrawal_tx(value + main_fee).get_fee().unwrap(),
+            bitcoin::Amount::ZERO
         );
-        Ok(())
-    }
-
-    #[test]
-    fn check_outpoint_key_size() -> anyhow::Result<()> {
-        let variants = [
-            OutPoint::Regular {
-                txid: Default::default(),
-                vout: u32::MAX,
-            },
-            OutPoint::Coinbase {
-                merkle_root: Default::default(),
-                vout: u32::MAX,
-            },
-            OutPoint::Deposit(bitcoin::OutPoint {
-                txid: bitcoin::Txid::from_byte_array([0; 32]),
-                vout: u32::MAX,
-            }),
-        ];
-
-        for op in variants {
-            let serialized = borsh::to_vec(&op)?;
-            anyhow::ensure!(
-                serialized.len() == OUTPOINT_KEY_SIZE,
-                "unexpected serialized size: {}",
-                serialized.len()
-            );
-
-            let key = OutPointKey::from(op);
-            let decoded = OutPoint::from(key);
-            anyhow::ensure!(decoded == op);
-        }
-
-        let market_funds = OutPoint::MarketFunds {
-            market_id: [0xAB; 6],
-            block_height: 42,
-            is_fee: true,
-        };
-        let mf_serialized = borsh::to_vec(&market_funds)?;
-        anyhow::ensure!(
-            mf_serialized.len() <= OUTPOINT_KEY_SIZE,
-            "MarketFunds serialized to {} bytes, exceeding max {}",
-            mf_serialized.len(),
-            OUTPOINT_KEY_SIZE,
-        );
-        let mf_key = OutPointKey::from(market_funds);
-        let mf_decoded = OutPoint::from(mf_key);
-        anyhow::ensure!(mf_decoded == market_funds);
-
-        let payout = OutPoint::Payout {
-            hash: Default::default(),
-            vout: u32::MAX,
-        };
-        let payout_serialized = borsh::to_vec(&payout)?;
-        anyhow::ensure!(
-            payout_serialized.len() == OUTPOINT_KEY_SIZE,
-            "Payout serialized to {} bytes, expected {}",
-            payout_serialized.len(),
-            OUTPOINT_KEY_SIZE,
-        );
-        let payout_key = OutPointKey::from(payout);
-        let payout_decoded = OutPoint::from(payout_key);
-        anyhow::ensure!(payout_decoded == payout);
-
-        Ok(())
     }
 
     #[test]
     fn claim_decision_variant_wire_format() -> anyhow::Result<()> {
-        use super::{
-            ClaimDecisionPayload, DecisionClaimEntry, TransactionData,
+        use crate::{
+            decision::DecisionType,
+            transaction::{
+                ClaimDecisionPayload, DecisionClaimEntry, TransactionData,
+            },
         };
-        use crate::decision::DecisionType;
 
         let payload = ClaimDecisionPayload {
             decision_type: DecisionType::Binary,
