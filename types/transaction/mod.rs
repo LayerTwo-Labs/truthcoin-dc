@@ -6,23 +6,20 @@ use std::{
 
 use bitcoin::amount::CheckedSum as _;
 use borsh::{self, BorshDeserialize, BorshSerialize};
+#[cfg(feature = "heed")]
 use heed::{BoxedError, BytesDecode, BytesEncode};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use utoipa::{PartialSchema, ToSchema};
 
 use crate::{
+    AmountOverflowError, GetAddress, GetBitcoinValue,
+    address::Address,
     authorization::Authorization,
-    state::{
-        decisions::DecisionType,
-        markets::{DimensionSpec, MarketId},
-    },
-    types::{
-        AmountOverflowError, GetAddress, GetBitcoinValue,
-        address::Address,
-        hashes::{self, AssetId, M6id, MerkleRoot, Txid},
-        serde_hexstr_human_readable,
-    },
+    decision::DecisionType,
+    hashes::{self, AssetId, M6id, MerkleRoot, Txid},
+    market::{DimensionSpec, MarketId},
+    serde_hexstr_human_readable,
 };
 
 mod output;
@@ -88,7 +85,7 @@ pub enum OutPoint {
         vout: u32,
     },
     // Created by mainchain deposits.
-    #[schema(value_type = crate::types::schema::BitcoinOutPoint)]
+    #[schema(value_type = crate::schema::BitcoinOutPoint)]
     Deposit(
         #[borsh(
             serialize_with = "borsh_serialize_bitcoin_outpoint",
@@ -227,6 +224,7 @@ impl AsRef<[u8]> for OutPointKey {
     }
 }
 
+#[cfg(feature = "heed")]
 impl<'a> BytesEncode<'a> for OutPointKey {
     type EItem = OutPointKey;
 
@@ -238,6 +236,7 @@ impl<'a> BytesEncode<'a> for OutPointKey {
     }
 }
 
+#[cfg(feature = "heed")]
 impl<'a> BytesDecode<'a> for OutPointKey {
     type DItem = OutPointKey;
 
@@ -928,7 +927,7 @@ mod tests {
         FilledTransaction, OUTPOINT_KEY_SIZE, OutPoint, OutPointKey, Output,
         OutputContent, Transaction, WithdrawalOutputContent,
     };
-    use crate::types::{Address, GetBitcoinValue as _};
+    use crate::{Address, GetBitcoinValue as _};
     use bitcoin::hashes::Hash as _;
 
     // a withdrawal output must be funded for both its payout and its mainchain
@@ -1047,7 +1046,7 @@ mod tests {
         use super::{
             ClaimDecisionPayload, DecisionClaimEntry, TransactionData,
         };
-        use crate::state::decisions::DecisionType;
+        use crate::decision::DecisionType;
 
         let payload = ClaimDecisionPayload {
             decision_type: DecisionType::Binary,

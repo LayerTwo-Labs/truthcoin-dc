@@ -11,7 +11,7 @@ impl DecisionValidator {
     pub fn parse_decision_id_from_hex(
         decision_id_hex: &str,
     ) -> Result<DecisionId, Error> {
-        DecisionId::from_hex(decision_id_hex)
+        Ok(DecisionId::from_hex(decision_id_hex)?)
     }
 
     /// Validate a single claim payload's type constraints and slot

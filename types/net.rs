@@ -6,7 +6,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::types::THIS_SIDECHAIN;
+use crate::THIS_SIDECHAIN;
 
 pub const DEFAULT_PORT: u16 = 4000 + THIS_SIDECHAIN as u16;
 

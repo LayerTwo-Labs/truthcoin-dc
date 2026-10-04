@@ -1,5 +1,4 @@
 pub mod archive;
-pub mod authorization;
 pub mod math;
 pub mod mempool;
 pub mod miner;
@@ -10,3 +9,5 @@ pub mod types;
 pub mod util;
 pub mod validation;
 pub mod wallet;
+
+pub use truthcoin_dc_types::authorization;

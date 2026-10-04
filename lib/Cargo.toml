@@ -24,7 +24,6 @@ byteorder = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-clap = { workspace = true, features = ["derive"], optional = true }
 curve25519-dalek = { workspace = true, features = ["group", "serde"] }
 frost-core = { workspace = true, features = ["internals"] }
 frost-ristretto255 = { workspace = true, features = ["serde"] }
@@ -70,13 +69,14 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 tracing = { workspace = true }
 transitive = { workspace = true }
+truthcoin_dc_types = { path = "../types", features = ["heed"] }
 url = { workspace = true }
 utoipa = { workspace = true, features = ["macros", "non_strict_integers"] }
 x25519-dalek = { workspace = true, features = ["serde", "static_secrets"] }
 zeromq = { workspace = true, optional = true }
 
 [features]
-clap = ["dep:clap"]
+clap = ["truthcoin_dc_types/clap"]
 zmq = ["dep:zeromq"]
 
 [dependencies.educe]

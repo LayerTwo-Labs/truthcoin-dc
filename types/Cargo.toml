@@ -1,0 +1,50 @@
+[package]
+name = "truthcoin_dc_types"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+bech32 = { workspace = true }
+bitcoin = { workspace = true, features = ["serde"] }
+blake3 = { workspace = true }
+borsh = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive"], optional = true }
+const-hex = { workspace = true, features = ["serde"] }
+frost-core = { workspace = true, features = ["internals"] }
+frost-ristretto255 = { workspace = true, features = ["serde"] }
+heed = { workspace = true, optional = true }
+itertools = { workspace = true }
+libes = { workspace = true }
+nonempty = { workspace = true, features = ["serialize"] }
+rand = { workspace = true, features = ["chacha"] }
+rayon = { workspace = true }
+semver = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_with = { workspace = true, features = ["alloc", "macros"] }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
+strum = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+url = { workspace = true }
+utoipa = { workspace = true, features = ["macros", "non_strict_integers"] }
+x25519-dalek = { workspace = true, features = ["serde", "static_secrets"] }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+curve25519-dalek = { workspace = true, features = ["group", "serde"] }
+rand = { workspace = true, features = ["thread_rng"] }
+
+[features]
+clap = ["dep:clap"]
+heed = ["dep:heed"]
+
+[lints]
+workspace = true
+
+[lib]
+name = "truthcoin_dc_types"
+path = "lib.rs"

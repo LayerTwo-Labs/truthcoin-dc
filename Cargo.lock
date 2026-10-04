@@ -7561,7 +7561,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
- "clap",
  "const-hex",
  "criterion",
  "curve25519-dalek 5.0.0",
@@ -7615,6 +7614,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "transitive",
+ "truthcoin_dc_types",
  "url",
  "utoipa",
  "x25519-dalek",
@@ -7737,6 +7737,39 @@ dependencies = [
  "tracing-subscriber",
  "truthcoin_dc",
  "truthcoin_dc_app_rpc_api",
+]
+
+[[package]]
+name = "truthcoin_dc_types"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "bech32",
+ "bitcoin",
+ "blake3",
+ "borsh",
+ "clap",
+ "const-hex",
+ "curve25519-dalek 5.0.0",
+ "frost-core",
+ "frost-ristretto255",
+ "heed",
+ "itertools 0.14.0",
+ "libes",
+ "nonempty 0.11.0",
+ "rand 0.10.1",
+ "rayon",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "sha2 0.10.9",
+ "sha3",
+ "strum 0.27.2",
+ "thiserror 2.0.20",
+ "url",
+ "utoipa",
+ "x25519-dalek",
 ]
 
 [[package]]

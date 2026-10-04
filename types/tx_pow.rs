@@ -182,18 +182,18 @@ pub fn serialize_trade_for_pow(
     market_id: &[u8; 6],
     outcome_index: u32,
     shares: i64,
-    trader: &crate::types::Address,
+    trader: &crate::Address,
     limit_sats: u64,
-    prev_block_hash: &crate::types::BlockHash,
+    prev_block_hash: &crate::BlockHash,
 ) -> Vec<u8> {
     #[derive(BorshSerialize)]
     struct TradePowInput<'a> {
         market_id: &'a [u8; 6],
         outcome_index: u32,
         shares: i64,
-        trader: &'a crate::types::Address,
+        trader: &'a crate::Address,
         limit_sats: u64,
-        prev_block_hash: &'a crate::types::BlockHash,
+        prev_block_hash: &'a crate::BlockHash,
     }
     let input = TradePowInput {
         market_id,
@@ -523,8 +523,8 @@ mod tests {
 
     #[test]
     fn test_serialize_trade_for_pow() {
-        let addr = crate::types::Address([0u8; 20]);
-        let block = crate::types::BlockHash([7u8; 32]);
+        let addr = crate::Address([0u8; 20]);
+        let block = crate::BlockHash([7u8; 32]);
         let data = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
             0,
@@ -548,9 +548,9 @@ mod tests {
 
     #[test]
     fn test_serialize_trade_for_pow_different_prev_block() {
-        let addr = crate::types::Address([0u8; 20]);
-        let block_a = crate::types::BlockHash([1u8; 32]);
-        let block_b = crate::types::BlockHash([2u8; 32]);
+        let addr = crate::Address([0u8; 20]);
+        let block_a = crate::BlockHash([1u8; 32]);
+        let block_b = crate::BlockHash([2u8; 32]);
         let data_a = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
             0,
@@ -577,9 +577,9 @@ mod tests {
             ordering: 0,
             difficulty: 4,
         };
-        let addr = crate::types::Address([0u8; 20]);
-        let block_a = crate::types::BlockHash([1u8; 32]);
-        let block_b = crate::types::BlockHash([2u8; 32]);
+        let addr = crate::Address([0u8; 20]);
+        let block_a = crate::BlockHash([1u8; 32]);
+        let block_b = crate::BlockHash([2u8; 32]);
         let data_a = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
             0,

@@ -9,7 +9,7 @@ use rayon::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::types::{
+use crate::{
     Address, AuthorizedTransaction, Body, GetAddress, Transaction, VerifyingKey,
 };
 
@@ -457,7 +457,7 @@ mod tests {
         authorize, get_address, sign, sign_tx, verify,
         verify_authorized_transaction,
     };
-    use crate::types::{
+    use crate::{
         Address, AuthorizedTransaction, GetAddress as _, Transaction,
         VerifyingKey,
     };
@@ -470,8 +470,8 @@ mod tests {
 
     fn one_input_tx() -> Transaction {
         Transaction {
-            inputs: vec![crate::types::OutPoint::Regular {
-                txid: crate::types::Txid::from([3; 32]),
+            inputs: vec![crate::OutPoint::Regular {
+                txid: crate::Txid::from([3; 32]),
                 vout: 0,
             }],
             ..Default::default()

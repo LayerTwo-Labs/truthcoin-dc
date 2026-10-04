@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::types::{FilledOutput, OutPoint, WithdrawalBundle};
+use crate::{FilledOutput, OutPoint, WithdrawalBundle};
 
 /// Information we have regarding a withdrawal bundle
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]

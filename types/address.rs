@@ -5,7 +5,7 @@ use serde_with::{DeserializeAs, DisplayFromStr};
 use thiserror::Error;
 use utoipa::ToSchema;
 
-use crate::types::THIS_SIDECHAIN;
+use crate::THIS_SIDECHAIN;
 
 #[derive(Debug, Error)]
 pub enum AddressParseError {

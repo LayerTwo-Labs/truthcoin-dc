@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::{DeserializeAs, IfIsHumanReadable, SerializeAs, serde_as};
 use utoipa::ToSchema;
 
-use crate::types::{
+use crate::{
     Address, AssetId, GetBitcoinValue, InPoint, OutPoint,
     serde_display_fromstr_human_readable, serde_hexstr_human_readable,
 };
@@ -132,7 +132,7 @@ mod withdrawal_content {
             serde(with = "bitcoin::amount::serde::as_sat")
         ],
         main_address_attrs: [
-            schema(value_type = crate::types::schema::BitcoinAddr),
+            schema(value_type = crate::schema::BitcoinAddr),
         ],
     );
 
@@ -235,7 +235,7 @@ mod withdrawal_content {
         }
     }
 
-    impl crate::types::GetBitcoinValue for WithdrawalContent {
+    impl crate::GetBitcoinValue for WithdrawalContent {
         fn get_bitcoin_value(&self) -> bitcoin::Amount {
             self.value
                 .checked_add(self.main_fee)
@@ -503,7 +503,7 @@ mod content {
         }
     }
 
-    impl crate::types::GetBitcoinValue for Content {
+    impl crate::GetBitcoinValue for Content {
         #[inline(always)]
         fn get_bitcoin_value(&self) -> bitcoin::Amount {
             match self {
@@ -519,7 +519,7 @@ pub use content::Content;
 mod filled_content {
     use serde::{Deserialize, Serialize};
 
-    use crate::types::AssetId;
+    use crate::AssetId;
 
     /// Defines a FilledContent enum with the specified visibility, name,
     /// derives, and attributes for each variant
@@ -730,7 +730,7 @@ mod filled_content {
         }
     }
 
-    impl crate::types::GetBitcoinValue for FilledContent {
+    impl crate::GetBitcoinValue for FilledContent {
         fn get_bitcoin_value(&self) -> bitcoin::Amount {
             super::Content::from(self.clone()).get_bitcoin_value()
         }

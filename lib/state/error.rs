@@ -194,6 +194,13 @@ pub enum Error {
     ReputationAnchorViolation { total: f64, anchor: f64, drift: f64 },
 }
 
+impl From<truthcoin_dc_types::error::InvalidDecisionId> for Error {
+    fn from(err: truthcoin_dc_types::error::InvalidDecisionId) -> Self {
+        let truthcoin_dc_types::error::InvalidDecisionId { reason } = err;
+        Self::InvalidDecisionId { reason }
+    }
+}
+
 impl From<sneed::Error> for Error {
     fn from(err: sneed::Error) -> Self {
         Self::Db(Box::new(err))
