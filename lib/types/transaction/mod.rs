@@ -255,169 +255,6 @@ impl<'a> BytesDecode<'a> for OutPointKey {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        BitcoinOutputContent, FilledOutput, FilledOutputContent,
-        FilledTransaction, OUTPOINT_KEY_SIZE, OutPoint, OutPointKey, Output,
-        OutputContent, Transaction, WithdrawalOutputContent,
-    };
-    use crate::types::{Address, GetBitcoinValue as _};
-    use bitcoin::hashes::Hash as _;
-
-    // a withdrawal output must be funded for both its payout and its mainchain
-    // fee, since both leave the treasury
-    #[test]
-    fn withdrawal_value_includes_main_fee() -> anyhow::Result<()> {
-        let value = bitcoin::Amount::from_sat(1000);
-        let main_fee = bitcoin::Amount::from_sat(300);
-        let main_address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
-            .parse::<bitcoin::Address<
-            bitcoin::address::NetworkUnchecked,
-        >>()?;
-        let withdrawal = Output {
-            address: Address::ALL_ZEROS,
-            content: OutputContent::Withdrawal(WithdrawalOutputContent {
-                value,
-                main_fee,
-                main_address,
-            }),
-            memo: Vec::new(),
-        };
-        anyhow::ensure!(
-            withdrawal.content.get_bitcoin_value() == value + main_fee
-        );
-
-        let value_output = |amount| FilledOutput {
-            address: Address::ALL_ZEROS,
-            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(amount)),
-            memo: Vec::new(),
-        };
-        let withdrawal_tx = |funding| FilledTransaction {
-            transaction: Transaction {
-                outputs: vec![withdrawal.clone()],
-                ..Default::default()
-            },
-            spent_utxos: vec![value_output(funding)],
-            actor_address: None,
-        };
-
-        // inputs covering only the payout are insufficient
-        anyhow::ensure!(withdrawal_tx(value).bitcoin_fee()?.is_none());
-        // inputs covering payout plus mainchain fee fully fund it
-        anyhow::ensure!(
-            withdrawal_tx(value + main_fee).bitcoin_fee()?
-                == Some(bitcoin::Amount::ZERO)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn check_outpoint_key_size() -> anyhow::Result<()> {
-        let variants = [
-            OutPoint::Regular {
-                txid: Default::default(),
-                vout: u32::MAX,
-            },
-            OutPoint::Coinbase {
-                merkle_root: Default::default(),
-                vout: u32::MAX,
-            },
-            OutPoint::Deposit(bitcoin::OutPoint {
-                txid: bitcoin::Txid::from_byte_array([0; 32]),
-                vout: u32::MAX,
-            }),
-        ];
-
-        for op in variants {
-            let serialized = borsh::to_vec(&op)?;
-            anyhow::ensure!(
-                serialized.len() == OUTPOINT_KEY_SIZE,
-                "unexpected serialized size: {}",
-                serialized.len()
-            );
-
-            let key = OutPointKey::from(op);
-            let decoded = OutPoint::from(key);
-            anyhow::ensure!(decoded == op);
-        }
-
-        let market_funds = OutPoint::MarketFunds {
-            market_id: [0xAB; 6],
-            block_height: 42,
-            is_fee: true,
-        };
-        let mf_serialized = borsh::to_vec(&market_funds)?;
-        anyhow::ensure!(
-            mf_serialized.len() <= OUTPOINT_KEY_SIZE,
-            "MarketFunds serialized to {} bytes, exceeding max {}",
-            mf_serialized.len(),
-            OUTPOINT_KEY_SIZE,
-        );
-        let mf_key = OutPointKey::from(market_funds);
-        let mf_decoded = OutPoint::from(mf_key);
-        anyhow::ensure!(mf_decoded == market_funds);
-
-        let payout = OutPoint::Payout {
-            hash: Default::default(),
-            vout: u32::MAX,
-        };
-        let payout_serialized = borsh::to_vec(&payout)?;
-        anyhow::ensure!(
-            payout_serialized.len() == OUTPOINT_KEY_SIZE,
-            "Payout serialized to {} bytes, expected {}",
-            payout_serialized.len(),
-            OUTPOINT_KEY_SIZE,
-        );
-        let payout_key = OutPointKey::from(payout);
-        let payout_decoded = OutPoint::from(payout_key);
-        anyhow::ensure!(payout_decoded == payout);
-
-        Ok(())
-    }
-
-    #[test]
-    fn claim_decision_variant_wire_format() -> anyhow::Result<()> {
-        use super::{
-            ClaimDecisionPayload, DecisionClaimEntry, TransactionData,
-        };
-        use crate::state::decisions::DecisionType;
-
-        let payload = ClaimDecisionPayload {
-            decision_type: DecisionType::Binary,
-            decisions: vec![DecisionClaimEntry {
-                decision_id_bytes: [0x01, 0x02, 0x03],
-                header: "h".to_string(),
-                description: "d".to_string(),
-                option_0_label: None,
-                option_1_label: None,
-                option_labels: None,
-                tags: None,
-            }],
-        };
-
-        let payload_bytes = borsh::to_vec(&payload)?;
-        let variant_bytes =
-            borsh::to_vec(&TransactionData::ClaimDecision(payload.clone()))?;
-
-        anyhow::ensure!(
-            !variant_bytes.is_empty(),
-            "variant encoding must not be empty"
-        );
-        anyhow::ensure!(
-            variant_bytes[0] == 0u8,
-            "ClaimDecision must be variant index 0 (got {})",
-            variant_bytes[0]
-        );
-        anyhow::ensure!(
-            &variant_bytes[1..] == payload_bytes.as_slice(),
-            "tuple-variant body must equal raw payload encoding"
-        );
-
-        Ok(())
-    }
-}
-
 /// Reference to a tx input.
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, ToSchema,
@@ -1075,5 +912,168 @@ impl From<Authorized<FilledTransaction>> for AuthorizedTransaction {
             authorizations: tx.authorizations,
             actor_proof: tx.actor_proof,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BitcoinOutputContent, FilledOutput, FilledOutputContent,
+        FilledTransaction, OUTPOINT_KEY_SIZE, OutPoint, OutPointKey, Output,
+        OutputContent, Transaction, WithdrawalOutputContent,
+    };
+    use crate::types::{Address, GetBitcoinValue as _};
+    use bitcoin::hashes::Hash as _;
+
+    // a withdrawal output must be funded for both its payout and its mainchain
+    // fee, since both leave the treasury
+    #[test]
+    fn withdrawal_value_includes_main_fee() -> anyhow::Result<()> {
+        let value = bitcoin::Amount::from_sat(1000);
+        let main_fee = bitcoin::Amount::from_sat(300);
+        let main_address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
+            .parse::<bitcoin::Address<
+            bitcoin::address::NetworkUnchecked,
+        >>()?;
+        let withdrawal = Output {
+            address: Address::ALL_ZEROS,
+            content: OutputContent::Withdrawal(WithdrawalOutputContent {
+                value,
+                main_fee,
+                main_address,
+            }),
+            memo: Vec::new(),
+        };
+        anyhow::ensure!(
+            withdrawal.content.get_bitcoin_value() == value + main_fee
+        );
+
+        let value_output = |amount| FilledOutput {
+            address: Address::ALL_ZEROS,
+            content: FilledOutputContent::Bitcoin(BitcoinOutputContent(amount)),
+            memo: Vec::new(),
+        };
+        let withdrawal_tx = |funding| FilledTransaction {
+            transaction: Transaction {
+                outputs: vec![withdrawal.clone()],
+                ..Default::default()
+            },
+            spent_utxos: vec![value_output(funding)],
+            actor_address: None,
+        };
+
+        // inputs covering only the payout are insufficient
+        anyhow::ensure!(withdrawal_tx(value).bitcoin_fee()?.is_none());
+        // inputs covering payout plus mainchain fee fully fund it
+        anyhow::ensure!(
+            withdrawal_tx(value + main_fee).bitcoin_fee()?
+                == Some(bitcoin::Amount::ZERO)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn check_outpoint_key_size() -> anyhow::Result<()> {
+        let variants = [
+            OutPoint::Regular {
+                txid: Default::default(),
+                vout: u32::MAX,
+            },
+            OutPoint::Coinbase {
+                merkle_root: Default::default(),
+                vout: u32::MAX,
+            },
+            OutPoint::Deposit(bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0; 32]),
+                vout: u32::MAX,
+            }),
+        ];
+
+        for op in variants {
+            let serialized = borsh::to_vec(&op)?;
+            anyhow::ensure!(
+                serialized.len() == OUTPOINT_KEY_SIZE,
+                "unexpected serialized size: {}",
+                serialized.len()
+            );
+
+            let key = OutPointKey::from(op);
+            let decoded = OutPoint::from(key);
+            anyhow::ensure!(decoded == op);
+        }
+
+        let market_funds = OutPoint::MarketFunds {
+            market_id: [0xAB; 6],
+            block_height: 42,
+            is_fee: true,
+        };
+        let mf_serialized = borsh::to_vec(&market_funds)?;
+        anyhow::ensure!(
+            mf_serialized.len() <= OUTPOINT_KEY_SIZE,
+            "MarketFunds serialized to {} bytes, exceeding max {}",
+            mf_serialized.len(),
+            OUTPOINT_KEY_SIZE,
+        );
+        let mf_key = OutPointKey::from(market_funds);
+        let mf_decoded = OutPoint::from(mf_key);
+        anyhow::ensure!(mf_decoded == market_funds);
+
+        let payout = OutPoint::Payout {
+            hash: Default::default(),
+            vout: u32::MAX,
+        };
+        let payout_serialized = borsh::to_vec(&payout)?;
+        anyhow::ensure!(
+            payout_serialized.len() == OUTPOINT_KEY_SIZE,
+            "Payout serialized to {} bytes, expected {}",
+            payout_serialized.len(),
+            OUTPOINT_KEY_SIZE,
+        );
+        let payout_key = OutPointKey::from(payout);
+        let payout_decoded = OutPoint::from(payout_key);
+        anyhow::ensure!(payout_decoded == payout);
+
+        Ok(())
+    }
+
+    #[test]
+    fn claim_decision_variant_wire_format() -> anyhow::Result<()> {
+        use super::{
+            ClaimDecisionPayload, DecisionClaimEntry, TransactionData,
+        };
+        use crate::state::decisions::DecisionType;
+
+        let payload = ClaimDecisionPayload {
+            decision_type: DecisionType::Binary,
+            decisions: vec![DecisionClaimEntry {
+                decision_id_bytes: [0x01, 0x02, 0x03],
+                header: "h".to_string(),
+                description: "d".to_string(),
+                option_0_label: None,
+                option_1_label: None,
+                option_labels: None,
+                tags: None,
+            }],
+        };
+
+        let payload_bytes = borsh::to_vec(&payload)?;
+        let variant_bytes =
+            borsh::to_vec(&TransactionData::ClaimDecision(payload.clone()))?;
+
+        anyhow::ensure!(
+            !variant_bytes.is_empty(),
+            "variant encoding must not be empty"
+        );
+        anyhow::ensure!(
+            variant_bytes[0] == 0u8,
+            "ClaimDecision must be variant index 0 (got {})",
+            variant_bytes[0]
+        );
+        anyhow::ensure!(
+            &variant_bytes[1..] == payload_bytes.as_slice(),
+            "tuple-variant body must equal raw payload encoding"
+        );
+
+        Ok(())
     }
 }
