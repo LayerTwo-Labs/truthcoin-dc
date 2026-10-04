@@ -10,7 +10,10 @@ use crate::{
     authorization::Authorization,
     decision::DecisionType,
     error,
-    hashes::{self, Hash, M6id, Txid, hash_with_scratch_buffer},
+    hashes::{
+        self, Hash, InputsMerkleRoot, M6id, OutputsMerkleRoot, TxMerkleRoot,
+        Txid, hash_with_scratch_buffer,
+    },
     market::{DimensionSpec, MarketId},
 };
 
@@ -289,6 +292,29 @@ impl Transaction {
     #[inline(always)]
     pub fn canonical_size(&self) -> borsh::io::Result<u64> {
         borsh::object_length(self).map(|size| size as u64)
+    }
+
+    pub(crate) fn compute_merkle_root(
+        &self,
+    ) -> Result<TxMerkleRoot, outputs::error::ComputeMerkleRoot> {
+        let Self {
+            inputs,
+            outputs,
+            data,
+        } = self;
+        // Borsh encoding for hashing
+        #[derive(BorshSerialize)]
+        struct HashComponents {
+            inputs_commitment: InputsMerkleRoot,
+            outputs_commitment: OutputsMerkleRoot,
+            data_commitment: Hash,
+        }
+        let res = hash_with_scratch_buffer(&HashComponents {
+            inputs_commitment: inputs.compute_merkle_root(),
+            outputs_commitment: outputs.compute_merkle_root()?,
+            data_commitment: hashes::hash(data),
+        });
+        Ok(res.into())
     }
 }
 

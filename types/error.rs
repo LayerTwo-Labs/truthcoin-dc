@@ -24,6 +24,44 @@ pub struct InvalidDecisionId {
     pub reason: String,
 }
 
+pub mod compute_merkle_root {
+    use thiserror::Error;
+
+    use crate::{error::ComputeFee, hashes::Txid};
+
+    #[derive(Debug, Error)]
+    pub(crate) enum Inner {
+        #[error("failed to compute merkle root for coinbase tx")]
+        CoinbaseMerkleRoot(
+            #[source] crate::transaction::outputs::error::ComputeMerkleRoot,
+        ),
+        #[error("failed to compute canonical size for tx ({txid})")]
+        TxCanonicalSize {
+            txid: Txid,
+            source: borsh::io::Error,
+        },
+        #[error("failed to compute fee for tx ({txid})")]
+        TxFee { txid: Txid, source: ComputeFee },
+        #[error("failed to compute merkle root for tx ({txid})")]
+        TxMerkleRoot {
+            txid: Txid,
+            source: crate::transaction::outputs::error::ComputeMerkleRoot,
+        },
+    }
+
+    #[derive(Debug, Error)]
+    #[error("failed to compute merkle root")]
+    #[repr(transparent)]
+    pub struct Error(Box<Inner>);
+
+    impl From<Inner> for Error {
+        fn from(err: Inner) -> Self {
+            Self(Box::new(err))
+        }
+    }
+}
+pub use compute_merkle_root::Error as ComputeMerkleRoot;
+
 pub mod withdrawal_bundle {
     use thiserror::Error;
 

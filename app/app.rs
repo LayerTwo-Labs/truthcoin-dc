@@ -13,8 +13,8 @@ use truthcoin_dc::{
     miner::{self, Miner},
     node::{self, Node},
     types::{
-        self, Address, AmountOverflowError, Body, Coinbase, InPoint, OutPoint,
-        Output, Transaction,
+        self, Address, AmountOverflowError, Body, Coinbase, FilledTransaction,
+        InPoint, OutPoint, Output, Transaction,
         proto::mainchain::{
             self,
             generated::{
@@ -32,6 +32,8 @@ use crate::cli::Config;
 pub enum Error {
     #[error(transparent)]
     AmountOverflow(#[from] AmountOverflowError),
+    #[error(transparent)]
+    ComputeMerkleRoot(#[from] truthcoin_dc::types::ComputeMerkleRootError),
     #[error("CUSF mainchain proto error: {0}")]
     CusfMainchain(#[from] truthcoin_dc::types::proto::Error),
     #[error("io error: {0}")]
@@ -538,12 +540,7 @@ impl App {
                      block connection"
                 );
             }
-            let merkle_root = Body::compute_merkle_root(
-                &coinbase,
-                &txs.iter()
-                    .map(|tx| tx.transaction.transaction.clone())
-                    .collect::<Vec<_>>(),
-            );
+            let merkle_root = Body::compute_merkle_root(&coinbase, &txs)?;
             let body = Body::new(
                 txs.into_iter().map(|tx| tx.into()).collect(),
                 coinbase,
@@ -563,7 +560,8 @@ impl App {
             (bribe, header, body, tx_fees)
         } else {
             let coinbase = Coinbase::default();
-            let merkle_root = Body::compute_merkle_root(&coinbase, &[]);
+            let txs: [FilledTransaction; 0] = [];
+            let merkle_root = Body::compute_merkle_root(&coinbase, &txs)?;
             let body = Body::new(Vec::new(), coinbase);
             let header = types::Header {
                 merkle_root,

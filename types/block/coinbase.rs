@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
-    hashes::{self, BlockHash, CoinbaseTxid, MerkleRoot},
-    transaction::outputs::Outputs,
+    hashes::{self, BlockHash, CoinbaseMerkleRoot, CoinbaseTxid, MerkleRoot},
+    transaction::outputs::{self, Outputs},
     util,
 };
 
@@ -17,6 +17,14 @@ pub struct Coinbase {
 }
 
 impl Coinbase {
+    pub(crate) fn compute_merkle_root(
+        &self,
+    ) -> Result<CoinbaseMerkleRoot, outputs::error::ComputeMerkleRoot> {
+        let Self { memo, outputs } = self;
+        let outputs_commitment = outputs.compute_merkle_root()?;
+        Ok(hashes::hash(&(memo, outputs_commitment)).into())
+    }
+
     /// [`CoinbaseTxid`]s are computed by hashing the concatenation of
     /// * The merkle root of the block that contains the coinbase tx
     /// * The previous mainchain hash for the block that contains the

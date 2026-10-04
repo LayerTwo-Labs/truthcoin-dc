@@ -1004,15 +1004,6 @@ pub fn disconnect_tip(
         };
         return Err(Error::InvalidHeader(err));
     }
-    let merkle_root =
-        Body::compute_merkle_root(&body.coinbase, &body.transactions);
-    if merkle_root != header.merkle_root {
-        let err = Error::InvalidBody {
-            expected: header.merkle_root,
-            computed: merkle_root,
-        };
-        return Err(err);
-    }
     let height = state.try_get_height(rwtxn)?.ok_or(Error::NoTip)?;
 
     // 2. Revert market settlement/payouts (runs last in connect, so first here)

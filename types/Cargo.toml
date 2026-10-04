@@ -17,6 +17,7 @@ frost-core = { workspace = true, features = ["internals"] }
 frost-ristretto255 = { workspace = true, features = ["serde"] }
 heed = { workspace = true, optional = true }
 libes = { workspace = true }
+merkle-cbt = { workspace = true }
 nonempty = { workspace = true, features = ["serialize"] }
 rand = { workspace = true, features = ["chacha"] }
 rayon = { workspace = true }

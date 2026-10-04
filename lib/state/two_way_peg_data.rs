@@ -1372,10 +1372,9 @@ mod tests {
             authorizations: Vec::new(),
             actor_proofs: Vec::new(),
         };
-        let merkle_root = Body::compute_merkle_root(
-            &empty_body.coinbase,
-            &empty_body.transactions,
-        );
+        let no_txs: [crate::types::FilledTransaction; 0] = [];
+        let merkle_root =
+            Body::compute_merkle_root(&empty_body.coinbase, &no_txs).unwrap();
         let main0 = bitcoin::BlockHash::from_byte_array([10; 32]);
         let main1 = bitcoin::BlockHash::from_byte_array([11; 32]);
 

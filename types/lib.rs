@@ -20,6 +20,7 @@ pub mod error;
 pub use error::{
     AmountOverflow as AmountOverflowError,
     AmountUnderflow as AmountUnderflowError, ComputeFee as ComputeFeeError,
+    ComputeMerkleRoot as ComputeMerkleRootError,
     WithdrawalBundle as WithdrawalBundleError,
 };
 pub mod hashes;

@@ -6,8 +6,8 @@ use thiserror::Error;
 use transitive::Transitive;
 
 use crate::types::{
-    AmountOverflowError, AmountUnderflowError, BlockHash, M6id, MerkleRoot,
-    OutPoint, WithdrawalBundleError,
+    AmountOverflowError, AmountUnderflowError, BlockHash,
+    ComputeMerkleRootError, M6id, MerkleRoot, OutPoint, WithdrawalBundleError,
 };
 
 #[derive(Debug, Error)]
@@ -80,6 +80,8 @@ pub enum Error {
     BodyTooLarge,
     #[error(transparent)]
     BorshSerialize(borsh::io::Error),
+    #[error(transparent)]
+    ComputeMerkleRoot(#[from] ComputeMerkleRootError),
     #[error("Database consistency error: {0}")]
     DatabaseError(String),
     #[error(transparent)]

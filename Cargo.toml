@@ -50,6 +50,7 @@ human-size = "0.4.3"
 itertools = "0.14.0"
 jsonrpsee = { version = "0.26.0", features = ["tracing"] }
 libm = "0.2"
+merkle-cbt = "0.3.2"
 libtest-mimic = "0.8.1"
 mimalloc = "0.1.48"
 nalgebra = "0.33"

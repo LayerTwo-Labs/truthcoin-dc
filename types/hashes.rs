@@ -88,6 +88,10 @@ macro_rules! new_hash_wrapper {
 }
 
 new_hash_wrapper!(pub BlockHash);
+new_hash_wrapper!(pub(crate) CoinbaseMerkleRoot);
+new_hash_wrapper!(pub(crate) InputsMerkleRoot);
+new_hash_wrapper!(pub(crate) OutputsMerkleRoot);
+new_hash_wrapper!(pub(crate) TxMerkleRoot);
 new_hash_wrapper!(pub MerkleRoot);
 new_hash_wrapper!(pub CoinbaseTxid);
 new_hash_wrapper!(pub Txid);

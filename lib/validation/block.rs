@@ -49,16 +49,6 @@ impl BlockValidator {
             };
             return Err(Error::InvalidHeader(err));
         };
-        let merkle_root =
-            Body::compute_merkle_root(&body.coinbase, &body.transactions);
-        if merkle_root != header.merkle_root {
-            let err = Error::InvalidBody {
-                expected: header.merkle_root,
-                computed: merkle_root,
-            };
-            return Err(err);
-        }
-
         let next_height =
             state.try_get_height(rotxn)?.map_or(0, |height| height + 1);
 
@@ -81,6 +71,16 @@ impl BlockValidator {
                 .get(i)
                 .and_then(|p| p.as_ref())
                 .map(|auth| auth.get_address());
+        }
+
+        let merkle_root =
+            Body::compute_merkle_root(&body.coinbase, filled_txs.as_slice())?;
+        if merkle_root != header.merkle_root {
+            let err = Error::InvalidBody {
+                expected: header.merkle_root,
+                computed: merkle_root,
+            };
+            return Err(err);
         }
 
         // Collect all inputs as fixed-width keys for efficient
@@ -480,10 +480,11 @@ mod tests {
             actor_proofs: Vec::new(),
         };
         let header = Header {
-            merkle_root: Body::compute_merkle_root(
+            merkle_root: Body::compute_merkle_root::<FilledTransaction>(
                 &body.coinbase,
-                &body.transactions,
-            ),
+                &[],
+            )
+            .unwrap(),
             prev_side_hash: None,
             prev_main_hash: bitcoin::BlockHash::from_byte_array([0; 32]),
         };

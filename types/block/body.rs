@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{borrow::Borrow, cmp::Ordering, collections::HashMap};
 
 use borsh::BorshSerialize;
 use serde::{Deserialize, Serialize};
@@ -8,12 +8,97 @@ use crate::{
     authorization::Authorization,
     block::coinbase::Coinbase,
     error,
-    hashes::{self, CoinbaseTxid, Hash, MerkleRoot},
+    hashes::{
+        self, CoinbaseMerkleRoot, CoinbaseTxid, Hash, MerkleRoot, TxMerkleRoot,
+    },
     transaction::{
         AuthorizedTransaction, FilledTransaction, GetValue, OutPoint, Output,
         Transaction,
     },
+    util,
 };
+
+/// Hash to get a [`CmbtNode`] inner commitment for a leaf value
+#[derive(BorshSerialize, Debug)]
+struct CbmtLeafPreCommitment {
+    #[borsh(serialize_with = "util::borsh::serialize::bitcoin_amount")]
+    fee: bitcoin::Amount,
+    /// Sum of canonical tx sizes for child txs
+    canonical_size: u64,
+    tx_merkle_root: TxMerkleRoot,
+}
+
+/// Hash to get a [`CmbtNode`] inner commitment for a non-leaf value
+#[derive(BorshSerialize, Debug)]
+struct CbmtNodePreCommitment {
+    /// left child inner commitment
+    left_commitment: Hash,
+    /// Sum of child tx fees
+    #[borsh(serialize_with = "util::borsh::serialize::bitcoin_amount")]
+    fees: bitcoin::Amount,
+    /// Sum of canonical sizes of child txs
+    canonical_size: u64,
+    /// right child inner commitment
+    right_commitment: Hash,
+}
+
+// Internal node of a CBMT
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CbmtNode {
+    // Commitment to child nodes or leaf value
+    commitment: Hash,
+    // Sum of fees for child nodes or leaf value
+    fees: bitcoin::Amount,
+    // Sum of canonical tx sizes for child nodes or leaf value
+    canonical_size: u64,
+    // CBT index, see https://github.com/nervosnetwork/merkle-tree/blob/5d1898263e7167560fdaa62f09e8d52991a1c712/README.md#tree-struct
+    // This is required so that `CbmtNode` can be `Ord` correctly
+    index: usize,
+}
+
+impl PartialOrd for CbmtNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CbmtNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.index.cmp(&other.index)
+    }
+}
+
+// Marker type for merging branch commitments with
+// * branch fee totals
+// * branch canonical size totals
+struct MergeFeeSizeTotal;
+
+impl merkle_cbt::merkle_tree::Merge for MergeFeeSizeTotal {
+    type Item = CbmtNode;
+
+    fn merge(lnode: &Self::Item, rnode: &Self::Item) -> Self::Item {
+        let fees = lnode.fees + rnode.fees;
+        let canonical_size = lnode.canonical_size + rnode.canonical_size;
+        // see https://github.com/nervosnetwork/merkle-tree/blob/5d1898263e7167560fdaa62f09e8d52991a1c712/README.md#tree-struct
+        assert_eq!(lnode.index + 1, rnode.index);
+        let index = (lnode.index - 1) / 2;
+        let commitment = hashes::hash(&CbmtNodePreCommitment {
+            left_commitment: lnode.commitment,
+            fees,
+            canonical_size,
+            right_commitment: rnode.commitment,
+        });
+        Self::Item {
+            commitment,
+            fees,
+            canonical_size,
+            index,
+        }
+    }
+}
+
+// Complete binary merkle tree with annotated fee and canonical size totals
+type CbmtWithFeeTotal = merkle_cbt::CBMT<CbmtNode, MergeFeeSizeTotal>;
 
 #[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct Body {
@@ -77,31 +162,76 @@ impl Body {
             .collect()
     }
 
-    pub fn compute_merkle_root(
+    pub fn compute_merkle_root<FilledTx>(
         coinbase: &Coinbase,
-        txs: &[Transaction],
-    ) -> MerkleRoot {
-        let coinbase_hash: Hash = hashes::hash_with_scratch_buffer(coinbase);
-        let mut leaves: Vec<Hash> = std::iter::once(coinbase_hash)
-            .chain(txs.iter().map(|tx| tx.txid().into()))
-            .collect();
-        while leaves.len() > 1 {
-            let mut next_level = Vec::with_capacity(leaves.len().div_ceil(2));
-            for pair in leaves.chunks(2) {
-                let left = pair[0].as_ref();
-                let right = if pair.len() == 2 {
-                    pair[1].as_ref()
-                } else {
-                    pair[0].as_ref()
-                };
-                let mut combined = [0u8; 64];
-                combined[..32].copy_from_slice(left);
-                combined[32..].copy_from_slice(right);
-                next_level.push(*blake3::hash(&combined).as_bytes());
-            }
-            leaves = next_level;
+        txs: &[FilledTx],
+    ) -> Result<MerkleRoot, error::ComputeMerkleRoot>
+    where
+        FilledTx: Borrow<FilledTransaction>,
+    {
+        let CbmtNode {
+            commitment: txs_commitment,
+            ..
+        } = {
+            let n_txs = txs.len();
+            let leaves: Vec<_> = txs
+                .iter()
+                .enumerate()
+                .map(|(idx, tx)| {
+                    let tx = tx.borrow();
+                    let fees = tx.get_fee().map_err(|err| {
+                        error::compute_merkle_root::Inner::TxFee {
+                            txid: tx.transaction.txid(),
+                            source: err,
+                        }
+                    })?;
+                    let canonical_size =
+                        tx.transaction.canonical_size().map_err(|err| {
+                            error::compute_merkle_root::Inner::TxCanonicalSize {
+                                txid: tx.transaction.txid(),
+                                source: err,
+                            }
+                        })?;
+                    let tx_merkle_root = tx
+                        .transaction
+                        .compute_merkle_root()
+                        .map_err(|err| {
+                        error::compute_merkle_root::Inner::TxMerkleRoot {
+                            txid: tx.transaction.txid(),
+                            source: err,
+                        }
+                    })?;
+                    let leaf_pre_commitment = CbmtLeafPreCommitment {
+                        fee: fees,
+                        canonical_size,
+                        tx_merkle_root,
+                    };
+                    Ok::<_, error::ComputeMerkleRoot>(CbmtNode {
+                        commitment: hashes::hash(&leaf_pre_commitment),
+                        fees,
+                        canonical_size,
+                        // see https://github.com/nervosnetwork/merkle-tree/blob/5d1898263e7167560fdaa62f09e8d52991a1c712/README.md#tree-struct
+                        index: (idx + n_txs) - 1,
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            CbmtWithFeeTotal::build_merkle_root(leaves.as_slice())
+        };
+        let coinbase_commitment = coinbase
+            .compute_merkle_root()
+            .map_err(error::compute_merkle_root::Inner::CoinbaseMerkleRoot)?;
+        // Borsh encoding for hashing
+        #[derive(BorshSerialize)]
+        struct HashComponents {
+            coinbase_commitment: CoinbaseMerkleRoot,
+            txs_commitment: Hash,
         }
-        leaves[0].into()
+        let root = hashes::hash_with_scratch_buffer(&HashComponents {
+            coinbase_commitment,
+            txs_commitment,
+        })
+        .into();
+        Ok(root)
     }
 
     pub fn get_inputs(&self) -> Vec<OutPoint> {
