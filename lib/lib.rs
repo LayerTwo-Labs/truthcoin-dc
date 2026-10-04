@@ -10,4 +10,4 @@ pub mod util;
 pub mod validation;
 pub mod wallet;
 
-pub use truthcoin_dc_types::authorization;
+pub use heed;

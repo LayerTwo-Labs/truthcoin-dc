@@ -1,133 +1,74 @@
 use std::{
     borrow::BorrowMut,
-    collections::{BTreeMap, HashMap, HashSet},
-    fmt::Debug,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
-    path::Path,
+    path::PathBuf,
     sync::Arc,
 };
 
 use fallible_iterator::{FallibleIterator, IteratorExt};
-use heed::EnvFlags;
-use sneed::{DbError, Env, EnvError, RoTxn, RwTxnError, env};
+use futures::Stream;
+use sneed::{DbError, Env, EnvError, RoTxn, RwTxn, RwTxnError};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
+use truthcoin_dc_types::{
+    M6id, WithdrawalBundleStatus, state::WithdrawalBundleInfo,
+};
 
 use crate::{
-    archive::{self, Archive},
-    authorization::{BatchVerificationContext, rand_core::CryptoRng},
+    archive::Archive,
     math::trading,
     mempool::{self, MemPool},
-    net::{self, DialSeedsHandle, Net, Peer},
+    net::{DialKnownPeersHandle, Net},
     state::{
         self, State,
-        block::{TradeApplyResult, TradeSimulation},
-        markets::MarketId,
+        markets::{
+            MarketId,
+            block::{TradeApplyResult, TradeSimulation},
+        },
     },
     types::{
-        Accumulator, Address, AmountOverflowError, AmountUnderflowError,
-        Authorized, AuthorizedTransaction, Block, BlockHash, BlockIndexEvents,
-        BmmResult, Body, FilledTransaction, Header, InPoint, M6id,
-        MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
-        SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
-        WithdrawalBundleStatus,
-        net::SeedAddress,
+        Accumulator, Address, AmountUnderflowError, Authorized,
+        AuthorizedTransaction, BlockHash, BlockIndexEvents, BmmResult, Body,
+        FilledTransaction, Header, InPoint, MainchainSyncProgress, Network,
+        OutPoint, OutPointKey, Output, SpentOutput, Tip, Transaction, TxIn,
+        Txid, WithdrawalBundle,
+        authorization::{BatchVerificationContext, rand_core::CryptoRng},
+        net::{Peer, PeerAddress, ResolvedPeerAddress},
         proto::{self, mainchain},
-        state::WithdrawalBundleInfo,
     },
     util::Watchable,
 };
-use sneed::RwTxn;
 
+pub(crate) mod error;
+pub use error::Error;
 mod mainchain_task;
-mod net_task;
-
-pub(crate) use mainchain_task::ResponseError;
-pub(crate) use net_task::MainchainAncestors;
-
 use mainchain_task::MainchainTaskHandle;
+mod net_task;
 use net_task::NetTaskHandle;
-#[cfg(feature = "zmq")]
-use net_task::ZmqPubHandler;
-
-#[allow(clippy::duplicated_attributes)]
-#[derive(thiserror::Error, transitive::Transitive, Debug)]
-#[transitive(from(env::error::OpenEnv, EnvError))]
-#[transitive(from(env::error::ReadTxn, EnvError))]
-#[transitive(from(env::error::WriteTxn, EnvError))]
-pub enum Error {
-    #[error("address parse error")]
-    AddrParse(#[from] std::net::AddrParseError),
-    #[error(transparent)]
-    AmountOverflow(#[from] AmountOverflowError),
-    #[error(transparent)]
-    AmountUnderflow(#[from] AmountUnderflowError),
-    #[error("archive error")]
-    Archive(#[from] archive::Error),
-    #[error("CUSF mainchain proto error")]
-    CusfMainchain(#[from] proto::Error),
-    #[error(transparent)]
-    Db(#[from] DbError),
-    #[error("Database env error")]
-    DbEnv(#[from] EnvError),
-    #[error("Database write error")]
-    DbWrite(#[from] RwTxnError),
-    #[error("I/O error")]
-    Io(#[from] std::io::Error),
-    #[error("error requesting mainchain ancestors")]
-    MainchainAncestors(#[source] mainchain_task::ResponseError),
-    #[error("market price history error")]
-    MarketPriceHistory(#[from] state::markets::price_history::Error),
-    #[error("mempool error")]
-    MemPool(#[from] mempool::Error),
-    #[error("net error")]
-    Net(#[source] Box<net::Error>),
-    #[error("net task error")]
-    NetTask(#[source] Box<net_task::Error>),
-    #[error("block {block_hash} is not in the current chain")]
-    NotInCurrentChain { block_hash: BlockHash },
-    #[error("peer info stream closed")]
-    PeerInfoRxClosed,
-    #[error("Receive mainchain task response cancelled")]
-    ReceiveMainchainTaskResponse,
-    #[error("Send mainchain task request failed")]
-    SendMainchainTaskRequest,
-    #[error("state error: {0}")]
-    State(#[source] Box<state::Error>),
-    #[error("Utreexo error: {0}")]
-    Utreexo(String),
-    #[cfg(feature = "zmq")]
-    #[error("ZMQ error")]
-    Zmq(#[from] zeromq::ZmqError),
-}
-
-impl From<net::Error> for Error {
-    fn from(err: net::Error) -> Self {
-        Self::Net(Box::new(err))
-    }
-}
-
-impl From<net_task::Error> for Error {
-    fn from(err: net_task::Error) -> Self {
-        Self::NetTask(Box::new(err))
-    }
-}
-
-impl From<state::Error> for Error {
-    fn from(err: state::Error) -> Self {
-        Self::State(Box::new(err))
-    }
-}
-
-/// Fee that the block builder credits to the coinbase for a transaction.
-fn block_template_fee(
-    filled_tx: &FilledTransaction,
-) -> Result<bitcoin::Amount, Error> {
-    Ok(crate::validation::BlockValidator::miner_fee(filled_tx)?)
-}
 
 pub type FilledTransactionWithPosition =
     (Authorized<FilledTransaction>, Option<TxIn>);
+
+#[derive(Debug)]
+pub struct Config {
+    pub datadir: PathBuf,
+    pub bind_addr: SocketAddr,
+    pub magic_bytes_override: Option<crate::net::peer_message::MagicBytes>,
+    pub network: Network,
+    pub add_peers: HashSet<PeerAddress>,
+    pub server_names: HashSet<String>,
+    /// Blocks per voting period, for a test network
+    pub decision_config_testing: Option<u32>,
+}
+
+/// Handles for spawned tasks / task sets
+#[derive(Clone)]
+struct TaskHandles {
+    _dial_known_peers: Arc<DialKnownPeersHandle>,
+    mainchain: MainchainTaskHandle,
+    net: NetTaskHandle,
+}
 
 #[derive(Clone)]
 pub struct Node<MainchainTransport = Channel> {
@@ -136,37 +77,25 @@ pub struct Node<MainchainTransport = Channel> {
     cusf_mainchain: mainchain::ValidatorClient<MainchainTransport>,
     cusf_mainchain_block_producer:
         Option<Arc<Mutex<mainchain::BlockProducerClient<MainchainTransport>>>>,
-    _dial_seeds: Arc<DialSeedsHandle>,
     env: sneed::Env<heed::WithoutTls>,
-    mainchain_task: MainchainTaskHandle,
     mempool: MemPool,
     net: Net,
-    net_task: NetTaskHandle,
     state: State,
-    #[cfg(feature = "zmq")]
-    zmq_pub_handler: Arc<ZmqPubHandler>,
+    task_handles: TaskHandles,
 }
 
 impl<MainchainTransport> Node<MainchainTransport>
 where
     MainchainTransport: proto::Transport,
 {
-    #[allow(clippy::too_many_arguments)]
-    pub async fn new<R>(
-        bind_addr: SocketAddr,
-        datadir: &Path,
-        magic_bytes_override: Option<crate::net::peer_message::MagicBytes>,
-        network: Network,
-        add_peers: HashSet<SeedAddress>,
-        server_names: HashSet<String>,
+    pub fn new<R>(
+        config: Config,
         cusf_mainchain: mainchain::ValidatorClient<MainchainTransport>,
         cusf_mainchain_block_producer: Option<
             mainchain::BlockProducerClient<MainchainTransport>,
         >,
         rng: &mut R,
         runtime: &tokio::runtime::Runtime,
-        decision_config_testing: Option<u32>,
-        #[cfg(feature = "zmq")] zmq_addr: SocketAddr,
     ) -> Result<Self, Error>
     where
         mainchain::ValidatorClient<MainchainTransport>: Clone,
@@ -176,9 +105,20 @@ where
         >>::Future: Send,
         R: CryptoRng,
 {
+        let Config {
+            datadir,
+            bind_addr,
+            magic_bytes_override,
+            network,
+            add_peers,
+            server_names,
+            decision_config_testing,
+        } = config;
         let env_path = datadir.join("data.mdb");
+        // let _ = std::fs::remove_dir_all(&env_path);
         std::fs::create_dir_all(&env_path)?;
         let env = {
+            use heed::EnvFlags;
             let mut env_open_opts =
                 heed::EnvOpenOptions::new().read_txn_without_tls();
             env_open_opts
@@ -202,12 +142,11 @@ where
             // - NO_READ_AHEAD disables kernel readahead that would otherwise
             //   touch cold pages we immediately overwrite, improving random
             //   access behaviour on SSDs used in testing.
-            // WRITE_MAP/MAP_ASYNC/NO_READ_AHEAD are gated off on
-            // Windows: LMDB's writable-mmap path returns
-            // ERROR_INVALID_HANDLE on commit there, and
-            // NO_READ_AHEAD has no effect without posix_madvise.
-            // NO_SYNC/NO_META_SYNC are kept on every platform
-            // since their tradeoffs are OS-independent.
+            // - NO_TLS stops LMDB from relying on thread-local storage for
+            //   reader slots so transactions can be moved across Tokio tasks.
+            // WRITE_MAP/MAP_ASYNC/NO_READ_AHEAD are gated off on Windows:
+            // LMDB's writable-mmap path returns ERROR_INVALID_HANDLE on commit
+            // there.
             #[cfg(not(windows))]
             let fast_flags = EnvFlags::WRITE_MAP
                 | EnvFlags::MAP_ASYNC
@@ -217,21 +156,20 @@ where
             #[cfg(windows)]
             let fast_flags = EnvFlags::NO_SYNC | EnvFlags::NO_META_SYNC;
             unsafe { env_open_opts.flags(fast_flags) };
-            unsafe { Env::open(&env_open_opts, &env_path) }?
+            unsafe { Env::open(&env_open_opts, &env_path) }
+                .map_err(EnvError::from)?
         };
         let state = State::new(&env, decision_config_testing)?;
-        #[cfg(feature = "zmq")]
-        let zmq_pub_handler = Arc::new(ZmqPubHandler::new(zmq_addr).await?);
         let archive = Archive::new(&env)?;
         let mempool = MemPool::new(&env)?;
-        let (mainchain_task, mainchain_task_event_rx) =
+        let (mainchain_task_handle, mainchain_task_event_rx) =
             MainchainTaskHandle::new(
                 env.clone(),
                 archive.clone(),
                 cusf_mainchain.clone(),
             );
         let batch_verification_ctxt = BatchVerificationContext::new(rng);
-        let (net, peer_info_rx, dial_seeds) = Net::new(
+        let (net, peer_info_rx, dial_known_peers_handle) = Net::new(
             runtime.handle(),
             &env,
             archive.clone(),
@@ -243,35 +181,34 @@ where
             add_peers,
             server_names,
         )?;
-        let cusf_mainchain_block_producer = cusf_mainchain_block_producer
-            .map(|block_producer| Arc::new(Mutex::new(block_producer)));
-        let net_task = NetTaskHandle::new(
+        let net_task_handle = NetTaskHandle::new(
             runtime,
             env.clone(),
             archive.clone(),
-            mainchain_task.clone(),
+            mainchain_task_handle.clone(),
             mainchain_task_event_rx,
             mempool.clone(),
             net.clone(),
             peer_info_rx,
             state.clone(),
-            #[cfg(feature = "zmq")]
-            zmq_pub_handler.clone(),
         );
+        let task_handles = TaskHandles {
+            _dial_known_peers: Arc::new(dial_known_peers_handle),
+            mainchain: mainchain_task_handle,
+            net: net_task_handle,
+        };
+        let cusf_mainchain_block_producer = cusf_mainchain_block_producer
+            .map(|block_producer| Arc::new(Mutex::new(block_producer)));
         Ok(Self {
             archive,
             batch_verification_ctxt,
             cusf_mainchain,
             cusf_mainchain_block_producer,
-            _dial_seeds: Arc::new(dial_seeds),
             env,
-            mainchain_task,
             mempool,
             net,
-            net_task,
             state,
-            #[cfg(feature = "zmq")]
-            zmq_pub_handler: zmq_pub_handler.clone(),
+            task_handles,
         })
     }
 
@@ -292,30 +229,28 @@ where
         f(&self.cusf_mainchain)
     }
 
-    pub fn try_get_tip_height(&self) -> Result<Option<u32>, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.state.try_get_height(&rotxn)?)
+    pub fn dns_resolver(&self) -> &Arc<hickory_resolver::TokioResolver> {
+        &self.net.dns_resolver
     }
 
-    pub fn try_get_tip(&self) -> Result<Option<BlockHash>, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.state.try_get_tip(&rotxn)?)
-    }
-
-    /// Invalidate a block and its descendants. If the tip descends from the
-    /// block, disconnect blocks back to the parent of the block.
+    /// Invalidate a block.
+    /// This will delete the header and body, and mark invalid, the specified
+    /// block and any descendants.
+    /// The node will re-org to a previous valid block in the active chain.
     pub fn invalidate_block(&self, block_hash: BlockHash) -> Result<(), Error> {
         let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
         let Some(header) = self.archive.try_get_header(&rwtxn, block_hash)?
         else {
             return Ok(());
         };
+        // check if the specified block is in the active chain
         let tip = self.state.try_get_tip(&rwtxn)?;
         let in_active_chain = if let Some(tip) = tip {
             self.archive.is_descendant(&rwtxn, block_hash, tip)?
         } else {
             false
         };
+        // re-org if necessary
         if in_active_chain {
             while self.state.try_get_tip(&rwtxn)? != header.prev_side_hash {
                 net_task::disconnect_tip_(
@@ -326,39 +261,20 @@ where
                 )?;
             }
         }
+        // invalidate within archive
         let () = self.archive.invalidate_block(&mut rwtxn, block_hash)?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(())
     }
 
-    pub fn try_get_height(
-        &self,
-        block_hash: BlockHash,
-    ) -> Result<Option<u32>, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.try_get_height(&rotxn, block_hash)?)
+    pub fn try_get_height(&self) -> Result<Option<u32>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.state.try_get_height(&rotxn)?)
     }
 
-    pub fn get_height(&self, block_hash: BlockHash) -> Result<u32, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.get_height(&rotxn, block_hash)?)
-    }
-
-    pub fn get_tx_inclusions(
-        &self,
-        txid: Txid,
-    ) -> Result<BTreeMap<BlockHash, u32>, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.get_tx_inclusions(&rotxn, txid)?)
-    }
-
-    pub fn is_descendant(
-        &self,
-        ancestor: BlockHash,
-        descendant: BlockHash,
-    ) -> Result<bool, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.is_descendant(&rotxn, ancestor, descendant)?)
+    pub fn try_get_best_hash(&self) -> Result<Option<BlockHash>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.state.try_get_tip(&rotxn)?)
     }
 
     /// Regenerate proofs and submit transaction
@@ -370,66 +286,158 @@ where
         Tx: BorrowMut<AuthorizedTransaction>,
     {
         {
-            let mut rwtxn = self.env.write_txn()?;
+            let mut rotxn = self.env.write_txn().map_err(EnvError::from)?;
             self.state.regenerate_proof(
-                &rwtxn,
+                &rotxn,
                 &mut transaction.borrow_mut().transaction,
             )?;
-            let transaction: &AuthorizedTransaction = transaction.borrow();
             self.state.validate_transaction(
-                &self.archive,
-                &rwtxn,
+                &rotxn,
                 &self.batch_verification_ctxt,
-                transaction,
+                transaction.borrow(),
+                &self.archive,
             )?;
-            self.mempool.put(&mut rwtxn, transaction)?;
-
-            if let Some(data) = transaction.transaction.data.as_ref() {
-                match data {
-                    crate::types::TxData::Trade {
-                        market_id,
-                        outcome_index,
-                        shares,
-                        ..
-                    } => {
-                        if *shares > 0 {
-                            self.update_mempool_buy(
-                                &mut rwtxn,
-                                *market_id,
-                                *outcome_index,
-                                *shares,
-                            )?;
-                        } else {
-                            self.update_mempool_sell(
-                                &mut rwtxn,
-                                *market_id,
-                                *outcome_index,
-                                shares.unsigned_abs() as i64,
-                            )?;
-                        }
-                    }
-                    crate::types::TxData::ClaimDecision(_)
-                    | crate::types::TxData::CreateMarket { .. }
-                    | crate::types::TxData::SubmitVote { .. }
-                    | crate::types::TxData::SubmitBallot { .. }
-                    | crate::types::TxData::TransferReputation { .. }
-                    | crate::types::TxData::AmplifyBeta { .. } => {}
-                }
-            }
-
-            rwtxn.commit().map_err(RwTxnError::from)?;
+            self.mempool.put(&mut rotxn, transaction.borrow())?;
+            let () = self.update_mempool_market(
+                &mut rotxn,
+                &transaction.borrow().transaction,
+            )?;
+            rotxn.commit().map_err(RwTxnError::from)?;
         }
         self.net.push_tx(Default::default(), transaction.borrow());
         Ok(())
     }
 
-    pub fn get_tip_accumulator(&self) -> Result<Accumulator, Error> {
+    pub fn get_all_utxos(&self) -> Result<HashMap<OutPoint, Output>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        self.state
+            .get_utxos(&rotxn)
+            .map_err(|err| DbError::from(err).into())
+    }
+
+    pub fn get_latest_failed_withdrawal_bundle_height(
+        &self,
+    ) -> Result<Option<u32>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let res = self
+            .state
+            .get_latest_failed_withdrawal_bundle(&rotxn)
+            .map_err(DbError::from)?
+            .map(|(height, _)| height);
+        Ok(res)
+    }
+
+    pub fn get_unconfirmed_spent_utxos<'a, OutPoints>(
+        &self,
+        outpoints: OutPoints,
+    ) -> Result<Vec<(OutPoint, InPoint)>, Error>
+    where
+        OutPoints: IntoIterator<Item = &'a OutPoint>,
+    {
         let rotxn = self.env.read_txn()?;
+        let mut spent = vec![];
+        for outpoint in outpoints {
+            let Some(txid) = self
+                .mempool
+                .spent_utxos
+                .try_get(&rotxn, outpoint)
+                .map_err(mempool::Error::from)?
+            else {
+                continue;
+            };
+            let tx = self
+                .mempool
+                .transactions
+                .try_get(&rotxn, &txid)
+                .map_err(mempool::Error::from)?
+                .ok_or(mempool::Error::MissingTransaction(txid))?;
+            if let Some(vin) = tx
+                .transaction
+                .inputs
+                .iter()
+                .position(|(spent_outpoint, _)| spent_outpoint == outpoint)
+            {
+                let inpoint = InPoint::Regular {
+                    txid,
+                    vin: vin as u32,
+                };
+                spent.push((*outpoint, inpoint));
+            }
+        }
+        Ok(spent)
+    }
+
+    pub fn get_unconfirmed_utxos_by_addresses(
+        &self,
+        addresses: &HashSet<Address>,
+    ) -> Result<HashMap<OutPoint, Output>, Error> {
+        let rotxn = self.env.read_txn()?;
+        let mut res = HashMap::new();
+        let () = addresses.iter().try_for_each(|addr| {
+            let utxos = self.mempool.get_unconfirmed_utxos(&rotxn, addr)?;
+            res.extend(utxos);
+            Result::<(), Error>::Ok(())
+        })?;
+        Ok(res)
+    }
+
+    pub fn get_spent_utxos(
+        &self,
+        outpoints: &[OutPoint],
+    ) -> Result<Vec<(OutPoint, SpentOutput)>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let mut spent = vec![];
+        for outpoint in outpoints {
+            let key = OutPointKey::from(outpoint);
+            if let Some(output) = self
+                .state
+                .stxos
+                .try_get(&rotxn, &key)
+                .map_err(DbError::from)?
+            {
+                spent.push((*outpoint, output));
+            }
+        }
+        Ok(spent)
+    }
+
+    pub fn get_stxos_by_addresses(
+        &self,
+        addresses: &HashSet<Address>,
+    ) -> Result<HashMap<OutPoint, SpentOutput>, Error> {
+        let rotxn = self.env.read_txn()?;
+        let stxos = self
+            .state
+            .get_stxos_by_addresses(&rotxn, addresses)
+            .map_err(DbError::from)?;
+        Ok(stxos)
+    }
+
+    pub fn get_utxos_by_addresses(
+        &self,
+        addresses: &HashSet<Address>,
+    ) -> Result<HashMap<OutPoint, Output>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let utxos = self
+            .state
+            .get_utxos_by_addresses(&rotxn, addresses)
+            .map_err(DbError::from)?;
+        Ok(utxos)
+    }
+
+    pub fn try_get_tip(&self) -> Result<Option<BlockHash>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let tip = self.state.try_get_tip(&rotxn)?;
+        Ok(tip)
+    }
+
+    pub fn get_tip_accumulator(&self) -> Result<Accumulator, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         Ok(self.state.get_accumulator(&rotxn)?)
     }
 
     pub fn regenerate_proof(&self, tx: &mut Transaction) -> Result<(), Error> {
-        let rotxn = self.env.read_txn()?;
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         let () = self.state.regenerate_proof(&rotxn, tx)?;
         Ok(())
     }
@@ -438,7 +446,7 @@ where
         &self,
         block_hash: BlockHash,
     ) -> Result<Option<Accumulator>, Error> {
-        let rotxn = self.env.read_txn()?;
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         Ok(self.archive.try_get_accumulator(&rotxn, block_hash)?)
     }
 
@@ -446,42 +454,607 @@ where
         &self,
         block_hash: BlockHash,
     ) -> Result<Accumulator, Error> {
-        let rotxn = self.env.read_txn()?;
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         Ok(self.archive.get_accumulator(&rotxn, block_hash)?)
     }
 
-    pub fn get_mempool_shares(
+    pub fn try_get_header(
         &self,
-        market_id: &crate::state::markets::MarketId,
-    ) -> Result<Option<ndarray::Array1<i64>>, Error> {
-        let rotxn = self.env.read_txn()?;
-        self.state
-            .get_mempool_shares(&rotxn, market_id)
-            .map_err(|e| Error::State(Box::new(e)))
+        block_hash: BlockHash,
+    ) -> Result<Option<Header>, Error> {
+        let txn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.archive.try_get_header(&txn, block_hash)?)
     }
 
-    pub fn get_pending_decision_claim_ids(
-        &self,
-    ) -> Result<std::collections::BTreeSet<[u8; 3]>, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.mempool.pending_decision_claim_ids(&rotxn)?)
+    pub fn get_header(&self, block_hash: BlockHash) -> Result<Header, Error> {
+        let txn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.archive.get_header(&txn, block_hash)?)
     }
 
-    /// Single unified watch stream - fires when state or mempool changes.
-    /// State changes cover: new blocks, market updates, decision changes.
-    /// Mempool changes cover: new tx submissions, tx confirmations.
-    pub fn watch(
+    /// Get the coin movements that the block applied outside its body
+    pub fn get_block_index_events(
         &self,
-    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = ()> + Send>> {
+        block_hash: BlockHash,
+    ) -> Result<BlockIndexEvents, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let height = self.archive.get_height(&rotxn, block_hash)?;
+        // The events are keyed by height, so a block off the current chain
+        // would read another block's events.
+        if self.try_get_block_hash_read(&rotxn, height)? != Some(block_hash) {
+            return Err(Error::NotInCurrentChain { block_hash });
+        }
+        let events = self.state.get_block_index_events(&rotxn, height)?;
+        Ok(events)
+    }
+
+    fn try_get_block_hash_read(
+        &self,
+        rotxn: &RoTxn,
+        height: u32,
+    ) -> Result<Option<BlockHash>, Error> {
+        let Some(tip) = self.state.try_get_tip(rotxn)? else {
+            return Ok(None);
+        };
+        let Some(tip_height) = self.state.try_get_height(rotxn)? else {
+            return Ok(None);
+        };
+        if tip_height >= height {
+            self.archive
+                .ancestors(rotxn, tip)
+                .nth((tip_height - height) as usize)
+                .map_err(Error::from)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get the block hash at the specified height in the active chain,
+    /// if it exists
+    pub fn try_get_block_hash(
+        &self,
+        height: u32,
+    ) -> Result<Option<BlockHash>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        self.try_get_block_hash_read(&rotxn, height)
+    }
+
+    pub fn try_get_body(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<Body>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.archive.try_get_body(&rotxn, block_hash)?)
+    }
+
+    pub fn get_body(&self, block_hash: BlockHash) -> Result<Body, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.archive.get_body(&rotxn, block_hash)?)
+    }
+
+    pub fn get_best_main_verification(
+        &self,
+        hash: BlockHash,
+    ) -> Result<bitcoin::BlockHash, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let hash = self.archive.get_best_main_verification(&rotxn, hash)?;
+        Ok(hash)
+    }
+
+    pub fn get_bmm_inclusions(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Vec<bitcoin::BlockHash>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let bmm_inclusions = self
+            .archive
+            .get_bmm_results(&rotxn, block_hash)?
+            .into_iter()
+            .filter_map(|(block_hash, bmm_res)| match bmm_res {
+                BmmResult::Verified => Some(block_hash),
+                BmmResult::Failed => None,
+            })
+            .collect();
+        Ok(bmm_inclusions)
+    }
+
+    pub fn get_all_transactions(
+        &self,
+    ) -> Result<Vec<AuthorizedTransaction>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let transactions = self.mempool.take_all(&rotxn)?;
+        Ok(transactions)
+    }
+
+    /// Get total sidechain wealth in Bitcoin
+    pub fn get_sidechain_wealth(&self) -> Result<bitcoin::Amount, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.state.sidechain_wealth(&rotxn)?)
+    }
+
+    pub fn get_transactions(
+        &self,
+        number: usize,
+    ) -> Result<(Vec<Authorized<FilledTransaction>>, bitcoin::Amount), Error>
+    {
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        // Take non-trade txs first, then trade txs in insertion order
+        let transactions = self.mempool.take(&rwtxn, number)?;
+        let trade_txs = self.mempool.take_trades_ordered(&rwtxn)?;
+        let trade_txids: HashSet<_> =
+            trade_txs.iter().map(|tx| tx.transaction.txid()).collect();
+        let transactions: Vec<_> = transactions
+            .into_iter()
+            .filter(|tx| !trade_txids.contains(&tx.transaction.txid()))
+            .chain(trade_txs)
+            .take(number)
+            .collect();
+        let mut fee = bitcoin::Amount::ZERO;
+        let mut returned_transactions = vec![];
+        let mut spent_utxos = HashSet::new();
+        let mut trades = TradeSimulation::default();
+        for transaction in transactions {
+            let inputs: HashSet<_> =
+                transaction.transaction.inputs.iter().copied().collect();
+            if !spent_utxos.is_disjoint(&inputs) {
+                // UTXO double spent
+                self.mempool
+                    .delete(&mut rwtxn, transaction.transaction.txid())?;
+                continue;
+            }
+            if self
+                .state
+                .validate_transaction(
+                    &rwtxn,
+                    &self.batch_verification_ctxt,
+                    &transaction,
+                    &self.archive,
+                )
+                .is_err()
+            {
+                self.mempool
+                    .delete(&mut rwtxn, transaction.transaction.txid())?;
+                continue;
+            }
+            let filled_transaction = self
+                .state
+                .fill_authorized_transaction(&rwtxn, transaction)?;
+            match trades.apply(
+                &self.state,
+                &self.archive,
+                &rwtxn,
+                &filled_transaction.transaction,
+            )? {
+                TradeApplyResult::Applied => (),
+                TradeApplyResult::Skipped { reason } => {
+                    tracing::debug!(
+                        txid = %filled_transaction.transaction.txid(),
+                        %reason,
+                        "Skip trade for this block"
+                    );
+                    continue;
+                }
+            }
+            fee = fee
+                .checked_add(crate::validation::miner_fee(
+                    &filled_transaction.transaction,
+                )?)
+                .ok_or(AmountUnderflowError)?;
+            spent_utxos.extend(
+                filled_transaction
+                    .transaction
+                    .transaction
+                    .inputs
+                    .iter()
+                    .cloned(),
+            );
+            returned_transactions.push(filled_transaction);
+        }
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        Ok((returned_transactions, fee))
+    }
+
+    /// Get a transaction if it exists in the active chain or mempool.
+    /// Returns the transaction and the block it was included in, if it exists
+    /// in the active chain.
+    pub fn try_get_transaction(
+        &self,
+        txid: Txid,
+    ) -> Result<Option<(Transaction, Option<BlockHash>)>, Error> {
+        let rotxn = self.env.read_txn()?;
+        let tip = self.state.try_get_tip(&rotxn)?;
+        if let Some(tip) = tip
+            && let Some((block_hash, txin)) = self
+                .archive
+                .get_tx_inclusions(&rotxn, txid)?
+                .into_iter()
+                .map(Ok)
+                .transpose_into_fallible()
+                .find(|(block_hash, _idx)| {
+                    self.archive.is_descendant(&rotxn, tip, *block_hash)
+                })?
+        {
+            let body = self.archive.get_body(&rotxn, block_hash)?;
+            let tx = body.transactions.into_iter().nth(txin as usize).unwrap();
+            Ok(Some((tx, Some(block_hash))))
+        } else if let Some(auth_tx) = self
+            .mempool
+            .transactions
+            .try_get(&rotxn, &txid)
+            .map_err(mempool::Error::from)?
+        {
+            Ok(Some((auth_tx.transaction, None)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn try_get_withdrawal_bundle(
+        &self,
+        m6id: &M6id,
+    ) -> Result<Option<(WithdrawalBundleInfo, WithdrawalBundleStatus)>, Error>
+    {
+        let rotxn = self.env.read_txn()?;
+        let res = self
+            .state
+            .try_get_withdrawal_bundle(&rotxn, m6id)
+            .map_err(state::Error::from)?;
+        Ok(res)
+    }
+
+    pub fn try_get_filled_transaction(
+        &self,
+        txid: Txid,
+    ) -> Result<Option<FilledTransactionWithPosition>, Error> {
+        let rotxn = self.env.read_txn()?;
+        let tip = self.state.try_get_tip(&rotxn)?;
+        let inclusions = self.archive.get_tx_inclusions(&rotxn, txid)?;
+        if let Some((block_hash, idx)) = inclusions
+            .into_iter()
+            .map(Ok)
+            .transpose_into_fallible()
+            .find(|(block_hash, _)| {
+                if let Some(tip) = tip {
+                    self.archive.is_descendant(&rotxn, *block_hash, tip)
+                } else {
+                    Ok(true)
+                }
+            })?
+        {
+            let body = self.archive.get_body(&rotxn, block_hash)?;
+            let auth_txs = body.authorized_transactions();
+            let auth_tx =
+                auth_txs.into_iter().nth(idx as usize).ok_or_else(|| {
+                    Error::State(Box::new(state::Error::InvalidTransaction {
+                        reason: format!(
+                            "tx index {idx} out of bounds in \
+                                 block {block_hash}"
+                        ),
+                    }))
+                })?;
+            let filled_tx = self
+                .state
+                .fill_transaction_from_stxos(&rotxn, auth_tx.transaction)?;
+            let auth_tx = Authorized {
+                transaction: filled_tx,
+                authorizations: auth_tx.authorizations,
+                actor_proof: auth_tx.actor_proof,
+            };
+            let txin = TxIn { block_hash, idx };
+            let res = (auth_tx, Some(txin));
+            return Ok(Some(res));
+        }
+        if let Some(auth_tx) = self
+            .mempool
+            .transactions
+            .try_get(&rotxn, &txid)
+            .map_err(mempool::Error::from)?
+        {
+            match self.state.fill_authorized_transaction(&rotxn, auth_tx) {
+                Ok(filled_tx) => {
+                    let res = (filled_tx, None);
+                    Ok(Some(res))
+                }
+                Err(state::Error::NoUtxo { .. }) => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn try_get_pending_withdrawal_bundle(
+        &self,
+    ) -> Result<Option<WithdrawalBundle>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let bundle = self
+            .state
+            .try_get_pending_withdrawal_bundle(&rotxn)?
+            .map(|(bundle, _)| bundle);
+        Ok(bundle)
+    }
+
+    pub fn remove_from_mempool(&self, txid: Txid) -> Result<(), Error> {
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        let () = self.mempool.delete(&mut rwtxn, txid)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        Ok(())
+    }
+
+    pub fn connect_peer(&self, addr: ResolvedPeerAddress) -> Result<(), Error> {
+        let peer_addr = addr.as_peer_address().to_owned();
+        let () =
+            self.net
+                .connect_peer(self.env.clone(), addr)
+                .map_err(|err| crate::net::Error::ConnectPeer {
+                    peer_addr,
+                    source: err,
+                })?;
+        Ok(())
+    }
+
+    pub fn forget_peer(&self, addr: &PeerAddress) -> Result<bool, Error> {
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        let res = self.net.forget_peer(&mut rwtxn, addr)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        Ok(res)
+    }
+
+    pub fn get_active_peers(&self) -> Vec<Peer> {
+        self.net.get_active_peers()
+    }
+
+    /// Get the progress of the startup sync with the mainchain
+    pub fn mainchain_sync_progress(&self) -> MainchainSyncProgress {
+        self.task_handles.mainchain.sync_progress()
+    }
+
+    pub async fn request_mainchain_ancestor_infos(
+        &self,
+        block_hash: bitcoin::BlockHash,
+    ) -> Result<bool, Error> {
+        let mainchain_task::Response::AncestorInfos(_, res): mainchain_task::Response = self
+            .task_handles
+            .mainchain
+            .request_oneshot(mainchain_task::Request::AncestorInfos(
+                block_hash,
+            ))
+            .map_err(|_| Error::SendMainchainTaskRequest)?
+            .await
+            .map_err(|_| Error::ReceiveMainchainTaskResponse)?;
+        res.map_err(Error::MainchainAncestors)
+    }
+
+    /// Attempt to submit a block.
+    /// Returns `Ok(true)` if the block was accepted successfully as the new tip.
+    /// Returns `Ok(false)` if the block could not be submitted for some reason,
+    /// or was rejected as the new tip.
+    pub async fn submit_block(
+        &self,
+        main_block_hash: bitcoin::BlockHash,
+        header: &Header,
+        body: &Body,
+    ) -> Result<bool, Error> {
+        let block_hash = header.hash();
+        // Store the header, if ancestors exist
+        if let Some(parent) = header.prev_side_hash
+            && self.try_get_header(parent)?.is_none()
+        {
+            tracing::error!(%block_hash,
+                "Rejecting block {block_hash} due to missing ancestor headers",
+            );
+            return Ok(false);
+        }
+        // Request mainchain header/infos if they do not exist
+        let mainchain_task::Response::AncestorInfos(_, res): mainchain_task::Response = self
+            .task_handles
+            .mainchain
+            .request_oneshot(mainchain_task::Request::AncestorInfos(
+                main_block_hash,
+            ))
+            .map_err(|_| Error::SendMainchainTaskRequest)?
+            .await
+            .map_err(|_| Error::ReceiveMainchainTaskResponse)?;
+        if !res.map_err(Error::MainchainAncestors)? {
+            return Ok(false);
+        };
+        // Write header
+        tracing::trace!("Storing header: {block_hash}");
+        {
+            let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+            let () = self.archive.put_header(&mut rwtxn, header)?;
+            rwtxn.commit().map_err(RwTxnError::from)?;
+        }
+        tracing::trace!("Stored header: {block_hash}");
+        // Check BMM
+        {
+            let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+            match self.archive.get_bmm_result(
+                &rotxn,
+                block_hash,
+                main_block_hash,
+            )? {
+                BmmResult::Verified => (),
+                BmmResult::Failed => {
+                    tracing::error!(%block_hash,
+                        "Rejecting block {block_hash} due to failing BMM verification",
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        // Check that ancestor bodies exist, and store body
+        {
+            let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+            let tip = self.state.try_get_tip(&rotxn)?;
+            let common_ancestor = if let Some(tip) = tip {
+                self.archive.last_common_ancestor(&rotxn, tip, block_hash)?
+            } else {
+                None
+            };
+            let missing_bodies = self.archive.get_missing_bodies(
+                &rotxn,
+                block_hash,
+                common_ancestor,
+            )?;
+            if !(missing_bodies.is_empty()
+                || missing_bodies == vec![block_hash])
+            {
+                tracing::error!(%block_hash,
+                    "Rejecting block {block_hash} due to missing ancestor bodies",
+                );
+                return Ok(false);
+            }
+            drop(rotxn);
+            if missing_bodies == vec![block_hash] {
+                let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+                let () = self.archive.put_body(&mut rwtxn, block_hash, body)?;
+                rwtxn.commit().map_err(RwTxnError::from)?;
+            }
+        }
+        // Submit new tip
+        let new_tip = Tip {
+            block_hash,
+            main_block_hash,
+        };
+        if !self.task_handles.net.new_tip_ready_confirm(new_tip).await? {
+            tracing::warn!(%block_hash, "Not ready to reorg");
+            return Ok(false);
+        };
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let bundle = self.state.try_get_pending_withdrawal_bundle(&rotxn)?;
+        if let Some((bundle, _)) = bundle {
+            let m6id = bundle.compute_m6id();
+            if let Some(cusf_mainchain_block_producer) =
+                self.cusf_mainchain_block_producer.as_ref()
+            {
+                {
+                    let mut cusf_mainchain_block_producer_lock =
+                        cusf_mainchain_block_producer.lock().await;
+                    let () = cusf_mainchain_block_producer_lock
+                        .propose_withdrawal_bundle(bundle.tx())
+                        .await?;
+                }
+                tracing::trace!(%m6id, "Proposed withdrawal bundle");
+            } else {
+                // Without the mainchain's block producer service there is
+                // nowhere to send the bundle, and it stays pending for every
+                // block that follows. Say so, or the withdrawal simply never
+                // completes and nothing explains why.
+                tracing::warn!(
+                    %m6id,
+                    "Withdrawal bundle is pending, but the mainchain node \
+                     does not serve BlockProducerService, so the bundle \
+                     cannot be proposed and the withdrawal cannot complete",
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// Get a notification whenever the tip changes
+    pub fn watch_state(&self) -> impl Stream<Item = ()> {
+        self.state.watch()
+    }
+
+    /// Get a notification whenever the tip or the mempool changes
+    pub fn watch(&self) -> std::pin::Pin<Box<dyn Stream<Item = ()> + Send>> {
         Box::pin(futures::stream::select(
             self.state.watch(),
             self.mempool.watch(),
         ))
     }
 
-    /// Watch for state changes only (new blocks)
-    pub fn watch_state(&self) -> <State as Watchable<()>>::WatchStream {
-        self.state.watch()
+    pub fn get_height(&self, block_hash: BlockHash) -> Result<u32, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.archive.get_height(&rotxn, block_hash)?)
+    }
+
+    /// Get UTXOs for addresses along with their mempool spent status.
+    /// This is atomic - both queries use the same read transaction.
+    #[allow(clippy::type_complexity)]
+    pub fn get_utxos_with_mempool_status(
+        &self,
+        addresses: &HashSet<Address>,
+    ) -> Result<(HashMap<OutPoint, Output>, Vec<(OutPoint, Txid)>), Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+
+        // Get confirmed UTXOs from state
+        let utxos = self
+            .state
+            .get_utxos_by_addresses(&rotxn, addresses)
+            .map_err(DbError::from)?;
+
+        // Check which are spent in mempool (same transaction - atomic)
+        let mut spent_in_mempool = vec![];
+        for outpoint in utxos.keys() {
+            if let Some(txid) = self
+                .mempool
+                .spent_utxos
+                .try_get(&rotxn, outpoint)
+                .map_err(mempool::Error::from)?
+            {
+                spent_in_mempool.push((*outpoint, txid));
+            }
+        }
+
+        Ok((utxos, spent_in_mempool))
+    }
+
+    pub fn read_txn(
+        &self,
+    ) -> Result<sneed::RoTxn<'_, heed::WithoutTls>, Error> {
+        self.env.read_txn().map_err(Into::into)
+    }
+
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    pub fn get_mempool_shares(
+        &self,
+        market_id: &MarketId,
+    ) -> Result<Option<ndarray::Array1<i64>>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.state.get_mempool_shares(&rotxn, market_id)?)
+    }
+
+    pub fn get_pending_decision_claim_ids(
+        &self,
+    ) -> Result<std::collections::BTreeSet<[u8; 3]>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.mempool.pending_decision_claim_ids(&rotxn)?)
+    }
+
+    /// Track the shares that a mempool trade moves
+    fn update_mempool_market(
+        &self,
+        rwtxn: &mut RwTxn,
+        transaction: &Transaction,
+    ) -> Result<(), Error> {
+        if let Some(crate::types::TxData::Trade {
+            market_id,
+            outcome_index,
+            shares,
+            ..
+        }) = transaction.data.as_ref()
+        {
+            if *shares > 0 {
+                self.update_mempool_buy(
+                    rwtxn,
+                    *market_id,
+                    *outcome_index,
+                    *shares,
+                )?;
+            } else {
+                self.update_mempool_sell(
+                    rwtxn,
+                    *market_id,
+                    *outcome_index,
+                    shares.unsigned_abs() as i64,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn update_mempool_buy(
@@ -653,640 +1226,6 @@ where
         market: &crate::state::Market,
     ) -> Result<f64, Error> {
         self.derive_market_beta(market)
-    }
-
-    pub fn get_all_utxos(&self) -> Result<HashMap<OutPoint, Output>, Error> {
-        let rotxn = self.env.read_txn()?;
-        self.state.get_utxos(&rotxn).map_err(Error::from)
-    }
-
-    pub fn get_latest_failed_bundle_height(
-        &self,
-    ) -> Result<Option<u32>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let res = self
-            .state
-            .get_latest_failed_withdrawal_bundle(&rotxn)?
-            .map(|(height, _)| height);
-        Ok(res)
-    }
-
-    pub fn get_spent_utxos(
-        &self,
-        outpoints: &[OutPoint],
-    ) -> Result<Vec<(OutPoint, SpentOutput)>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let mut spent = vec![];
-        for outpoint in outpoints {
-            let outpoint_key = OutPointKey::from(outpoint);
-            if let Some(output) = self
-                .state
-                .stxos()
-                .try_get(&rotxn, &outpoint_key)
-                .map_err(state::Error::from)?
-            {
-                spent.push((*outpoint, output));
-            }
-        }
-        Ok(spent)
-    }
-
-    pub fn get_unconfirmed_spent_utxos<'a, OutPoints>(
-        &self,
-        outpoints: OutPoints,
-    ) -> Result<Vec<(OutPoint, InPoint)>, Error>
-    where
-        OutPoints: IntoIterator<Item = &'a OutPoint>,
-    {
-        let rotxn = self.env.read_txn()?;
-        let mut spent = vec![];
-        for outpoint in outpoints {
-            if let Some(inpoint) = self
-                .mempool
-                .spent_utxos
-                .try_get(&rotxn, outpoint)
-                .map_err(mempool::Error::from)?
-            {
-                spent.push((*outpoint, inpoint));
-            }
-        }
-        Ok(spent)
-    }
-
-    pub fn get_unconfirmed_utxos_by_addresses(
-        &self,
-        addresses: &HashSet<Address>,
-    ) -> Result<HashMap<OutPoint, Output>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let mut res = HashMap::new();
-        let () = addresses.iter().try_for_each(|addr| {
-            let utxos = self.mempool.get_unconfirmed_utxos(&rotxn, addr)?;
-            res.extend(utxos);
-            Result::<(), Error>::Ok(())
-        })?;
-        Ok(res)
-    }
-
-    pub fn get_stxos_by_addresses(
-        &self,
-        addresses: &HashSet<Address>,
-    ) -> Result<HashMap<OutPoint, SpentOutput>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let stxos = self.state.get_stxos_by_addresses(&rotxn, addresses)?;
-        Ok(stxos)
-    }
-
-    pub fn get_utxos_by_addresses(
-        &self,
-        addresses: &HashSet<Address>,
-    ) -> Result<HashMap<OutPoint, Output>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let utxos = self.state.get_utxos_by_addresses(&rotxn, addresses)?;
-        Ok(utxos)
-    }
-
-    /// Get UTXOs for addresses along with their mempool spent status.
-    /// This is atomic - both queries use the same read transaction.
-    #[allow(clippy::type_complexity)]
-    pub fn get_utxos_with_mempool_status(
-        &self,
-        addresses: &HashSet<Address>,
-    ) -> Result<(HashMap<OutPoint, Output>, Vec<(OutPoint, InPoint)>), Error>
-    {
-        let rotxn = self.env.read_txn()?;
-
-        // Get confirmed UTXOs from state
-        let utxos = self.state.get_utxos_by_addresses(&rotxn, addresses)?;
-
-        // Check which are spent in mempool (same transaction - atomic)
-        let mut spent_in_mempool = vec![];
-        for outpoint in utxos.keys() {
-            if let Some(inpoint) = self
-                .mempool
-                .spent_utxos
-                .try_get(&rotxn, outpoint)
-                .map_err(mempool::Error::from)?
-            {
-                spent_in_mempool.push((*outpoint, inpoint));
-            }
-        }
-
-        Ok((utxos, spent_in_mempool))
-    }
-
-    pub fn try_get_header(
-        &self,
-        block_hash: BlockHash,
-    ) -> Result<Option<Header>, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.try_get_header(&rotxn, block_hash)?)
-    }
-
-    pub fn get_header(&self, block_hash: BlockHash) -> Result<Header, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.get_header(&rotxn, block_hash)?)
-    }
-
-    pub fn try_get_block_hash(
-        &self,
-        height: u32,
-    ) -> Result<Option<BlockHash>, Error> {
-        let rotxn = self.env.read_txn()?;
-        self.try_get_block_hash_read(&rotxn, height)
-    }
-
-    fn try_get_block_hash_read(
-        &self,
-        rotxn: &RoTxn,
-        height: u32,
-    ) -> Result<Option<BlockHash>, Error> {
-        let Some(tip) = self.state.try_get_tip(rotxn)? else {
-            return Ok(None);
-        };
-        let Some(tip_height) = self.state.try_get_height(rotxn)? else {
-            return Ok(None);
-        };
-        if tip_height >= height {
-            self.archive
-                .ancestors(rotxn, tip)
-                .nth((tip_height - height) as usize)
-                .map_err(Error::from)
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Get the coin movements that the block applied outside its body
-    pub fn get_block_index_events(
-        &self,
-        block_hash: BlockHash,
-    ) -> Result<BlockIndexEvents, Error> {
-        let rotxn = self.env.read_txn()?;
-        let height = self.archive.get_height(&rotxn, block_hash)?;
-        // The events are keyed by height, so a block off the current chain
-        // would read another block's events.
-        if self.try_get_block_hash_read(&rotxn, height)? != Some(block_hash) {
-            return Err(Error::NotInCurrentChain { block_hash });
-        }
-        let events = self.state.get_block_index_events(&rotxn, height)?;
-        Ok(events)
-    }
-
-    pub fn try_get_body(
-        &self,
-        block_hash: BlockHash,
-    ) -> Result<Option<Body>, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.try_get_body(&rotxn, block_hash)?)
-    }
-
-    pub fn get_body(&self, block_hash: BlockHash) -> Result<Body, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.get_body(&rotxn, block_hash)?)
-    }
-
-    pub fn get_best_main_verification(
-        &self,
-        hash: BlockHash,
-    ) -> Result<bitcoin::BlockHash, Error> {
-        let rotxn = self.env.read_txn()?;
-        let hash = self.archive.get_best_main_verification(&rotxn, hash)?;
-        Ok(hash)
-    }
-
-    pub fn get_bmm_inclusions(
-        &self,
-        block_hash: BlockHash,
-    ) -> Result<Vec<bitcoin::BlockHash>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let bmm_inclusions = self
-            .archive
-            .get_bmm_results(&rotxn, block_hash)?
-            .into_iter()
-            .filter_map(|(block_hash, bmm_res)| match bmm_res {
-                BmmResult::Verified => Some(block_hash),
-                BmmResult::Failed => None,
-            })
-            .collect();
-        Ok(bmm_inclusions)
-    }
-
-    pub fn try_get_block(
-        &self,
-        block_hash: BlockHash,
-    ) -> Result<Option<Block>, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.try_get_block(&rotxn, block_hash)?)
-    }
-
-    pub fn get_block(&self, block_hash: BlockHash) -> Result<Block, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.archive.get_block(&rotxn, block_hash)?)
-    }
-
-    pub fn get_all_transactions(
-        &self,
-    ) -> Result<Vec<AuthorizedTransaction>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let transactions = self.mempool.take_all(&rotxn)?;
-        Ok(transactions)
-    }
-
-    pub fn get_sidechain_wealth(&self) -> Result<bitcoin::Amount, Error> {
-        let rotxn = self.env.read_txn()?;
-        Ok(self.state.sidechain_wealth(&rotxn)?)
-    }
-
-    pub fn get_transactions(
-        &self,
-        number: usize,
-    ) -> Result<(Vec<Authorized<FilledTransaction>>, bitcoin::Amount), Error>
-    {
-        let mut rwtxn = self.env.write_txn()?;
-
-        // Take non-trade TXs first, then trade TXs in chronological order
-        let all_txs = self.mempool.take(&rwtxn, number)?;
-        let trade_txs = self.mempool.take_trades_ordered(&rwtxn)?;
-
-        // Separate non-trade TXs (those not in the trade list)
-        let trade_txids: HashSet<_> =
-            trade_txs.iter().map(|tx| tx.transaction.txid()).collect();
-        let non_trade_txs: Vec<_> = all_txs
-            .into_iter()
-            .filter(|tx| !trade_txids.contains(&tx.transaction.txid()))
-            .collect();
-
-        // Process non-trade TXs first, then trade TXs in insertion order
-        let combined_txs =
-            non_trade_txs.into_iter().chain(trade_txs).take(number);
-
-        let mut fee = bitcoin::Amount::ZERO;
-        let mut returned_transactions = vec![];
-        let mut spent_utxos = HashSet::new();
-        let mut trades = TradeSimulation::default();
-
-        for transaction in combined_txs {
-            let txid = transaction.transaction.txid();
-
-            let inputs: HashSet<_> = transaction
-                .transaction
-                .inputs
-                .iter()
-                .map(|(outpoint, _)| *outpoint)
-                .collect();
-            if !spent_utxos.is_disjoint(&inputs) {
-                self.mempool.delete(&mut rwtxn, txid)?;
-                continue;
-            }
-            let filled_transaction = match self
-                .state
-                .fill_authorized_transaction(&rwtxn, transaction.clone())
-            {
-                Ok(filled_tx) => filled_tx,
-                Err(err) => {
-                    tracing::warn!(
-                        "Cannot fill transaction {} during block construction: {:?}. Removing from mempool.",
-                        txid,
-                        err
-                    );
-                    self.mempool.delete(&mut rwtxn, txid)?;
-                    continue;
-                }
-            };
-
-            match trades.apply(
-                &self.state,
-                &self.archive,
-                &rwtxn,
-                &filled_transaction.transaction,
-            ) {
-                Ok(TradeApplyResult::Applied) => {}
-                Ok(TradeApplyResult::Skipped { reason }) => {
-                    tracing::info!(
-                        "Skipping tx {} due to slippage - will retry next block: {}",
-                        txid,
-                        reason
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Skipping tx {} that fails the trade checks: {:?}",
-                        txid,
-                        e
-                    );
-                    continue;
-                }
-            }
-
-            let tx_fee = block_template_fee(&filled_transaction.transaction)?;
-
-            fee = fee.checked_add(tx_fee).ok_or(AmountUnderflowError)?;
-            spent_utxos.extend(
-                filled_transaction
-                    .transaction
-                    .inputs()
-                    .map(|(outpoint, _, _)| *outpoint),
-            );
-            returned_transactions.push(filled_transaction);
-        }
-        rwtxn.commit().map_err(RwTxnError::from)?;
-        Ok((returned_transactions, fee))
-    }
-
-    pub fn try_get_transaction(
-        &self,
-        txid: Txid,
-    ) -> Result<Option<Transaction>, Error> {
-        let rotxn = self.env.read_txn()?;
-        if let Some((block_hash, txin)) = self
-            .archive
-            .get_tx_inclusions(&rotxn, txid)?
-            .first_key_value()
-        {
-            let body = self.archive.get_body(&rotxn, *block_hash)?;
-            let tx = body
-                .transactions
-                .into_iter()
-                .nth(*txin as usize)
-                .ok_or_else(|| {
-                    Error::State(Box::new(state::Error::InvalidTransaction {
-                        reason: format!(
-                            "tx index {txin} out of bounds in \
-                             block {block_hash}"
-                        ),
-                    }))
-                })?;
-            Ok(Some(tx))
-        } else if let Some(auth_tx) = self
-            .mempool
-            .transactions
-            .try_get(&rotxn, &txid)
-            .map_err(mempool::Error::from)?
-        {
-            Ok(Some(auth_tx.transaction))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub fn try_get_filled_transaction(
-        &self,
-        txid: Txid,
-    ) -> Result<Option<FilledTransactionWithPosition>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let tip = self.state.try_get_tip(&rotxn)?;
-        let inclusions = self.archive.get_tx_inclusions(&rotxn, txid)?;
-        if let Some((block_hash, idx)) = inclusions
-            .into_iter()
-            .map(Ok)
-            .transpose_into_fallible()
-            .find(|(block_hash, _)| {
-                if let Some(tip) = tip {
-                    self.archive.is_descendant(&rotxn, *block_hash, tip)
-                } else {
-                    Ok(true)
-                }
-            })?
-        {
-            let body = self.archive.get_body(&rotxn, block_hash)?;
-            let auth_txs = body.authorized_transactions();
-            let auth_tx =
-                auth_txs.into_iter().nth(idx as usize).ok_or_else(|| {
-                    Error::State(Box::new(state::Error::InvalidTransaction {
-                        reason: format!(
-                            "tx index {idx} out of bounds in \
-                                 block {block_hash}"
-                        ),
-                    }))
-                })?;
-            let filled_tx = self
-                .state
-                .fill_transaction_from_stxos(&rotxn, auth_tx.transaction)?;
-            let auth_tx = Authorized {
-                transaction: filled_tx,
-                authorizations: auth_tx.authorizations,
-                actor_proof: auth_tx.actor_proof,
-            };
-            let txin = TxIn { block_hash, idx };
-            let res = (auth_tx, Some(txin));
-            return Ok(Some(res));
-        }
-        if let Some(auth_tx) = self
-            .mempool
-            .transactions
-            .try_get(&rotxn, &txid)
-            .map_err(mempool::Error::from)?
-        {
-            match self.state.fill_authorized_transaction(&rotxn, auth_tx) {
-                Ok(filled_tx) => {
-                    let res = (filled_tx, None);
-                    Ok(Some(res))
-                }
-                Err(state::Error::NoUtxo { .. }) => Ok(None),
-                Err(err) => Err(err.into()),
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub fn try_get_withdrawal_bundle(
-        &self,
-        m6id: &M6id,
-    ) -> Result<Option<(WithdrawalBundleInfo, WithdrawalBundleStatus)>, Error>
-    {
-        let rotxn = self.env.read_txn()?;
-        let res = self.state.try_get_withdrawal_bundle(&rotxn, m6id)?;
-        Ok(res)
-    }
-
-    pub fn get_pending_withdrawal_bundle(
-        &self,
-    ) -> Result<Option<WithdrawalBundle>, Error> {
-        let rotxn = self.env.read_txn()?;
-        let bundle = self
-            .state
-            .get_pending_withdrawal_bundle(&rotxn)?
-            .map(|(bundle, _)| bundle);
-        Ok(bundle)
-    }
-
-    pub fn remove_from_mempool(&self, txid: Txid) -> Result<(), Error> {
-        let mut rwtxn = self.env.write_txn()?;
-        let () = self.mempool.delete(&mut rwtxn, txid)?;
-        rwtxn.commit().map_err(RwTxnError::from)?;
-        Ok(())
-    }
-
-    pub fn connect_peer(&self, addr: SocketAddr) -> Result<(), Error> {
-        self.net
-            .connect_peer(self.env.clone(), addr.into())
-            .map_err(Error::from)
-    }
-
-    pub fn forget_peer(&self, addr: &SocketAddr) -> Result<bool, Error> {
-        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
-        let res = self.net.forget_peer(&mut rwtxn, addr)?;
-        rwtxn.commit().map_err(RwTxnError::from)?;
-        Ok(res)
-    }
-
-    pub fn get_active_peers(&self) -> Vec<Peer> {
-        self.net.get_active_peers()
-    }
-
-    /// Get the progress of the sync with the mainchain
-    pub fn mainchain_sync_progress(&self) -> MainchainSyncProgress {
-        self.mainchain_task.sync_progress()
-    }
-
-    pub async fn request_mainchain_ancestor_infos(
-        &self,
-        block_hash: bitcoin::BlockHash,
-    ) -> Result<bool, Error> {
-        let mainchain_task::Response::AncestorInfos(_, res): mainchain_task::Response = self
-            .mainchain_task
-            .request_oneshot(mainchain_task::Request::AncestorInfos(
-                block_hash,
-            ))
-            .map_err(|_| Error::SendMainchainTaskRequest)?
-            .await
-            .map_err(|_| Error::ReceiveMainchainTaskResponse)?;
-        res.map_err(Error::MainchainAncestors)
-    }
-
-    /// Attempt to submit a block.
-    /// Returns `Ok(true)` if the block was accepted successfully as the new tip.
-    /// Returns `Ok(false)` if the block could not be submitted for some reason,
-    /// or was rejected as the new tip.
-    pub async fn submit_block(
-        &self,
-        main_block_hash: bitcoin::BlockHash,
-        header: &Header,
-        body: &Body,
-    ) -> Result<bool, Error> {
-        let block_hash = header.hash();
-        if let Some(parent) = header.prev_side_hash
-            && self.try_get_header(parent)?.is_none()
-        {
-            tracing::error!(%block_hash,
-                "Rejecting block {block_hash} due to missing ancestor headers",
-            );
-            return Ok(false);
-        }
-        let mainchain_task::Response::AncestorInfos(_, res): mainchain_task::Response = self
-            .mainchain_task
-            .request_oneshot(mainchain_task::Request::AncestorInfos(
-                main_block_hash,
-            ))
-            .map_err(|_| Error::SendMainchainTaskRequest)?
-            .await
-            .map_err(|_| Error::ReceiveMainchainTaskResponse)?;
-        if !res.map_err(Error::MainchainAncestors)? {
-            tracing::error!(%block_hash, "submit_block: Mainchain ancestor infos check failed");
-            return Ok(false);
-        };
-        tracing::trace!("Storing header: {block_hash}");
-        {
-            let mut rwtxn = self.env.write_txn()?;
-            let () = self.archive.put_header(&mut rwtxn, header)?;
-            // Check BMM in same transaction before committing
-            // This prevents TOCTOU: other threads won't see the header until BMM is verified
-            if self.archive.get_bmm_result(
-                &rwtxn,
-                block_hash,
-                main_block_hash,
-            )? == BmmResult::Failed
-            {
-                tracing::error!(%block_hash,
-                    "Rejecting block {block_hash} due to failing BMM verification",
-                );
-                // Don't commit - transaction will be dropped and header discarded
-                return Ok(false);
-            }
-            rwtxn.commit().map_err(RwTxnError::from)?;
-        }
-        tracing::trace!("Stored header: {block_hash}");
-        {
-            let rotxn = self.env.read_txn()?;
-            let tip = self.state.try_get_tip(&rotxn)?;
-            let common_ancestor = if let Some(tip) = tip {
-                self.archive.last_common_ancestor(&rotxn, tip, block_hash)?
-            } else {
-                None
-            };
-            let missing_bodies = self.archive.get_missing_bodies(
-                &rotxn,
-                block_hash,
-                common_ancestor,
-            )?;
-            if !(missing_bodies.is_empty()
-                || missing_bodies == vec![block_hash])
-            {
-                tracing::error!(%block_hash,
-                    "Rejecting block {block_hash} due to missing ancestor bodies",
-                );
-                return Ok(false);
-            }
-            drop(rotxn);
-            if missing_bodies == vec![block_hash] {
-                let mut rwtxn = self.env.write_txn()?;
-                let () = self.archive.put_body(&mut rwtxn, block_hash, body)?;
-                rwtxn.commit().map_err(RwTxnError::from)?;
-            }
-        }
-        let new_tip = Tip {
-            block_hash,
-            main_block_hash,
-        };
-        if !self.net_task.new_tip_ready_confirm(new_tip).await? {
-            tracing::error!(%block_hash, "submit_block: new_tip_ready_confirm returned false - reorg failed!");
-            return Ok(false);
-        };
-        let rotxn = self.env.read_txn()?;
-        let bundle = self.state.get_pending_withdrawal_bundle(&rotxn)?;
-        #[cfg(feature = "zmq")]
-        {
-            let height = self
-                .state
-                .try_get_height(&rotxn)?
-                .ok_or_else(|| Error::State(Box::new(state::Error::NoTip)))?;
-            let block_hash = header.hash();
-            let mut zmq_msg = zeromq::ZmqMessage::from("hashblock");
-            zmq_msg.push_back(bytes::Bytes::copy_from_slice(&block_hash.0));
-            zmq_msg.push_back(bytes::Bytes::copy_from_slice(
-                &height.to_le_bytes(),
-            ));
-            if let Err(e) = self.zmq_pub_handler.tx.unbounded_send(zmq_msg) {
-                tracing::warn!(
-                    "Failed to send ZMQ hashblock notification: {e}"
-                );
-            }
-        }
-        if let Some((bundle, _)) = bundle {
-            let m6id = bundle.compute_m6id();
-            if let Some(cusf_mainchain_block_producer) =
-                self.cusf_mainchain_block_producer.as_ref()
-            {
-                {
-                    let mut cusf_mainchain_block_producer_lock =
-                        cusf_mainchain_block_producer.lock().await;
-                    let () = cusf_mainchain_block_producer_lock
-                        .propose_withdrawal_bundle(bundle.tx())
-                        .await?;
-                }
-                tracing::trace!(%m6id, "Proposed withdrawal bundle");
-            } else {
-                tracing::warn!(
-                    %m6id,
-                    "Withdrawal bundle is pending, but the mainchain node \
-                     does not serve BlockProducerService, so the bundle \
-                     cannot be proposed and the withdrawal cannot complete",
-                );
-            }
-        }
-        Ok(true)
     }
 
     pub fn get_all_decision_periods(&self) -> Result<Vec<(u32, u64)>, Error> {
@@ -1498,7 +1437,7 @@ where
         Option<Vec<state::markets::price_history::MarketPricePoint>>,
         Error,
     > {
-        let rotxn = self.env.read_txn()?;
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         Ok(state::markets::price_history::try_get_market_price_history(
             &self.state,
             &self.archive,
@@ -1609,30 +1548,12 @@ where
         )?)
     }
 
-    pub fn read_txn(
-        &self,
-    ) -> Result<sneed::RoTxn<'_, heed::WithoutTls>, Error> {
-        self.env.read_txn().map_err(Into::into)
-    }
-
-    pub fn state(&self) -> &State {
-        &self.state
-    }
-
     pub fn voting_state(&self) -> &crate::state::voting::VotingSystem {
         self.state.voting()
     }
 
     pub fn reputation(&self) -> &crate::state::reputation::ReputationDbs {
         self.state.reputation()
-    }
-
-    pub fn get_tip_height(&self) -> Result<u32, Error> {
-        self.try_get_tip_height()?.ok_or_else(|| {
-            Error::State(Box::new(state::Error::InvalidTransaction {
-                reason: "No tip height found".to_string(),
-            }))
-        })
     }
 
     pub fn get_last_block_timestamp(&self) -> Result<u64, Error> {
@@ -1688,42 +1609,10 @@ where
         }; // rotxn is dropped here before the await
 
         // Trigger the reorg via net_task
-        self.net_task
+        self.task_handles
+            .net
             .new_tip_ready_confirm(new_tip)
             .await
             .map_err(Error::from)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::math::trading::TRADE_MINER_FEE_SATS;
-    use crate::types::{OutputContent, TxData};
-
-    #[test]
-    fn block_template_fee_excludes_amplify_beta_deposit() {
-        let amount = 50_000;
-        let amplify = FilledTransaction {
-            transaction: Transaction {
-                data: Some(TxData::AmplifyBeta {
-                    market_id: MarketId::new([1; 6]),
-                    amount,
-                    market_author: Address::ALL_ZEROS,
-                }),
-                ..Transaction::default()
-            },
-            spent_utxos: vec![Output {
-                address: Address::ALL_ZEROS,
-                content: OutputContent::Value(bitcoin::Amount::from_sat(
-                    amount + TRADE_MINER_FEE_SATS,
-                )),
-            }],
-            actor_address: None,
-        };
-        assert_eq!(
-            block_template_fee(&amplify).unwrap(),
-            bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
-        );
     }
 }

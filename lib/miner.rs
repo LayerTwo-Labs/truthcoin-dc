@@ -9,8 +9,8 @@ use crate::types::{
 pub enum Error {
     #[error("CUSF mainchain proto error")]
     CusfMainchain(#[from] proto::Error),
-    #[error("merkle root mismatch: header and body are inconsistent")]
-    MerkleRootMismatch,
+    #[error("invalid json: {json}")]
+    InvalidJson { json: serde_json::Value },
     #[error("No CUSF mainchain mining client")]
     NoCusfMainchainMiningClient,
 }
@@ -74,7 +74,8 @@ where
                 header.prev_main_hash,
             )
             .await?;
-        tracing::info!(%txid, "created BMM tx");
+        tracing::info!("attempt BMM: created TX: {txid}");
+        // assert_eq!(header.merkle_root, body.compute_merkle_root());
         self.block = Some((header, body));
         Ok(txid)
     }
@@ -89,10 +90,12 @@ where
             return Ok(None);
         };
         let block_hash = header.hash();
-        tracing::trace!(%block_hash, "verifying bmm...");
+        tracing::debug!(%block_hash, "confirm BMM: verifying...");
+
         let mut events_stream = self.cusf_mainchain.subscribe_events().await?;
         if let Some(event) = events_stream.try_next().await? {
             match event {
+                // Our BMM request made it into a block!
                 Event::ConnectBlock {
                     header_info,
                     block_info,
@@ -101,11 +104,11 @@ where
                         && bmm_commitment == block_hash
                     {
                         tracing::debug!(
-                            side_hash = %block_hash,
-                            main_height = header_info.height,
-                            main_hash = %header_info.block_hash,
-                            bmm_commitment = %bmm_commitment,
-                            "Verified BMM"
+                                side_hash = %block_hash,
+                                main_height = header_info.height,
+                                main_hash = %header_info.block_hash,
+                                bmm_commitment = %bmm_commitment,
+                                "confirm BMM: verified!"
                         );
                         self.block = None;
                         return Ok(Some((
@@ -122,7 +125,8 @@ where
                                 .bmm_commitment
                                 .map(|h| h.to_string())
                                 .unwrap_or("none".to_string()),
-                            "Received new block without our BMM commitment"
+
+                            "confirm BMM: received new block without our BMM commitment"
                         );
                     }
                 }
@@ -133,14 +137,15 @@ where
                     tracing::warn!(
                         %block_hash,
                         event = ?disconnect,
-                        "received disconnect block event"
+                        "confirm BMM: received 'disconnect block' event"
                     );
                 }
             }
         };
+
         // BMM requests expire after one block, so if we we weren't able to
         // get it in, the request failed.
-        tracing::debug!(%block_hash, "bmm verification failed");
+        tracing::debug!(%block_hash, "confirm BMM: verification failed");
         self.block = None;
         Ok(None)
     }

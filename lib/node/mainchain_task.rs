@@ -15,7 +15,6 @@ use futures::{
     },
 };
 use sneed::{EnvError, RwTxn, RwTxnError};
-use thiserror::Error;
 use tokio::{
     spawn,
     task::{self, JoinHandle},
@@ -23,6 +22,7 @@ use tokio::{
 
 use crate::{
     archive::{self, Archive},
+    node::error::mainchain_task::{self as error, Error},
     types::{
         BmmResult, MainchainSyncPhase, MainchainSyncProgress,
         proto::{
@@ -43,24 +43,11 @@ pub(super) enum Request {
     AncestorInfos(bitcoin::BlockHash),
 }
 
-/// Error included in a response
-#[derive(Debug, Error)]
-pub enum ResponseError {
-    #[error("Archive error")]
-    Archive(#[from] archive::Error),
-    #[error("Database env error")]
-    DbEnv(#[from] EnvError),
-    #[error("Database write error")]
-    DbWrite(#[from] sneed::rwtxn::Error),
-    #[error("CUSF Mainchain proto error")]
-    Mainchain(#[from] proto::Error),
-}
-
 /// Response indicating that a request has been fulfilled
 #[derive(Debug)]
 pub(super) enum Response {
     /// Response bool indicates if the requested header was available
-    AncestorInfos(bitcoin::BlockHash, Result<bool, ResponseError>),
+    AncestorInfos(bitcoin::BlockHash, Result<bool, error::Response>),
 }
 
 impl From<&Response> for Request {
@@ -79,55 +66,7 @@ pub(super) enum Event {
     Response(Response),
 }
 
-#[derive(Debug, Error)]
-enum SyncSideTipsToTip {
-    #[error("Archive error")]
-    Archive(#[from] archive::Error),
-    #[error("Send event error")]
-    SendEvent(#[from] mpsc::SendError),
-    #[error("Database write error")]
-    RwTxnCommit(#[from] sneed::rwtxn::error::Commit),
-}
-
-#[derive(Debug, Error)]
-enum HandleBlockEvent {
-    #[error("Archive error")]
-    Archive(#[from] archive::Error),
-    #[error("Database env error")]
-    DbEnv(#[source] EnvError),
-    #[error("Database write error")]
-    DbWrite(#[source] RwTxnError),
-    #[error("Send event error")]
-    SendEvent(#[from] mpsc::SendError),
-}
-
-#[derive(Debug, Error)]
-enum Error {
-    #[error("Ancestor info for tip ({tip}) was unavailable")]
-    AncestorInfoUnavailable { tip: bitcoin::BlockHash },
-    #[error("Database env error")]
-    DbEnv(#[source] EnvError),
-    #[error(transparent)]
-    HandleBlockEvent(#[from] HandleBlockEvent),
-    #[error("CUSF Mainchain proto error")]
-    Mainchain(#[from] proto::Error),
-    #[error("Failed to fetch ancestor info for tip ({tip})")]
-    RequestAncestorInfos {
-        tip: bitcoin::BlockHash,
-        source: Box<ResponseError>,
-    },
-    #[error("Send event error")]
-    SendEvent(#[source] mpsc::SendError),
-    #[error("Send response error (oneshot)")]
-    SendResponseOneshot(Box<Response>),
-    #[error("Failed to sync sidechain tips to mainchain tip ({tip})")]
-    SyncSideTipsToTip {
-        tip: bitcoin::BlockHash,
-        source: Box<SyncSideTipsToTip>,
-    },
-}
-
-/// Progress of the sync with the mainchain, shared with the RPC server
+/// Progress of the startup sync, shared with the RPC server
 #[derive(Clone, Default)]
 struct SyncProgress(Arc<parking_lot::Mutex<MainchainSyncProgress>>);
 
@@ -159,6 +98,19 @@ impl SyncProgress {
         self.0.lock().done += headers;
     }
 
+    fn start_state(&self, tip_height: u32, total: u32) {
+        *self.0.lock() = MainchainSyncProgress {
+            phase: MainchainSyncPhase::State,
+            done: 0,
+            total,
+            tip_height,
+        };
+    }
+
+    fn connected(&self, blocks: u32) {
+        self.0.lock().done += blocks;
+    }
+
     fn set_idle(&self) {
         *self.0.lock() = MainchainSyncProgress::default();
     }
@@ -178,7 +130,7 @@ struct MainchainTask<Transport = tonic::transport::Channel> {
     mainchain: ValidatorClient<Transport>,
     sync_progress: SyncProgress,
     // receive a request, and optional oneshot sender to send the result to
-    // instead of sending on `event_tx`
+    // instead of sending on `response_tx`
     request_rx: UnboundedReceiver<(Request, Option<oneshot::Sender<Response>>)>,
     event_tx: UnboundedSender<Event>,
 }
@@ -229,7 +181,7 @@ where
         cusf_mainchain: &mut ValidatorClient<Transport>,
         sync_progress: &SyncProgress,
         block_hash: bitcoin::BlockHash,
-    ) -> Result<bool, ResponseError> {
+    ) -> Result<bool, error::RequestAncestorInfos> {
         if block_hash == bitcoin::BlockHash::all_zeros() {
             return Ok(true);
         } else {
@@ -315,9 +267,10 @@ where
     fn sync_side_tips_to_tip(
         mut rwtxn: RwTxn,
         archive: &Archive,
+        sync_progress: &SyncProgress,
         mainchain_tip: bitcoin::BlockHash,
         event_tx: &mut UnboundedSender<Event>,
-    ) -> Result<(), SyncSideTipsToTip> {
+    ) -> Result<(), error::SyncSideTipsToTip> {
         let side_tips_tip = archive
             .side_tips()
             .get_mainchain_tip(&rwtxn)
@@ -363,6 +316,16 @@ where
             });
             side_tips_tip_info = main_state_prev_tip_info;
         }
+        if let Some(tip_info) =
+            archive.try_get_main_header_info(&rwtxn, &mainchain_tip)?
+        {
+            let start_height =
+                side_tips_tip_info.map_or(0, |info| info.height + 1);
+            sync_progress.start_state(
+                tip_info.height,
+                tip_info.height + 1 - start_height,
+            );
+        }
         // connect mainchain state tip until mainchain tip is reached
         while extract_tip(side_tips_tip_info) != mainchain_tip {
             // Batch iterator items
@@ -379,6 +342,7 @@ where
                     .take(BATCH_SIZE)
                     .collect()?
             };
+            let batch_len = main_header_infos.len() as u32;
             for main_header_info in main_header_infos {
                 let main_block_info = archive.get_main_block_info(
                     &rwtxn,
@@ -438,6 +402,7 @@ where
                     block_info: main_block_info,
                 });
             }
+            sync_progress.connected(batch_len);
         }
         rwtxn.commit()?;
         // emit events
@@ -454,10 +419,10 @@ where
         archive: &Archive,
         event_tx: &mut UnboundedSender<Event>,
         event: proto::mainchain::Event,
-    ) -> Result<(), HandleBlockEvent> {
+    ) -> Result<(), error::HandleBlockEvent> {
         let mut rwtxn = env
             .write_txn()
-            .map_err(|err| HandleBlockEvent::DbEnv(err.into()))?;
+            .map_err(|err| error::HandleBlockEvent::DbEnv(err.into()))?;
         match event {
             proto::mainchain::Event::ConnectBlock {
                 header_info,
@@ -547,7 +512,7 @@ where
         }
         rwtxn
             .commit()
-            .map_err(|err| HandleBlockEvent::DbWrite(err.into()))?;
+            .map_err(|err| error::HandleBlockEvent::DbWrite(err.into()))?;
         event_tx
             .unbounded_send(Event::Block(event))
             .map_err(|err| err.into_send_error())?;
@@ -568,13 +533,14 @@ where
                     ctxt.sync_progress,
                     main_block_hash,
                 )
-                .await;
+                .await
+                .map_err(error::Response::from);
                 ctxt.sync_progress.set_idle();
                 let response = Response::AncestorInfos(main_block_hash, res);
                 if let Some(response_tx) = response_tx {
-                    response_tx.send(response).map_err(|resp| {
-                        Error::SendResponseOneshot(Box::new(resp))
-                    })?;
+                    response_tx
+                        .send(response)
+                        .map_err(|_: Response| Error::SendResponseOneshot)?;
                 } else {
                     ctxt.event_tx
                         .unbounded_send(Event::Response(response))
@@ -590,18 +556,17 @@ where
     async fn run_once(&mut self) -> Result<(), Error> {
         let (best_main_tip, block_event_stream) =
             Self::subscribe_block_events(&mut self.mainchain).await?;
-        let ancestor_infos = Self::request_ancestor_infos(
+        if !Self::request_ancestor_infos(
             &self.env,
             &self.archive,
             &mut self.mainchain,
             &self.sync_progress,
             best_main_tip,
         )
-        .await;
-        self.sync_progress.set_idle();
-        if !ancestor_infos.map_err(|err| Error::RequestAncestorInfos {
+        .await
+        .map_err(|err| Error::RequestAncestorInfos {
             tip: best_main_tip,
-            source: Box::new(err),
+            source: err,
         })? {
             return Err(Error::AncestorInfoUnavailable { tip: best_main_tip });
         }
@@ -617,6 +582,7 @@ where
             let () = Self::sync_side_tips_to_tip(
                 rwtxn,
                 &self.archive,
+                &self.sync_progress,
                 best_main_tip,
                 &mut self.event_tx,
             )
@@ -624,6 +590,7 @@ where
                 tip: best_main_tip,
                 source: Box::new(err),
             })?;
+            self.sync_progress.set_idle();
         }
         enum MailboxItem {
             BlockEvent(proto::mainchain::Event),
@@ -689,6 +656,7 @@ where
                     ErrorChain::new(&err)
                 ),
             }
+            self.sync_progress.set_idle();
             tokio::time::sleep(RECONNECT_DELAY).await;
             tracing::info!("Mainchain task: connecting to the mainchain node");
         }
@@ -711,7 +679,7 @@ impl MainchainTaskHandle {
     pub fn new<Transport>(
         env: sneed::Env<heed::WithoutTls>,
         archive: Archive,
-        mainchain: mainchain::ValidatorClient<Transport>,
+        mainchain: ValidatorClient<Transport>,
     ) -> (Self, mpsc::UnboundedReceiver<Event>)
     where
         Transport: proto::Transport + Send + 'static,
@@ -753,7 +721,7 @@ impl MainchainTaskHandle {
     }
 
     /// Send a request, and receive the response on a oneshot receiver instead
-    /// of the event stream
+    /// of the response stream
     pub fn request_oneshot(
         &self,
         request: Request,
@@ -795,44 +763,25 @@ mod test {
     };
 
     use bitcoin::hashes::Hash as _;
+    use futures::channel::mpsc;
     use parking_lot::Mutex;
     use tonic::codegen::{BoxFuture, Service, http};
 
     use super::{MainchainTask, SyncProgress};
     use crate::{
-        archive::Archive,
+        archive::{Archive, test::main_header_info},
         types::{
             MainchainSyncPhase, MainchainSyncProgress,
             proto::{
                 common::{ConsensusHex, ReverseHex},
-                mainchain::{self, ValidatorClient, generated},
+                mainchain::{ValidatorClient, generated},
             },
         },
     };
 
-    fn main_header_info(height: u32) -> mainchain::BlockHeaderInfo {
-        let block_hash = |height: u32| {
-            let mut bytes = [0u8; 32];
-            bytes[0] = 0xff;
-            bytes[1..5].copy_from_slice(&height.to_le_bytes());
-            bitcoin::BlockHash::from_byte_array(bytes)
-        };
-        let prev_block_hash = match height.checked_sub(1) {
-            Some(prev_height) => block_hash(prev_height),
-            None => bitcoin::BlockHash::all_zeros(),
-        };
-        mainchain::BlockHeaderInfo {
-            block_hash: block_hash(height),
-            prev_block_hash,
-            height,
-            work: bitcoin::Target::MAX.to_work(),
-            timestamp: 0,
-        }
-    }
-
     fn temp_env()
-    -> anyhow::Result<(tempfile::TempDir, sneed::Env<heed::WithoutTls>)> {
-        let temp_dir = tempfile::tempdir()?;
+    -> anyhow::Result<(temp_dir::TempDir, sneed::Env<heed::WithoutTls>)> {
+        let temp_dir = temp_dir::TempDir::new()?;
         let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
         opts.map_size(256 * 1024 * 1024).max_dbs(Archive::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, temp_dir.path()) }?;
@@ -862,7 +811,12 @@ mod test {
         fn call(
             &mut self,
             request: tonic::Request<generated::GetBlockInfoRequest>,
-        ) -> Self::Future {
+        ) -> Ready<
+            Result<
+                tonic::Response<generated::GetBlockInfoResponse>,
+                tonic::Status,
+            >,
+        > {
             let request = request.into_inner();
             let block_hash: bitcoin::BlockHash = request
                 .block_hash
@@ -894,7 +848,7 @@ mod test {
                             work: Some(ConsensusHex::encode(
                                 &info.work.to_le_bytes(),
                             )),
-                            timestamp: info.timestamp,
+                            timestamp: 0,
                         }),
                         block_info: Some(generated::BlockInfo::default()),
                     }
@@ -921,7 +875,7 @@ mod test {
         fn call(
             &mut self,
             request: http::Request<tonic::body::Body>,
-        ) -> Self::Future {
+        ) -> BoxFuture<http::Response<tonic::body::Body>, Infallible> {
             assert_eq!(
                 request.uri().path(),
                 "/cusf.mainchain.v1.ValidatorService/GetBlockInfo"
@@ -959,7 +913,7 @@ mod test {
     }
 
     #[test]
-    fn sync_progress_reports_headers_writing_then_idle() -> anyhow::Result<()> {
+    fn sync_progress_walks_headers_writing_then_state() -> anyhow::Result<()> {
         const TIP_HEIGHT: u32 = 20_099;
         let (_temp_dir, env) = temp_env()?;
         let archive = Archive::new(&env)?;
@@ -1020,6 +974,24 @@ mod test {
             serde_json::to_value(sync_progress.get())?,
             serde_json::json!({
                 "phase": "writing",
+                "done": TIP_HEIGHT + 1,
+                "total": TIP_HEIGHT + 1,
+                "tip_height": TIP_HEIGHT,
+            })
+        );
+
+        let (mut event_tx, _event_rx) = mpsc::unbounded();
+        MainchainTask::<MockValidator>::sync_side_tips_to_tip(
+            env.write_txn()?,
+            &archive,
+            sync_progress,
+            tip,
+            &mut event_tx,
+        )?;
+        assert_eq!(
+            serde_json::to_value(sync_progress.get())?,
+            serde_json::json!({
+                "phase": "state",
                 "done": TIP_HEIGHT + 1,
                 "total": TIP_HEIGHT + 1,
                 "tip_height": TIP_HEIGHT,
