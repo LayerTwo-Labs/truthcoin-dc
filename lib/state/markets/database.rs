@@ -5,8 +5,8 @@ use sneed::{DatabaseUnique, Env, RoTxn, RwTxn};
 use std::collections::{HashMap, HashSet};
 
 use crate::state::Error;
-use crate::state::UtxoManager;
 use crate::state::decisions::{Decision, DecisionId};
+use crate::state::markets::utxos::UtxoManager;
 use crate::types::{AccumulatorDiff, Address, GetValue, OutPoint, OutPointKey};
 
 use super::market::Market;
@@ -1192,7 +1192,7 @@ impl MarketsDatabase {
                 let utxo = state
                     .utxos
                     .try_get(txn, &OutPointKey::from(&outpoint))?
-                    .ok_or(Error::NoUtxo { outpoint })?;
+                    .ok_or(crate::state::error::NoUtxo { outpoint })?;
                 Ok(utxo.get_value().to_sat())
             }
             None => Ok(0),

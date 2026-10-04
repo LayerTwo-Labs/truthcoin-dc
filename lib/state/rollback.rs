@@ -1,24 +1,27 @@
 use nonempty::NonEmpty;
 use serde::{Deserialize, Serialize};
 
+/// Data of type `T` paired with block height at which it was last updated
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HeightStamped<T> {
     pub value: T,
     pub height: u32,
 }
 
+/// Wrapper struct for fields that support rollbacks
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[repr(transparent)]
 #[serde(transparent)]
-pub struct RollBack<T>(pub(in crate::state) NonEmpty<T>);
+pub struct RollBack<T>(NonEmpty<HeightStamped<T>>);
 
-impl<T> RollBack<HeightStamped<T>> {
-    pub(in crate::state) fn new(value: T, height: u32) -> Self {
+impl<T> RollBack<T> {
+    pub fn new(value: T, height: u32) -> Self {
         let height_stamped = HeightStamped { value, height };
         Self(NonEmpty::new(height_stamped))
     }
 
-    pub(in crate::state) fn pop(mut self) -> (Option<Self>, HeightStamped<T>) {
+    /// Pop the most recent value
+    pub fn pop(mut self) -> (Option<Self>, HeightStamped<T>) {
         if let Some(value) = self.0.pop() {
             (Some(self), value)
         } else {
@@ -26,11 +29,9 @@ impl<T> RollBack<HeightStamped<T>> {
         }
     }
 
-    pub(in crate::state) fn push(
-        &mut self,
-        value: T,
-        height: u32,
-    ) -> Result<(), T> {
+    /// Attempt to push a value as the new most recent.
+    /// Returns the value if the operation fails.
+    pub fn push(&mut self, value: T, height: u32) -> Result<(), T> {
         if self.0.last().height > height {
             return Err(value);
         }
@@ -39,17 +40,18 @@ impl<T> RollBack<HeightStamped<T>> {
         Ok(())
     }
 
+    /// Returns the earliest value
     #[allow(dead_code)]
-    pub(in crate::state) fn earliest(&self) -> &HeightStamped<T> {
+    pub fn earliest(&self) -> &HeightStamped<T> {
         self.0.first()
     }
 
-    pub(in crate::state) fn iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = &HeightStamped<T>> {
+    /// Iterate values, earliest to latest
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &HeightStamped<T>> {
         self.0.iter()
     }
 
+    /// Returns the most recent value
     pub fn latest(&self) -> &HeightStamped<T> {
         self.0.last()
     }

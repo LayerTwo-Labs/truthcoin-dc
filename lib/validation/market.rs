@@ -259,7 +259,7 @@ impl MarketValidator {
         }
 
         if total_listing_fee > 0 {
-            let tx_fee = crate::validation::block::tx_fee(tx)?;
+            let tx_fee = crate::validation::tx_fee(tx)?;
             if tx_fee.to_sat() < total_listing_fee {
                 return Err(Error::InvalidTransaction {
                     reason: format!(

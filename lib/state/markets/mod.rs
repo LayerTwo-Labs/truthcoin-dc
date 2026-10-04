@@ -1,8 +1,10 @@
+pub mod block;
 pub mod database;
 pub mod market;
 pub mod payouts;
 pub mod price_history;
 pub mod types;
+pub mod utxos;
 
 #[cfg(test)]
 #[allow(clippy::print_stdout, clippy::uninlined_format_args)]
