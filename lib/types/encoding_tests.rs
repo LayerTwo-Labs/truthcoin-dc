@@ -82,6 +82,7 @@ fn transactions() -> anyhow::Result<[Transaction; 2]> {
             (deposit, [46; 32]),
         ]
         .into(),
+        proof: Default::default(),
         outputs: outputs()?.to_vec().into(),
         data: Some(TransactionData::Trade {
             market_id: MarketId::new([22; 6]),
@@ -95,6 +96,7 @@ fn transactions() -> anyhow::Result<[Transaction; 2]> {
     };
     let create_market = Transaction {
         inputs: vec![(market_funds, [47; 32]), (payout, [48; 32])].into(),
+        proof: Default::default(),
         outputs: Vec::new().into(),
         data: Some(TransactionData::CreateMarket {
             title: "title".to_owned(),
@@ -133,6 +135,7 @@ fn block() -> anyhow::Result<Block> {
         merkle_root: MerkleRoot::from([31; 32]),
         prev_side_hash: Some(BlockHash([32; 32])),
         prev_main_hash: bitcoin::BlockHash::from_byte_array([33; 32]),
+        roots: Vec::new(),
     };
     let body = Body {
         coinbase: Coinbase {

@@ -2,6 +2,7 @@ use std::{borrow::Borrow, collections::HashSet};
 
 use bitcoin::amount::CheckedSum;
 use borsh::{self, BorshSerialize};
+use rustreexo::accumulator::proof::Proof as UtreexoProof;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -15,6 +16,7 @@ use crate::{
         Txid, hash_with_scratch_buffer,
     },
     market::{DimensionSpec, MarketId},
+    schema,
 };
 
 pub mod inputs;
@@ -272,6 +274,10 @@ pub struct AmplifyBeta {
 pub struct Transaction {
     #[schema(value_type = Vec<(OutPoint, String)>)]
     pub inputs: Inputs<(OutPoint, Hash)>,
+    /// Utreexo proof for inputs
+    #[borsh(skip)]
+    #[schema(value_type = schema::UtreexoProof)]
+    pub proof: UtreexoProof,
     pub outputs: Outputs,
     pub data: Option<TransactionData>,
 }
@@ -299,6 +305,7 @@ impl Transaction {
     ) -> Result<TxMerkleRoot, outputs::error::ComputeMerkleRoot> {
         let Self {
             inputs,
+            proof: _,
             outputs,
             data,
         } = self;

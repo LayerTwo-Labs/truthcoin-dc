@@ -133,6 +133,10 @@ rev = "0966bd1529aa062ad3b621af99e277f976b1c0f0"
 git = "https://github.com/Ash-L2L/l2l-openapi"
 rev = "a97f7923ce4b62587aebc7561d713bb2ebc89e52"
 
+[workspace.dependencies.rustreexo]
+git = "https://github.com/mit-dci/rustreexo"
+rev = "6da503b598470f6e87aa9d769b94df64df7ff3ae"
+
 [workspace.dependencies.libes]
 version = "0.9.1"
 features = ["AES256-GCM", "ECIES-MAC", "HMAC-SHA256", "x25519"]

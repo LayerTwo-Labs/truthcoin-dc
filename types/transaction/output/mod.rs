@@ -4,6 +4,7 @@ use utoipa::ToSchema;
 
 use crate::{
     address::Address,
+    hashes::{UtreexoNodeHash, hash},
     transaction::{GetValue, outpoint::OutPoint},
 };
 
@@ -56,10 +57,22 @@ pub struct Pointed<Output = crate::transaction::output::Output> {
     pub output: Output,
 }
 
+impl From<&Pointed> for UtreexoNodeHash {
+    fn from(pointed_output: &Pointed) -> Self {
+        Self::new(hash(pointed_output))
+    }
+}
+
 /// Useful when computing hashes for Utreexo,
 /// without needing to clone an output
 #[derive(BorshSerialize, Clone, Copy, Debug)]
 pub struct PointedOutputRef<'a> {
     pub outpoint: OutPoint,
     pub output: &'a Output,
+}
+
+impl From<PointedOutputRef<'_>> for UtreexoNodeHash {
+    fn from(pointed_output: PointedOutputRef) -> Self {
+        Self::new(hash(&pointed_output))
+    }
 }

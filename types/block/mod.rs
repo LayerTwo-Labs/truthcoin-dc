@@ -1,9 +1,10 @@
 use borsh::BorshSerialize;
 use serde::{Deserialize, Serialize};
+use serde_with::{DisplayFromStr, IfIsHumanReadable, serde_as};
 use utoipa::ToSchema;
 
 use crate::{
-    hashes::{self, BlockHash, CoinbaseTxid, MerkleRoot},
+    hashes::{self, BlockHash, CoinbaseTxid, MerkleRoot, UtreexoNodeHash},
     schema, util,
 };
 
@@ -12,6 +13,7 @@ pub use body::Body;
 pub mod coinbase;
 pub use coinbase::Coinbase;
 
+#[serde_as]
 #[derive(
     BorshSerialize,
     Clone,
@@ -29,6 +31,11 @@ pub struct Header {
     #[borsh(serialize_with = "util::borsh::serialize::bitcoin_block_hash")]
     #[schema(value_type = schema::BitcoinBlockHash)]
     pub prev_main_hash: bitcoin::BlockHash,
+    /// Utreexo roots
+    #[borsh(serialize_with = "util::borsh::serialize::utreexo_roots")]
+    #[schema(value_type = Vec<schema::UtreexoNodeHash>)]
+    #[serde_as(as = "Vec<IfIsHumanReadable<DisplayFromStr>>")]
+    pub roots: Vec<UtreexoNodeHash>,
 }
 
 impl Header {
@@ -37,6 +44,7 @@ impl Header {
             merkle_root,
             prev_side_hash,
             prev_main_hash,
+            roots: _,
         } = self;
         Coinbase::compute_txid(
             merkle_root,
@@ -71,6 +79,7 @@ mod block_json_tests {
                 merkle_root: MerkleRoot::from([1; 32]),
                 prev_side_hash: None,
                 prev_main_hash: bitcoin::BlockHash::from_byte_array([2; 32]),
+                roots: Vec::new(),
             },
             body: Body {
                 coinbase: Coinbase::default(),

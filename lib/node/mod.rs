@@ -1,4 +1,5 @@
 use std::{
+    borrow::BorrowMut,
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Debug,
     net::SocketAddr,
@@ -24,11 +25,12 @@ use crate::{
         markets::MarketId,
     },
     types::{
-        Address, AmountOverflowError, AmountUnderflowError, Authorized,
-        AuthorizedTransaction, Block, BlockHash, BlockIndexEvents, BmmResult,
-        Body, FilledTransaction, Header, InPoint, M6id, MainchainSyncProgress,
-        Network, OutPoint, OutPointKey, Output, SpentOutput, Tip, Transaction,
-        TxIn, Txid, WithdrawalBundle, WithdrawalBundleStatus,
+        Accumulator, Address, AmountOverflowError, AmountUnderflowError,
+        Authorized, AuthorizedTransaction, Block, BlockHash, BlockIndexEvents,
+        BmmResult, Body, FilledTransaction, Header, InPoint, M6id,
+        MainchainSyncProgress, Network, OutPoint, OutPointKey, Output,
+        SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
+        WithdrawalBundleStatus,
         net::SeedAddress,
         proto::{self, mainchain},
         state::WithdrawalBundleInfo,
@@ -359,12 +361,21 @@ where
         Ok(self.archive.is_descendant(&rotxn, ancestor, descendant)?)
     }
 
-    pub fn submit_transaction(
+    /// Regenerate proofs and submit transaction
+    pub fn submit_transaction<Tx>(
         &self,
-        transaction: &AuthorizedTransaction,
-    ) -> Result<(), Error> {
+        mut transaction: Tx,
+    ) -> Result<(), Error>
+    where
+        Tx: BorrowMut<AuthorizedTransaction>,
+    {
         {
             let mut rwtxn = self.env.write_txn()?;
+            self.state.regenerate_proof(
+                &rwtxn,
+                &mut transaction.borrow_mut().transaction,
+            )?;
+            let transaction: &AuthorizedTransaction = transaction.borrow();
             self.state.validate_transaction(
                 &self.archive,
                 &rwtxn,
@@ -408,8 +419,35 @@ where
 
             rwtxn.commit().map_err(RwTxnError::from)?;
         }
-        self.net.push_tx(Default::default(), transaction);
+        self.net.push_tx(Default::default(), transaction.borrow());
         Ok(())
+    }
+
+    pub fn get_tip_accumulator(&self) -> Result<Accumulator, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.get_accumulator(&rotxn)?)
+    }
+
+    pub fn regenerate_proof(&self, tx: &mut Transaction) -> Result<(), Error> {
+        let rotxn = self.env.read_txn()?;
+        let () = self.state.regenerate_proof(&rotxn, tx)?;
+        Ok(())
+    }
+
+    pub fn try_get_accumulator(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<Accumulator>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.archive.try_get_accumulator(&rotxn, block_hash)?)
+    }
+
+    pub fn get_accumulator(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Accumulator, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.archive.get_accumulator(&rotxn, block_hash)?)
     }
 
     pub fn get_mempool_shares(

@@ -29,8 +29,8 @@ use truthcoin_dc::{
     types::{
         Address, Authorization, AuthorizedTransaction, Block, BlockHash,
         BlockIndex, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body,
-        EncryptionPubKey, M6id, MainchainSyncProgress, OutputContent,
-        PointedOutput, Transaction, Txid, VerifyingKey, WithdrawalBundle,
+        EncryptionPubKey, M6id, MainchainSyncProgress, PointedOutput,
+        Transaction, Txid, VerifyingKey, WithdrawalBundle,
     },
     validation::DecisionValidator,
     wallet::{Balance, CreateMarketInput, DecisionClaimInput, TransferDests},
@@ -1497,7 +1497,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                 ))
             })?;
         let txid = tx.transaction.txid();
-        self.app.node.submit_transaction(&tx).map_err(custom_err)?;
+        self.app.node.submit_transaction(tx).map_err(custom_err)?;
         Ok(txid)
     }
 
@@ -1511,11 +1511,12 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         &self,
         transaction: AuthorizedTransaction,
     ) -> RpcResult<Txid> {
+        let txid = transaction.transaction.txid();
         let () = self
             .app
-            .submit_transaction(&transaction)
+            .submit_transaction(transaction)
             .map_err(custom_err)?;
-        Ok(transaction.transaction.txid())
+        Ok(txid)
     }
 
     async fn vote_list(&self, filter: VoteFilter) -> RpcResult<Vec<VoteInfo>> {
@@ -2149,7 +2150,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         transaction: Transaction,
         broadcast: Option<bool>,
     ) -> RpcResult<AuthorizedTransaction> {
-        let authorized = self
+        let mut authorized = self
             .app
             .wallet
             .authorize(rand::rng(), transaction)
@@ -2157,7 +2158,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         if let Some(true) = broadcast {
             let () = self
                 .app
-                .submit_transaction(&authorized)
+                .submit_transaction(&mut authorized)
                 .map_err(custom_err)?;
         }
         Ok(authorized)

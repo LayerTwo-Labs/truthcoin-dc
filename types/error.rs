@@ -24,6 +24,11 @@ pub struct InvalidDecisionId {
     pub reason: String,
 }
 
+#[derive(Debug, Error)]
+#[error("utreexo error ({0})")]
+#[repr(transparent)]
+pub struct Utreexo(pub(crate) String);
+
 pub mod compute_merkle_root {
     use thiserror::Error;
 

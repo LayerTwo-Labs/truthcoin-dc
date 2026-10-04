@@ -26,6 +26,8 @@ pub(crate) mod borsh {
     pub mod serialize {
         use borsh::BorshSerialize;
 
+        use crate::UtreexoNodeHash;
+
         pub fn bitcoin_address<V, W>(
             bitcoin_address: &bitcoin::Address<V>,
             writer: &mut W,
@@ -72,6 +74,35 @@ pub(crate) mod borsh {
             let bitcoin::OutPoint { txid, vout } = block_hash;
             let txid_bytes: &[u8; 32] = txid.as_ref();
             BorshSerialize::serialize(&(txid_bytes, vout), writer)
+        }
+
+        pub fn utreexo_node_hash<W>(
+            node_hash: &UtreexoNodeHash,
+            writer: &mut W,
+        ) -> borsh::io::Result<()>
+        where
+            W: borsh::io::Write,
+        {
+            let bytes: &[u8; 32] = node_hash;
+            BorshSerialize::serialize(bytes, writer)
+        }
+
+        pub fn utreexo_roots<W>(
+            roots: &[UtreexoNodeHash],
+            writer: &mut W,
+        ) -> borsh::io::Result<()>
+        where
+            W: borsh::io::Write,
+        {
+            #[derive(BorshSerialize)]
+            #[repr(transparent)]
+            struct SerializeUtreexoNodeHash<'a>(
+                #[borsh(serialize_with = "utreexo_node_hash")]
+                &'a UtreexoNodeHash,
+            );
+            let roots: Vec<SerializeUtreexoNodeHash> =
+                roots.iter().map(SerializeUtreexoNodeHash).collect();
+            BorshSerialize::serialize(&roots, writer)
         }
     }
 }

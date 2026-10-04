@@ -6,9 +6,9 @@ use crate::{
     math::trading,
     state::{Error, State, UtxoManager, error, markets::MarketId},
     types::{
-        Address, Body, FilledTransaction, GetValue as _, Header, InPoint,
-        MerkleRoot, OutPoint, OutPointKey, Output, OutputContent, SpentOutput,
-        TxData,
+        AccumulatorDiff, Address, Body, FilledTransaction, GetValue as _,
+        Header, InPoint, MerkleRoot, OutPoint, OutPointKey, OutputContent,
+        SpentOutput, TxData,
     },
 };
 
@@ -151,6 +151,7 @@ impl StateUpdate {
         &self,
         state: &State,
         rwtxn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
         height: u32,
     ) -> Result<Option<crate::state::undo::ConsolidationUndoData>, Error> {
         for creation in &self.market_creations {
@@ -292,6 +293,7 @@ impl StateUpdate {
         let consolidation_undo = Self::consolidate_market_utxos(
             state,
             rwtxn,
+            accumulator_diff,
             height,
             &self.pending_sell_payouts,
             &self.pending_buy_settlements,
@@ -368,6 +370,7 @@ impl StateUpdate {
     fn consolidate_market_utxos(
         state: &State,
         rwtxn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
         height: u32,
         pending_sell_payouts: &[PendingSellPayout],
         pending_buy_settlements: &[PendingBuySettlement],
@@ -379,18 +382,14 @@ impl StateUpdate {
             generate_market_treasury_address,
         };
         use crate::types::{OutPoint, Output};
-        use std::collections::HashSet;
+        use std::collections::BTreeSet;
 
-        let sell_payout_markets: HashSet<[u8; 6]> =
-            pending_sell_payouts.iter().map(|p| p.market_id.0).collect();
-        let buy_settlement_markets: HashSet<[u8; 6]> = pending_buy_settlements
+        // Accumulator insertion order must match on every node.
+        let markets_to_consolidate: BTreeSet<[u8; 6]> = pending_sell_payouts
             .iter()
-            .map(|s| s.market_id.0)
+            .map(|p| p.market_id.0)
+            .chain(pending_buy_settlements.iter().map(|s| s.market_id.0))
             .collect();
-
-        let mut markets_to_consolidate: HashSet<[u8; 6]> = HashSet::new();
-        markets_to_consolidate.extend(sell_payout_markets);
-        markets_to_consolidate.extend(buy_settlement_markets);
 
         if markets_to_consolidate.is_empty()
             && pending_sell_input_changes.is_empty()
@@ -485,7 +484,7 @@ impl StateUpdate {
                 && (treasury_total > 0 || !market_sell_payouts.is_empty())
             {
                 for outpoint in &treasury_utxos_to_consume {
-                    state.delete_utxo(rwtxn, outpoint)?;
+                    state.delete_utxo(rwtxn, outpoint, accumulator_diff)?;
                 }
                 state
                     .markets()
@@ -507,6 +506,7 @@ impl StateUpdate {
                         rwtxn,
                         &payout_outpoint,
                         &payout_output,
+                        accumulator_diff,
                     )?;
                     sell_payout_utxos.push(payout_outpoint);
                 }
@@ -544,6 +544,7 @@ impl StateUpdate {
                             rwtxn,
                             &change_outpoint,
                             &change_output,
+                            accumulator_diff,
                         )?;
                         buy_change_utxos.push(change_outpoint);
                     }
@@ -579,7 +580,12 @@ impl StateUpdate {
                             is_fee: false,
                         },
                     };
-                    state.insert_utxo(rwtxn, &new_outpoint, &new_output)?;
+                    state.insert_utxo(
+                        rwtxn,
+                        &new_outpoint,
+                        &new_output,
+                        accumulator_diff,
+                    )?;
                     state.markets().set_market_funds_utxo(
                         rwtxn,
                         &market_id,
@@ -596,7 +602,7 @@ impl StateUpdate {
 
             if has_fee_work && fee_total > 0 {
                 for outpoint in &fee_utxos_to_consume {
-                    state.delete_utxo(rwtxn, outpoint)?;
+                    state.delete_utxo(rwtxn, outpoint, accumulator_diff)?;
                 }
                 state
                     .markets()
@@ -617,7 +623,12 @@ impl StateUpdate {
                         is_fee: true,
                     },
                 };
-                state.insert_utxo(rwtxn, &new_outpoint, &new_output)?;
+                state.insert_utxo(
+                    rwtxn,
+                    &new_outpoint,
+                    &new_output,
+                    accumulator_diff,
+                )?;
                 state.markets().set_market_funds_utxo(
                     rwtxn,
                     &market_id,
@@ -651,7 +662,12 @@ impl StateUpdate {
                         *change_sats,
                     )),
                 };
-                state.insert_utxo(rwtxn, &change_outpoint, &change_output)?;
+                state.insert_utxo(
+                    rwtxn,
+                    &change_outpoint,
+                    &change_output,
+                    accumulator_diff,
+                )?;
                 sell_input_change_utxos.push(change_outpoint);
             }
         }
@@ -715,6 +731,7 @@ pub fn connect_prevalidated(
 ) -> Result<(), Error> {
     // Use precomputed values — validation already done in prevalidate
     let height = prevalidated.next_height;
+    let mut accumulator_diff = AccumulatorDiff::default();
     let filled_txs = prevalidated.filled_transactions;
     let validated_coinbase = prevalidated.coinbase_value;
 
@@ -778,7 +795,7 @@ pub fn connect_prevalidated(
             txid: coinbase_txid,
             vout: vout as u32,
         };
-        state.insert_utxo(rwtxn, &outpoint, output)?;
+        state.insert_utxo(rwtxn, &outpoint, output, &mut accumulator_diff)?;
     }
     let mut state_update = StateUpdate::new();
     let mut skipped_tx_indices: HashSet<usize> = HashSet::new();
@@ -850,12 +867,15 @@ pub fn connect_prevalidated(
         if skipped_tx_indices.contains(&idx) {
             continue;
         }
-        apply_utxo_changes(state, rwtxn, filled_tx)?;
+        apply_utxo_changes(state, rwtxn, &mut accumulator_diff, filled_tx)?;
     }
 
-    if let Some(consolidation_undo) =
-        state_update.apply_all_changes(state, rwtxn, height)?
-    {
+    if let Some(consolidation_undo) = state_update.apply_all_changes(
+        state,
+        rwtxn,
+        &mut accumulator_diff,
+        height,
+    )? {
         state
             .consolidation_undo
             .put(rwtxn, &height, &consolidation_undo)?;
@@ -939,6 +959,7 @@ pub fn connect_prevalidated(
         let (payout_results, settlement_undo_entries) =
             state.markets().transition_and_payout_resolved_markets(
                 rwtxn,
+                &mut accumulator_diff,
                 state,
                 state.decisions(),
                 height,
@@ -986,6 +1007,9 @@ pub fn connect_prevalidated(
         .mainchain_timestamp
         .put(rwtxn, &(), &mainchain_timestamp)?;
 
+    let mut accumulator = state.get_accumulator(rwtxn)?;
+    let () = accumulator.apply_diff(accumulator_diff)?;
+    state.utreexo_accumulator.put(rwtxn, &(), &accumulator)?;
     Ok(())
 }
 
@@ -1005,12 +1029,19 @@ pub fn disconnect_tip(
         return Err(Error::InvalidHeader(err));
     }
     let height = state.try_get_height(rwtxn)?.ok_or(Error::NoTip)?;
+    let mut accumulator_diff = AccumulatorDiff::default();
 
     // 2. Revert market settlement/payouts (runs last in connect, so first here)
     if let Some(settlement_undo) =
         state.settlement_undo.try_get(rwtxn, &height)?
     {
-        revert_settlement(state, rwtxn, &settlement_undo, height)?;
+        revert_settlement(
+            state,
+            rwtxn,
+            &mut accumulator_diff,
+            &settlement_undo,
+            height,
+        )?;
         state.settlement_undo.delete(rwtxn, &height)?;
     }
 
@@ -1026,7 +1057,12 @@ pub fn disconnect_tip(
     if let Some(consolidation_undo) =
         state.consolidation_undo.try_get(rwtxn, &height)?
     {
-        revert_consolidation(state, rwtxn, &consolidation_undo)?;
+        revert_consolidation(
+            state,
+            rwtxn,
+            &mut accumulator_diff,
+            &consolidation_undo,
+        )?;
         state.consolidation_undo.delete(rwtxn, &height)?;
     }
 
@@ -1055,8 +1091,12 @@ pub fn disconnect_tip(
                 let () = revert_create_market(state, rwtxn, &filled_tx)?;
             }
             Some(TxData::Trade { .. }) => {
-                let delta =
-                    revert_trade_market_state(state, rwtxn, &filled_tx)?;
+                let delta = revert_trade_market_state(
+                    state,
+                    rwtxn,
+                    &mut accumulator_diff,
+                    &filled_tx,
+                )?;
                 trade_share_deltas.push(delta);
             }
             Some(TxData::SubmitVote { .. }) => {
@@ -1077,7 +1117,7 @@ pub fn disconnect_tip(
                     txid,
                     vout: vout as u32,
                 };
-                if state.delete_utxo(rwtxn, &outpoint)? {
+                if state.delete_utxo(rwtxn, &outpoint, &mut accumulator_diff)? {
                     Ok(())
                 } else {
                     Err(Error::NoUtxo { outpoint })
@@ -1090,7 +1130,12 @@ pub fn disconnect_tip(
                 state.stxos.try_get(rwtxn, &outpoint_key)?
             {
                 state.stxos.delete(rwtxn, &outpoint_key)?;
-                state.insert_utxo(rwtxn, outpoint, &spent_output.output)?;
+                state.insert_utxo(
+                    rwtxn,
+                    outpoint,
+                    &spent_output.output,
+                    &mut accumulator_diff,
+                )?;
                 Ok(())
             } else {
                 Err(Error::NoStxo {
@@ -1176,7 +1221,7 @@ pub fn disconnect_tip(
                 txid: coinbase_txid,
                 vout: vout as u32,
             };
-            if state.delete_utxo(rwtxn, &outpoint)? {
+            if state.delete_utxo(rwtxn, &outpoint, &mut accumulator_diff)? {
                 Ok(())
             } else {
                 Err(Error::NoUtxo { outpoint })
@@ -1220,15 +1265,19 @@ pub fn disconnect_tip(
             state.height.put(rwtxn, &(), &(height - 1))?;
         }
     }
+    let mut accumulator = state.get_accumulator(rwtxn)?;
+    let () = accumulator.apply_diff(accumulator_diff)?;
+    state.utreexo_accumulator.put(rwtxn, &(), &accumulator)?;
     Ok(())
 }
 
 fn revert_delete_utxo(
     state: &State,
     rwtxn: &mut RwTxn,
+    accumulator_diff: &mut AccumulatorDiff,
     outpoint: &OutPoint,
 ) -> Result<(), Error> {
-    let deleted = state.delete_utxo(rwtxn, outpoint)?;
+    let deleted = state.delete_utxo(rwtxn, outpoint, accumulator_diff)?;
     if !deleted {
         tracing::trace!(
             "UTXO not found during revert \
@@ -1242,31 +1291,42 @@ fn revert_delete_utxo(
 fn revert_consolidation(
     state: &State,
     rwtxn: &mut RwTxn,
+    accumulator_diff: &mut AccumulatorDiff,
     undo: &crate::state::undo::ConsolidationUndoData,
 ) -> Result<(), Error> {
     // Process entries in reverse order
     for entry in undo.entries.iter().rev() {
         // Delete new UTXOs that were created during consolidation
         if let Some(ref outpoint) = entry.new_treasury_utxo {
-            revert_delete_utxo(state, rwtxn, outpoint)?;
+            revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
         }
         if let Some(ref outpoint) = entry.new_fee_utxo {
-            revert_delete_utxo(state, rwtxn, outpoint)?;
+            revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
         }
         for outpoint in &entry.sell_payout_utxos {
-            revert_delete_utxo(state, rwtxn, outpoint)?;
+            revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
         }
         for outpoint in &entry.buy_change_utxos {
-            revert_delete_utxo(state, rwtxn, outpoint)?;
+            revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
         }
 
         // Restore old treasury UTXOs
         for (outpoint, filled_output) in &entry.old_treasury_utxos {
-            state.insert_utxo(rwtxn, outpoint, filled_output)?;
+            state.insert_utxo(
+                rwtxn,
+                outpoint,
+                filled_output,
+                accumulator_diff,
+            )?;
         }
         // Restore old fee UTXOs
         for (outpoint, filled_output) in &entry.old_fee_utxos {
-            state.insert_utxo(rwtxn, outpoint, filled_output)?;
+            state.insert_utxo(
+                rwtxn,
+                outpoint,
+                filled_output,
+                accumulator_diff,
+            )?;
         }
 
         // Restore market_funds_utxo pointers
@@ -1302,7 +1362,7 @@ fn revert_consolidation(
 
     // Delete sell input change UTXOs
     for outpoint in &undo.sell_input_change_utxos {
-        revert_delete_utxo(state, rwtxn, outpoint)?;
+        revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
     }
 
     tracing::info!(
@@ -1316,6 +1376,7 @@ fn revert_consolidation(
 fn revert_settlement(
     state: &State,
     rwtxn: &mut RwTxn,
+    accumulator_diff: &mut AccumulatorDiff,
     undo: &crate::state::undo::SettlementUndoData,
     block_height: u32,
 ) -> Result<(), Error> {
@@ -1324,13 +1385,19 @@ fn revert_settlement(
         state.markets().revert_automatic_share_payouts(
             state,
             rwtxn,
+            accumulator_diff,
             &entry.payout_summary,
             block_height,
         )?;
 
         // Restore treasury UTXO
         if let Some((ref outpoint, ref filled_output)) = entry.treasury_utxo {
-            state.insert_utxo(rwtxn, outpoint, filled_output)?;
+            state.insert_utxo(
+                rwtxn,
+                outpoint,
+                filled_output,
+                accumulator_diff,
+            )?;
             state.markets().set_market_funds_utxo(
                 rwtxn,
                 &entry.pre_settlement_market.id,
@@ -1341,7 +1408,12 @@ fn revert_settlement(
 
         // Restore fee UTXO
         if let Some((ref outpoint, ref filled_output)) = entry.fee_utxo {
-            state.insert_utxo(rwtxn, outpoint, filled_output)?;
+            state.insert_utxo(
+                rwtxn,
+                outpoint,
+                filled_output,
+                accumulator_diff,
+            )?;
             state.markets().set_market_funds_utxo(
                 rwtxn,
                 &entry.pre_settlement_market.id,
@@ -1621,6 +1693,7 @@ struct TradeShareDelta {
 fn revert_trade_market_state(
     state: &State,
     rwtxn: &mut RwTxn,
+    accumulator_diff: &mut AccumulatorDiff,
     filled_tx: &FilledTransaction,
 ) -> Result<TradeShareDelta, Error> {
     let trade = filled_tx.trade().ok_or_else(|| Error::InvalidTransaction {
@@ -1719,7 +1792,9 @@ fn revert_trade_market_state(
             &trade.trader,
             filled_tx.txid().0,
         );
-        if let Err(e) = state.delete_utxo(rwtxn, &change_outpoint) {
+        if let Err(e) =
+            state.delete_utxo(rwtxn, &change_outpoint, accumulator_diff)
+        {
             tracing::trace!(
                 "UTXO not found during trade revert (expected if 0 change): {e:?}"
             );
@@ -1730,7 +1805,9 @@ fn revert_trade_market_state(
             &trade.trader,
             filled_tx.txid().0,
         );
-        if let Err(e) = state.delete_utxo(rwtxn, &payout_outpoint) {
+        if let Err(e) =
+            state.delete_utxo(rwtxn, &payout_outpoint, accumulator_diff)
+        {
             tracing::trace!(
                 "UTXO not found during trade revert (expected if 0 change): {e:?}"
             );
@@ -1740,7 +1817,9 @@ fn revert_trade_market_state(
             &trade.trader,
             filled_tx.txid().0,
         );
-        if let Err(e) = state.delete_utxo(rwtxn, &change_outpoint) {
+        if let Err(e) =
+            state.delete_utxo(rwtxn, &change_outpoint, accumulator_diff)
+        {
             tracing::trace!(
                 "UTXO not found during trade revert (expected if 0 change): {e:?}"
             );
@@ -1760,6 +1839,7 @@ fn revert_trade_market_state(
 fn apply_utxo_changes(
     state: &State,
     rwtxn: &mut RwTxn,
+    accumulator_diff: &mut AccumulatorDiff,
     filled_tx: &FilledTransaction,
 ) -> Result<(), Error> {
     let txid = filled_tx.txid();
@@ -1781,7 +1861,7 @@ fn apply_utxo_changes(
                 vin: vin as u32,
             },
         };
-        state.delete_utxo(rwtxn, outpoint)?;
+        state.delete_utxo(rwtxn, outpoint, accumulator_diff)?;
         state.stxos.put(rwtxn, &input_key, &spent_output)?;
     }
 
@@ -1790,7 +1870,7 @@ fn apply_utxo_changes(
             txid,
             vout: vout as u32,
         };
-        state.insert_utxo(rwtxn, &outpoint, output)?;
+        state.insert_utxo(rwtxn, &outpoint, output, accumulator_diff)?;
     }
 
     Ok(())
@@ -2514,6 +2594,7 @@ fn apply_transfer_reputation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Output;
 
     fn bitcoin_input(sats: u64) -> Output {
         Output {
@@ -2588,6 +2669,7 @@ mod tests {
             merkle_root: MerkleRoot::default(),
             prev_side_hash: None,
             prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
         };
         let tip = header.hash();
         let mut rwtxn = env.write_txn().unwrap();

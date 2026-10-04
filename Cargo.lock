@@ -6278,6 +6278,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustreexo"
+version = "0.3.0"
+source = "git+https://github.com/mit-dci/rustreexo?rev=6da503b598470f6e87aa9d769b94df64df7ff3ae#6da503b598470f6e87aa9d769b94df64df7ff3ae"
+dependencies = [
+ "bitcoin_hashes",
+ "serde",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7756,12 +7765,14 @@ dependencies = [
  "curve25519-dalek 5.0.0",
  "frost-core",
  "frost-ristretto255",
+ "hashlink 0.10.0",
  "heed",
  "libes",
  "merkle-cbt",
  "nonempty 0.11.0",
  "rand 0.10.1",
  "rayon",
+ "rustreexo",
  "semver",
  "serde",
  "serde_json",
@@ -7770,6 +7781,7 @@ dependencies = [
  "sha3",
  "strum 0.27.2",
  "thiserror 2.0.20",
+ "tracing",
  "url",
  "utoipa",
  "x25519-dalek",

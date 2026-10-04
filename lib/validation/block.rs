@@ -1,9 +1,10 @@
 use crate::authorization::{self, BatchVerificationContext};
 use crate::state::{Error, PrevalidatedBlock};
 use crate::types::{
-    AmountOverflowError, AuthorizedTransaction, Body, ComputeFeeError,
-    FilledTransaction, GetAddress as _, GetValue as _, Header, OutPointKey,
-    OutputContent, PointedOutputRef, TransactionData,
+    AccumulatorDiff, AmountOverflowError, AuthorizedTransaction, Body,
+    ComputeFeeError, FilledTransaction, GetAddress as _, GetValue as _, Header,
+    OutPoint, OutPointKey, OutputContent, PointedOutputRef, TransactionData,
+    UtreexoNodeHash,
 };
 use rayon::prelude::*;
 use sneed::RoTxn;
@@ -83,6 +84,44 @@ impl BlockValidator {
             return Err(err);
         }
 
+        let mut accumulator = state.get_accumulator(rotxn)?;
+        let mut accumulator_diff = AccumulatorDiff::default();
+        let coinbase_txid = header.compute_coinbase_txid();
+        for (vout, output) in body.coinbase.outputs.iter().enumerate() {
+            let outpoint = OutPoint::Coinbase {
+                txid: coinbase_txid,
+                vout: vout as u32,
+            };
+            accumulator_diff
+                .insert(PointedOutputRef { outpoint, output }.into());
+        }
+        for filled_tx in &filled_txs {
+            let txid = filled_tx.transaction.txid();
+            // hashes of spent utxos, used to verify the utreexo proof
+            let mut spent_utxo_hashes = Vec::<UtreexoNodeHash>::with_capacity(
+                filled_tx.transaction.inputs.len(),
+            );
+            for (_, utxo_hash) in &filled_tx.transaction.inputs {
+                spent_utxo_hashes.push(utxo_hash.into());
+                accumulator_diff.remove(utxo_hash.into());
+            }
+            for (vout, output) in
+                filled_tx.transaction.outputs.iter().enumerate()
+            {
+                let outpoint = OutPoint::Regular {
+                    txid,
+                    vout: vout as u32,
+                };
+                accumulator_diff
+                    .insert(PointedOutputRef { outpoint, output }.into());
+            }
+            if !accumulator
+                .verify(&filled_tx.transaction.proof, &spent_utxo_hashes)?
+            {
+                return Err(Error::UtreexoProofFailed { txid });
+            }
+        }
+
         // Collect all inputs as fixed-width keys for efficient
         // double-spend detection via parallel sort-and-scan
         let total_inputs: usize =
@@ -125,6 +164,12 @@ impl BlockValidator {
         }
         if authorization::verify_body(batch_verification_ctxt, body).is_err() {
             return Err(Error::AuthorizationError);
+        }
+        // Check root consistency without committing to DB
+        let () = accumulator.apply_diff(accumulator_diff)?;
+        let roots: Vec<UtreexoNodeHash> = accumulator.get_roots();
+        if roots != header.roots {
+            return Err(Error::UtreexoRootsMismatch);
         }
 
         Ok(PrevalidatedBlock {
@@ -487,6 +532,7 @@ mod tests {
             .unwrap(),
             prev_side_hash: None,
             prev_main_hash: bitcoin::BlockHash::from_byte_array([0; 32]),
+            roots: Vec::new(),
         };
         let batch_verification_ctxt =
             BatchVerificationContext::new(&mut rand::rng());

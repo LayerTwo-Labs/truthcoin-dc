@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use crate::state::Error;
 use crate::state::UtxoManager;
 use crate::state::decisions::{Decision, DecisionId};
-use crate::types::{Address, GetValue, OutPoint, OutPointKey};
+use crate::types::{AccumulatorDiff, Address, GetValue, OutPoint, OutPointKey};
 
 use super::market::Market;
 use super::payouts::{
@@ -356,6 +356,7 @@ impl MarketsDatabase {
     pub fn transition_and_payout_resolved_markets(
         &self,
         txn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
         state: &crate::state::State,
         decisions_db: &crate::state::decisions::Dbs,
         current_height: u32,
@@ -478,6 +479,7 @@ impl MarketsDatabase {
                 self.apply_automatic_share_payouts(
                     state,
                     txn,
+                    accumulator_diff,
                     &payout_summary,
                     current_height,
                 )?;
@@ -968,6 +970,7 @@ impl MarketsDatabase {
         &self,
         state: &crate::state::State,
         txn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
         payout_summary: &MarketPayoutSummary,
         block_height: u32,
     ) -> Result<(), Error> {
@@ -991,7 +994,7 @@ impl MarketsDatabase {
                     )),
                 };
 
-                state.insert_utxo(txn, &outpoint, &output)?;
+                state.insert_utxo(txn, &outpoint, &output, accumulator_diff)?;
             }
 
             self.remove_shares_from_account(
@@ -1021,7 +1024,12 @@ impl MarketsDatabase {
                 )),
             };
 
-            state.insert_utxo(txn, &fee_outpoint, &fee_output)?;
+            state.insert_utxo(
+                txn,
+                &fee_outpoint,
+                &fee_output,
+                accumulator_diff,
+            )?;
             sequence += 1;
         }
 
@@ -1038,14 +1046,19 @@ impl MarketsDatabase {
                     refund.amount_sats,
                 )),
             };
-            state.insert_utxo(txn, &refund_outpoint, &refund_output)?;
+            state.insert_utxo(
+                txn,
+                &refund_outpoint,
+                &refund_output,
+                accumulator_diff,
+            )?;
         }
 
         // Consume the Market UTXO (treasury is now distributed to shareholders)
         if let Some(market_utxo) =
             self.get_market_funds_utxo(txn, &payout_summary.market_id, false)?
         {
-            state.delete_utxo(txn, &market_utxo)?;
+            state.delete_utxo(txn, &market_utxo, accumulator_diff)?;
             self.clear_market_funds_utxo(
                 txn,
                 &payout_summary.market_id,
@@ -1057,7 +1070,7 @@ impl MarketsDatabase {
         if let Some(fee_utxo) =
             self.get_market_funds_utxo(txn, &payout_summary.market_id, true)?
         {
-            state.delete_utxo(txn, &fee_utxo)?;
+            state.delete_utxo(txn, &fee_utxo, accumulator_diff)?;
             self.clear_market_funds_utxo(txn, &payout_summary.market_id, true)?;
         }
 
@@ -1068,6 +1081,7 @@ impl MarketsDatabase {
         &self,
         state: &crate::state::State,
         txn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
         payout_summary: &MarketPayoutSummary,
         block_height: u32,
     ) -> Result<(), Error> {
@@ -1082,7 +1096,7 @@ impl MarketsDatabase {
                     sequence,
                 );
 
-                state.delete_utxo(txn, &outpoint)?;
+                state.delete_utxo(txn, &outpoint, accumulator_diff)?;
             }
 
             self.add_shares_to_account(
@@ -1105,7 +1119,7 @@ impl MarketsDatabase {
                 sequence,
             );
 
-            state.delete_utxo(txn, &fee_outpoint)?;
+            state.delete_utxo(txn, &fee_outpoint, accumulator_diff)?;
             sequence += 1;
         }
 
@@ -1116,7 +1130,7 @@ impl MarketsDatabase {
                 block_height,
                 sequence,
             );
-            state.delete_utxo(txn, &refund_outpoint)?;
+            state.delete_utxo(txn, &refund_outpoint, accumulator_diff)?;
         }
 
         tracing::info!(

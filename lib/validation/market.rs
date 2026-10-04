@@ -706,6 +706,7 @@ mod tests {
                     [0; 32],
                 )]
                 .into(),
+                proof: Default::default(),
                 outputs: vec![Output {
                     address: maker,
                     content: OutputContent::MarketFunds {
@@ -809,6 +810,7 @@ mod tests {
                     [0; 32],
                 )]
                 .into(),
+                proof: Default::default(),
                 outputs: vec![Output {
                     address: treasury_address,
                     content: OutputContent::MarketFunds {

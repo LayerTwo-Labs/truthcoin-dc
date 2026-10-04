@@ -5,6 +5,8 @@ use std::{
 };
 
 use borsh::BorshSerialize;
+use hashlink::{LinkedHashMap, linked_hash_map};
+use rustreexo::accumulator::mem_forest::MemForest;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use utoipa::ToSchema;
@@ -20,13 +22,13 @@ pub mod error;
 pub use error::{
     AmountOverflow as AmountOverflowError,
     AmountUnderflow as AmountUnderflowError, ComputeFee as ComputeFeeError,
-    ComputeMerkleRoot as ComputeMerkleRootError,
+    ComputeMerkleRoot as ComputeMerkleRootError, Utreexo as UtreexoError,
     WithdrawalBundle as WithdrawalBundleError,
 };
 pub mod hashes;
 pub use hashes::{
     BlockHash, CoinbaseTxid, Hash, M6id, MerkleRoot, NonZeroBitcoinBlockHash,
-    Txid, hash, hash_with_scratch_buffer,
+    Txid, UtreexoNodeHash, hash, hash_with_scratch_buffer,
 };
 pub mod keys;
 pub use keys::{EncryptionPubKey, VerifyingKey};
@@ -46,6 +48,8 @@ pub mod tx_pow;
 mod util;
 
 pub const THIS_SIDECHAIN: u8 = 13;
+
+pub type UtreexoProof = rustreexo::accumulator::proof::Proof<UtreexoNodeHash>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum WithdrawalBundleEventStatus {
@@ -379,6 +383,180 @@ impl Ord for AggregatedWithdrawal {
 impl PartialOrd for AggregatedWithdrawal {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// Manage accumulator diffs.
+/// Insertions and removals 'cancel out' exactly once.
+/// Inserting twice will cause one insertion.
+/// Removing twice will cause one deletion.
+/// Inserting and then removing will have no overall effect,
+/// but a second removal will still cause a deletion.
+#[derive(Clone, Debug)]
+pub struct AccumulatorDiff {
+    /// `true` indicates insertion, `false` indicates removal.
+    diff: LinkedHashMap<UtreexoNodeHash, bool>,
+    /// Total number of insertions still represented in `diff`.
+    insertions: usize,
+    /// Total number of deletions still represented in `diff`.
+    deletions: usize,
+}
+
+impl Default for AccumulatorDiff {
+    fn default() -> Self {
+        Self {
+            diff: LinkedHashMap::new(),
+            insertions: 0,
+            deletions: 0,
+        }
+    }
+}
+
+impl AccumulatorDiff {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            diff: LinkedHashMap::with_capacity(capacity),
+            insertions: 0,
+            deletions: 0,
+        }
+    }
+
+    pub fn insert(&mut self, utxo_hash: UtreexoNodeHash) {
+        match self.diff.entry(utxo_hash) {
+            linked_hash_map::Entry::Occupied(entry) => {
+                if !entry.get() {
+                    entry.remove();
+                    debug_assert!(self.deletions > 0);
+                    self.deletions -= 1;
+                }
+            }
+            linked_hash_map::Entry::Vacant(entry) => {
+                entry.insert(true);
+                self.insertions += 1;
+            }
+        }
+    }
+
+    pub fn remove(&mut self, utxo_hash: UtreexoNodeHash) {
+        match self.diff.entry(utxo_hash) {
+            linked_hash_map::Entry::Occupied(entry) => {
+                if *entry.get() {
+                    entry.remove();
+                    debug_assert!(self.insertions > 0);
+                    self.insertions -= 1;
+                }
+            }
+            linked_hash_map::Entry::Vacant(entry) => {
+                entry.insert(false);
+                self.deletions += 1;
+            }
+        }
+    }
+
+    /// Returns the number of tracked insertions and deletions, in that order.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.insertions, self.deletions)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.diff.is_empty()
+    }
+}
+
+#[derive(Debug, Default)]
+#[repr(transparent)]
+pub struct Accumulator(pub MemForest<UtreexoNodeHash>);
+
+impl Accumulator {
+    pub fn apply_diff(
+        &mut self,
+        diff: AccumulatorDiff,
+    ) -> Result<(), UtreexoError> {
+        let AccumulatorDiff {
+            diff,
+            insertions: n_insertions,
+            deletions: n_deletions,
+        } = diff;
+        let (mut insertions, mut deletions) = (
+            Vec::with_capacity(n_insertions),
+            Vec::with_capacity(n_deletions),
+        );
+        for (utxo_hash, insert) in diff {
+            if insert {
+                insertions.push(utxo_hash);
+            } else {
+                deletions.push(utxo_hash);
+            }
+        }
+        tracing::trace!(
+            leaves = %self.0.leaves,
+            roots = ?self.get_roots(),
+            insertions = ?insertions,
+            deletions = ?deletions,
+            "Applying diff"
+        );
+        let () = self
+            .0
+            .modify(&insertions, &deletions)
+            .map_err(UtreexoError)?;
+        tracing::debug!(
+            leaves = %self.0.leaves,
+            roots = ?self.get_roots(),
+            "Applied diff"
+        );
+        Ok(())
+    }
+
+    pub fn get_roots(&self) -> Vec<UtreexoNodeHash> {
+        self.0
+            .get_roots()
+            .iter()
+            .map(|node| node.get_data())
+            .collect()
+    }
+
+    pub fn prove(
+        &self,
+        targets: &[UtreexoNodeHash],
+    ) -> Result<UtreexoProof, UtreexoError> {
+        self.0.prove(targets).map_err(UtreexoError)
+    }
+
+    pub fn verify(
+        &self,
+        proof: &UtreexoProof,
+        del_hashes: &[UtreexoNodeHash],
+    ) -> Result<bool, UtreexoError> {
+        self.0.verify(proof, del_hashes).map_err(UtreexoError)
+    }
+}
+
+impl<'de> Deserialize<'de> for Accumulator {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes: Vec<u8> =
+            <Vec<_> as Deserialize>::deserialize(deserializer)?;
+        let mem_forest = MemForest::deserialize(&*bytes)
+            .inspect_err(|err| {
+                tracing::debug!("deserialize err: {err}\n bytes: {bytes:?}")
+            })
+            .map_err(<D::Error as serde::de::Error>::custom)?;
+        Ok(Self(mem_forest))
+    }
+}
+
+impl Serialize for Accumulator {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut bytes = Vec::new();
+        self.0
+            .serialize(&mut bytes)
+            .map_err(<S::Error as serde::ser::Error>::custom)?;
+        <Vec<_> as Serialize>::serialize(&bytes, serializer)
     }
 }
 

@@ -1,6 +1,7 @@
 use std::{borrow::Borrow, cmp::Ordering, collections::HashMap};
 
 use borsh::BorshSerialize;
+use rustreexo::accumulator::mem_forest::MemForest;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -10,10 +11,11 @@ use crate::{
     error,
     hashes::{
         self, CoinbaseMerkleRoot, CoinbaseTxid, Hash, MerkleRoot, TxMerkleRoot,
+        UtreexoNodeHash,
     },
     transaction::{
         AuthorizedTransaction, FilledTransaction, GetValue, OutPoint, Output,
-        Transaction,
+        PointedOutput, Transaction,
     },
     util,
 };
@@ -232,6 +234,55 @@ impl Body {
         })
         .into();
         Ok(root)
+    }
+
+    // Modifies the memforest, without checking tx proofs
+    pub fn modify_memforest<FilledTx>(
+        coinbase_txid: CoinbaseTxid,
+        coinbase_outputs: &[Output],
+        txs: &[FilledTx],
+        memforest: &mut MemForest<UtreexoNodeHash>,
+    ) -> Result<(), error::Utreexo>
+    where
+        FilledTx: Borrow<FilledTransaction>,
+    {
+        // New leaves for the accumulator
+        let mut accumulator_add = Vec::<UtreexoNodeHash>::new();
+        // Accumulator leaves to delete
+        let mut accumulator_del = Vec::<UtreexoNodeHash>::new();
+        for (vout, output) in coinbase_outputs.iter().enumerate() {
+            let outpoint = OutPoint::Coinbase {
+                txid: coinbase_txid,
+                vout: vout as u32,
+            };
+            let pointed_output = PointedOutput {
+                outpoint,
+                output: output.clone(),
+            };
+            accumulator_add.push((&pointed_output).into());
+        }
+        for tx in txs {
+            let tx = tx.borrow();
+            let txid = tx.transaction.txid();
+            for (_, utxo_hash) in tx.transaction.inputs.iter() {
+                accumulator_del.push(utxo_hash.into());
+            }
+            for (vout, output) in tx.transaction.outputs.iter().enumerate() {
+                let outpoint = OutPoint::Regular {
+                    txid,
+                    vout: vout as u32,
+                };
+                let pointed_output = PointedOutput {
+                    outpoint,
+                    output: output.clone(),
+                };
+                accumulator_add.push((&pointed_output).into());
+            }
+        }
+        let () = memforest
+            .modify(&accumulator_add, &accumulator_del)
+            .map_err(error::Utreexo)?;
+        Ok(())
     }
 
     pub fn get_inputs(&self) -> Vec<OutPoint> {

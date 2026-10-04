@@ -11,8 +11,8 @@ use tokio_stream::{StreamMap, wrappers::WatchStream};
 
 use crate::{
     types::{
-        Address, AuthorizedTransaction, InPoint, OutPoint, Output, Transaction,
-        Txid, VERSION, Version,
+        Accumulator, Address, AuthorizedTransaction, InPoint, OutPoint, Output,
+        Transaction, Txid, VERSION, Version,
     },
     util::Watchable,
 };
@@ -453,6 +453,59 @@ impl MemPool {
             .map_err(|err| DbError::from(err).into())
     }
 
+    /// regenerate utreexo proofs for all txs in the mempool
+    ///
+    /// A transaction whose inputs can no longer be proven against the
+    /// accumulator (eg. because they were spent by a just-connected block via
+    /// a conflicting transaction) is no longer valid. Such a transaction is
+    /// evicted from the mempool, along with its descendants, rather than
+    /// propagating an error that would abort block connect/disconnect.
+    pub fn regenerate_proofs(
+        &self,
+        rwtxn: &mut RwTxn,
+        accumulator: &Accumulator,
+    ) -> Result<(), Error> {
+        let txids: Vec<_> = self
+            .transactions
+            .iter_keys(rwtxn)
+            .map_err(DbError::from)?
+            .collect()
+            .map_err(DbError::from)?;
+        for txid in txids {
+            // The tx may already have been evicted as a descendant of an
+            // earlier invalidated tx.
+            let Some(mut tx) = self
+                .transactions
+                .try_get(rwtxn, &txid)
+                .map_err(DbError::from)?
+            else {
+                continue;
+            };
+            let targets: Vec<_> = tx
+                .transaction
+                .inputs
+                .iter()
+                .map(|(_, utxo_hash)| utxo_hash.into())
+                .collect();
+            match accumulator.prove(&targets) {
+                Ok(proof) => {
+                    tx.transaction.proof = proof;
+                    self.transactions
+                        .put(rwtxn, &txid, &tx)
+                        .map_err(DbError::from)?;
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "evicting mempool transaction {txid}: inputs no \
+                         longer in accumulator"
+                    );
+                    let () = self.delete(rwtxn, txid)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn take_trades_ordered(
         &self,
         rotxn: &RoTxn,
@@ -598,7 +651,12 @@ mod p2p_validation_bypass_tests {
         {
             let mut rwtxn = env.write_txn().expect("write txn");
             state
-                .insert_utxo(&mut rwtxn, &funding_outpoint, &funded_output)
+                .insert_utxo(
+                    &mut rwtxn,
+                    &funding_outpoint,
+                    &funded_output,
+                    &mut crate::types::AccumulatorDiff::default(),
+                )
                 .expect("insert utxo");
             rwtxn.commit().expect("commit funding");
         }
@@ -612,6 +670,7 @@ mod p2p_validation_bypass_tests {
                 }),
             )]
             .into(),
+            proof: Default::default(),
             outputs: vec![Output {
                 address: get_address(&VerifyingKey::from(&signing_key(2))),
                 content: OutputContent::Value(Amount::from_sat(90_000)),
@@ -747,6 +806,7 @@ mod tests {
             decision_ids.iter().copied().map(claim_entry).collect();
         let tx = Transaction {
             inputs: vec![(input_outpoint(input_seed), [0; 32])].into(),
+            proof: Default::default(),
             outputs: vec![].into(),
             data: Some(TransactionData::ClaimDecision(
                 crate::types::ClaimDecisionPayload {
@@ -765,6 +825,7 @@ mod tests {
     fn regular_tx(input_seed: u8) -> AuthorizedTransaction {
         let tx = Transaction {
             inputs: vec![(input_outpoint(input_seed), [0; 32])].into(),
+            proof: Default::default(),
             outputs: vec![].into(),
             data: None,
         };

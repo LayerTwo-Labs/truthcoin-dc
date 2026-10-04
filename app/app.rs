@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{borrow::BorrowMut, collections::HashMap, sync::Arc, time::Duration};
 
 use fallible_iterator::FallibleIterator as _;
 use futures::{StreamExt as _, TryFutureExt as _};
@@ -34,6 +34,8 @@ pub enum Error {
     AmountOverflow(#[from] AmountOverflowError),
     #[error(transparent)]
     ComputeMerkleRoot(#[from] truthcoin_dc::types::ComputeMerkleRootError),
+    #[error(transparent)]
+    Utreexo(#[from] truthcoin_dc::types::UtreexoError),
     #[error("CUSF mainchain proto error: {0}")]
     CusfMainchain(#[from] truthcoin_dc::types::proto::Error),
     #[error("io error: {0}")]
@@ -391,10 +393,11 @@ impl App {
         )
     }
 
-    pub fn submit_transaction(
-        &self,
-        tx: &truthcoin_dc::types::AuthorizedTransaction,
-    ) -> Result<(), Error> {
+    /// Regenerate proofs and submit transaction
+    pub fn submit_transaction<Tx>(&self, tx: Tx) -> Result<(), Error>
+    where
+        Tx: BorrowMut<truthcoin_dc::types::AuthorizedTransaction>,
+    {
         self.node.submit_transaction(tx)?;
         let () = self.update()?;
         Ok(())
@@ -402,7 +405,7 @@ impl App {
 
     pub fn sign_and_send(&self, tx: Transaction) -> Result<(), Error> {
         let authorized_transaction = self.wallet.authorize(rand::rng(), tx)?;
-        self.submit_transaction(&authorized_transaction)
+        self.submit_transaction(authorized_transaction)
     }
 
     pub async fn get_new_main_address(
@@ -541,12 +544,45 @@ impl App {
                 );
             }
             let merkle_root = Body::compute_merkle_root(&coinbase, &txs)?;
+            let roots = {
+                let mut accumulator = if let Some(tip_hash) = tip_hash {
+                    let rotxn = self
+                        .node
+                        .env()
+                        .read_txn()
+                        .map_err(node::Error::from)?;
+                    self.node
+                        .archive()
+                        .get_accumulator(&rotxn, tip_hash)
+                        .map_err(node::Error::from)?
+                } else {
+                    types::Accumulator::default()
+                };
+                let coinbase_txid = Coinbase::compute_txid(
+                    &merkle_root,
+                    &prev_main_hash,
+                    prev_side_hash.as_ref(),
+                );
+                let () = types::Body::modify_memforest(
+                    coinbase_txid,
+                    coinbase.outputs.as_slice(),
+                    &txs,
+                    &mut accumulator.0,
+                )?;
+                accumulator
+                    .0
+                    .get_roots()
+                    .iter()
+                    .map(|root| root.get_data())
+                    .collect()
+            };
             let body = Body::new(
                 txs.into_iter().map(|tx| tx.into()).collect(),
                 coinbase,
             );
             let header = types::Header {
                 merkle_root,
+                roots,
                 prev_side_hash,
                 prev_main_hash,
             };
@@ -562,9 +598,43 @@ impl App {
             let coinbase = Coinbase::default();
             let txs: [FilledTransaction; 0] = [];
             let merkle_root = Body::compute_merkle_root(&coinbase, &txs)?;
+            let roots = {
+                let mut accumulator =
+                    if let Some(prev_side_hash) = prev_side_hash {
+                        let rotxn = self
+                            .node
+                            .env()
+                            .read_txn()
+                            .map_err(node::Error::from)?;
+                        self.node
+                            .archive()
+                            .get_accumulator(&rotxn, prev_side_hash)
+                            .map_err(node::Error::from)?
+                    } else {
+                        types::Accumulator::default()
+                    };
+                let coinbase_txid = Coinbase::compute_txid(
+                    &merkle_root,
+                    &prev_main_hash,
+                    prev_side_hash.as_ref(),
+                );
+                let () = types::Body::modify_memforest(
+                    coinbase_txid,
+                    coinbase.outputs.as_slice(),
+                    &txs,
+                    &mut accumulator.0,
+                )?;
+                accumulator
+                    .0
+                    .get_roots()
+                    .iter()
+                    .map(|root| root.get_data())
+                    .collect()
+            };
             let body = Body::new(Vec::new(), coinbase);
             let header = types::Header {
                 merkle_root,
+                roots,
                 prev_side_hash,
                 prev_main_hash,
             };

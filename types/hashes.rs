@@ -12,6 +12,8 @@ const BLAKE3_LENGTH: usize = 32;
 
 pub type Hash = [u8; BLAKE3_LENGTH];
 
+pub type UtreexoNodeHash = rustreexo::accumulator::node_hash::BitcoinNodeHash;
+
 macro_rules! new_hash_wrapper {
     ($vis:vis $ident:ident) => {
         #[derive(

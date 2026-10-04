@@ -212,7 +212,7 @@ pub mod node {
             /// This trait exists only as a bound, and should not be implemented
             /// manually
             #[open_api(ref_schemas[
-truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_schema::BitcoinOutPoint, Address, Authorization, BallotItem, Block, BlockHash, BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, DecisionClaimEntry, Header, MarketId, MerkleRoot, Output, OutputContent, Signature, Transaction, TransactionVerbose, TxData, Txid, CoinbaseTxid, Outputs, Coinbase,
+truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_schema::BitcoinOutPoint, Address, Authorization, BallotItem, Block, BlockHash, BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, DecisionClaimEntry, Header, MarketId, MerkleRoot, Output, OutputContent, Signature, Transaction, TransactionVerbose, TxData, Txid, CoinbaseTxid, Outputs, Coinbase, truthcoin_schema::UtreexoNodeHash, truthcoin_schema::UtreexoProof,
 ])]
             #[rpc(server, server_bounds(Self: private::Sealed))]
             pub trait Rpc {
@@ -271,7 +271,7 @@ truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_sch
     #[open_api(
         merge_apis[get_block::RpcDoc],
         ref_schemas[
-truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_schema::BitcoinOutPoint, truthcoin_schema::BitcoinTransaction, truthcoin_schema::SocketAddr, Address, Authorization, BallotItem, BlockHash, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body, ClaimDecisionPayload, ConsensusResults, DecisionClaimEntry, DecisionContentInfo, DecisionInfo, DecisionState, DecisionSummary, DecisionType, Output, OutputContent, Header, InPoint, M6id, MainchainSyncPhase, MarketDimension, MarketDimensionKind, MarketId, MarketOutcome, MarketResolution, MarketStatus, MerkleRoot, OutPoint, ParticipationStats, PeerConnectionStatus, PeriodStats, ScoreChange, SharePosition, Signature, SpentOutput, Transaction, TxData, TxIn, Txid, WinningOutcome, WithdrawalBundle, WithdrawalBundleInfo, WithdrawalBundleStatus, CoinbaseTxid, Outputs, Coinbase,
+truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_schema::BitcoinOutPoint, truthcoin_schema::BitcoinTransaction, truthcoin_schema::SocketAddr, Address, Authorization, BallotItem, BlockHash, BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body, ClaimDecisionPayload, ConsensusResults, DecisionClaimEntry, DecisionContentInfo, DecisionInfo, DecisionState, DecisionSummary, DecisionType, Output, OutputContent, Header, InPoint, M6id, MainchainSyncPhase, MarketDimension, MarketDimensionKind, MarketId, MarketOutcome, MarketResolution, MarketStatus, MerkleRoot, OutPoint, ParticipationStats, PeerConnectionStatus, PeriodStats, ScoreChange, SharePosition, Signature, SpentOutput, Transaction, TxData, TxIn, Txid, WinningOutcome, WithdrawalBundle, WithdrawalBundleInfo, WithdrawalBundleStatus, CoinbaseTxid, Outputs, Coinbase, truthcoin_schema::UtreexoNodeHash, truthcoin_schema::UtreexoProof,
 ],
     )]
     #[rpc(
@@ -595,7 +595,7 @@ pub mod wallet {
     };
 
     #[open_api(ref_schemas[
-truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_schema::BitcoinOutPoint, Address, Authorization, BallotItem, Block, BlockHash, Body, ClaimDecisionPayload, ClaimedDecisionInfo, DecisionClaimEntry, DecisionClaimItem, DimensionInput, Output, Header, MarketId, MerkleRoot, OutPoint, OutputContent, Signature, Transaction, TxData, Txid, CoinbaseTxid, Outputs, Coinbase,
+truthcoin_schema::BitcoinAddr, truthcoin_schema::BitcoinBlockHash, truthcoin_schema::BitcoinOutPoint, Address, Authorization, BallotItem, Block, BlockHash, Body, ClaimDecisionPayload, ClaimedDecisionInfo, DecisionClaimEntry, DecisionClaimItem, DimensionInput, Output, Header, MarketId, MerkleRoot, OutPoint, OutputContent, Signature, Transaction, TxData, Txid, CoinbaseTxid, Outputs, Coinbase, truthcoin_schema::UtreexoNodeHash, truthcoin_schema::UtreexoProof,
 ])]
     #[rpc(client, server, server_bounds(Self: super::open_api::RpcServer))]
     pub trait Rpc {

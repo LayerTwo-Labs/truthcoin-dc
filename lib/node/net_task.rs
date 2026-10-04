@@ -204,13 +204,16 @@ fn connect_tip_(
                             "connected body")
     }
     let () = state.connect_two_way_peg_data(rwtxn, two_way_peg_data)?;
+    let accumulator = state.get_accumulator(rwtxn)?;
     let () = archive.put_header(rwtxn, header)?;
     let () = archive.put_body(rwtxn, block_hash, body)?;
+    let () = archive.put_accumulator(rwtxn, block_hash, &accumulator)?;
     for transaction in &body.transactions {
         let _evicted =
             mempool.evict_decision_claim_conflicts(rwtxn, transaction)?;
         let () = mempool.delete(rwtxn, transaction.txid())?;
     }
+    let () = mempool.regenerate_proofs(rwtxn, &accumulator)?;
     Ok(())
 }
 
@@ -308,6 +311,25 @@ pub(in crate::node) fn disconnect_tip_(
     };
     let () = state.disconnect_two_way_peg_data(rwtxn, &two_way_peg_data)?;
     let () = state.disconnect_tip(rwtxn, &tip_header, &tip_body)?;
+    // TODO: revert accumulator only necessary because rustreexo does not
+    // support undo yet
+    {
+        match state.try_get_tip(rwtxn)? {
+            Some(new_tip) => {
+                let accumulator = archive.get_accumulator(rwtxn, new_tip)?;
+                let () = state
+                    .utreexo_accumulator
+                    .put(rwtxn, &(), &accumulator)
+                    .map_err(DbError::from)?;
+            }
+            None => {
+                state
+                    .utreexo_accumulator
+                    .delete(rwtxn, &())
+                    .map_err(DbError::from)?;
+            }
+        };
+    }
     for transaction in tip_body.authorized_transactions().iter().rev() {
         match mempool.put(rwtxn, transaction) {
             Ok(()) => {}
@@ -321,6 +343,8 @@ pub(in crate::node) fn disconnect_tip_(
             Err(e) => return Err(e.into()),
         }
     }
+    let accumulator = state.get_accumulator(rwtxn)?;
+    mempool.regenerate_proofs(rwtxn, &accumulator)?;
     Ok(())
 }
 
@@ -1466,13 +1490,23 @@ impl NetTask {
                                 .unbounded_send((new_tip, Some(addr), None))
                                 .map_err(Error::SendNewTipReady)?;
                         }
-                        PeerConnectionInfo::NewTransaction(new_tx) => {
+                        PeerConnectionInfo::NewTransaction(mut new_tx) => {
                             let txid = new_tx.transaction.txid();
                             let result: Result<(), crate::mempool::Error> =
                                 (|| {
                                     let mut rwtxn =
                                         self.ctxt.env.write_txn().map_err(
                                             crate::mempool::Error::from,
+                                        )?;
+                                    let () = self
+                                        .ctxt
+                                        .state
+                                        .regenerate_proof(
+                                            &rwtxn,
+                                            &mut new_tx.transaction,
+                                        )
+                                        .map_err(
+                                            crate::mempool::Error::Validation,
                                         )?;
                                     // Validate the peer-supplied transaction
                                     // before accepting it into the mempool,
@@ -1866,6 +1900,7 @@ mod test {
             merkle_root: MerkleRoot::from([0xab; 32]),
             prev_side_hash: None,
             prev_main_hash: main_hash,
+            roots: Vec::new(),
         };
         let block_hash = header.hash();
         {

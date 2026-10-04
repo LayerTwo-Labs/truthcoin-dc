@@ -40,6 +40,8 @@ pub enum Error {
     InvalidPrevSideHash,
     #[error("invalid merkle root")]
     InvalidMerkleRoot,
+    #[error("no accumulator for block {0}")]
+    NoAccumulator(BlockHash),
     #[error("no ancestor with depth {depth} for block {block_hash}")]
     NoAncestor { block_hash: BlockHash, depth: u32 },
     #[error("no block with hash {0}")]

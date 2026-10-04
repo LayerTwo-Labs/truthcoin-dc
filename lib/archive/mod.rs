@@ -11,7 +11,8 @@ use sneed::{
 };
 
 use crate::types::{
-    Block, BlockHash, BmmResult, Body, Header, Tip, Txid, VERSION, Version,
+    Accumulator, Block, BlockHash, BmmResult, Body, Header, Tip, Txid, VERSION,
+    Version,
     proto::mainchain::{self, BlockHeaderInfo},
 };
 
@@ -24,6 +25,8 @@ pub use side_tips::SideTips;
 
 #[derive(Clone)]
 pub struct Archive {
+    accumulators:
+        DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<Accumulator>>,
     block_hash_to_height:
         DatabaseUnique<SerdeBincode<BlockHash>, SerdeBincode<u32>>,
     /// BMM results for each header.
@@ -104,7 +107,7 @@ pub struct Archive {
 }
 
 impl Archive {
-    pub const NUM_DBS: u32 = SideTips::NUM_DBS + 15;
+    pub const NUM_DBS: u32 = SideTips::NUM_DBS + 16;
 
     pub fn new<Tls>(env: &sneed::Env<Tls>) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn()?;
@@ -127,6 +130,8 @@ impl Archive {
             Some(_) => (),
             None => version.put(&mut rwtxn, &(), &*VERSION)?,
         }
+        let accumulators =
+            DatabaseUnique::create(env, &mut rwtxn, "accumulators")?;
         let block_hash_to_height =
             DatabaseUnique::create(env, &mut rwtxn, "hash_to_height")?;
         let bmm_results =
@@ -180,6 +185,7 @@ impl Archive {
             DatabaseUnique::create(env, &mut rwtxn, "txid_to_inclusions")?;
         rwtxn.commit()?;
         Ok(Self {
+            accumulators,
             block_hash_to_height,
             bmm_results,
             bodies,
@@ -201,6 +207,24 @@ impl Archive {
 
     pub fn side_tips(&self) -> &SideTips {
         &self.side_tips
+    }
+
+    pub fn try_get_accumulator(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: BlockHash,
+    ) -> Result<Option<Accumulator>, Error> {
+        let accumulator = self.accumulators.try_get(rotxn, &block_hash)?;
+        Ok(accumulator)
+    }
+
+    pub fn get_accumulator(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: BlockHash,
+    ) -> Result<Accumulator, Error> {
+        self.try_get_accumulator(rotxn, block_hash)?
+            .ok_or(Error::NoAccumulator(block_hash))
     }
 
     /** Get the height of a block from it's hash.
@@ -647,6 +671,16 @@ impl Archive {
         Ok(inclusions)
     }
 
+    pub fn put_accumulator(
+        &self,
+        rwtxn: &mut RwTxn,
+        block_hash: BlockHash,
+        accumulator: &Accumulator,
+    ) -> Result<(), Error> {
+        self.accumulators.put(rwtxn, &block_hash, accumulator)?;
+        Ok(())
+    }
+
     /// Store a block body. The header must already exist.
     pub fn put_body(
         &self,
@@ -785,6 +819,7 @@ impl Archive {
     ) -> Result<(), Error> {
         let mut stack = vec![block_hash];
         while let Some(block_hash) = stack.pop() {
+            self.accumulators.delete(rwtxn, &block_hash)?;
             self.block_hash_to_height.delete(rwtxn, &block_hash)?;
             if let Some(body) = self.bodies.try_get(rwtxn, &block_hash)? {
                 for tx in body.transactions {

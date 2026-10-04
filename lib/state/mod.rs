@@ -10,30 +10,40 @@ use sneed::{DatabaseUnique, RoDatabaseUnique, RoTxn, RwTxn, UnitKey};
 use crate::{
     authorization::BatchVerificationContext,
     types::{
-        Address, AmountOverflowError, Authorized, AuthorizedTransaction,
-        BlockHash, BlockIndexEvents, Body, FilledTransaction, GetAddress as _,
-        GetValue as _, Header, InPoint, M6id, MerkleRoot, OutPoint,
-        OutPointKey, Output, SpentOutput, Transaction, VERSION, Version,
-        WithdrawalBundle, WithdrawalBundleStatus,
-        proto::mainchain::TwoWayPegData, state::WithdrawalBundleInfo,
+        Accumulator, AccumulatorDiff, Address, AmountOverflowError, Authorized,
+        AuthorizedTransaction, BlockHash, BlockIndexEvents, Body,
+        FilledTransaction, GetAddress as _, GetValue as _, Header, InPoint,
+        M6id, MerkleRoot, OutPoint, OutPointKey, Output, PointedOutput,
+        PointedOutputRef, SpentOutput, Transaction, UtreexoNodeHash,
+        UtreexoProof, VERSION, Version, WithdrawalBundle,
+        WithdrawalBundleStatus, proto::mainchain::TwoWayPegData,
+        state::WithdrawalBundleInfo,
     },
     util::Watchable,
     validation::DecisionValidationInterface,
 };
 
+/// Writes to the UTXO set. Each write records its Utreexo leaf in the
+/// accumulator diff.
 pub trait UtxoManager {
     fn insert_utxo(
         &self,
         rwtxn: &mut RwTxn,
         outpoint: &OutPoint,
         output: &Output,
+        accumulator_diff: &mut AccumulatorDiff,
     ) -> Result<(), Error>;
     fn delete_utxo(
         &self,
         rwtxn: &mut RwTxn,
         outpoint: &OutPoint,
+        accumulator_diff: &mut AccumulatorDiff,
     ) -> Result<bool, Error>;
-    fn clear_utxos(&self, rwtxn: &mut RwTxn) -> Result<(), Error>;
+    fn clear_utxos(
+        &self,
+        rwtxn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
+    ) -> Result<(), Error>;
 }
 
 pub mod block;
@@ -106,6 +116,7 @@ pub struct State {
         SerdeBincode<u32>,
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     >,
+    pub utreexo_accumulator: DatabaseUnique<UnitKey, SerdeBincode<Accumulator>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
     // Undo databases for disconnect_tip chain reorganization support
     settlement_undo: DatabaseUnique<
@@ -208,7 +219,7 @@ impl DecisionValidationInterface for State {
 }
 
 impl State {
-    const BASE_DBS: u32 = 14;
+    const BASE_DBS: u32 = 15;
     const UNDO_DBS: u32 = 6;
 
     pub const NUM_DBS: u32 = reputation::ReputationDbs::NUM_DBS
@@ -274,6 +285,8 @@ impl State {
             &mut rwtxn,
             "withdrawal_bundle_event_blocks",
         )?;
+        let utreexo_accumulator =
+            DatabaseUnique::create(env, &mut rwtxn, "utreexo_accumulator")?;
         let version = DatabaseUnique::create(env, &mut rwtxn, "state_version")?;
         if version.try_get(&rwtxn, &())?.is_none() {
             version.put(&mut rwtxn, &(), &*VERSION)?;
@@ -312,6 +325,7 @@ impl State {
             block_index_events,
             withdrawal_bundle_event_blocks,
             deposit_blocks,
+            utreexo_accumulator,
             _version: version,
             settlement_undo,
             consensus_undo,
@@ -457,11 +471,19 @@ impl UtxoManager for State {
         rwtxn: &mut RwTxn,
         outpoint: &OutPoint,
         output: &Output,
+        accumulator_diff: &mut AccumulatorDiff,
     ) -> Result<(), Error> {
         let key = OutPointKey::from(outpoint);
         self.utxos.put(rwtxn, &key, output)?;
         self.utxos_by_address
             .put(rwtxn, &(output.address, *outpoint), &())?;
+        accumulator_diff.insert(
+            PointedOutputRef {
+                outpoint: *outpoint,
+                output,
+            }
+            .into(),
+        );
         Ok(())
     }
 
@@ -469,6 +491,7 @@ impl UtxoManager for State {
         &self,
         rwtxn: &mut RwTxn,
         outpoint: &OutPoint,
+        accumulator_diff: &mut AccumulatorDiff,
     ) -> Result<bool, Error> {
         let key = OutPointKey::from(outpoint);
         let output = if let Some(output) = self.utxos.try_get(rwtxn, &key)? {
@@ -491,11 +514,33 @@ impl UtxoManager for State {
             )?;
             return Ok(false);
         }
-
+        accumulator_diff.remove(
+            PointedOutputRef {
+                outpoint: *outpoint,
+                output: &output,
+            }
+            .into(),
+        );
         Ok(true)
     }
 
-    fn clear_utxos(&self, rwtxn: &mut RwTxn) -> Result<(), Error> {
+    fn clear_utxos(
+        &self,
+        rwtxn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
+    ) -> Result<(), Error> {
+        let mut iter = self.utxos.iter(rwtxn)?;
+        while let Some((key, output)) = iter.next()? {
+            let outpoint = OutPoint::from(key);
+            accumulator_diff.remove(
+                PointedOutputRef {
+                    outpoint,
+                    output: &output,
+                }
+                .into(),
+            );
+        }
+        drop(iter);
         self.utxos.clear(rwtxn)?;
         self.utxos_by_address.clear(rwtxn)?;
         Ok(())
@@ -564,6 +609,47 @@ impl State {
                 ))
             })?;
         Ok(Some((failed_height, latest_failed_m6id)))
+    }
+
+    /// Get the current Utreexo accumulator
+    pub fn get_accumulator(&self, rotxn: &RoTxn) -> Result<Accumulator, Error> {
+        let accumulator = self
+            .utreexo_accumulator
+            .try_get(rotxn, &())?
+            .unwrap_or_default();
+        Ok(accumulator)
+    }
+
+    /// Regenerate utreexo proof for a tx
+    pub fn regenerate_proof(
+        &self,
+        rotxn: &RoTxn,
+        tx: &mut Transaction,
+    ) -> Result<(), Error> {
+        let accumulator = self.get_accumulator(rotxn)?;
+        let targets: Vec<_> = tx
+            .inputs
+            .iter()
+            .map(|(_, utxo_hash)| utxo_hash.into())
+            .collect();
+        tx.proof = accumulator.prove(&targets)?;
+        Ok(())
+    }
+
+    /// Get a Utreexo proof for the provided utxos
+    pub fn get_utreexo_proof<'a, Utxos>(
+        &self,
+        rotxn: &RoTxn,
+        utxos: Utxos,
+    ) -> Result<UtreexoProof, Error>
+    where
+        Utxos: IntoIterator<Item = &'a PointedOutput>,
+    {
+        let accumulator = self.get_accumulator(rotxn)?;
+        let targets: Vec<UtreexoNodeHash> =
+            utxos.into_iter().map(UtreexoNodeHash::from).collect();
+        let proof = accumulator.prove(&targets)?;
+        Ok(proof)
     }
 
     pub fn fill_transaction(

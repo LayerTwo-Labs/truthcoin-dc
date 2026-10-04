@@ -7,7 +7,8 @@ use transitive::Transitive;
 
 use crate::types::{
     AmountOverflowError, AmountUnderflowError, BlockHash,
-    ComputeMerkleRootError, M6id, MerkleRoot, OutPoint, WithdrawalBundleError,
+    ComputeMerkleRootError, M6id, MerkleRoot, OutPoint, Txid, UtreexoError,
+    WithdrawalBundleError,
 };
 
 #[derive(Debug, Error)]
@@ -145,6 +146,12 @@ pub enum Error {
         m6id: M6id,
         outpoint: OutPoint,
     },
+    #[error(transparent)]
+    Utreexo(#[from] UtreexoError),
+    #[error("Utreexo proof verification failed for tx {txid}")]
+    UtreexoProofFailed { txid: Txid },
+    #[error("Computed Utreexo roots do not match the header roots")]
+    UtreexoRootsMismatch,
     #[error("utxo double spent")]
     UtxoDoubleSpent,
     #[error(

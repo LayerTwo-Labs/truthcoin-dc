@@ -57,6 +57,7 @@ fn spend_inputs(coins: HashMap<OutPoint, Output>) -> Vec<(OutPoint, Hash)> {
 fn new_tx(inputs: Vec<(OutPoint, Hash)>, outputs: Vec<Output>) -> Transaction {
     Transaction {
         inputs: inputs.into(),
+        proof: Default::default(),
         outputs: outputs.into(),
         data: None,
     }
