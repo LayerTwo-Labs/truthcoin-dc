@@ -100,9 +100,11 @@ async fn wallet_sync_task(
             )
         })?
         .decode::<CreateDepositTransactionResponse, _>("txid")?;
-    let () =
-        wait_for_tx_in_mempool(&enforcer_post_setup.bitcoin_cli, &deposit_txid)
-            .await?;
+    let () = wait_for_tx_in_mempool(
+        &enforcer_post_setup.bitcoind_client,
+        &deposit_txid,
+    )
+    .await?;
     let () = mine::mine::<PostSetup>(
         &mut enforcer_post_setup,
         1,
