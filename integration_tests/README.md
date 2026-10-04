@@ -10,12 +10,17 @@ cargo run --example integration_tests
 
 ## Setup
 
-The tests drive a real enforcer, bitcoind and electrs. They read the paths to
-these binaries from environment variables. An example env file is provided
-[here](/integration_tests/example.env).
+The tests drive a real enforcer, bitcoind and electrs. The quickest way to get
+those in place is
 
-Copy it to `integrationtests.env` in the repo root, and set the paths. The
-tests read that file from the working directory or from a parent directory.
+```sh
+./scripts/setup_integration_tests.sh
+```
+
+which fetches or builds the binaries and writes their paths to
+`integrationtests.env` in the repo root. The tests read that file from the
+working directory or from a parent directory. To write the file by hand, start
+from the example env file [here](/integration_tests/example.env).
 
 ```sh
 cargo run --example integration_tests
