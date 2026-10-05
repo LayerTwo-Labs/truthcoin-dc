@@ -21,6 +21,7 @@ use truthcoin_dc_types::authorization::BatchVerificationContext;
 
 use crate::{
     archive::Archive,
+    mempool::MemPool,
     state::State,
     types::{
         AuthorizedTransaction, Network, VERSION, Version,
@@ -302,6 +303,7 @@ pub struct Net {
     pub(crate) batch_verification_ctxt: BatchVerificationContext,
     pub dns_resolver: Arc<TokioResolver>,
     magic_bytes: peer_message::MagicBytes,
+    mempool: MemPool,
     state: State,
     active_peers: Arc<RwLock<HashMap<SocketAddr, PeerConnectionHandle>>>,
     // None indicates that the stream has ended
@@ -439,6 +441,7 @@ impl Net {
             batch_verification_ctxt: self.batch_verification_ctxt,
             magic_bytes: self.magic_bytes,
             resolved_address: resolved_addr,
+            mempool: self.mempool.clone(),
             state: self.state.clone(),
         };
 
@@ -562,6 +565,7 @@ impl Net {
         batch_verification_ctxt: BatchVerificationContext,
         magic_bytes_override: Option<peer_message::MagicBytes>,
         network: Network,
+        mempool: MemPool,
         state: State,
         bind_addr: SocketAddr,
         add_peers: HashSet<PeerAddress>,
@@ -614,6 +618,7 @@ impl Net {
             batch_verification_ctxt,
             dns_resolver,
             magic_bytes,
+            mempool,
             state,
             active_peers,
             peer_info_tx,
@@ -696,6 +701,7 @@ impl Net {
             batch_verification_ctxt: self.batch_verification_ctxt,
             magic_bytes: self.magic_bytes,
             resolved_address: addr.into(),
+            mempool: self.mempool.clone(),
             state: self.state.clone(),
         };
         let (connection_handle, info_rx) =
@@ -780,6 +786,7 @@ mod test {
 
     use crate::{
         archive::Archive,
+        mempool::MemPool,
         net::{
             Net, PeerAddress, PeerConnectionInfo, PeerInfoRx,
             ensure_seed_peers, make_server_endpoint, resolve_peer_address,
@@ -800,8 +807,9 @@ mod test {
             std::process::id()
         ))?;
         let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
-        opts.map_size(16 * 1024 * 1024)
-            .max_dbs(Archive::NUM_DBS + State::NUM_DBS + Net::NUM_DBS);
+        opts.map_size(16 * 1024 * 1024).max_dbs(
+            Archive::NUM_DBS + MemPool::NUM_DBS + State::NUM_DBS + Net::NUM_DBS,
+        );
         let env = unsafe { sneed::Env::open(&opts, temp_dir.path()) }?;
         Ok((temp_dir, env))
     }
@@ -816,6 +824,7 @@ mod test {
     )> {
         let (temp_dir, env) = temp_env(test_name)?;
         let archive = Archive::new(&env)?;
+        let mempool = MemPool::new(&env)?;
         let state = State::new(&env, None)?;
         let (net, info_rx, _known_peers) = Net::new(
             &tokio::runtime::Handle::current(),
@@ -824,6 +833,7 @@ mod test {
             BatchVerificationContext::new(&mut rand::rng()),
             None,
             Network::Regtest,
+            mempool,
             state,
             (Ipv4Addr::LOCALHOST, 0).into(),
             HashSet::new(),
@@ -848,6 +858,7 @@ mod test {
             batch_verification_ctxt: net.batch_verification_ctxt,
             magic_bytes: net.magic_bytes,
             resolved_address: addr.into(),
+            mempool: net.mempool.clone(),
             state: net.state.clone(),
         };
         let (duplicate, duplicate_info) = super::peer::connect(

@@ -454,16 +454,21 @@ impl State {
         Ok(accumulator)
     }
 
-    /// Regenerate utreexo proof for a tx
+    /// Regenerate utreexo proof for a tx.
+    ///
+    /// An input that `unconfirmed` answers has no leaf in the accumulator, so
+    /// it is not a proof target. The transaction that made it proves it.
     pub fn regenerate_proof(
         &self,
         rotxn: &RoTxn,
+        unconfirmed: &HashMap<OutPoint, Output>,
         tx: &mut Transaction,
     ) -> Result<(), Error> {
         let accumulator = self.get_accumulator(rotxn)?;
         let targets: Vec<_> = tx
             .inputs
             .iter()
+            .filter(|(outpoint, _)| !unconfirmed.contains_key(outpoint))
             .map(|(_, utxo_hash)| utxo_hash.into())
             .collect();
         tx.proof = accumulator.prove(&targets)?;
@@ -486,18 +491,28 @@ impl State {
         Ok(proof)
     }
 
+    /// Fill a transaction with the outputs it spends.
+    ///
+    /// `unconfirmed` holds the outputs of transactions that the chain does not
+    /// carry yet: the earlier transactions of a block body, or the ancestors a
+    /// mempool holds. Pass an empty map to read the confirmed set alone.
     pub fn fill_transaction(
         &self,
         rotxn: &RoTxn,
+        unconfirmed: &HashMap<OutPoint, Output>,
         transaction: &Transaction,
     ) -> Result<FilledTransaction, Error> {
         let mut spent_utxos = Vec::with_capacity(transaction.inputs.len());
         for (outpoint, _) in &transaction.inputs {
             let key = OutPointKey::from(outpoint);
-            let utxo =
-                self.utxos.try_get(rotxn, &key)?.ok_or(error::NoUtxo {
-                    outpoint: *outpoint,
-                })?;
+            let utxo = match self.utxos.try_get(rotxn, &key)? {
+                Some(utxo) => utxo,
+                None => {
+                    unconfirmed.get(outpoint).cloned().ok_or(error::NoUtxo {
+                        outpoint: *outpoint,
+                    })?
+                }
+            };
             spent_utxos.push(utxo);
         }
         Ok(FilledTransaction {
@@ -541,10 +556,14 @@ impl State {
     pub fn fill_authorized_transaction(
         &self,
         rotxn: &RoTxn,
+        unconfirmed: &HashMap<OutPoint, Output>,
         transaction: AuthorizedTransaction,
     ) -> Result<Authorized<FilledTransaction>, Error> {
-        let mut filled_tx =
-            self.fill_transaction(rotxn, &transaction.transaction)?;
+        let mut filled_tx = self.fill_transaction(
+            rotxn,
+            unconfirmed,
+            &transaction.transaction,
+        )?;
         filled_tx.actor_address = transaction
             .actor_proof
             .as_ref()
@@ -646,11 +665,15 @@ impl State {
         &self,
         rotxn: &RoTxn,
         batch_verification_ctxt: &BatchVerificationContext,
+        unconfirmed: &HashMap<OutPoint, Output>,
         transaction: &AuthorizedTransaction,
         archive: &crate::archive::Archive,
     ) -> Result<bitcoin::Amount, Error> {
-        let mut filled_transaction =
-            self.fill_transaction(rotxn, &transaction.transaction)?;
+        let mut filled_transaction = self.fill_transaction(
+            rotxn,
+            unconfirmed,
+            &transaction.transaction,
+        )?;
         filled_transaction.actor_address = transaction
             .actor_proof
             .as_ref()
@@ -1107,6 +1130,8 @@ impl Watchable<()> for State {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+
     use bitcoin::hashes::Hash as _;
 
     use crate::{
@@ -1214,7 +1239,8 @@ mod test {
             authorize(rand::rng(), &[(actor, &key)], Transaction::default())?;
         tx.actor_proof = tx.authorizations.pop().map(Box::new);
         let rotxn = env.read_txn()?;
-        let filled = state.fill_authorized_transaction(&rotxn, tx)?;
+        let filled =
+            state.fill_authorized_transaction(&rotxn, &HashMap::new(), tx)?;
         anyhow::ensure!(filled.transaction.actor_address == Some(actor));
         Ok(())
     }

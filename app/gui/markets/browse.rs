@@ -2456,6 +2456,7 @@ impl Browse {
                     }
                 };
                 match app.wallet.amplify_beta(
+                    app.spend_zero_conf_change,
                     market.id,
                     amount,
                     market.creator_address,
@@ -2533,6 +2534,7 @@ impl Browse {
             }
         };
         match app.wallet.trade(
+            app.spend_zero_conf_change,
             market.id,
             actual_idx,
             preview.shares as i64,
@@ -2604,6 +2606,7 @@ impl Browse {
             }
         };
         match app.wallet.trade(
+            app.spend_zero_conf_change,
             market.id,
             actual_idx,
             -(preview.shares as i64),

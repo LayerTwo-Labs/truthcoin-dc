@@ -2120,7 +2120,10 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
 #[async_trait]
 impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
     async fn balance(&self) -> RpcResult<Balance> {
-        self.app.wallet.get_balance().map_err(custom_err)
+        self.app
+            .wallet
+            .get_balance(self.app.spend_zero_conf_change)
+            .map_err(custom_err)
     }
 
     async fn create_deposit(
@@ -2155,6 +2158,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .wallet
             .create_transaction(
                 &accumulator,
+                self.app.spend_zero_conf_change,
                 dest,
                 Amount::from_sat(value_sats),
                 Amount::from_sat(fee_sats),
@@ -2184,6 +2188,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .wallet
             .create_transaction_many(
                 &accumulator,
+                self.app.spend_zero_conf_change,
                 &dests,
                 Amount::from_sat(fee_sats),
             )
@@ -2207,6 +2212,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .wallet
             .create_withdrawal(
                 &accumulator,
+                self.app.spend_zero_conf_change,
                 mainchain_address,
                 Amount::from_sat(amount_sats),
                 Amount::from_sat(mainchain_fee_sats),
@@ -2271,6 +2277,21 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
 
     async fn get_wallet_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
         let utxos = self.app.wallet.get_utxos().map_err(custom_err)?;
+        let utxos = utxos
+            .into_iter()
+            .map(|(outpoint, output)| PointedOutput { outpoint, output })
+            .collect();
+        Ok(utxos)
+    }
+
+    async fn get_unconfirmed_wallet_utxos(
+        &self,
+    ) -> RpcResult<Vec<PointedOutput>> {
+        let utxos = self
+            .app
+            .wallet
+            .get_unconfirmed_utxos()
+            .map_err(custom_err)?;
         let utxos = utxos
             .into_iter()
             .map(|(outpoint, output)| PointedOutput { outpoint, output })
@@ -2536,6 +2557,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .claim_decision(
+                self.app.spend_zero_conf_change,
                 DecisionClaimInput {
                     decision_type,
                     decisions: entries,
@@ -2762,6 +2784,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .create_market(
+                self.app.spend_zero_conf_change,
                 CreateMarketInput {
                     title: request.title,
                     description: request.description,
@@ -2873,6 +2896,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .trade(
+                self.app.spend_zero_conf_change,
                 market_id_struct,
                 request.outcome_index,
                 request.shares_amount,
@@ -2999,6 +3023,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .trade(
+                self.app.spend_zero_conf_change,
                 market_id_struct,
                 request.outcome_index,
                 -request.shares_amount, // Negative for sell
@@ -3035,6 +3060,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .amplify_beta(
+                self.app.spend_zero_conf_change,
                 market_id,
                 request.amount_sats,
                 market.creator_address,
@@ -3123,7 +3149,12 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         let tx = self
             .app
             .wallet
-            .submit_ballot(batch_items, period_id, fee)
+            .submit_ballot(
+                self.app.spend_zero_conf_change,
+                batch_items,
+                period_id,
+                fee,
+            )
             .map_err(custom_err)?;
 
         let txid = tx.txid();
@@ -3174,6 +3205,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .trade(
+                self.app.spend_zero_conf_change,
                 market_id_struct,
                 request.outcome_index,
                 request.shares_amount,

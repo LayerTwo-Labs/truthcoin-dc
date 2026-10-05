@@ -689,7 +689,11 @@ impl CreateMarket {
             1000u64.saturating_add(total_listing_fee),
         );
 
-        match app.wallet.create_market(input, tx_fee) {
+        match app.wallet.create_market(
+            app.spend_zero_conf_change,
+            input,
+            tx_fee,
+        ) {
             Ok((tx, _market_id)) => {
                 if let Err(e) = app.sign_and_send(tx) {
                     self.error = Some(format!("Failed to send: {e:#}"));

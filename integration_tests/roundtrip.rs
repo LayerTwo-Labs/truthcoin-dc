@@ -358,6 +358,7 @@ impl TruthcoinNodes {
                 Init {
                     truthcoin_dc_app: truthcoin_app.clone(),
                     data_dir_suffix: Some(suffix.to_owned()),
+                    extra_args: Vec::new(),
                 },
                 enforcer_post_setup,
                 res_tx.clone(),

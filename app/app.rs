@@ -76,21 +76,17 @@ fn update_wallet(node: &Node, wallet: &Wallet) -> Result<(), Error> {
         .collect();
     wallet.spend_utxos(&redistributed)?;
     let outpoints: Vec<_> = wallet_utxos.into_keys().collect();
-    let spent = node
+    let spent: Vec<_> = node
         .get_spent_utxos(&outpoints)?
         .into_iter()
-        .map(|(outpoint, spent_output)| (outpoint, spent_output.inpoint));
-    let unconfirmed_utxos =
-        node.get_unconfirmed_utxos_by_addresses(&addresses)?;
-    let unconfirmed_outpoints: Vec<_> =
-        wallet.get_unconfirmed_utxos()?.into_keys().collect();
-    let unconfirmed_spent = node.get_unconfirmed_spent_utxos(
-        utxos.keys().chain(&unconfirmed_outpoints),
-    )?;
-    let spent: Vec<_> = spent.chain(unconfirmed_spent).collect();
-    wallet.put_utxos(&utxos)?;
-    wallet.put_unconfirmed_utxos(&unconfirmed_utxos)?;
-    wallet.spend_utxos(&spent)?;
+        .map(|(outpoint, spent_output)| (outpoint, spent_output.inpoint))
+        .collect();
+    wallet.sync_confirmed(&utxos, &spent)?;
+    let confirmed: HashSet<OutPoint> =
+        wallet.get_utxos()?.into_keys().collect();
+    let (unconfirmed, mempool_spent) =
+        node.get_mempool_view(&addresses, &confirmed)?;
+    wallet.set_mempool_view(&unconfirmed, &mempool_spent)?;
 
     tracing::debug!("finished wallet update");
     Ok(())
@@ -102,13 +98,49 @@ fn update(
     utxos: &mut HashMap<OutPoint, Output>,
     unconfirmed_utxos: &mut HashMap<OutPoint, Output>,
     wallet: &Wallet,
+    spend_zero_conf_change: bool,
 ) -> Result<(), Error> {
     tracing::trace!("Updating wallet");
     let () = update_wallet(node, wallet)?;
-    *utxos = wallet.get_utxos()?;
-    *unconfirmed_utxos = wallet.get_unconfirmed_utxos()?;
+    *utxos = spendable_utxos(wallet, spend_zero_conf_change)?;
+    *unconfirmed_utxos = unspendable_unconfirmed_utxos(node, wallet, utxos)?;
     tracing::trace!("Updated wallet");
     Ok(())
+}
+
+/// The coins the wallet may put in a new transaction. It matches what
+/// `Wallet::select_coins` takes under the same option.
+fn spendable_utxos(
+    wallet: &Wallet,
+    spend_zero_conf_change: bool,
+) -> Result<HashMap<OutPoint, Output>, Error> {
+    let mut utxos = wallet.get_utxos()?;
+    let spent = wallet.get_mempool_spent_utxos()?;
+    if spend_zero_conf_change {
+        utxos.extend(wallet.get_unconfirmed_utxos()?);
+    }
+    // A withdrawal output belongs to a bundle, and the state refuses a
+    // transaction that spends one, so `select_coins` skips it too.
+    utxos.retain(|outpoint, output| {
+        !spent.contains(outpoint) && !output.content.is_withdrawal()
+    });
+    Ok(utxos)
+}
+
+/// Outputs of mempool transactions that pay the wallet, and that the wallet
+/// may not spend
+fn unspendable_unconfirmed_utxos(
+    node: &Node,
+    wallet: &Wallet,
+    spendable: &HashMap<OutPoint, Output>,
+) -> Result<HashMap<OutPoint, Output>, Error> {
+    let addresses = wallet.get_addresses()?;
+    let mut utxos = node.get_unconfirmed_utxos_by_addresses(&addresses)?;
+    for (outpoint, _) in node.get_unconfirmed_spent_utxos(utxos.keys())? {
+        utxos.remove(&outpoint);
+    }
+    utxos.retain(|outpoint, _| !spendable.contains_key(outpoint));
+    Ok(utxos)
 }
 
 struct ProtoSupport {
@@ -140,6 +172,7 @@ pub struct Config {
     pub network_magic_override:
         Option<truthcoin_dc::net::peer_message::MagicBytes>,
     pub server_names: HashSet<String>,
+    pub spend_zero_conf_change: bool,
     pub wallet_dir: PathBuf,
 }
 
@@ -149,8 +182,10 @@ pub struct App {
     pub wallet: Wallet,
     pub miner: Option<Arc<TokioRwLock<Miner>>>,
     pub utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
-    /// Outputs of mempool transactions that pay the wallet
+    /// Outputs of mempool transactions that pay the wallet, and that the
+    /// wallet may not spend
     pub unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
+    pub spend_zero_conf_change: bool,
     task: Arc<JoinHandle<()>>,
     pub transaction: Arc<RwLock<Transaction>>,
     pub runtime: Arc<tokio::runtime::Runtime>,
@@ -163,14 +198,19 @@ impl App {
         utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         wallet: Wallet,
+        spend_zero_conf_change: bool,
     ) -> Result<(), Error> {
-        let mut state_changes = node.watch_state();
-        while let Some(()) = state_changes.next().await {
+        // The mempool signal matters as much as the tip: a payment that a peer
+        // sends appears without a block, and a coin that a transaction spends
+        // leaves the spendable set the moment the mempool takes it.
+        let mut changes = node.watch();
+        while let Some(()) = changes.next().await {
             let update_result = update(
                 &node,
                 &mut utxos.write(),
                 &mut unconfirmed_utxos.write(),
                 &wallet,
+                spend_zero_conf_change,
             );
             if let Err(err) = update_result {
                 let err = anyhow::Error::from(err);
@@ -185,14 +225,20 @@ impl App {
         utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         wallet: Wallet,
+        spend_zero_conf_change: bool,
     ) -> JoinHandle<()> {
         spawn(
-            Self::task(node, utxos, unconfirmed_utxos, wallet).unwrap_or_else(
-                |err| {
-                    let err = anyhow::Error::from(err);
-                    tracing::error!("{err:#}")
-                },
-            ),
+            Self::task(
+                node,
+                utxos,
+                unconfirmed_utxos,
+                wallet,
+                spend_zero_conf_change,
+            )
+            .unwrap_or_else(|err| {
+                let err = anyhow::Error::from(err);
+                tracing::error!("{err:#}")
+            }),
         )
     }
 
@@ -391,28 +437,23 @@ impl App {
             &mut rng,
             &runtime,
         )?;
-        let (utxos, unconfirmed_utxos) = {
-            let mut utxos = wallet.get_utxos()?;
-            let mut unconfirmed_utxos = wallet.get_unconfirmed_utxos()?;
-            let transactions = node.get_all_transactions()?;
-            for transaction in &transactions {
-                for (outpoint, _) in &transaction.transaction.inputs {
-                    utxos.remove(outpoint);
-                    unconfirmed_utxos.remove(outpoint);
-                }
-            }
-            (
-                Arc::new(RwLock::new(utxos)),
-                Arc::new(RwLock::new(unconfirmed_utxos)),
-            )
-        };
         let node = Arc::new(node);
+        let spend_zero_conf_change = config.spend_zero_conf_change;
+        let () = update_wallet(&node, &wallet)?;
+        let utxos = Arc::new(RwLock::new(spendable_utxos(
+            &wallet,
+            spend_zero_conf_change,
+        )?));
+        let unconfirmed_utxos = Arc::new(RwLock::new(
+            unspendable_unconfirmed_utxos(&node, &wallet, &utxos.read())?,
+        ));
         let miner = miner.map(|miner| Arc::new(TokioRwLock::new(miner)));
         let task = Self::spawn_task(
             node.clone(),
             utxos.clone(),
             unconfirmed_utxos.clone(),
             wallet.clone(),
+            spend_zero_conf_change,
         );
         drop(rt_guard);
         Ok(Self {
@@ -421,6 +462,7 @@ impl App {
             miner,
             utxos,
             unconfirmed_utxos,
+            spend_zero_conf_change,
             task: Arc::new(task),
             transaction: Arc::new(RwLock::new(Transaction {
                 inputs: vec![].into(),
@@ -440,6 +482,7 @@ impl App {
             &mut self.utxos.write(),
             &mut self.unconfirmed_utxos.write(),
             &self.wallet,
+            self.spend_zero_conf_change,
         )
     }
 

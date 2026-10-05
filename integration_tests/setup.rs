@@ -37,6 +37,9 @@ impl ReservedPorts {
 pub struct Init {
     pub truthcoin_dc_app: PathBuf,
     pub data_dir_suffix: Option<String>,
+    /// More arguments for the truthcoin binary, such as
+    /// `--spend-zero-conf-change=false`.
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -172,12 +175,17 @@ impl Sidechain for PostSetup {
             decision_config_testing: Some(10),
         };
         let truthcoin_dc_app_task = truthcoin_dc_app
-            .spawn_command_with_args::<String, String, _, _, _>([], [], {
-                let res_tx = res_tx.clone();
-                move |err| {
-                    let _err: Result<(), _> = res_tx.unbounded_send(Err(err));
-                }
-            });
+            .spawn_command_with_args::<String, String, _, _, _>(
+                [],
+                init.extra_args,
+                {
+                    let res_tx = res_tx.clone();
+                    move |err| {
+                        let _err: Result<(), _> =
+                            res_tx.unbounded_send(Err(err));
+                    }
+                },
+            );
         tracing::debug!("Started truthcoin");
         sleep(Duration::from_secs(1)).await;
         let rpc_client = jsonrpsee::http_client::HttpClient::builder()

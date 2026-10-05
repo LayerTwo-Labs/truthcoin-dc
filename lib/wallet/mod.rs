@@ -7,7 +7,7 @@ use bip32ish::U31;
 use byteorder::{BigEndian, ByteOrder};
 use fallible_iterator::FallibleIterator as _;
 use futures::{Stream, StreamExt};
-use heed::types::{Bytes, SerdeBincode, U8};
+use heed::types::{Bytes, SerdeBincode, U8, Unit};
 use libes::EciesError;
 use sneed::{Env, EnvError, RwTxnError, UnitKey, db::error::Error as DbError};
 use thiserror::Error;
@@ -184,6 +184,15 @@ pub struct WalletEnv;
 type DatabaseUnique<KC, DC> = sneed::DatabaseUnique<KC, DC, WalletEnv>;
 type RoTxn<'a> = sneed::RoTxn<'a, heed::AnyTls, WalletEnv>;
 
+/// The coins a wallet picked for a transaction.
+pub struct SelectedCoins {
+    pub total: bitcoin::Amount,
+    pub coins: HashMap<OutPoint, Output>,
+    /// The picked coins that no block carries yet. The accumulator holds no
+    /// leaf for them, so a proof leaves them out.
+    pub unconfirmed: HashSet<OutPoint>,
+}
+
 #[derive(Clone)]
 pub struct Wallet {
     env: sneed::Env<heed::WithoutTls, WalletEnv>,
@@ -199,6 +208,12 @@ pub struct Wallet {
         DatabaseUnique<SerdeBincode<[u8; 4]>, SerdeBincode<Address>>,
     utxos: DatabaseUnique<OutPointKey, SerdeBincode<Output>>,
     stxos: DatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>>,
+    /// Unconfirmed outputs that the wallet may spend. The node fills it from
+    /// the mempool on every sync.
+    unconfirmed_utxos: DatabaseUnique<OutPointKey, SerdeBincode<Output>>,
+    /// Confirmed outputs that a mempool transaction already spends. Picking
+    /// one again would make a double spend that the mempool refuses.
+    mempool_spent_utxos: DatabaseUnique<OutPointKey, Unit>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
     /// Map each encryption pubkey to it's index
     epk_to_index:
@@ -212,10 +227,6 @@ pub struct Wallet {
     /// Map each message signing key index to a verifying key
     index_to_vk:
         DatabaseUnique<SerdeBincode<[u8; 4]>, SerdeBincode<VerifyingKey>>,
-    /// Outputs of mempool transactions that pay the wallet
-    unconfirmed_utxos: DatabaseUnique<OutPointKey, SerdeBincode<Output>>,
-    spent_unconfirmed_utxos:
-        DatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>>,
 }
 
 impl Wallet {
@@ -275,6 +286,12 @@ impl Wallet {
             .map_err(EnvError::from)?;
         let stxos = DatabaseUnique::create(&env, &mut rwtxn, "stxos")
             .map_err(EnvError::from)?;
+        let unconfirmed_utxos =
+            DatabaseUnique::create(&env, &mut rwtxn, "unconfirmed_utxos")
+                .map_err(EnvError::from)?;
+        let mempool_spent_utxos =
+            DatabaseUnique::create(&env, &mut rwtxn, "mempool_spent_utxos")
+                .map_err(EnvError::from)?;
         let version = DatabaseUnique::create(&env, &mut rwtxn, "version")
             .map_err(EnvError::from)?;
         let epk_to_index =
@@ -288,12 +305,6 @@ impl Wallet {
                 .map_err(EnvError::from)?;
         let index_to_vk =
             DatabaseUnique::create(&env, &mut rwtxn, "index_to_vk")
-                .map_err(EnvError::from)?;
-        let unconfirmed_utxos =
-            DatabaseUnique::create(&env, &mut rwtxn, "unconfirmed_utxos")
-                .map_err(EnvError::from)?;
-        let spent_unconfirmed_utxos =
-            DatabaseUnique::create(&env, &mut rwtxn, "spent_unconfirmed_utxos")
                 .map_err(EnvError::from)?;
         match version.try_get(&rwtxn, &()).map_err(DbError::from)? {
             Some(db_version)
@@ -322,13 +333,13 @@ impl Wallet {
             index_to_address,
             utxos,
             stxos,
+            unconfirmed_utxos,
+            mempool_spent_utxos,
             _version: version,
             epk_to_index,
             index_to_epk,
             vk_to_index,
             index_to_vk,
-            unconfirmed_utxos,
-            spent_unconfirmed_utxos,
         })
     }
 
@@ -347,7 +358,7 @@ impl Wallet {
         self.unconfirmed_utxos
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
-        self.spent_unconfirmed_utxos
+        self.mempool_spent_utxos
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
         rwtxn.commit().map_err(RwTxnError::from)?;
@@ -408,6 +419,7 @@ impl Wallet {
     pub fn create_withdrawal(
         &self,
         accumulator: &Accumulator,
+        spend_zero_conf_change: bool,
         main_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
         value: bitcoin::Amount,
         main_fee: bitcoin::Amount,
@@ -421,24 +433,29 @@ impl Wallet {
             value = %value.display_dynamic(),
             "Creating withdrawal"
         );
-        let (total, coins) = self.select_coins(
+        let selected = self.select_coins(
             value
                 .checked_add(fee)
                 .ok_or(AmountOverflowError)?
                 .checked_add(main_fee)
                 .ok_or(AmountOverflowError)?,
+            spend_zero_conf_change,
         )?;
-        let change = total - value - fee - main_fee;
+        let change = selected.total - value - fee - main_fee;
 
-        let inputs: Vec<_> = coins
+        let inputs: Vec<_> = selected
+            .coins
             .into_iter()
             .map(|(outpoint, output)| {
                 let utxo_hash = hash(&PointedOutput { outpoint, output });
                 (outpoint, utxo_hash)
             })
             .collect();
-        let input_utxo_hashes: Vec<UtreexoNodeHash> =
-            inputs.iter().map(|(_, hash)| hash.into()).collect();
+        let input_utxo_hashes: Vec<UtreexoNodeHash> = inputs
+            .iter()
+            .filter(|(outpoint, _)| !selected.unconfirmed.contains(outpoint))
+            .map(|(_, hash)| hash.into())
+            .collect();
         let proof = accumulator.prove(&input_utxo_hashes)?;
         let outputs = vec![
             Output {
@@ -466,12 +483,14 @@ impl Wallet {
     pub fn create_transaction(
         &self,
         accumulator: &Accumulator,
+        spend_zero_conf_change: bool,
         address: Address,
         value: bitcoin::Amount,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
         self.create_transaction_many(
             accumulator,
+            spend_zero_conf_change,
             &BTreeMap::from([(address, value)]),
             fee,
         )
@@ -481,6 +500,7 @@ impl Wallet {
     pub fn create_transaction_many(
         &self,
         accumulator: &Accumulator,
+        spend_zero_conf_change: bool,
         dests: &BTreeMap<Address, bitcoin::Amount>,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
@@ -493,18 +513,24 @@ impl Wallet {
                 total.checked_add(*value)
             })
             .ok_or(AmountOverflowError)?;
-        let (total, coins) = self
-            .select_coins(value.checked_add(fee).ok_or(AmountOverflowError)?)?;
-        let change = total - value - fee;
-        let inputs: Vec<_> = coins
+        let selected = self.select_coins(
+            value.checked_add(fee).ok_or(AmountOverflowError)?,
+            spend_zero_conf_change,
+        )?;
+        let change = selected.total - value - fee;
+        let inputs: Vec<_> = selected
+            .coins
             .into_iter()
             .map(|(outpoint, output)| {
                 let utxo_hash = hash(&PointedOutput { outpoint, output });
                 (outpoint, utxo_hash)
             })
             .collect();
-        let input_utxo_hashes: Vec<UtreexoNodeHash> =
-            inputs.iter().map(|(_, hash)| hash.into()).collect();
+        let input_utxo_hashes: Vec<UtreexoNodeHash> = inputs
+            .iter()
+            .filter(|(outpoint, _)| !selected.unconfirmed.contains(outpoint))
+            .map(|(_, hash)| hash.into())
+            .collect();
         let proof = accumulator.prove(&input_utxo_hashes)?;
         let mut outputs: Vec<Output> = dests
             .iter()
@@ -526,23 +552,52 @@ impl Wallet {
         })
     }
 
+    /// Pick coins worth at least `value`. A confirmed coin comes first, so a
+    /// chain of unconfirmed transactions only forms when the confirmed coins
+    /// fall short. Bitcoin Core orders its coin selection the same way.
+    ///
+    /// `spend_zero_conf_change` decides whether the wallet's own unconfirmed
+    /// change joins the pick at all.
     pub fn select_coins(
         &self,
         value: bitcoin::Amount,
-    ) -> Result<(bitcoin::Amount, HashMap<OutPoint, Output>), Error> {
+        spend_zero_conf_change: bool,
+    ) -> Result<SelectedCoins, Error> {
         use rayon::prelude::ParallelSliceMut;
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let mempool_spent: HashSet<OutPointKey> = self
+            .mempool_spent_utxos
+            .iter_keys(&rotxn)
+            .map_err(DbError::from)?
+            .collect()
+            .map_err(DbError::from)?;
         let mut utxos: Vec<_> = self
             .utxos
             .iter(&rotxn)
             .map_err(DbError::from)?
-            .collect()
+            .collect::<Vec<_>>()
             .map_err(DbError::from)?;
+        utxos.retain(|(outpoint_key, _)| !mempool_spent.contains(outpoint_key));
         utxos.par_sort_unstable_by_key(|(_, output)| output.get_value());
+        let mut unconfirmed_utxos: Vec<_> = if spend_zero_conf_change {
+            self.unconfirmed_utxos
+                .iter(&rotxn)
+                .map_err(DbError::from)?
+                .collect()
+                .map_err(DbError::from)?
+        } else {
+            Vec::new()
+        };
+        unconfirmed_utxos
+            .par_sort_unstable_by_key(|(_, output)| output.get_value());
+        let confirmed_count = utxos.len();
 
         let mut selected = HashMap::new();
+        let mut unconfirmed = HashSet::new();
         let mut total = bitcoin::Amount::ZERO;
-        for (outpoint_key, output) in &utxos {
+        for (index, (outpoint_key, output)) in
+            utxos.iter().chain(&unconfirmed_utxos).enumerate()
+        {
             if output.content.is_withdrawal()
                 || output.content.is_market_funds()
             {
@@ -556,11 +611,18 @@ impl Wallet {
                 .ok_or(AmountOverflowError)?;
             let outpoint: OutPoint = outpoint_key.into();
             selected.insert(outpoint, output.clone());
+            if index >= confirmed_count {
+                unconfirmed.insert(outpoint);
+            }
         }
         if total < value {
             return Err(Error::NotEnoughFunds);
         }
-        Ok((total, selected))
+        Ok(SelectedCoins {
+            total,
+            coins: selected,
+            unconfirmed,
+        })
     }
 
     pub fn delete_utxos(&self, outpoints: &[OutPoint]) -> Result<(), Error> {
@@ -591,39 +653,58 @@ impl Wallet {
                 self.stxos
                     .put(&mut txn, &key, &spent_output)
                     .map_err(DbError::from)?;
-            } else if let Some(output) = self
-                .unconfirmed_utxos
-                .try_get(&txn, &key)
-                .map_err(DbError::from)?
-            {
-                self.unconfirmed_utxos
-                    .delete(&mut txn, &key)
-                    .map_err(DbError::from)?;
-                let spent_output = SpentOutput {
-                    output,
-                    inpoint: *inpoint,
-                };
-                self.spent_unconfirmed_utxos
-                    .put(&mut txn, &key, &spent_output)
-                    .map_err(DbError::from)?;
             }
         }
         txn.commit().map_err(RwTxnError::from)?;
         Ok(())
     }
 
-    pub fn put_unconfirmed_utxos(
+    /// Make the confirmed table say what the chain says. `utxos` is every
+    /// output the chain holds for this wallet, and `spent` is what a block
+    /// spent since the last call.
+    ///
+    /// A block that disconnects takes an output off the chain without a spend,
+    /// and it takes the utreexo leaf with it. A row that stays behind reads as
+    /// confirmed, so `create_transaction` makes it a proof target and every
+    /// send fails. Delete such a row here, where the chain's answer is known.
+    pub fn sync_confirmed(
         &self,
         utxos: &HashMap<OutPoint, Output>,
+        spent: &[(OutPoint, InPoint)],
     ) -> Result<(), Error> {
-        let mut txn = self.env.write_txn().map_err(EnvError::from)?;
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
         for (outpoint, output) in utxos {
-            let key = OutPointKey::from(outpoint);
-            self.unconfirmed_utxos
-                .put(&mut txn, &key, output)
+            self.utxos
+                .put(&mut rwtxn, &OutPointKey::from(outpoint), output)
                 .map_err(DbError::from)?;
         }
-        txn.commit().map_err(RwTxnError::from)?;
+        for (outpoint, inpoint) in spent {
+            let key = OutPointKey::from(outpoint);
+            let Some(output) =
+                self.utxos.try_get(&rwtxn, &key).map_err(DbError::from)?
+            else {
+                continue;
+            };
+            self.utxos.delete(&mut rwtxn, &key).map_err(DbError::from)?;
+            let spent_output = SpentOutput {
+                output,
+                inpoint: *inpoint,
+            };
+            self.stxos
+                .put(&mut rwtxn, &key, &spent_output)
+                .map_err(DbError::from)?;
+        }
+        let stale: Vec<OutPointKey> = self
+            .utxos
+            .iter_keys(&rwtxn)
+            .map_err(DbError::from)?
+            .filter(|key| Ok(!utxos.contains_key(&key.into())))
+            .collect()
+            .map_err(DbError::from)?;
+        for key in &stale {
+            self.utxos.delete(&mut rwtxn, key).map_err(DbError::from)?;
+        }
+        rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(())
     }
 
@@ -642,7 +723,16 @@ impl Wallet {
         Ok(())
     }
 
-    pub fn get_balance(&self) -> Result<Balance, Error> {
+    /// The value the wallet holds. A confirmed output that a mempool
+    /// transaction already spends counts for nothing, because the money left.
+    ///
+    /// An unconfirmed output always counts toward `total` and `unconfirmed`,
+    /// the way Bitcoin Core always reports such value. It counts toward
+    /// `available` only when `spend_zero_conf_change` lets the wallet take it.
+    pub fn get_balance(
+        &self,
+        spend_zero_conf_change: bool,
+    ) -> Result<Balance, Error> {
         let mut balance = Balance::default();
         let txn = self.env.read_txn().map_err(EnvError::from)?;
         let () = self
@@ -650,7 +740,15 @@ impl Wallet {
             .iter(&txn)
             .map_err(DbError::from)?
             .map_err(|err| DbError::from(err).into())
-            .for_each(|(_, utxo)| {
+            .for_each(|(key, utxo)| {
+                if self
+                    .mempool_spent_utxos
+                    .try_get(&txn, &key)
+                    .map_err(DbError::from)?
+                    .is_some()
+                {
+                    return Ok(());
+                }
                 let value = utxo.get_value();
                 balance.total = balance
                     .total
@@ -664,19 +762,72 @@ impl Wallet {
                 }
                 Ok::<_, Error>(())
             })?;
+        let () = self
+            .unconfirmed_utxos
+            .iter(&txn)
+            .map_err(DbError::from)?
+            .map_err(|err| DbError::from(err).into())
+            .for_each(|(_, utxo)| {
+                let value = utxo.get_value();
+                balance.total = balance
+                    .total
+                    .checked_add(value)
+                    .ok_or(AmountOverflowError)?;
+                balance.unconfirmed = balance
+                    .unconfirmed
+                    .checked_add(value)
+                    .ok_or(AmountOverflowError)?;
+                if spend_zero_conf_change && !utxo.content.is_withdrawal() {
+                    balance.available = balance
+                        .available
+                        .checked_add(value)
+                        .ok_or(AmountOverflowError)?;
+                }
+                Ok::<_, Error>(())
+            })?;
         Ok(balance)
     }
 
-    pub fn get_utxos(&self) -> Result<HashMap<OutPoint, Output>, Error> {
+    /// Replace what the wallet knows about the mempool: the unconfirmed
+    /// outputs it may spend, and the confirmed outputs a mempool transaction
+    /// already spends. The node states both on every sync, so a wholesale
+    /// replacement leaves no stale row behind when a transaction drops out.
+    pub fn set_mempool_view(
+        &self,
+        unconfirmed: &HashMap<OutPoint, Output>,
+        spent: &HashSet<OutPoint>,
+    ) -> Result<(), Error> {
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        self.unconfirmed_utxos
+            .clear(&mut rwtxn)
+            .map_err(DbError::from)?;
+        self.mempool_spent_utxos
+            .clear(&mut rwtxn)
+            .map_err(DbError::from)?;
+        for (outpoint, output) in unconfirmed {
+            self.unconfirmed_utxos
+                .put(&mut rwtxn, &OutPointKey::from(outpoint), output)
+                .map_err(DbError::from)?;
+        }
+        for outpoint in spent {
+            self.mempool_spent_utxos
+                .put(&mut rwtxn, &OutPointKey::from(outpoint), &())
+                .map_err(DbError::from)?;
+        }
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        Ok(())
+    }
+
+    pub fn get_mempool_spent_utxos(&self) -> Result<HashSet<OutPoint>, Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
-        let utxos: HashMap<OutPoint, Output> = self
-            .utxos
-            .iter(&rotxn)
+        let outpoints: HashSet<OutPoint> = self
+            .mempool_spent_utxos
+            .iter_keys(&rotxn)
             .map_err(DbError::from)?
-            .map(|(key, output)| Ok((key.into(), output)))
+            .map(|key| Ok((&key).into()))
             .collect()
             .map_err(DbError::from)?;
-        Ok(utxos)
+        Ok(outpoints)
     }
 
     pub fn get_unconfirmed_utxos(
@@ -685,6 +836,18 @@ impl Wallet {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         let utxos: HashMap<OutPoint, Output> = self
             .unconfirmed_utxos
+            .iter(&rotxn)
+            .map_err(DbError::from)?
+            .map(|(key, output)| Ok((key.into(), output)))
+            .collect()
+            .map_err(DbError::from)?;
+        Ok(utxos)
+    }
+
+    pub fn get_utxos(&self) -> Result<HashMap<OutPoint, Output>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let utxos: HashMap<OutPoint, Output> = self
+            .utxos
             .iter(&rotxn)
             .map_err(DbError::from)?
             .map(|(key, output)| Ok((key.into(), output)))
@@ -730,11 +893,15 @@ impl Wallet {
         let mut input_addresses = HashSet::new();
         for (outpoint, _) in &transaction.inputs {
             let key = OutPointKey::from(outpoint);
-            let spent_utxo = self
-                .utxos
-                .try_get(&txn, &key)
-                .map_err(DbError::from)?
-                .ok_or(Error::NoUtxo)?;
+            let spent_utxo =
+                match self.utxos.try_get(&txn, &key).map_err(DbError::from)? {
+                    Some(spent_utxo) => spent_utxo,
+                    None => self
+                        .unconfirmed_utxos
+                        .try_get(&txn, &key)
+                        .map_err(DbError::from)?
+                        .ok_or(Error::NoUtxo)?,
+                };
             input_addresses.insert(spent_utxo.address);
             let index = self
                 .address_to_index
@@ -1144,6 +1311,7 @@ impl Wallet {
     /// Returns a new transaction ready to be signed and sent.
     pub fn claim_decision(
         &self,
+        spend_zero_conf_change: bool,
         input: DecisionClaimInput,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
@@ -1152,9 +1320,9 @@ impl Wallet {
             decisions,
         } = input;
 
-        let (total_bitcoin, bitcoin_utxos) = self.select_coins(fee)?;
-        let change = total_bitcoin - fee;
-        let inputs = spend_inputs(bitcoin_utxos);
+        let selected = self.select_coins(fee, spend_zero_conf_change)?;
+        let change = selected.total - fee;
+        let inputs = spend_inputs(selected.coins);
 
         let mut outputs = Vec::new();
         self.push_bitcoin_change(&mut outputs, change)?;
@@ -1180,6 +1348,7 @@ impl Wallet {
     /// - Mixed: `[004008,[004009,00400a]]`
     pub fn create_market(
         &self,
+        spend_zero_conf_change: bool,
         input: CreateMarketInput,
         fee: bitcoin::Amount,
     ) -> Result<(Transaction, crate::state::markets::MarketId), Error> {
@@ -1263,7 +1432,11 @@ impl Wallet {
         }
 
         // Select UTXOs - need to get creator_address from first UTXO
-        let (total_bitcoin, bitcoin_utxos) = self.select_coins(total_cost)?;
+        let SelectedCoins {
+            total: total_bitcoin,
+            coins: bitcoin_utxos,
+            unconfirmed: _,
+        } = self.select_coins(total_cost, spend_zero_conf_change)?;
         let change = total_bitcoin - total_cost;
 
         // Collect inputs first so creator_address matches the first
@@ -1321,6 +1494,7 @@ impl Wallet {
     #[allow(clippy::too_many_arguments)]
     pub fn trade(
         &self,
+        spend_zero_conf_change: bool,
         market_id: crate::state::markets::MarketId,
         outcome_index: usize,
         shares: i64,
@@ -1332,14 +1506,17 @@ impl Wallet {
         let is_buy = shares > 0;
 
         let inputs = if is_buy {
-            let (_total_bitcoin, bitcoin_utxos) =
-                self.select_coins(bitcoin::Amount::from_sat(limit_sats))?;
-            spend_inputs(bitcoin_utxos)
+            let selected = self.select_coins(
+                bitcoin::Amount::from_sat(limit_sats),
+                spend_zero_conf_change,
+            )?;
+            spend_inputs(selected.coins)
         } else {
             let min_fee =
                 bitcoin::Amount::from_sat(trading::TRADE_MINER_FEE_SATS);
-            let (_total_bitcoin, bitcoin_utxos) = self.select_coins(min_fee)?;
-            spend_inputs(bitcoin_utxos)
+            let selected =
+                self.select_coins(min_fee, spend_zero_conf_change)?;
+            spend_inputs(selected.coins)
         };
 
         let outputs = Vec::new();
@@ -1379,6 +1556,7 @@ impl Wallet {
     /// authorization can prove author identity.
     pub fn amplify_beta(
         &self,
+        spend_zero_conf_change: bool,
         market_id: crate::state::markets::MarketId,
         amount: u64,
         market_author: Address,
@@ -1395,8 +1573,9 @@ impl Wallet {
                 .ok_or(AmountOverflowError)?,
         );
 
-        let (_total_bitcoin, bitcoin_utxos) =
-            self.select_coins(total_needed)?;
+        let bitcoin_utxos = self
+            .select_coins(total_needed, spend_zero_conf_change)?
+            .coins;
 
         let has_author_input = bitcoin_utxos
             .values()
@@ -1419,6 +1598,7 @@ impl Wallet {
 
     pub fn submit_ballot(
         &self,
+        spend_zero_conf_change: bool,
         votes: Vec<crate::types::BallotItem>,
         voting_period: u32,
         fee: bitcoin::Amount,
@@ -1430,10 +1610,10 @@ impl Wallet {
             voting_period,
         };
 
-        let (total_bitcoin, bitcoin_utxos) = self.select_coins(fee)?;
-        let change_bitcoin = total_bitcoin - fee;
+        let selected = self.select_coins(fee, spend_zero_conf_change)?;
+        let change_bitcoin = selected.total - fee;
 
-        let inputs = spend_inputs(bitcoin_utxos);
+        let inputs = spend_inputs(selected.coins);
         let mut outputs = Vec::new();
         self.push_bitcoin_change(&mut outputs, change_bitcoin)?;
 
@@ -1529,13 +1709,13 @@ impl Watchable<()> for Wallet {
             index_to_address,
             utxos,
             stxos,
+            unconfirmed_utxos,
+            mempool_spent_utxos,
             _version: _,
             epk_to_index,
             index_to_epk,
             vk_to_index,
             index_to_vk,
-            unconfirmed_utxos,
-            spent_unconfirmed_utxos,
         } = self;
         let watchables = [
             seed.watch().clone(),
@@ -1543,12 +1723,12 @@ impl Watchable<()> for Wallet {
             index_to_address.watch().clone(),
             utxos.watch().clone(),
             stxos.watch().clone(),
+            unconfirmed_utxos.watch().clone(),
+            mempool_spent_utxos.watch().clone(),
             epk_to_index.watch().clone(),
             index_to_epk.watch().clone(),
             vk_to_index.watch().clone(),
             index_to_vk.watch().clone(),
-            unconfirmed_utxos.watch().clone(),
-            spent_unconfirmed_utxos.watch().clone(),
         ];
         let streams = StreamMap::from_iter(
             watchables.into_iter().map(WatchStream::new).enumerate(),
@@ -1565,6 +1745,91 @@ impl Watchable<()> for Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block that disconnects takes an output off the chain without a
+    /// spend, and it takes the utreexo leaf with it. The confirmed row must go
+    /// too, so the output moves to the unconfirmed side, where the proof code
+    /// leaves it out.
+    #[test]
+    fn a_disconnected_output_leaves_the_confirmed_table() -> anyhow::Result<()>
+    {
+        use crate::types::OutputContent;
+
+        let temp_dir = temp_dir::TempDir::with_prefix(format!(
+            "wallet-disconnect-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            std::process::id()
+        ))?;
+        let wallet = Wallet::new(temp_dir.path())?;
+        wallet.set_seed(&[0x99; 64])?;
+        let address = wallet.get_new_address()?;
+        let outpoint = OutPoint::Regular {
+            txid: crate::types::hash(&[0u8; 32]).into(),
+            vout: 0,
+        };
+        let output = Output {
+            address,
+            content: OutputContent::Value(bitcoin::Amount::from_sat(10_000)),
+        };
+        let held = HashMap::from([(outpoint, output.clone())]);
+
+        wallet.sync_confirmed(&held, &[])?;
+        anyhow::ensure!(wallet.get_utxos()?.len() == 1);
+
+        // The chain drops the output, and no block spends it.
+        wallet.sync_confirmed(&HashMap::new(), &[])?;
+        anyhow::ensure!(
+            wallet.get_utxos()?.is_empty(),
+            "the confirmed row must go when the chain drops the output",
+        );
+
+        // The transaction that made it sits in the mempool again.
+        wallet.set_mempool_view(&held, &HashSet::new())?;
+        let balance = wallet.get_balance(true)?;
+        anyhow::ensure!(
+            balance.unconfirmed == bitcoin::Amount::from_sat(10_000),
+            "the output reads as unconfirmed, got {balance:?}",
+        );
+        anyhow::ensure!(
+            balance.total == bitcoin::Amount::from_sat(10_000),
+            "the wallet counts the output one time, got {balance:?}",
+        );
+        anyhow::ensure!(
+            balance.available == bitcoin::Amount::from_sat(10_000),
+            "the wallet may take it, got {balance:?}",
+        );
+
+        // With the option off the value still shows, and the wallet may not
+        // take it. Bitcoin Core reports such value the same way.
+        let balance = wallet.get_balance(false)?;
+        anyhow::ensure!(
+            balance.unconfirmed == bitcoin::Amount::from_sat(10_000)
+                && balance.total == bitcoin::Amount::from_sat(10_000),
+            "the value stays visible, got {balance:?}",
+        );
+        anyhow::ensure!(
+            balance.available == bitcoin::Amount::ZERO,
+            "the wallet may not take it, got {balance:?}",
+        );
+        anyhow::ensure!(
+            wallet
+                .select_coins(bitcoin::Amount::from_sat(1_000), false)
+                .is_err(),
+            "coin selection must refuse the unconfirmed coin",
+        );
+
+        // With the option on the wallet takes it, and marks it unconfirmed so
+        // the proof leaves it out.
+        let selected =
+            wallet.select_coins(bitcoin::Amount::from_sat(1_000), true)?;
+        anyhow::ensure!(
+            selected.unconfirmed.contains(&outpoint),
+            "the wallet takes the coin and marks it unconfirmed",
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_get_receive_address() -> anyhow::Result<()> {
@@ -1712,7 +1977,8 @@ mod tests {
             (Address([3u8; 20]), bitcoin::Amount::from_sat(3000)),
         ]);
         let fee = bitcoin::Amount::from_sat(500);
-        let tx = wallet.create_transaction_many(&accumulator, &dests, fee)?;
+        let tx =
+            wallet.create_transaction_many(&accumulator, true, &dests, fee)?;
 
         let outputs = tx.outputs.as_slice();
         assert_eq!(outputs.len(), 4);
@@ -1737,6 +2003,7 @@ mod tests {
         let dest = Address([4u8; 20]);
         let tx = wallet.create_transaction(
             &accumulator,
+            true,
             dest,
             bitcoin::Amount::from_sat(1000),
             bitcoin::Amount::from_sat(500),
@@ -1766,6 +2033,7 @@ mod tests {
         ]);
         let result = wallet.create_transaction_many(
             &accumulator,
+            true,
             &dests,
             bitcoin::Amount::from_sat(500),
         );
@@ -1783,6 +2051,7 @@ mod tests {
 
         let result = wallet.create_transaction_many(
             &accumulator,
+            true,
             &BTreeMap::new(),
             bitcoin::Amount::from_sat(500),
         );
@@ -1804,6 +2073,7 @@ mod tests {
         // Each coin alone is too small, so the sum decides the selection.
         let tx = wallet.create_transaction_many(
             &accumulator,
+            true,
             &dests,
             bitcoin::Amount::from_sat(100),
         )?;
@@ -1812,6 +2082,7 @@ mod tests {
 
         let result = wallet.create_transaction_many(
             &accumulator,
+            true,
             &dests,
             bitcoin::Amount::from_sat(1000),
         );

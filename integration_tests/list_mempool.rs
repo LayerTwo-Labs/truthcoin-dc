@@ -61,6 +61,7 @@ async fn list_mempool_task(
         Init {
             truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: None,
+            extra_args: Vec::new(),
         },
         &enforcer_post_setup,
         res_tx,

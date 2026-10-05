@@ -19,6 +19,7 @@ use crate::{
     receive_address::receive_address_trial,
     roundtrip::roundtrip_trial,
     setup::{Init, PostSetup},
+    spend_unconfirmed::{spend_unconfirmed_off_trial, spend_unconfirmed_trial},
     transfer_many::transfer_many_trial,
     unknown_withdrawal::unknown_withdrawal_trial,
     util::BinPaths,
@@ -166,6 +167,7 @@ fn deposit_withdraw_roundtrip_trial(
                 Init {
                     truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
                     data_dir_suffix: None,
+                    extra_args: Vec::new(),
                 },
                 res_tx,
             )
@@ -219,6 +221,16 @@ pub fn tests(
             failure_collector.clone(),
         ),
         block_template_address_trial(
+            bin_paths.clone(),
+            file_registry.clone(),
+            failure_collector.clone(),
+        ),
+        spend_unconfirmed_trial(
+            bin_paths.clone(),
+            file_registry.clone(),
+            failure_collector.clone(),
+        ),
+        spend_unconfirmed_off_trial(
             bin_paths.clone(),
             file_registry.clone(),
             failure_collector.clone(),

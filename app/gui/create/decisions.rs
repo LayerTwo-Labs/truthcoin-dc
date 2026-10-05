@@ -429,7 +429,11 @@ impl Decisions {
         let total_fee =
             bitcoin::Amount::from_sat(listing_fee.saturating_add(tx_fee_sats));
 
-        match app.wallet.claim_decision(input, total_fee) {
+        match app.wallet.claim_decision(
+            app.spend_zero_conf_change,
+            input,
+            total_fee,
+        ) {
             Ok(tx) => {
                 if let Err(e) = app.sign_and_send(tx) {
                     self.error = Some(format!("Failed to send: {e:#}"));

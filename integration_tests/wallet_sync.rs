@@ -48,6 +48,7 @@ async fn wallet_sync_task(
         Init {
             truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("miner".to_owned()),
+            extra_args: Vec::new(),
         },
         &enforcer_post_setup,
         res_tx.clone(),
@@ -57,6 +58,7 @@ async fn wallet_sync_task(
         Init {
             truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("wallet".to_owned()),
+            extra_args: Vec::new(),
         },
         &enforcer_post_setup,
         res_tx,
