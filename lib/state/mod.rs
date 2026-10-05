@@ -17,15 +17,14 @@ use sneed::{
 use crate::{
     types::{
         Accumulator, Address, AmountOverflowError, AmountUnderflowError,
-        Authorized, AuthorizedTransaction, BlockHash, BlockIndexEvents, Body,
-        FilledTransaction, GetAddress, GetValue, Header, InPoint, M6id,
-        MerkleRoot, OutPoint, OutPointKey, Output, PointedOutput,
-        PointedOutputRef, SpentOutput, Transaction, UtreexoNodeHash,
-        UtreexoProof, VERSION, Version, WithdrawalBundle,
-        WithdrawalBundleStatus,
+        Authorized, AuthorizedTransaction, BlockHash, Body, FilledTransaction,
+        GetAddress, GetValue, Header, InPoint, M6id, MerkleRoot, OutPoint,
+        OutPointKey, Output, PointedOutput, PointedOutputRef, SpentOutput,
+        Transaction, UtreexoNodeHash, UtreexoProof, VERSION, Version,
+        WithdrawalBundle, WithdrawalBundleStatus,
         authorization::{self, BatchVerificationContext},
         proto::mainchain::TwoWayPegData,
-        state::WithdrawalBundleInfo,
+        state::{TwoWayPegEvent, WithdrawalBundleInfo},
     },
     util::Watchable,
     validation::DecisionValidationInterface,
@@ -86,10 +85,6 @@ pub struct State {
         SerdeBincode<M6id>,
         SerdeBincode<(WithdrawalBundleInfo, RollBack<WithdrawalBundleStatus>)>,
     >,
-    /// Coin movements that no block body carries, keyed by the height that
-    /// applied them
-    pub block_index_events:
-        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<BlockIndexEvents>>,
     /// deposit blocks and the height at which they were applied, keyed sequentially
     pub deposit_blocks: DatabaseUnique<
         SerdeBincode<u32>,
@@ -100,6 +95,10 @@ pub struct State {
         SerdeBincode<u32>,
         SerdeBincode<(bitcoin::BlockHash, u32)>,
     >,
+    /// Coin movements that no block body carries, keyed by the height that
+    /// applied them, in the order the node applied them
+    two_way_peg_events:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Vec<TwoWayPegEvent>>>,
     pub utreexo_accumulator: DatabaseUnique<UnitKey, SerdeBincode<Accumulator>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
     /// Timestamp of the mainchain block that the tip names
@@ -166,9 +165,6 @@ impl State {
         let withdrawal_bundles =
             DatabaseUnique::create(env, &mut rwtxn, "withdrawal_bundles")
                 .map_err(EnvError::from)?;
-        let block_index_events =
-            DatabaseUnique::create(env, &mut rwtxn, "block_index_events")
-                .map_err(EnvError::from)?;
         let deposit_blocks =
             DatabaseUnique::create(env, &mut rwtxn, "deposit_blocks")
                 .map_err(EnvError::from)?;
@@ -178,6 +174,9 @@ impl State {
             "withdrawal_bundle_event_blocks",
         )
         .map_err(EnvError::from)?;
+        let two_way_peg_events =
+            DatabaseUnique::create(env, &mut rwtxn, "two_way_peg_events")
+                .map_err(EnvError::from)?;
         let utreexo_accumulator =
             DatabaseUnique::create(env, &mut rwtxn, "utreexo_accumulator")
                 .map_err(EnvError::from)?;
@@ -248,9 +247,9 @@ impl State {
             pending_withdrawal_bundle,
             latest_failed_withdrawal_bundle,
             withdrawal_bundles,
-            block_index_events,
             deposit_blocks,
             withdrawal_bundle_event_blocks,
+            two_way_peg_events,
             utreexo_accumulator,
             _version: version,
             mainchain_timestamp,
@@ -325,14 +324,15 @@ impl State {
         self.markets.clear_mempool_shares(rwtxn, market_id)
     }
 
-    /// Coin movements that the block at this height applied outside its body.
-    pub fn get_block_index_events(
+    /// Coin movements that the block at this height applied outside its body,
+    /// in the order the node applied them
+    pub fn get_two_way_peg_events(
         &self,
         rotxn: &RoTxn,
         height: u32,
-    ) -> Result<BlockIndexEvents, Error> {
+    ) -> Result<Vec<TwoWayPegEvent>, Error> {
         let events = self
-            .block_index_events
+            .two_way_peg_events
             .try_get(rotxn, &height)?
             .unwrap_or_default();
         Ok(events)
@@ -1112,9 +1112,9 @@ mod test {
     use crate::{
         state::State,
         types::{
-            Address, BlockIndexEvents, FilledTransaction, InPoint, M6id,
-            OutPoint, OutPointKey, Output, OutputContent, PointedOutputRef,
-            SpentOutput, Transaction, hash,
+            Address, FilledTransaction, InPoint, M6id, OutPoint, OutPointKey,
+            Output, OutputContent, PointedOutputRef, SpentOutput, Transaction,
+            hash, state::TwoWayPegEvent,
         },
     };
 
@@ -1298,35 +1298,41 @@ mod test {
     }
 
     #[test]
-    fn block_index_events_round_trip() -> anyhow::Result<()> {
-        let (_temp_dir, env, state) = fresh_state("block-index-events")?;
+    fn two_way_peg_events_round_trip() -> anyhow::Result<()> {
+        let (_temp_dir, env, state) = fresh_state("two-way-peg-events")?;
         let deposit_outpoint = |byte: u8| {
             OutPoint::Deposit(bitcoin::OutPoint {
                 txid: bitcoin::Txid::from_byte_array([byte; 32]),
                 vout: 0,
             })
         };
-        let events = BlockIndexEvents {
-            deposits: vec![(
-                deposit_outpoint(1),
-                value_output(Address::ALL_ZEROS, 5000),
-            )],
-            bundle_spends: vec![(
-                deposit_outpoint(2),
-                M6id(bitcoin::Txid::from_byte_array([3; 32])),
-            )],
-        };
+        let m6id = M6id(bitcoin::Txid::from_byte_array([3; 32]));
+        let events = vec![
+            TwoWayPegEvent::Deposit {
+                outpoint: deposit_outpoint(1),
+                output: value_output(Address::ALL_ZEROS, 5000),
+            },
+            TwoWayPegEvent::BundleSpend {
+                outpoint: deposit_outpoint(2),
+                m6id,
+            },
+            TwoWayPegEvent::BundleReturn {
+                outpoint: deposit_outpoint(2),
+                output: value_output(Address::ALL_ZEROS, 7000),
+                m6id,
+            },
+        ];
         {
             let mut rwtxn = env.write_txn()?;
-            state.block_index_events.put(&mut rwtxn, &7, &events)?;
+            state.two_way_peg_events.put(&mut rwtxn, &7, &events)?;
             rwtxn.commit()?;
         }
         {
             let rotxn = env.read_txn()?;
-            anyhow::ensure!(state.get_block_index_events(&rotxn, 7)? == events);
+            anyhow::ensure!(state.get_two_way_peg_events(&rotxn, 7)? == events);
             // A height that moved nothing outside its body reads as empty.
             anyhow::ensure!(
-                state.get_block_index_events(&rotxn, 8)?.is_empty()
+                state.get_two_way_peg_events(&rotxn, 8)?.is_empty()
             );
         }
 
@@ -1334,17 +1340,17 @@ mod test {
         // the block that takes the height.
         {
             let mut rwtxn = env.write_txn()?;
-            state.block_index_events.delete(&mut rwtxn, &7)?;
+            state.two_way_peg_events.delete(&mut rwtxn, &7)?;
             rwtxn.commit()?;
         }
         let rotxn = env.read_txn()?;
-        anyhow::ensure!(state.get_block_index_events(&rotxn, 7)?.is_empty());
+        anyhow::ensure!(state.get_two_way_peg_events(&rotxn, 7)?.is_empty());
 
         // A height that moved nothing writes no row, so deleting it again is
         // still safe.
         {
             let mut rwtxn = env.write_txn()?;
-            state.block_index_events.delete(&mut rwtxn, &8)?;
+            state.two_way_peg_events.delete(&mut rwtxn, &8)?;
             rwtxn.commit()?;
         }
         Ok(())

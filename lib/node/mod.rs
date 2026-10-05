@@ -29,13 +29,13 @@ use crate::{
     },
     types::{
         Accumulator, Address, AmountUnderflowError, Authorized,
-        AuthorizedTransaction, BlockHash, BlockIndexEvents, BmmResult, Body,
-        FilledTransaction, Header, InPoint, MainchainSyncProgress, Network,
-        OutPoint, OutPointKey, Output, SpentOutput, Tip, Transaction, TxIn,
-        Txid, WithdrawalBundle,
+        AuthorizedTransaction, BlockHash, BmmResult, Body, FilledTransaction,
+        Header, InPoint, MainchainSyncProgress, Network, OutPoint, OutPointKey,
+        Output, SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
         authorization::{BatchVerificationContext, rand_core::CryptoRng},
         net::{Peer, PeerAddress, ResolvedPeerAddress},
         proto::{self, mainchain},
+        state::TwoWayPegEvent,
     },
     util::Watchable,
 };
@@ -471,23 +471,7 @@ where
         Ok(self.archive.get_header(&txn, block_hash)?)
     }
 
-    /// Get the coin movements that the block applied outside its body
-    pub fn get_block_index_events(
-        &self,
-        block_hash: BlockHash,
-    ) -> Result<BlockIndexEvents, Error> {
-        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
-        let height = self.archive.get_height(&rotxn, block_hash)?;
-        // The events are keyed by height, so a block off the current chain
-        // would read another block's events.
-        if self.try_get_block_hash_read(&rotxn, height)? != Some(block_hash) {
-            return Err(Error::NotInCurrentChain { block_hash });
-        }
-        let events = self.state.get_block_index_events(&rotxn, height)?;
-        Ok(events)
-    }
-
-    fn try_get_block_hash_read(
+    fn try_get_block_hash_at(
         &self,
         rotxn: &RoTxn,
         height: u32,
@@ -515,7 +499,23 @@ where
         height: u32,
     ) -> Result<Option<BlockHash>, Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
-        self.try_get_block_hash_read(&rotxn, height)
+        self.try_get_block_hash_at(&rotxn, height)
+    }
+
+    /// Get the coin movements that a block applied outside its body, in the
+    /// order the node applied them
+    pub fn get_two_way_peg_events(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Vec<TwoWayPegEvent>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let height = self.archive.get_height(&rotxn, block_hash)?;
+        // The events are keyed by height, so a block off the active chain
+        // would read another block's events.
+        if self.try_get_block_hash_at(&rotxn, height)? != Some(block_hash) {
+            return Err(Error::NotInActiveChain { block_hash });
+        }
+        Ok(self.state.get_two_way_peg_events(&rotxn, height)?)
     }
 
     pub fn try_get_body(

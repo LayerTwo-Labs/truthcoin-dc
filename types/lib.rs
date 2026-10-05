@@ -95,18 +95,6 @@ pub static OP_DRIVECHAIN_SCRIPT: LazyLock<bitcoin::ScriptBuf> =
         script
     });
 
-/// Coin movements that a block body does not carry: a mainchain deposit, and
-/// the outputs a withdrawal bundle removed
-#[derive(
-    Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,
-)]
-pub struct BlockIndexEvents {
-    /// Outputs that mainchain deposits created
-    pub deposits: Vec<(transaction::OutPoint, transaction::Output)>,
-    /// Outputs that a withdrawal bundle removed, with the bundle that took them
-    pub bundle_spends: Vec<(transaction::OutPoint, M6id)>,
-}
-
 /// One transaction of a block, with the fields its body omits
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct BlockIndexTx {
@@ -169,13 +157,6 @@ pub struct MainchainSyncProgress {
     pub total: u32,
     /// Height of the mainchain tip that the sync moves to
     pub tip_height: u32,
-}
-
-impl BlockIndexEvents {
-    /// True when the block moved no coins outside its body
-    pub fn is_empty(&self) -> bool {
-        self.deposits.is_empty() && self.bundle_spends.is_empty()
-    }
 }
 
 #[serde_as]

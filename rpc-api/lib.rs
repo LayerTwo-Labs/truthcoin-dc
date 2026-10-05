@@ -98,7 +98,7 @@ pub mod node {
         decision::DecisionType,
         market::MarketId,
         net::{Peer, PeerAddress, PeerConnectionStatus},
-        state::WithdrawalBundleInfo,
+        state::{TwoWayPegEvent, WithdrawalBundleInfo},
         transaction::Outputs,
     };
     use typewit::const_marker::Bool;
@@ -476,6 +476,16 @@ pub mod node {
             &self,
             txid: Txid,
         ) -> RpcResult<Option<GetTransactionResponse>>;
+
+        /// Get the coin movements that a block applied outside its body: a
+        /// mainchain deposit, a withdrawal bundle spend, and the outputs a
+        /// failed bundle returned. The list keeps the order the node applied.
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "get_two_way_peg_events")]
+        async fn get_two_way_peg_events(
+            &self,
+            block_hash: truthcoin_dc_types::BlockHash,
+        ) -> RpcResult<Vec<TwoWayPegEvent>>;
 
         /// Get utxos for addresses
         #[method(name = "get_utxos")]

@@ -29,6 +29,7 @@ use truthcoin_dc::{
         WithdrawalBundle,
         authorization::{self, Dst, Signature},
         net::{Peer, PeerAddress},
+        state::TwoWayPegEvent,
         wallet::{Balance, TransferDests},
     },
     validation::DecisionValidator,
@@ -890,25 +891,30 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         let events = self
             .app
             .node
-            .get_block_index_events(block_hash)
+            .get_two_way_peg_events(block_hash)
             .map_err(custom_err)?;
+        let mut deposits = Vec::new();
+        let mut bundle_spends = Vec::new();
+        for event in events {
+            match event {
+                TwoWayPegEvent::Deposit { outpoint, output } => {
+                    deposits.push(truthcoin_dc::types::BlockIndexDeposit {
+                        outpoint,
+                        output,
+                    })
+                }
+                TwoWayPegEvent::BundleSpend { outpoint, m6id } => bundle_spends
+                    .push(truthcoin_dc::types::BlockIndexSpend {
+                        outpoint,
+                        m6id,
+                    }),
+                TwoWayPegEvent::BundleReturn { .. } => (),
+            }
+        }
         Ok(truthcoin_dc::types::BlockIndex {
             txs,
-            deposits: events
-                .deposits
-                .into_iter()
-                .map(|(outpoint, output)| {
-                    truthcoin_dc::types::BlockIndexDeposit { outpoint, output }
-                })
-                .collect(),
-            bundle_spends: events
-                .bundle_spends
-                .into_iter()
-                .map(|(outpoint, m6id)| truthcoin_dc::types::BlockIndexSpend {
-                    outpoint,
-                    m6id,
-                })
-                .collect(),
+            deposits,
+            bundle_spends,
         })
     }
 
@@ -950,6 +956,16 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                     rpc_api::node::GetTransactionResponse { tx, block_hash }
                 });
         Ok(res)
+    }
+
+    async fn get_two_way_peg_events(
+        &self,
+        block_hash: truthcoin_dc::types::BlockHash,
+    ) -> RpcResult<Vec<TwoWayPegEvent>> {
+        self.app
+            .node
+            .get_two_way_peg_events(block_hash)
+            .map_err(custom_err)
     }
 
     async fn get_utxos(

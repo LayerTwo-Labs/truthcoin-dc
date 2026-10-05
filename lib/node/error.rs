@@ -176,8 +176,8 @@ pub enum Error {
     Net(#[from] Box<net::Error>),
     #[error("net task error")]
     NetTask(#[source] Box<net_task::Error>),
-    #[error("block {block_hash} is not in the current chain")]
-    NotInCurrentChain { block_hash: BlockHash },
+    #[error("block {block_hash} is not in the active chain")]
+    NotInActiveChain { block_hash: BlockHash },
     #[error("peer info stream closed")]
     PeerInfoRxClosed,
     #[error("Receive mainchain task response cancelled")]
