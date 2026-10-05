@@ -1411,7 +1411,8 @@ mod tests {
         assert_eq!(fee_sats, 500);
     }
 
-    // A repeated address must not silently drop one of the two payments.
+    // Without `MapPreventDuplicates`, serde keeps the last value for a
+    // repeated key and drops the first payment.
     #[test]
     fn refuse_a_repeated_address() {
         let address = Address([1u8; 20]);

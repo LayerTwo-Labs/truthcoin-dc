@@ -22,7 +22,7 @@ use futures::{
 };
 use tokio::time::sleep;
 use tracing::Instrument as _;
-use truthcoin_dc::types::{GetValue as _, wallet::TransferDests};
+use truthcoin_dc::types::{GetValue as _, OutPoint, wallet::TransferDests};
 use truthcoin_dc_app_rpc_api::{node::RpcClient as _, wallet::RpcClient as _};
 
 use crate::{
@@ -109,14 +109,30 @@ async fn transfer_many_task(
     let () = sidechain.bmm_single(&mut enforcer_post_setup).await?;
     anyhow::ensure!(sidechain.rpc_client.list_mempool().await?.is_empty());
 
-    tracing::debug!("Checking that each address owns its output");
+    tracing::debug!("Checking that one transaction pays each address");
     let utxos = sidechain.rpc_client.get_wallet_utxos().await?;
+    let transfer_txid = |outpoint: OutPoint| match outpoint {
+        OutPoint::Regular { txid, .. } => Some(txid),
+        _ => None,
+    };
     for (address, value_sats) in &dests {
-        anyhow::ensure!(utxos.iter().any(|utxo| {
-            utxo.output.address == *address
-                && utxo.output.get_value() == Amount::from_sat(*value_sats)
-        }));
+        let utxo = utxos
+            .iter()
+            .find(|utxo| utxo.output.address == *address)
+            .ok_or_else(|| {
+                anyhow::anyhow!("no output paid the address `{address}`")
+            })?;
+        anyhow::ensure!(
+            utxo.output.get_value() == Amount::from_sat(*value_sats)
+        );
+        anyhow::ensure!(transfer_txid(utxo.outpoint) == Some(txid));
     }
+    // One output per address, and one more for the change.
+    let transfer_outputs = utxos
+        .iter()
+        .filter(|utxo| transfer_txid(utxo.outpoint) == Some(txid))
+        .count();
+    anyhow::ensure!(transfer_outputs == dests.len() + 1);
 
     drop(sidechain);
     tracing::info!(

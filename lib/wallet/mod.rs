@@ -1714,12 +1714,13 @@ mod tests {
         let fee = bitcoin::Amount::from_sat(500);
         let tx = wallet.create_transaction_many(&accumulator, &dests, fee)?;
 
-        assert_eq!(tx.outputs.len(), 4);
+        let outputs = tx.outputs.as_slice();
+        assert_eq!(outputs.len(), 4);
         for (index, (address, value)) in dests.iter().enumerate() {
-            assert_eq!(tx.outputs.as_slice()[index].address, *address);
-            assert_eq!(value_of(&tx.outputs.as_slice()[index]), value.to_sat());
+            assert_eq!(outputs[index].address, *address);
+            assert_eq!(value_of(&outputs[index]), value.to_sat());
         }
-        let change = &tx.outputs.as_slice()[3];
+        let change = &outputs[3];
         assert_eq!(value_of(change), 10_000 - 1000 - 2000 - 3000 - 500);
         assert!(wallet.get_addresses()?.contains(&change.address));
 
@@ -1741,15 +1742,12 @@ mod tests {
             bitcoin::Amount::from_sat(500),
         )?;
 
-        assert_eq!(tx.outputs.len(), 2);
-        assert_eq!(tx.outputs.as_slice()[0].address, dest);
-        assert_eq!(value_of(&tx.outputs.as_slice()[0]), 1000);
-        assert_eq!(value_of(&tx.outputs.as_slice()[1]), 10_000 - 1000 - 500);
-        assert!(
-            wallet
-                .get_addresses()?
-                .contains(&tx.outputs.as_slice()[1].address)
-        );
+        let outputs = tx.outputs.as_slice();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].address, dest);
+        assert_eq!(value_of(&outputs[0]), 1000);
+        assert_eq!(value_of(&outputs[1]), 10_000 - 1000 - 500);
+        assert!(wallet.get_addresses()?.contains(&outputs[1].address));
 
         let _unused = std::fs::remove_dir_all(&test_dir);
         Ok(())
