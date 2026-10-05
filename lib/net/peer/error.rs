@@ -548,8 +548,13 @@ pub mod mailbox {
     impl Error {
         pub fn is_bad_magic(&self) -> bool {
             match self {
+                Self::BlockingTask(_)
+                | Self::ForwardResponse(_)
+                | Self::HeartbeatTimeout
+                | Self::JoinSendResponse(_)
+                | Self::RequestQueue(_)
+                | Self::SendResponse(_) => false,
                 Self::ReceiveRequest(err) => err.is_bad_magic(),
-                _ => false,
             }
         }
     }
@@ -639,9 +644,18 @@ impl Error {
     /// peer runs a different chain, so it never becomes useful.
     pub fn is_bad_magic(&self) -> bool {
         match self {
+            Self::Archive(_)
+            | Self::Connection(_)
+            | Self::DbEnv(_)
+            | Self::MissingPeerState(_)
+            | Self::SendBlockingTask
+            | Self::SendHeartbeat(_)
+            | Self::SendInfo
+            | Self::SendRequest(_)
+            | Self::SendResponse(_)
+            | Self::State(_) => false,
             Self::Mailbox(err) => err.is_bad_magic(),
             Self::ReceiveResponse(err) => err.is_bad_magic(),
-            _ => false,
         }
     }
 }
