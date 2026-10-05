@@ -1324,6 +1324,14 @@ mod test {
     }
 
     #[test]
+    fn state_opens_a_database_it_created() -> anyhow::Result<()> {
+        let (_temp_dir, env, state) = fresh_state("state-reopen")?;
+        drop(state);
+        State::new(&env, None)?;
+        Ok(())
+    }
+
+    #[test]
     fn two_way_peg_events_round_trip() -> anyhow::Result<()> {
         let (_temp_dir, env, state) = fresh_state("two-way-peg-events")?;
         let deposit_outpoint = |byte: u8| {

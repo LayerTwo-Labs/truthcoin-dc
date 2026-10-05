@@ -7454,7 +7454,7 @@ dependencies = [
 
 [[package]]
 name = "truthcoin_dc"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-lock",
@@ -7517,7 +7517,7 @@ dependencies = [
 
 [[package]]
 name = "truthcoin_dc_app"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7566,7 +7566,7 @@ dependencies = [
 
 [[package]]
 name = "truthcoin_dc_app_cli"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -7589,7 +7589,7 @@ dependencies = [
 
 [[package]]
 name = "truthcoin_dc_app_rpc_api"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -7605,7 +7605,7 @@ dependencies = [
 
 [[package]]
 name = "truthcoin_dc_integration_tests"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "bip300301_enforcer_integration_tests",
@@ -7629,7 +7629,7 @@ dependencies = [
 
 [[package]]
 name = "truthcoin_dc_types"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "bech32",
