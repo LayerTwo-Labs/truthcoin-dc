@@ -48,12 +48,10 @@ pub struct InvalidDecisionId {
 pub enum ParseAddress {
     #[error("bs58 error")]
     Bs58(#[from] bitcoin::base58::InvalidCharacterError),
-    #[error("deposit address `{0}` has no checksum")]
-    MissingDepositChecksum(String),
-    #[error("deposit address `{0}` has no `s<slot>_` prefix")]
-    MissingDepositPrefix(String),
-    #[error("deposit address `{address}` has wrong checksum `{checksum}`")]
-    WrongDepositChecksum { address: String, checksum: String },
+    #[error("`{0}` has no `s<slot>_` prefix or no checksum")]
+    NotADepositAddress(String),
+    #[error("deposit address `{0}` carries a wrong checksum")]
+    WrongDepositChecksum(String),
     #[error("wrong address length {0} != 20")]
     WrongLength(usize),
 }

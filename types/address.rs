@@ -36,29 +36,20 @@ impl Address {
         format!("{prefix}{}", const_hex::encode(&prefix_digest[..3]))
     }
 
-    /// Parse the form that `format_for_deposit` writes
+    /// Parse the form that [`Self::format_for_deposit`] writes
     pub fn from_deposit_address(s: &str) -> Result<Self, ParseAddressError> {
-        let prefix = format!("s{THIS_SIDECHAIN}_");
-        let rest = s.strip_prefix(&prefix).ok_or_else(|| {
-            ParseAddressError::MissingDepositPrefix(s.to_owned())
-        })?;
-        let (address_str, checksum) = rest
-            .rsplit_once('_')
-            .filter(|(_, checksum)| !checksum.is_empty())
+        let address_str = s
+            .strip_prefix(&format!("s{THIS_SIDECHAIN}_"))
+            .and_then(|rest| rest.rsplit_once('_'))
+            .map(|(address_str, _checksum)| address_str)
             .ok_or_else(|| {
-                ParseAddressError::MissingDepositChecksum(s.to_owned())
+                ParseAddressError::NotADepositAddress(s.to_owned())
             })?;
-        let digest =
-            sha256::Hash::hash(format!("{prefix}{address_str}_").as_bytes())
-                .to_byte_array();
-        // A writer may use a longer checksum, so compare only what it names.
-        if !const_hex::encode(digest).starts_with(&checksum.to_lowercase()) {
-            return Err(ParseAddressError::WrongDepositChecksum {
-                address: s.to_owned(),
-                checksum: checksum.to_owned(),
-            });
+        let address: Self = address_str.parse()?;
+        if !address.format_for_deposit().eq_ignore_ascii_case(s) {
+            return Err(ParseAddressError::WrongDepositChecksum(s.to_owned()));
         }
-        address_str.parse()
+        Ok(address)
     }
 }
 
@@ -118,8 +109,6 @@ impl Serialize for Address {
 
 #[cfg(test)]
 mod test {
-    use bitcoin::hashes::{Hash as _, sha256};
-
     use crate::{THIS_SIDECHAIN, address::Address};
 
     #[test]
@@ -130,16 +119,15 @@ mod test {
     }
 
     #[test]
-    fn deposit_address_accepts_longer_checksum() {
+    fn deposit_address_rejects_a_short_checksum() {
         let address = Address([9u8; 20]);
-        let prefix = format!("s{}_{}_", THIS_SIDECHAIN, address.as_base58());
-        let digest = sha256::Hash::hash(prefix.as_bytes()).to_byte_array();
-        let formatted = format!("{prefix}{}", const_hex::encode(&digest[..6]));
-        assert_eq!(Address::from_deposit_address(&formatted).unwrap(), address);
+        let formatted = address.format_for_deposit();
+        let short = &formatted[..formatted.len() - 1];
+        assert!(Address::from_deposit_address(short).is_err());
     }
 
     #[test]
-    fn deposit_address_rejects_wrong_checksum() {
+    fn deposit_address_rejects_a_wrong_checksum() {
         let address = Address([3u8; 20]);
         let formatted =
             format!("s{}_{}_ffffff", THIS_SIDECHAIN, address.as_base58());
@@ -147,7 +135,7 @@ mod test {
     }
 
     #[test]
-    fn deposit_address_rejects_wrong_sidechain() {
+    fn deposit_address_rejects_another_sidechain() {
         let address = Address([3u8; 20]);
         let formatted =
             format!("s{}_{}_000000", THIS_SIDECHAIN + 1, address.as_base58());
@@ -155,7 +143,7 @@ mod test {
     }
 
     #[test]
-    fn deposit_address_rejects_bare_address() {
+    fn deposit_address_rejects_a_bare_address() {
         let address = Address([3u8; 20]);
         assert!(Address::from_deposit_address(&address.as_base58()).is_err());
     }
