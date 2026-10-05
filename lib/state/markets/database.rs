@@ -369,8 +369,10 @@ impl MarketsDatabase {
     > {
         let mut results = Vec::new();
         let mut undo_entries = Vec::new();
-        let trading_markets =
+        let mut trading_markets =
             self.get_markets_by_state(txn, MarketState::Trading)?;
+        // Accumulator insertion order must match on every node.
+        trading_markets.sort_by_key(|market| market.id);
 
         for mut market in trading_markets {
             if market.decision_ids.is_empty() {

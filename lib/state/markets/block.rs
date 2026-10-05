@@ -2919,4 +2919,139 @@ mod tests {
 
         assert!(base2_sequential > base1);
     }
+
+    /// Settlement adds Utreexo leaves, so the order of the settled markets is
+    /// consensus. A rollback puts the markets back in the trading index in
+    /// the reverse order, and the replay of the same block must reach the
+    /// same roots.
+    #[test]
+    fn settlement_replay_keeps_the_roots() -> anyhow::Result<()> {
+        use crate::archive::Archive;
+        use crate::state::MarketBuilder;
+        use crate::state::decisions::{Decision, DecisionId, DecisionType};
+        use crate::state::markets::{
+            DimensionSpec, generate_market_treasury_address,
+        };
+        use crate::state::undo::SettlementUndoData;
+        use crate::types::{Accumulator, Output, Txid, UtreexoNodeHash};
+
+        const HEIGHT: u32 = 3;
+
+        let dir = tempfile::tempdir()?;
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }?;
+        let state = State::new(&env, None)?;
+        let mut rwtxn = env.write_txn()?;
+
+        // Leaves of the two treasury outputs that settlement spends
+        let mut treasury_leaves = AccumulatorDiff::default();
+        for index in 0..2u8 {
+            let decision_id = DecisionId::new(false, 0, index.into())?;
+            let decision = Decision::new(
+                Address::ALL_ZEROS.0,
+                DecisionType::Binary,
+                format!("Header {index}"),
+                "Desc".to_string(),
+                None,
+                None,
+                vec![],
+            )?;
+            let decisions = state.decisions();
+            decisions.claim_decision(
+                &mut rwtxn,
+                decision_id,
+                decision.clone(),
+                Txid([index; 32]),
+                Some(0),
+            )?;
+            decisions.transition_decision_to_voting(
+                &mut rwtxn,
+                decision_id,
+                1,
+            )?;
+            decisions.transition_decision_to_resolved(
+                &mut rwtxn,
+                decision_id,
+                2,
+                1.0,
+            )?;
+            let market = MarketBuilder::new(
+                format!("Market {index}"),
+                Address::ALL_ZEROS,
+            )
+            .with_dimensions(vec![DimensionSpec::Single(decision_id)])
+            .build(
+                0,
+                None,
+                &HashMap::from([(decision_id, decision)]),
+            )?;
+            state.markets().add_market(&mut rwtxn, &market)?;
+            let treasury = OutPoint::Regular {
+                txid: Txid([0x10 + index; 32]),
+                vout: 0,
+            };
+            let treasury_output = Output {
+                address: generate_market_treasury_address(&market.id),
+                content: OutputContent::MarketFunds {
+                    market_id: market.id.0,
+                    amount: bitcoin::Amount::from_sat(10_000),
+                    is_fee: false,
+                },
+            };
+            state.insert_utxo(
+                &mut rwtxn,
+                &treasury,
+                &treasury_output,
+                &mut treasury_leaves,
+            )?;
+            state.markets().set_market_funds_utxo(
+                &mut rwtxn, &market.id, false, &treasury,
+            )?;
+            state.markets().add_shares_to_account(
+                &mut rwtxn,
+                &Address([index + 1; 20]),
+                market.id,
+                0,
+                1_000,
+                0,
+            )?;
+        }
+
+        let settle = |rwtxn: &mut RwTxn| -> anyhow::Result<(
+            Vec<UtreexoNodeHash>,
+            SettlementUndoData,
+        )> {
+            let mut diff = AccumulatorDiff::default();
+            let (_, entries) =
+                state.markets().transition_and_payout_resolved_markets(
+                    rwtxn,
+                    &mut diff,
+                    &state,
+                    state.decisions(),
+                    HEIGHT,
+                )?;
+            anyhow::ensure!(entries.len() == 2, "both markets must settle");
+            let mut accumulator = Accumulator::default();
+            accumulator.apply_diff(treasury_leaves.clone())?;
+            accumulator.apply_diff(diff)?;
+            Ok((accumulator.get_roots(), SettlementUndoData { entries }))
+        };
+
+        let (roots, undo) = settle(&mut rwtxn)?;
+        revert_settlement(
+            &state,
+            &mut rwtxn,
+            &mut AccumulatorDiff::default(),
+            &undo,
+            HEIGHT,
+        )?;
+        let (replayed_roots, _) = settle(&mut rwtxn)?;
+        anyhow::ensure!(
+            replayed_roots == roots,
+            "the replay reached other roots: {replayed_roots:?} != {roots:?}"
+        );
+        Ok(())
+    }
 }
