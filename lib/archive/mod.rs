@@ -1680,7 +1680,7 @@ pub(crate) mod test {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let temp_dir = temp_dir::TempDir::with_prefix(format!(
-            "thunder-{test_name}-{}-{nanos}",
+            "truthcoin-{test_name}-{}-{nanos}",
             std::process::id()
         ))?;
         let mut opts = heed::EnvOpenOptions::new();

@@ -498,8 +498,16 @@ where
                 let bmm_commitment = archive
                     .get_main_block_info(&rwtxn, &block_hash)?
                     .bmm_commitment;
-                let parent_info =
-                    archive.main_parent_header_info(&rwtxn, &header_info)?;
+                let parent_info = if header_info.prev_block_hash
+                    != bitcoin::BlockHash::all_zeros()
+                {
+                    Some(archive.get_main_header_info(
+                        &rwtxn,
+                        &header_info.prev_block_hash,
+                    )?)
+                } else {
+                    None
+                };
                 let () = archive
                     .side_tips()
                     .disconnect_mainchain_tip(
@@ -658,7 +666,9 @@ where
             }
             self.sync_progress.set_idle();
             tokio::time::sleep(RECONNECT_DELAY).await;
-            tracing::info!("Mainchain task: connecting to the mainchain node");
+            tracing::info!(
+                "Mainchain task: connect to the mainchain node again"
+            );
         }
     }
 }
@@ -767,17 +777,22 @@ mod test {
     use parking_lot::Mutex;
     use tonic::codegen::{BoxFuture, Service, http};
 
-    use super::{MainchainTask, SyncProgress};
+    use super::{
+        MainchainBlockEvent, MainchainTask, MainchainTaskHandle, Request,
+        SyncProgress,
+    };
     use crate::{
         archive::{Archive, test::main_header_info},
         types::{
             MainchainSyncPhase, MainchainSyncProgress,
             proto::{
                 common::{ConsensusHex, ReverseHex},
-                mainchain::{ValidatorClient, generated},
+                mainchain::{BlockInfo, ValidatorClient, generated},
             },
         },
     };
+
+    type Task = MainchainTask<tonic::transport::Channel>;
 
     fn temp_env()
     -> anyhow::Result<(temp_dir::TempDir, sneed::Env<heed::WithoutTls>)> {
@@ -1007,6 +1022,82 @@ mod test {
                 "total": 0,
                 "tip_height": 0,
             })
+        );
+        Ok(())
+    }
+
+    /// A disconnect must return the mainchain tip to the parent of the block
+    /// it removes, so that the same block connects again.
+    #[test]
+    fn a_disconnect_returns_the_tip_to_the_parent() -> anyhow::Result<()> {
+        let (_temp_dir, env) = temp_env()?;
+        let archive = Archive::new(&env)?;
+        let (mut event_tx, _event_rx) = mpsc::unbounded();
+        let connect = |height: u32| MainchainBlockEvent::ConnectBlock {
+            header_info: main_header_info(height),
+            block_info: BlockInfo {
+                bmm_commitment: None,
+                events: Vec::new(),
+            },
+        };
+
+        for height in 0..2 {
+            let () = Task::handle_block_event(
+                &env,
+                &archive,
+                &mut event_tx,
+                connect(height),
+            )?;
+        }
+        let () = Task::handle_block_event(
+            &env,
+            &archive,
+            &mut event_tx,
+            MainchainBlockEvent::DisconnectBlock {
+                block_hash: main_header_info(1).block_hash,
+            },
+        )?;
+        {
+            let rotxn = env.read_txn()?;
+            let tip = archive.side_tips().get_mainchain_tip(&rotxn)?;
+            anyhow::ensure!(
+                tip.tip_info.map(|info| info.block_hash)
+                    == Some(main_header_info(0).block_hash),
+                "the disconnect left the tip at the block it removed"
+            );
+        }
+        // The block connects again, which it cannot do while the tip holds it.
+        let () = Task::handle_block_event(
+            &env,
+            &archive,
+            &mut event_tx,
+            connect(1),
+        )?;
+        Ok(())
+    }
+
+    /// The mainchain node can go away, and the task must take a request after
+    /// it does. A task that stops for good closes the request channel.
+    #[tokio::test]
+    async fn the_task_takes_a_request_after_the_mainchain_node_fails()
+    -> anyhow::Result<()> {
+        let (_temp_dir, env) = temp_env()?;
+        let archive = Archive::new(&env)?;
+        // Port 1 accepts nothing, so every call to the validator service fails.
+        let transport = tonic::transport::channel::Channel::from_static(
+            "http://127.0.0.1:1",
+        )
+        .connect_lazy();
+        let (task_handle, _event_rx) = MainchainTaskHandle::new(
+            env,
+            archive,
+            ValidatorClient::new(transport),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let request = Request::AncestorInfos(bitcoin::BlockHash::all_zeros());
+        anyhow::ensure!(
+            task_handle.request(request).is_ok(),
+            "the task stopped, so it took no request"
         );
         Ok(())
     }
