@@ -200,8 +200,8 @@ const FORKNET_SEED_PEER_ADDRS: &[PeerAddress<&'static str>] = {
     ]
 };
 
-/// Add every seed address the network names that the database does not hold.
-/// A datadir made before a seed existed would otherwise never learn it.
+/// Write every seed address that the network names. A datadir made before a
+/// seed existed would otherwise never learn it.
 fn ensure_seed_peers(
     known_peers: &DatabaseUnique<SerdeBincode<PeerAddress>, Unit>,
     rwtxn: &mut RwTxn,
@@ -209,9 +209,7 @@ fn ensure_seed_peers(
 ) -> Result<(), DbError> {
     for seed_peer_addr in seed_peer_addrs(network) {
         let seed_peer_addr = PeerAddress::to_owned(seed_peer_addr);
-        if known_peers.try_get(rwtxn, &seed_peer_addr)?.is_none() {
-            known_peers.put(rwtxn, &seed_peer_addr, &())?;
-        }
+        known_peers.put(rwtxn, &seed_peer_addr, &())?;
     }
     Ok(())
 }
@@ -1063,8 +1061,8 @@ mod test {
         Ok(())
     }
 
-    /// Every seed reaches a peer table that already exists, and a second call
-    /// writes the same set.
+    /// A datadir made before a seed existed still learns it, and a second
+    /// start adds no row.
     #[test]
     fn seeds_reach_an_existing_database() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("seed-peers")?;
