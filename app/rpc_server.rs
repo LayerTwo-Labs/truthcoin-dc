@@ -2451,7 +2451,12 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         let tx = self
             .app
             .wallet
-            .transfer_reputation(dest, amount, Amount::from_sat(fee_sats))
+            .transfer_reputation(
+                self.app.spend_zero_conf_change,
+                dest,
+                amount,
+                Amount::from_sat(fee_sats),
+            )
             .map_err(custom_err)?;
         let txid = tx.txid();
         let () = self.app.sign_and_send(tx).map_err(custom_err)?;

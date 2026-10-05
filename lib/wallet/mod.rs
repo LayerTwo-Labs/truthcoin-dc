@@ -1625,6 +1625,7 @@ impl Wallet {
 
     pub fn transfer_reputation(
         &self,
+        spend_zero_conf_change: bool,
         dest: Address,
         amount: f64,
         fee: bitcoin::Amount,
@@ -1636,8 +1637,12 @@ impl Wallet {
             amount,
         };
 
-        let (total_bitcoin, bitcoin_utxos) =
-            self.select_bitcoins_from_address(fee, voter_addr)?;
+        let (total_bitcoin, bitcoin_utxos) = self
+            .select_bitcoins_from_address(
+                fee,
+                voter_addr,
+                spend_zero_conf_change,
+            )?;
         let change_bitcoin = total_bitcoin - fee;
 
         let inputs = spend_inputs(bitcoin_utxos);
@@ -1655,12 +1660,21 @@ impl Wallet {
         Ok(tx)
     }
 
+    /// Pick coins of `address` worth at least `value`. A confirmed coin comes
+    /// first, the same way as in `select_coins`.
     fn select_bitcoins_from_address(
         &self,
         value: bitcoin::Amount,
         address: Address,
+        spend_zero_conf_change: bool,
     ) -> Result<(bitcoin::Amount, HashMap<OutPoint, Output>), Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let mempool_spent: HashSet<OutPointKey> = self
+            .mempool_spent_utxos
+            .iter_keys(&rotxn)
+            .map_err(DbError::from)?
+            .collect()
+            .map_err(DbError::from)?;
 
         let mut bitcoin_utxos = Vec::with_capacity(16);
         let mut iter = self.utxos.iter(&rotxn).map_err(DbError::from)?;
@@ -1670,6 +1684,7 @@ impl Wallet {
             if output.address == address
                 && output.content.is_value()
                 && output.get_value() > bitcoin::Amount::ZERO
+                && !mempool_spent.contains(&outpoint)
             {
                 bitcoin_utxos.push((OutPoint::from(outpoint), output));
             }
@@ -1680,6 +1695,27 @@ impl Wallet {
                 std::cmp::Reverse(output.get_value())
             },
         );
+        if spend_zero_conf_change {
+            let mut unconfirmed_utxos = Vec::new();
+            let mut iter =
+                self.unconfirmed_utxos.iter(&rotxn).map_err(DbError::from)?;
+            while let Some((outpoint, output)) =
+                iter.next().map_err(DbError::from)?
+            {
+                if output.address == address
+                    && output.content.is_value()
+                    && output.get_value() > bitcoin::Amount::ZERO
+                {
+                    unconfirmed_utxos.push((OutPoint::from(outpoint), output));
+                }
+            }
+            unconfirmed_utxos.sort_unstable_by_key(
+                |(_, output): &(OutPoint, Output)| {
+                    std::cmp::Reverse(output.get_value())
+                },
+            );
+            bitcoin_utxos.extend(unconfirmed_utxos);
+        }
 
         let mut selected = HashMap::with_capacity(bitcoin_utxos.len().min(10));
         let mut total = bitcoin::Amount::ZERO;
@@ -1989,6 +2025,62 @@ mod tests {
         let change = &outputs[3];
         assert_eq!(value_of(change), 10_000 - 1000 - 2000 - 3000 - 500);
         assert!(wallet.get_addresses()?.contains(&change.address));
+
+        let _unused = std::fs::remove_dir_all(&test_dir);
+        Ok(())
+    }
+
+    /// The node marks the inputs of a mempool transaction as mempool-spent.
+    /// A second reputation transfer before a block must take another coin.
+    #[test]
+    fn a_second_reputation_transfer_skips_mempool_spent_coins()
+    -> anyhow::Result<()> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let test_dir = std::env::temp_dir()
+            .join(format!("truthcoin_dc_test_reputation_twice_{nanos}"));
+        let wallet = Wallet::new(&test_dir)?;
+        wallet.set_seed(&[3u8; 64])?;
+        let voter = wallet.voter_address()?;
+        let utxos: HashMap<OutPoint, Output> = [5_000, 4_000]
+            .into_iter()
+            .enumerate()
+            .map(|(index, sats)| {
+                let outpoint = OutPoint::Regular {
+                    txid: [index as u8; 32].into(),
+                    vout: 0,
+                };
+                let output = Output {
+                    address: voter,
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        sats,
+                    )),
+                };
+                (outpoint, output)
+            })
+            .collect();
+        wallet.put_utxos(&utxos)?;
+        let dest = Address([5u8; 20]);
+        let fee = bitcoin::Amount::from_sat(1_000);
+
+        let first = wallet.transfer_reputation(true, dest, 0.1, fee)?;
+        let first_inputs: HashSet<OutPoint> =
+            first.inputs.iter().map(|(outpoint, _)| *outpoint).collect();
+        wallet.set_mempool_view(&HashMap::new(), &first_inputs)?;
+        let second = wallet.transfer_reputation(true, dest, 0.1, fee)?;
+        let second_inputs: HashSet<OutPoint> = second
+            .inputs
+            .iter()
+            .map(|(outpoint, _)| *outpoint)
+            .collect();
+        anyhow::ensure!(
+            first_inputs.is_disjoint(&second_inputs),
+            "both transfers spend {:?}",
+            first_inputs
+                .intersection(&second_inputs)
+                .collect::<Vec<_>>(),
+        );
 
         let _unused = std::fs::remove_dir_all(&test_dir);
         Ok(())
