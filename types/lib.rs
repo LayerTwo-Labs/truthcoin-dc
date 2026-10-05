@@ -143,18 +143,6 @@ pub struct BlockIndex {
     pub bundle_spends: Vec<BlockIndexSpend>,
 }
 
-/// One transaction the mempool holds
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MempoolTx {
-    /// Blake3 over the canonical encoding
-    pub txid: Txid,
-    /// Canonical size in bytes
-    pub size: u64,
-    /// Borsh encoding, as hex
-    pub raw: String,
-    pub tx: transaction::Transaction,
-}
-
 /// Step of the startup sync with the mainchain
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ToSchema,

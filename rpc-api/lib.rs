@@ -91,7 +91,7 @@ pub mod node {
         BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body,
         ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
         Header, InPoint, M6id, MainchainSyncPhase, MainchainSyncProgress,
-        MempoolTx, MerkleRoot, OutPoint, Output, OutputContent, PointedOutput,
+        MerkleRoot, OutPoint, Output, OutputContent, PointedOutput,
         SpentOutput, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
         WithdrawalBundleStatus,
         authorization::Signature,
@@ -349,6 +349,18 @@ pub mod node {
         pub tx: Transaction,
         /// Block hash, if in the active chain
         pub block_hash: Option<BlockHash>,
+    }
+
+    /// One transaction the mempool holds
+    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+    pub struct MempoolTx {
+        /// Blake3 over the canonical encoding
+        pub txid: Txid,
+        /// Canonical size in bytes
+        pub size: u64,
+        /// Borsh encoding, as hex
+        pub raw: String,
+        pub tx: Transaction,
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]

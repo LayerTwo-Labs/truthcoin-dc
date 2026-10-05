@@ -1008,24 +1008,23 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         Ok(peers)
     }
 
-    async fn list_mempool(
-        &self,
-    ) -> RpcResult<Vec<truthcoin_dc::types::MempoolTx>> {
+    async fn list_mempool(&self) -> RpcResult<Vec<rpc_api::node::MempoolTx>> {
         let txs = self.app.node.get_all_transactions().map_err(custom_err)?;
-        let res = txs
-            .into_iter()
+        txs.into_iter()
             .map(|authorized| {
                 let tx = authorized.transaction;
-                Ok(truthcoin_dc::types::MempoolTx {
+                let size = tx.canonical_size().map_err(custom_err)?;
+                let raw = const_hex::encode(
+                    tx.canonical_bytes().map_err(custom_err)?,
+                );
+                Ok(rpc_api::node::MempoolTx {
                     txid: tx.txid(),
-                    size: tx.canonical_size()?,
-                    raw: const_hex::encode(tx.canonical_bytes()?),
+                    size,
+                    raw,
                     tx,
                 })
             })
-            .collect::<Result<_, std::io::Error>>()
-            .map_err(custom_err)?;
-        Ok(res)
+            .collect()
     }
 
     async fn list_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
