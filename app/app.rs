@@ -572,10 +572,10 @@ impl App {
                         address: self.wallet.voter_address()?,
                         content: types::OutputContent::Value(tx_fees),
                     }],
+                    // A template is built on every poll and mostly thrown
+                    // away, so it must not derive an address each time.
                     _ => vec![types::Output {
-                        // A template is built on every poll and mostly thrown
-                        // away, so it must not derive an address each time.
-                        address: self.wallet.get_receive_address()?,
+                        address: self.wallet.get_or_generate_last_address()?,
                         content: types::OutputContent::Value(tx_fees),
                     }],
                 };
