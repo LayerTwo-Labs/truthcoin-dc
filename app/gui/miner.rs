@@ -30,7 +30,7 @@ impl Miner {
     ) {
         let tip = app.and_then(|app| app.node.try_get_tip().ok().flatten());
         let block_height =
-            app.and_then(|app| app.node.try_get_tip_height().ok().flatten());
+            app.and_then(|app| app.node.try_get_height().ok().flatten());
 
         match (tip, block_height) {
             (Some(hash), Some(h)) => {

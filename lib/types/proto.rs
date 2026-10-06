@@ -2,11 +2,12 @@
 
 use thiserror::Error;
 
-/// Convenience trait for a lengthy trait bound. A blanket impl covers every
-/// type that satisfies the bounds.
+/// Convenience trait to avoid writing out a lengthy trait bound.
 ///
-/// The associated types restate the `GrpcService` bounds, so that
-/// `T: Transport` alone gives all of them.
+/// The associated types exist only to restate the bounds on
+/// `GrpcService`'s associated types as bounds on `Transport`'s own associated
+/// types, so that `T: Transport` alone implies all of them. Blanket-implemented
+/// for every type satisfying those bounds.
 pub trait Transport:
     tonic::client::GrpcService<
         tonic::body::Body,
@@ -281,6 +282,8 @@ pub mod common {
 }
 
 pub mod mainchain {
+    use std::str::FromStr;
+
     use bitcoin::{
         self, BlockHash, Network, OutPoint, Transaction, Txid, Work,
         hashes::Hash as _,
@@ -292,12 +295,8 @@ pub mod mainchain {
     use thiserror::Error;
 
     use super::common::{ConsensusHex, ReverseHex};
-    use crate::types::{
-        BitcoinOutputContent, FilledOutput, FilledOutputContent, M6id,
-        THIS_SIDECHAIN,
-    };
+    use crate::types::{M6id, Output, OutputContent, THIS_SIDECHAIN};
 
-    #[allow(clippy::double_must_use)]
     pub mod generated {
         tonic::include_proto!("cusf.mainchain.v1");
     }
@@ -444,7 +443,7 @@ pub mod mainchain {
         }
     }
 
-    impl TryFrom<generated::deposit::Output> for FilledOutput {
+    impl TryFrom<generated::deposit::Output> for Output {
         type Error = super::Error;
 
         fn try_from(
@@ -481,7 +480,11 @@ pub mod mainchain {
                             break 'address Address::ALL_ZEROS;
                         }
                     };
-                match <Address as std::str::FromStr>::from_str(address_utf8) {
+                // A deposit made before the prefixed form carries a bare
+                // address.
+                match Address::from_deposit_address(address_utf8)
+                    .or_else(|_| Address::from_str(address_utf8))
+                {
                     Ok(address) => address,
                     Err(_) => {
                         tracing::warn!(
@@ -501,10 +504,7 @@ pub mod mainchain {
                 .map(bitcoin::Amount::from_sat)?;
             Ok(Self {
                 address,
-                memo: Vec::new(),
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    value,
-                )),
+                content: OutputContent::Value(value),
             })
         }
     }
@@ -528,7 +528,7 @@ pub mod mainchain {
         /// Position of this transaction within the block that included it
         pub tx_index: u64,
         pub outpoint: OutPoint,
-        pub output: FilledOutput,
+        pub output: Output,
     }
 
     impl TryFrom<generated::Deposit> for Deposit {
@@ -1016,6 +1016,16 @@ pub mod mainchain {
             Self(generated::block_producer_service_client::BlockProducerServiceClient::<T>::new(inner))
         }
 
+        /// Hand a withdrawal bundle to the block producer, which proposes it
+        /// as an M3. The bundle only reaches the block producer database, so
+        /// this RPC itself needs no mainchain wallet.
+        ///
+        /// Thunder as a whole still does. `Miner` holds a `WalletClient`
+        /// outright, so without `WalletService` there is no miner, no BMM,
+        /// and therefore no block to propose a bundle from -- the call site
+        /// in `Node::submit_block` is unreachable. Running wallet-free end to
+        /// end means breaking that coupling first, which is also why no
+        /// integration test covers it.
         pub async fn propose_withdrawal_bundle(
             &mut self,
             transaction: &Transaction,
@@ -1128,8 +1138,7 @@ pub mod mainchain {
                         generated::GetBlockHeaderInfoResponse,
                     >(
                         "header_infos",
-                        &serde_json::to_string(&header_info)
-                            .expect("BlockHeaderInfo serializes to JSON"),
+                        &serde_json::to_string(&header_info).unwrap(),
                     ));
                 }
             }
@@ -1165,7 +1174,7 @@ pub mod mainchain {
                     >(
                         "infos",
                         &serde_json::to_string(&(header_info, block_info))
-                            .expect("(BlockHeaderInfo, BlockInfo) serializes to JSON"),
+                            .unwrap(),
                     ));
                 }
             }

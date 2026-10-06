@@ -1,4 +1,2 @@
 /target
-*.log
-.DS_Store
-.claude/
+/integrationtests.env

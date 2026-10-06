@@ -8,60 +8,56 @@ version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 bincode = { workspace = true }
 bitcoin = { workspace = true, features = ["serde"] }
 blake3 = { workspace = true }
 borsh = { workspace = true }
-chrono = "0.4"
 clap = { workspace = true, features = ["derive"] }
-dirs = "6.0.0"
-eframe = "0.31.0"
-either = "1.13.0"
-fallible-iterator = { workspace = true }
-fraction = { workspace = true, features = ["with-serde-support"] }
-futures = { workspace = true }
 const-hex = { workspace = true }
+dirs = { workspace = true }
+either = { workspace = true }
+fallible-iterator = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
-human-size = "0.4.3"
-itertools = { workspace = true }
+human-size = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server"] }
-mimalloc = { version = "0.1.48", features = ["v3"] }
+libes = { workspace = true }
+mimalloc = { workspace = true, features = ["v3"] }
 parking_lot = { workspace = true }
+poll-promise = { workspace = true, features = ["tokio"] }
 rand = { workspace = true, features = ["thread_rng"] }
+rustreexo = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+shlex = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
 truthcoin_dc = { path = "../lib", features = ["clap"] }
 truthcoin_dc_app_cli = { path = "../cli" }
 truthcoin_dc_app_rpc_api = { path = "../rpc-api" }
-poll-promise = { version = "0.3.0", features = ["tokio"] }
-serde = { workspace = true, features = ["derive"] }
-shlex = "1.3.0"
-strum = {  workspace = true, features = ["derive"] }
-thiserror = { workspace = true }
 tiny-bip39 = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tonic = { workspace = true }
-tonic-health = "0.14.3"
+tonic-health = { workspace = true }
 # needs to line up with jsonrpsee tower version...
-tower = "0.5.2"
-tower-http = { version = "0.6.2", features = ["cors", "request-id", "trace"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "request-id", "trace"] }
 tracing = { workspace = true }
-tracing-appender = "0.2.3"
+tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 url = { workspace = true }
 utoipa = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true }
 
-[dependencies.libes]
-version = "0.9.1"
-features = ["AES256-GCM", "ECIES-MAC", "HMAC-SHA256", "x25519"]
+[dependencies.eframe]
+workspace = true
+
+[dependencies.tokio]
+workspace = true
+features = ["macros", "rt-multi-thread", "signal"]
 
 [dev-dependencies]
-reserve-port = "2.0.1"
-
-[features]
-default = ["zmq"]
-zmq = ["truthcoin_dc/zmq"]
+reserve-port = { workspace = true }
 
 [lints]
 workspace = true

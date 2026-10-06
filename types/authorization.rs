@@ -9,8 +9,9 @@ use rayon::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::types::{
-    Address, AuthorizedTransaction, Body, GetAddress, Transaction, VerifyingKey,
+use crate::{
+    Address, AuthorizedTransaction, Body, GetAddress, Transaction,
+    VerifyingKey, error::Authorization as Error,
 };
 
 pub use frost_ristretto255::rand_core;
@@ -110,24 +111,6 @@ pub enum Dst {
     Arbitrary = u8::MAX,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("borsh serialization error")]
-    BorshSerialize(#[from] borsh::io::Error),
-    #[error("signature verification error")]
-    SignatureVerification(#[from] SignatureError),
-    #[error(
-        "wrong key for address: address = {address},
-             hash(verifying_key) = {hash_verifying_key}"
-    )]
-    WrongKeyForAddress {
-        address: Address,
-        hash_verifying_key: Address,
-    },
-    #[error("signature count mismatch: expected {expected}, got {actual}")]
-    SignatureCountMismatch { expected: usize, actual: usize },
-}
-
 #[derive(
     BorshSerialize,
     Debug,
@@ -179,13 +162,7 @@ pub fn verify_body(
     body: &Body,
 ) -> Result<(), Error> {
     verify_authorizations(ctxt, body)?;
-    let authorized_txs = body.authorized_transactions().map_err(|_| {
-        Error::SignatureCountMismatch {
-            expected: 0,
-            actual: 0,
-        }
-    })?;
-    for tx in &authorized_txs {
+    for tx in &body.authorized_transactions() {
         verify_actor_proof(tx)?;
     }
     Ok(())
@@ -200,7 +177,7 @@ struct BatchVerifier {
 }
 
 impl BatchVerifier {
-    fn queue_item<Msg>(
+    pub fn queue_item<Msg>(
         mut self,
         verifying_key: VerifyingKey,
         signature: Signature,
@@ -215,9 +192,22 @@ impl BatchVerifier {
             hasher,
         } = &mut self;
         let msg_bytes = msg.as_ref();
-        hasher.update(&verifying_key.to_bytes());
-        hasher.update(&signature.to_bytes());
-        hasher.update(msg_bytes);
+        // Borsh encoding for hashing
+        #[derive(BorshSerialize)]
+        struct HashComponents<'a> {
+            verifying_key: &'a VerifyingKey,
+            signature: &'a Signature,
+            msg_bytes: &'a [u8],
+        }
+        borsh::to_writer(
+            hasher,
+            &HashComponents {
+                verifying_key: &verifying_key,
+                signature: &signature,
+                msg_bytes,
+            },
+        )
+        .expect("failed to serialize with borsh to compute a hash");
         *items += 1;
         inner.queue(frost_core::batch::Item::new(
             verifying_key.0,
@@ -229,7 +219,7 @@ impl BatchVerifier {
 
     /// Performs batch verification, returning `Ok(_)` if all signatures were
     /// valid and the batch was non-empty, and `Err(_)` otherwise.
-    fn verify(self) -> Result<(), SignatureError> {
+    pub fn verify(self) -> Result<(), SignatureError> {
         let Self {
             hasher,
             inner,
@@ -238,7 +228,8 @@ impl BatchVerifier {
         let rng = {
             // move hasher so that it can be dropped early automatically
             let mut hasher = hasher;
-            hasher.update(&items.to_le_bytes());
+            borsh::to_writer(&mut hasher, &items)
+                .expect("failed to serialize with borsh to compute a hash");
             <rand::rngs::ChaCha20Rng as rand::SeedableRng>::from_seed(
                 hasher.finalize().into(),
             )
@@ -296,20 +287,21 @@ pub fn verify_authorized_transaction(
     ctxt: &BatchVerificationContext,
     transaction: &AuthorizedTransaction,
 ) -> Result<(), Error> {
-    if transaction.authorizations.len() != transaction.transaction.inputs.len()
-    {
-        return Err(Error::SignatureCountMismatch {
-            expected: transaction.transaction.inputs.len(),
-            actual: transaction.authorizations.len(),
-        });
+    let verifications_required = &transaction.transaction.inputs.len();
+    match transaction.authorizations.len().cmp(verifications_required) {
+        std::cmp::Ordering::Less => return Err(Error::NotEnoughAuthorizations),
+        std::cmp::Ordering::Equal => (),
+        std::cmp::Ordering::Greater => {
+            return Err(Error::TooManyAuthorizations);
+        }
     }
-    let tx_msg_canonical = tx_msg_canonical(&transaction.transaction)?;
     let mut batch_verifier = ctxt.verifier();
-    for Authorization {
-        verifying_key,
-        signature,
-    } in &transaction.authorizations
-    {
+    let tx_msg_canonical = tx_msg_canonical(&transaction.transaction)?;
+    for auth in &transaction.authorizations {
+        let Authorization {
+            verifying_key,
+            signature,
+        } = auth;
         batch_verifier = batch_verifier.queue_item(
             *verifying_key,
             *signature,
@@ -324,44 +316,40 @@ pub fn verify_authorizations(
     ctxt: &BatchVerificationContext,
     body: &Body,
 ) -> Result<(), Error> {
-    let input_numbers: Vec<usize> = body
-        .transactions
-        .iter()
-        .map(|transaction| transaction.inputs.len())
-        .collect();
-    let total_inputs: usize = input_numbers.iter().sum();
-    if body.authorizations.len() != total_inputs {
-        return Err(Error::SignatureCountMismatch {
-            expected: total_inputs,
-            actual: body.authorizations.len(),
-        });
+    let verifications_required =
+        body.transactions.par_iter().map(|tx| tx.inputs.len()).sum();
+    match body.authorizations.len().cmp(&verifications_required) {
+        std::cmp::Ordering::Less => return Err(Error::NotEnoughAuthorizations),
+        std::cmp::Ordering::Equal => (),
+        std::cmp::Ordering::Greater => {
+            return Err(Error::TooManyAuthorizations);
+        }
     }
-    if total_inputs == 0 {
+    if verifications_required == 0 {
         return Ok(());
     }
-    let serialized_transactions: Vec<Vec<u8>> = body
+    // pairs of serialized txs, and the number of inputs
+    let serialized_transactions_inputs: Vec<(Vec<u8>, usize)> = body
         .transactions
         .par_iter()
-        .map(tx_msg_canonical)
-        .collect::<Result<_, _>>()?;
-    let serialized_transactions =
-        serialized_transactions.iter().map(Vec::as_slice);
-    let messages = input_numbers
-        .iter()
-        .copied()
-        .zip(serialized_transactions)
-        .flat_map(|(input_number, serialized_transaction)| {
-            std::iter::repeat_n(serialized_transaction, input_number)
-        });
+        .map(|tx| Ok((tx_msg_canonical(tx)?, tx.inputs.len())))
+        .collect::<Result<_, Error>>()?;
+    let messages =
+        serialized_transactions_inputs
+            .iter()
+            .flat_map(|(tx, n_inputs)| {
+                std::iter::repeat_n(tx.as_slice(), *n_inputs)
+            });
     let pairs = body.authorizations.iter().zip(messages).collect::<Vec<_>>();
+    assert_eq!(pairs.len(), body.authorizations.len());
     const CHUNK_SIZE: usize = 1 << 14;
     pairs.par_chunks(CHUNK_SIZE).try_for_each(|chunk| {
         let mut batch_verifier = ctxt.verifier();
-        for (authorization, msg) in chunk {
+        for (auth, msg) in chunk {
             let Authorization {
                 verifying_key,
                 signature,
-            } = authorization;
+            } = auth;
             batch_verifier =
                 batch_verifier.queue_item(*verifying_key, *signature, msg)?;
         }
@@ -457,7 +445,7 @@ mod tests {
         authorize, get_address, sign, sign_tx, verify,
         verify_authorized_transaction,
     };
-    use crate::types::{
+    use crate::{
         Address, AuthorizedTransaction, GetAddress as _, Transaction,
         VerifyingKey,
     };
@@ -470,10 +458,14 @@ mod tests {
 
     fn one_input_tx() -> Transaction {
         Transaction {
-            inputs: vec![crate::types::OutPoint::Regular {
-                txid: crate::types::Txid::from([3; 32]),
-                vout: 0,
-            }],
+            inputs: vec![(
+                crate::OutPoint::Regular {
+                    txid: crate::Txid::from([3; 32]),
+                    vout: 0,
+                },
+                [4; 32],
+            )]
+            .into(),
             ..Default::default()
         }
     }
@@ -574,7 +566,7 @@ mod tests {
         let ctxt = BatchVerificationContext::new(&mut rng);
         assert!(matches!(
             verify_authorized_transaction(&ctxt, &authorized),
-            Err(super::Error::SignatureCountMismatch { .. })
+            Err(super::Error::NotEnoughAuthorizations)
         ));
     }
 

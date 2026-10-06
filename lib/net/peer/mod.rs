@@ -14,15 +14,17 @@ use quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{spawn, task::JoinHandle, time::Duration};
+use truthcoin_dc_types::authorization::BatchVerificationContext;
 
 use crate::{
     archive::Archive,
-    authorization::BatchVerificationContext,
+    mempool::MemPool,
     state::State,
     types::{
-        AuthorizedTransaction, Hash, Tip, Version, hashes::hash,
-        net::ResolvedSeedAddress, schema,
+        AuthorizedTransaction, Hash, Tip, Version, hash,
+        net::{PeerConnectionStatus, ResolvedPeerAddress},
     },
+    util::ErrorChain,
 };
 
 mod channel_pool;
@@ -107,13 +109,12 @@ pub struct PeerResponseItem {
 }
 
 /// Info to send to the net task / node
-#[allow(clippy::large_enum_variant)]
 #[must_use]
 #[derive(Debug)]
 pub enum Info {
     Error {
         err: ConnectionError,
-        resolved_addr: ResolvedSeedAddress,
+        resolved_peer_addr: ResolvedPeerAddress,
     },
     /// Need Mainchain ancestors for the specified tip
     NeedMainchainAncestors {
@@ -208,7 +209,8 @@ impl Connection {
             );
         }
         let msg_bytes = rx.read_to_end(Connection::READ_REQUEST_LIMIT).await?;
-        let msg: RequestMessage = bincode::deserialize(&msg_bytes)?;
+        let msg: RequestMessage = bincode::deserialize(&msg_bytes)
+            .map_err(error::connection::Receive::DeserializeMessage)?;
         tracing::trace!(
             recv_id = %rx.id(),
             ?msg,
@@ -229,7 +231,8 @@ impl Connection {
         );
         let message = RequestMessageRef::from(heartbeat);
         let mut message_buf = self.magic_bytes.to_vec();
-        bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &message)?;
+        bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &message)
+            .map_err(error::connection::Send::SerializeMessage)?;
         send.write_all(&message_buf).await.map_err(|err| {
             error::connection::Send::Write {
                 stream_id: send.id(),
@@ -257,7 +260,9 @@ impl Connection {
         }
         let response_bytes =
             recv.read_to_end(read_response_limit.get()).await?;
-        let response: ResponseMessage = bincode::deserialize(&response_bytes)?;
+        let response: ResponseMessage =
+            bincode::deserialize(&response_bytes)
+                .map_err(error::connection::Receive::DeserializeMessage)?;
         tracing::trace!(
             recv_id = %recv.id(),
             ?response,
@@ -279,7 +284,8 @@ impl Connection {
         );
         let message = RequestMessageRef::from(request);
         let mut message_buf = self.magic_bytes.to_vec();
-        bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &message)?;
+        bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &message)
+            .map_err(error::connection::Send::SerializeMessage)?;
         send.write_all(&message_buf).await.map_err(|err| {
             error::connection::Send::Write {
                 stream_id: send.id(),
@@ -341,19 +347,17 @@ impl Connection {
             "Sending response"
         );
         let mut message_buf = magic_bytes.to_vec();
-        bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &response)?;
-        let stream_id = response_tx.id();
+        bincode::serialize_into::<&mut Vec<_>, _>(&mut message_buf, &response)
+            .map_err(error::connection::Send::SerializeMessage)?;
         response_tx.write_all(&message_buf).await.map_err(|err| {
-            error::connection::Send::Write {
-                stream_id,
-                source: err,
+            {
+                error::connection::Send::Write {
+                    stream_id: response_tx.id(),
+                    source: err,
+                }
             }
-        })?;
-        // A SendStream that drops without this resets the stream, and the reset
-        // discards data the peer has not read. `send_request` and
-        // `send_heartbeat` both finish their streams for the same reason.
-        response_tx.finish()?;
-        Ok(())
+            .into()
+        })
     }
 }
 
@@ -362,43 +366,61 @@ pub struct ConnectionContext {
     pub archive: Archive,
     pub batch_verification_ctxt: BatchVerificationContext,
     pub magic_bytes: message::MagicBytes,
-    pub resolved_address: ResolvedSeedAddress,
+    pub resolved_address: ResolvedPeerAddress,
+    pub mempool: MemPool,
     pub state: State,
 }
 
-#[derive(
-    Clone,
-    Copy,
-    Eq,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    strum::Display,
-    utoipa::ToSchema,
-)]
-pub enum PeerConnectionStatus {
-    /// We're still in the process of initializing the peer connection
-    Connecting,
-    /// The connection is successfully established
-    Connected,
-}
+/// Used to make `bool` representation explicit and unique
+#[repr(transparent)]
+struct StatusRepr(bool);
 
-impl PeerConnectionStatus {
-    /// Convert from boolean representation
-    // Should remain private to this module
-    fn from_repr(repr: bool) -> Self {
+impl From<StatusRepr> for PeerConnectionStatus {
+    fn from(repr: StatusRepr) -> Self {
+        let StatusRepr(repr) = repr;
         match repr {
             false => Self::Connecting,
             true => Self::Connected,
         }
     }
+}
 
-    /// Convert to boolean representation
-    // Should remain private to this module
-    fn as_repr(self) -> bool {
-        match self {
-            Self::Connecting => false,
-            Self::Connected => true,
+impl From<PeerConnectionStatus> for StatusRepr {
+    fn from(status: PeerConnectionStatus) -> Self {
+        match status {
+            PeerConnectionStatus::Connecting => Self(false),
+            PeerConnectionStatus::Connected => Self(true),
+        }
+    }
+}
+
+/// Atomic representation of [`PeerConnectionStatus`]
+#[repr(transparent)]
+pub(in crate::net) struct AtomicStatus {
+    atomic_repr: AtomicBool,
+}
+
+impl AtomicStatus {
+    #[inline(always)]
+    fn load(&self, ordering: atomic::Ordering) -> StatusRepr {
+        StatusRepr(self.atomic_repr.load(ordering))
+    }
+
+    #[inline(always)]
+    fn store(&self, repr: StatusRepr, ordering: atomic::Ordering) {
+        self.atomic_repr.store(repr.0, ordering)
+    }
+}
+
+impl<T> From<T> for AtomicStatus
+where
+    StatusRepr: From<T>,
+{
+    #[inline(always)]
+    fn from(value: T) -> Self {
+        let StatusRepr(repr) = value.into();
+        Self {
+            atomic_repr: AtomicBool::new(repr),
         }
     }
 }
@@ -408,17 +430,15 @@ pub struct ConnectionHandle {
     task: JoinHandle<()>,
     /// Indicates that at least one message has been received successfully
     pub(in crate::net) received_msg_successfully: Arc<AtomicBool>,
-    /// Representation of [`PeerConnectionStatus`]
-    pub(in crate::net) status_repr: Arc<AtomicBool>,
+    /// Atomic representation of [`PeerConnectionStatus`]
+    pub(in crate::net) status: Arc<AtomicStatus>,
     /// Push messages from connection task / net task / node
     pub internal_message_tx: mpsc::UnboundedSender<InternalMessage>,
 }
 
 impl ConnectionHandle {
     pub fn connection_status(&self) -> PeerConnectionStatus {
-        PeerConnectionStatus::from_repr(
-            self.status_repr.load(atomic::Ordering::SeqCst),
-        )
+        self.status.load(atomic::Ordering::SeqCst).into()
     }
 
     /// Indicates that at least one message has been received successfully
@@ -463,13 +483,21 @@ pub fn handle(
     };
     let task = spawn(async move {
         if let Err(err) = connection_task().await {
-            tracing::error!(%addr, "connection task error, sending on info_tx: {err:#}");
+            tracing::error!(
+                %addr,
+                "connection task error, sending on info_tx: {:#}",
+                ErrorChain::new(&err),
+            );
 
-            if let Err(send_error) =
-                info_tx.unbounded_send(Info::Error { err, resolved_addr })
-                && let Info::Error { err, .. } = send_error.into_inner()
+            if let Err(send_error) = info_tx.unbounded_send(Info::Error {
+                err,
+                resolved_peer_addr: resolved_addr,
+            }) && let Info::Error { err, .. } = send_error.into_inner()
             {
-                tracing::warn!("Failed to send error to receiver: {err}")
+                tracing::warn!(
+                    "Failed to send error to receiver: {:#}",
+                    ErrorChain::new(&err),
+                )
             }
         }
     });
@@ -477,7 +505,7 @@ pub fn handle(
     let connection_handle = ConnectionHandle {
         task,
         received_msg_successfully,
-        status_repr: Arc::new(AtomicBool::new(status.as_repr())),
+        status: Arc::new(AtomicStatus::from(status)),
         internal_message_tx,
     };
     (connection_handle, info_rx)
@@ -488,22 +516,22 @@ pub fn connect(
     ctxt: ConnectionContext,
 ) -> (ConnectionHandle, mpsc::UnboundedReceiver<Info>) {
     let connection_status = PeerConnectionStatus::Connecting;
-    let status_repr = Arc::new(AtomicBool::new(connection_status.as_repr()));
+    let status = Arc::new(AtomicStatus::from(connection_status));
     let received_msg_successfully = Arc::new(AtomicBool::new(false));
     let (info_tx, info_rx) = mpsc::unbounded();
     let (mailbox_tx, mailbox_rx) = mailbox::new();
     let internal_message_tx = mailbox_tx.internal_message_tx.clone();
-    let resolved_addr = ctxt.resolved_address.clone();
+    let resolved_address = ctxt.resolved_address.clone();
     let connection_task = {
         let received_msg_successfully = received_msg_successfully.clone();
-        let status_repr = status_repr.clone();
+        let status = status.clone();
         let info_tx = info_tx.clone();
         move || async move {
             let connection =
                 Connection::from_connecting(connecting, ctxt.magic_bytes)
                     .await?;
-            status_repr.store(
-                PeerConnectionStatus::Connected.as_repr(),
+            status.store(
+                PeerConnectionStatus::Connected.into(),
                 atomic::Ordering::SeqCst,
             );
 
@@ -520,110 +548,35 @@ pub fn connect(
     };
     let task = spawn(async move {
         if let Err(err) = connection_task().await
-            && let Err(send_error) =
-                info_tx.unbounded_send(Info::Error { err, resolved_addr })
+            && let Err(send_error) = info_tx.unbounded_send(Info::Error {
+                err,
+                resolved_peer_addr: resolved_address,
+            })
             && let Info::Error { err, .. } = send_error.into_inner()
         {
-            tracing::warn!("Failed to send error to receiver: {err}")
+            tracing::warn!(
+                "Failed to send error to receiver: {:#}",
+                ErrorChain::new(&err),
+            )
         }
     });
     let connection_handle = ConnectionHandle {
         task,
         received_msg_successfully,
-        status_repr,
+        status,
         internal_message_tx,
     };
     (connection_handle, info_rx)
 }
 
-// RPC output representation for peer + state
-#[derive(Clone, serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
-pub struct Peer {
-    #[schema(value_type = schema::SocketAddr)]
-    pub address: SocketAddr,
-    pub status: PeerConnectionStatus,
-}
-
 #[cfg(test)]
 mod test {
-    use std::{
-        collections::HashSet,
-        net::{Ipv4Addr, SocketAddr},
-        num::NonZeroUsize,
-        time::Duration,
-    };
+    use std::num::NonZeroUsize;
 
     use crate::{
-        net::{
-            make_server_endpoint,
-            peer::{
-                Connection,
-                message::{self, GetBlockRequest, ResponseMessage},
-            },
-            tests::set_crypto_provider,
-        },
+        net::peer::{Connection, message::GetBlockRequest},
         types::BlockHash,
     };
-
-    const TEST_MAGIC: message::MagicBytes = *b"TEST";
-
-    /// A peer reads a response some time after it arrives. `send_response` must
-    /// finish its stream, because a stream that resets discards the bytes the
-    /// peer did not read, and the peer then reads an incomplete message.
-    #[tokio::test]
-    async fn send_response_survives_a_late_read() -> anyhow::Result<()> {
-        set_crypto_provider();
-        let (server, _cert) = make_server_endpoint(
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            HashSet::new(),
-        )?;
-        let (client, _cert) = make_server_endpoint(
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            HashSet::new(),
-        )?;
-        let server_addr = server.local_addr()?;
-
-        let accept = tokio::spawn(async move {
-            let incoming =
-                server.accept().await.expect("no incoming connection");
-            let conn = incoming.await.expect("the handshake failed");
-            let (tx, _rx) = conn.accept_bi().await.expect("no stream");
-            Connection::send_response(
-                TEST_MAGIC,
-                tx,
-                ResponseMessage::NoBlock {
-                    block_hash: BlockHash([7u8; 32]),
-                },
-            )
-            .await
-            .expect("the response failed");
-            // Hold the connection open, so only the stream state decides what
-            // the peer reads.
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        });
-
-        let conn = client.connect(server_addr, "localhost")?.await?;
-        let (mut tx, mut rx) = conn.open_bi().await?;
-        tx.write_all(b"ping").await?;
-        tx.finish()?;
-        // The peer answers and drops its stream while this task sleeps.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let mut magic_bytes = [0u8; message::MAGIC_BYTES_LEN];
-        rx.read_exact(&mut magic_bytes).await?;
-        assert_eq!(magic_bytes, TEST_MAGIC);
-        let response_bytes = rx.read_to_end(1024).await?;
-        let response: ResponseMessage = bincode::deserialize(&response_bytes)?;
-        assert!(matches!(
-            response,
-            ResponseMessage::NoBlock {
-                block_hash: BlockHash(hash),
-            } if hash == [7u8; 32]
-        ));
-
-        accept.abort();
-        Ok(())
-    }
 
     /// A large (up to 10MB) block response must be granted substantially more
     /// time than the heartbeat timeout, so that a slow but steadily-progressing

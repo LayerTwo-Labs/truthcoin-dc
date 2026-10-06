@@ -1,31 +1,10 @@
-#![allow(clippy::too_many_arguments)]
+//! RPC API
 
-use std::net::SocketAddr;
+/// Exported for convenience
+pub use typewit;
 
-use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-
-use serde::{Deserialize, Serialize};
-use truthcoin_dc::{
-    authorization::{Dst, Signature},
-    net::{Peer, PeerConnectionStatus},
-    state::{decisions::DecisionType, markets::MarketId},
-    types::{
-        Address, Authorization, Authorized, BitcoinOutputContent, Block,
-        BlockHash, BlockIndex, BlockIndexDeposit, BlockIndexSpend,
-        BlockIndexTx, Body, ClaimDecisionPayload, DecisionClaimEntry,
-        EncryptionPubKey, FilledOutput, FilledOutputContent, Header, InPoint,
-        M6id, MainchainSyncPhase, MainchainSyncProgress, MerkleRoot, OutPoint,
-        Output, OutputContent, PointedOutput, SpentOutput, Transaction, TxData,
-        TxIn, Txid, VerifyingKey, WithdrawalBundle, WithdrawalOutputContent,
-        schema as truthcoin_schema,
-    },
-    wallet::{Balance, TransferDests},
-};
-use utoipa::ToSchema;
-
+pub mod markets;
 mod schema;
-#[cfg(test)]
-mod test;
 
 fn build_openapi(
     build: fn() -> utoipa::openapi::OpenApi,
@@ -85,603 +64,944 @@ pub fn private_openapi() -> std::io::Result<utoipa::openapi::OpenApi> {
     })
 }
 
-/// A spent output, and the outpoint that created it
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct PointedSpentOutput {
-    pub outpoint: OutPoint,
-    pub output: SpentOutput,
+pub mod open_api {
+    use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+    use l2l_openapi::open_api;
+
+    use crate::schema;
+
+    #[open_api]
+    #[rpc(client, server)]
+    pub trait Rpc {
+        /// Get OpenAPI schema
+        #[open_api_method(output_schema(PartialSchema = "schema::OpenApi"))]
+        #[method(name = "openapi_schema")]
+        async fn openapi_schema(&self) -> RpcResult<utoipa::openapi::OpenApi>;
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct TxInfo {
-    pub confirmations: Option<u32>,
-    pub fee_sats: u64,
-    pub txin: Option<TxIn>,
-}
+pub mod node {
+    use std::collections::HashSet;
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct GetBlockTemplateResponse {
-    /// Block hash to commit to in a BMM request
-    pub critical_hash: BlockHash,
-    /// Block to pass to `connect_block` once its BMM request is included in a
-    /// mainchain block
-    pub block: Block,
-    /// Fees collected by the transactions in the block, in sats
-    pub fees_sats: u64,
-}
+    use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+    use l2l_openapi::open_api;
+    use serde::{Deserialize, Serialize};
+    use truthcoin_dc_types::{
+        Address, Authorization, Authorized, Block, BlockHash, BlockIndex,
+        BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body,
+        ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
+        Header, InPoint, M6id, MainchainSyncPhase, MainchainSyncProgress,
+        MerkleRoot, OutPoint, Output, OutputContent, PointedOutput,
+        SpentOutput, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
+        WithdrawalBundleStatus,
+        authorization::Signature,
+        decision::DecisionType,
+        market::MarketId,
+        net::{Peer, PeerAddress, PeerConnectionStatus},
+        state::{TwoWayPegEvent, WithdrawalBundleInfo},
+        transaction::Outputs,
+    };
+    use typewit::const_marker::Bool;
+    use utoipa::ToSchema;
 
-/// One transaction the mempool holds
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MempoolTx {
-    /// Blake3 over the borsh encoding
-    pub txid: Txid,
-    /// Borsh size in bytes
-    pub size: u64,
-    pub tx: Transaction,
-    /// Borsh encoding, as hex
-    pub raw: String,
-}
+    use crate::{
+        markets::{
+            BallotItem, CalculateInitialLiquidityRequest, ConsensusResults,
+            DecisionContentInfo, DecisionDetails, DecisionFilter, DecisionInfo,
+            DecisionListItem, DecisionListingFeeInfo, DecisionPeriodStatus,
+            DecisionState, DecisionSummary, InitialLiquidityCalculation,
+            MarketData, MarketDimension, MarketDimensionKind, MarketOutcome,
+            MarketPricePoint, MarketResolution, MarketStatus, MarketSummary,
+            ParticipationStats, PeriodPricingSummary, PeriodStats, ScoreChange,
+            SharePosition, UserHoldings, VoteFilter, VoteInfo, VoterInfo,
+            VoterInfoFull, VotingPeriodFull, WinningOutcome,
+        },
+        open_api, schema,
+    };
 
-pub use truthcoin_dc::state::decisions::DecisionState;
+    #[open_api]
+    #[rpc(client, server, server_bounds(Self: open_api::RpcServer))]
+    pub trait PrivateRpc {
+        /// Connect to a peer
+        #[method(name = "connect_peer")]
+        async fn connect_peer(&self, addr: PeerAddress) -> RpcResult<()>;
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionFilter {
-    pub period: Option<u32>,
-    pub status: Option<DecisionState>,
-}
+        /// Delete peer from known_peers DB.
+        /// Connections to the peer are not terminated.
+        #[method(name = "forget_peer")]
+        async fn forget_peer(&self, addr: PeerAddress) -> RpcResult<()>;
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionListItem {
-    pub decision_id_hex: String,
-    pub period_index: u32,
-    pub decision_index: u32,
-    pub state: DecisionState,
-    pub decision: Option<DecisionInfo>,
-}
+        /// Invalidate a block, potentially re-orging to a valid ancestor of
+        /// the current tip.
+        #[method(name = "invalidate_block")]
+        async fn invalidate_block(
+            &self,
+            block_hash: BlockHash,
+        ) -> RpcResult<()>;
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketBuyRequest {
-    pub market_id: String,
-    pub outcome_index: usize,
-    pub shares_amount: i64,
-    pub max_cost: Option<u64>,
-    pub dry_run: Option<bool>,
-}
+        /// Remove a tx from the mempool
+        #[method(name = "remove_from_mempool")]
+        async fn remove_from_mempool(&self, txid: Txid) -> RpcResult<()>;
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketAmplifyBetaRequest {
-    pub market_id: String,
-    pub amount_sats: u64,
-}
+        /// Stop the node
+        #[method(name = "stop")]
+        async fn stop(&self);
 
-/// Request to build and sign (but not submit) a Trade transaction with
-/// a caller-supplied `prev_block_hash`.
-///
-/// `shares_amount` is positive for buy, negative for sell. For sells,
-/// `trader_address` must be supplied and must own the shares.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct CreateTradeRequest {
-    pub market_id: String,
-    pub outcome_index: usize,
-    pub shares_amount: i64,
-    pub limit_sats: u64,
-    /// Address of the share-holder (required for sells; ignored for buys,
-    /// in which case the wallet's first address is used as trader).
-    pub trader_address: Option<Address>,
-    /// Hex-encoded block hash to bind the trade's PoW preimage and
-    /// chain-recency check to.
-    pub prev_block_hash: String,
-}
+        /// Trigger a sync to a specific tip block hash.
+        /// The block must already exist in our archive (received via P2P).
+        /// Returns true if reorg was successful, false if not needed or failed.
+        #[method(name = "sync_to_tip")]
+        async fn sync_to_tip(&self, block_hash: BlockHash) -> RpcResult<bool>;
+    }
 
-/// Hex-encoded signed `AuthorizedTransaction` plus its txid.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct CreateTradeResponse {
-    pub signed_tx_hex: String,
-    pub txid: String,
-}
+    /// Fee and position of a transaction in the active chain
+    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+    pub struct TxInfo {
+        pub confirmations: Option<u32>,
+        pub fee_sats: u64,
+        pub txin: Option<TxIn>,
+    }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionClaimItem {
-    pub period_index: u32,
-    pub header: String,
-    pub description: Option<String>,
-    pub option_0_label: Option<String>,
-    pub option_1_label: Option<String>,
-    pub option_labels: Option<Vec<String>>,
-    pub tags: Option<Vec<String>>,
-}
+    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+    pub struct TransactionVerbose {
+        #[serde(flatten)]
+        pub tx: Transaction,
+        #[serde(with = "const_hex")]
+        pub canonical_bytes: Vec<u8>,
+    }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionClaimRequest {
-    pub decision_type: String,
-    pub decisions: Vec<DecisionClaimItem>,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-    /// Step size for valid vote values. Honored only when
-    /// `decision_type == "scaled"`. Defaults to `1.0` when omitted.
-    /// `(max - min)` must be an integer multiple of `increment`.
-    pub increment: Option<f64>,
-    pub tx_fee_sats: u64,
-    pub max_listing_fee_sats: Option<u64>,
-}
+    pub mod get_block {
+        use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+        use serde::{Deserialize, Serialize, de::DeserializeOwned};
+        use truthcoin_dc_types::{Authorization, Coinbase, Header};
+        use utoipa::ToSchema;
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionClaimResponse {
-    pub txid: Txid,
-    pub decision_ids: Vec<String>,
-    pub listing_fee_paid_sats: u64,
-}
+        use crate::node::TransactionVerbose;
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketBuyResponse {
-    pub txid: Option<String>,
-    /// Total estimated cost in satoshis (LMSR cost + trading fee)
-    pub cost_sats: u64,
-    /// Trading fee that goes to market author
-    pub trading_fee_sats: u64,
-    pub new_price: f64,
-}
-
-/// Request to sell shares in a prediction market
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketSellRequest {
-    pub market_id: String,
-    pub outcome_index: usize,
-    pub shares_amount: i64,
-    /// Address holding the shares to sell (required)
-    pub seller_address: Address,
-    /// Minimum proceeds required (slippage protection)
-    pub min_proceeds: Option<u64>,
-    pub dry_run: Option<bool>,
-}
-
-/// Response from selling shares in a prediction market
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketSellResponse {
-    /// Transaction ID for the sell transaction (None for dry runs)
-    pub txid: Option<String>,
-    /// Gross proceeds before trading fee (LMSR payout)
-    pub proceeds_sats: u64,
-    /// Trading fee deducted from proceeds
-    pub trading_fee_sats: u64,
-    /// Net proceeds seller will receive (proceeds_sats - trading_fee_sats)
-    pub net_proceeds_sats: u64,
-    pub new_price: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct VoteFilter {
-    pub voter: Option<Address>,
-    pub decision_id: Option<String>,
-    pub period_id: Option<u32>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct VotingPeriodFull {
-    pub period_id: u32,
-    pub status: String,
-    pub start_height: u32,
-    pub end_height: u32,
-    pub start_time: u64,
-    pub end_time: u64,
-    pub decisions: Vec<DecisionSummary>,
-    pub stats: PeriodStats,
-    pub consensus: Option<ConsensusResults>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionSummary {
-    pub decision_id_hex: String,
-    pub header: String,
-    pub is_standard: bool,
-    pub decision_type: DecisionType,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct PeriodStats {
-    pub total_voters: u64,
-    pub active_voters: u64,
-    pub total_votes: u64,
-    pub participation_rate: f64,
-}
-
-/// Results from the SVD consensus algorithm for a voting period.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct ConsensusResults {
-    /// Final consensus outcomes for each decision (decision_id_hex -> value).
-    /// For scaled decisions, values are in real units (e.g., 270 electoral votes).
-    /// For binary decisions, values are 0.0 or 1.0.
-    pub outcomes: std::collections::HashMap<String, f64>,
-    pub first_loading: Vec<f64>,
-    pub certainty: f64,
-    pub score_changes: std::collections::HashMap<String, ScoreChange>,
-    pub outliers: Vec<String>,
-    pub vote_matrix_dimensions: (usize, usize),
-    pub algorithm_version: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct VoterInfoFull {
-    pub address: String,
-    pub votecoin_balance: f64,
-    pub total_votes: u64,
-    pub periods_active: u32,
-    pub is_active: bool,
-    pub current_period_participation: Option<ParticipationStats>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct ParticipationStats {
-    pub period_id: u32,
-    pub votes_cast: u32,
-    pub decisions_available: u32,
-    pub participation_rate: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionDetails {
-    pub decision_id_hex: String,
-    pub period_index: u32,
-    pub decision_index: u32,
-    pub content: DecisionContentInfo,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub enum DecisionContentInfo {
-    Empty,
-    Decision(DecisionInfo),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionInfo {
-    pub id: String,
-    pub market_maker_pubkey_hash: String,
-    pub is_standard: bool,
-    pub decision_type: DecisionType,
-    pub header: String,
-    pub description: String,
-    pub tags: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionPeriodStatus {
-    pub is_testing_mode: bool,
-    pub blocks_per_period: u32,
-    pub current_period: u32,
-    pub current_period_name: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct DecisionListingFeeInfo {
-    pub p_period: u64,
-    pub p_floor: u64,
-    pub mints: u64,
-    pub tier_prices: [u64; 5],
-    pub last_reprice_block: u32,
-    pub period_capacity: u64,
-    pub claimed: u64,
-}
-
-#[derive(
-    Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, ToSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum MarketStatus {
-    Trading,
-    Cancelled,
-    Invalid,
-    Settled,
-}
-
-impl From<truthcoin_dc::state::markets::MarketState> for MarketStatus {
-    fn from(state: truthcoin_dc::state::markets::MarketState) -> Self {
-        match state {
-            truthcoin_dc::state::markets::MarketState::Trading => Self::Trading,
-            truthcoin_dc::state::markets::MarketState::Cancelled => {
-                Self::Cancelled
-            }
-            truthcoin_dc::state::markets::MarketState::Invalid => Self::Invalid,
-            truthcoin_dc::state::markets::MarketState::Settled => Self::Settled,
+        #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+        pub struct BodyVerbose {
+            pub coinbase: Coinbase,
+            pub transactions: Vec<TransactionVerbose>,
+            pub authorizations: Vec<Authorization>,
+            pub actor_proofs: Vec<Option<Authorization>>,
         }
+
+        #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+        pub struct BlockVerbose {
+            pub header: Header,
+            pub body: BodyVerbose,
+        }
+
+        pub mod verbosity {
+            use serde::{Serialize, de::DeserializeOwned};
+            use truthcoin_dc_types::Block;
+            use typewit::const_marker::Bool;
+
+            use crate::node::get_block::BlockVerbose;
+
+            mod private {
+                pub trait Sealed {}
+            }
+
+            pub trait Verbosity: Serialize + private::Sealed {
+                type Response: DeserializeOwned + Serialize;
+            }
+
+            impl<const B: bool> private::Sealed for Bool<B> {}
+
+            impl Verbosity for Bool<true> {
+                type Response = BlockVerbose;
+            }
+
+            impl Verbosity for Bool<false> {
+                type Response = Block;
+            }
+
+            impl private::Sealed for Option<Bool<false>> {}
+
+            impl Verbosity for Option<Bool<false>> {
+                type Response = <Bool<false> as Verbosity>::Response;
+            }
+        }
+        pub use verbosity::Verbosity;
+
+        #[rpc(client, server, server_bounds(
+            V: DeserializeOwned + Verbosity,
+            <V as Verbosity>::Response: Clone + 'static,
+        ))]
+        pub trait Rpc<V>
+        where
+            V: Verbosity,
+        {
+            /// Get the block with specified block hash, if it exists
+            #[method(name = "get_block")]
+            async fn get_block(
+                &self,
+                block_hash: truthcoin_dc_types::BlockHash,
+                verbose: V,
+            ) -> RpcResult<Option<V::Response>>;
+        }
+
+        pub mod untyped {
+            use jsonrpsee::{
+                core::{RpcResult, async_trait},
+                proc_macros::rpc,
+            };
+            use l2l_openapi::open_api;
+            use serde::Serialize;
+            use truthcoin_dc_types::{
+                Address, Authorization, Block, BlockHash, Body,
+                ClaimDecisionPayload, Coinbase, CoinbaseTxid,
+                DecisionClaimEntry, Header, MerkleRoot, Output, OutputContent,
+                Transaction, TxData, Txid, authorization::Signature,
+                market::MarketId, transaction::Outputs,
+            };
+            use typewit::const_marker::Bool;
+            use utoipa::ToSchema;
+
+            use crate::{
+                markets::BallotItem,
+                node::{
+                    TransactionVerbose,
+                    get_block::{
+                        BlockVerbose, BodyVerbose, RpcServer as GetBlock,
+                    },
+                },
+                schema,
+            };
+
+            mod private {
+                pub trait Sealed {}
+            }
+
+            impl<S> private::Sealed for S where
+                S: GetBlock<Bool<false>> + GetBlock<Bool<true>>
+            {
+            }
+
+            #[derive(Clone, Serialize, ToSchema)]
+            #[serde(untagged)]
+            pub enum Response {
+                NonVerbose(Block),
+                Verbose(BlockVerbose),
+            }
+
+            /// This trait exists only as a bound, and should not be implemented
+            /// manually
+            #[open_api(ref_schemas[
+                Address, Authorization, BallotItem, Block, BlockHash,
+                BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, Coinbase,
+                CoinbaseTxid, DecisionClaimEntry, Header, MarketId, MerkleRoot,
+                Output, OutputContent, Outputs, Signature, Transaction,
+                TransactionVerbose, TxData, Txid, schema::BitcoinAddr,
+                schema::BitcoinBlockHash, schema::BitcoinOutPoint,
+                schema::UtreexoNodeHash, schema::UtreexoProof,
+            ])]
+            #[rpc(server, server_bounds(Self: private::Sealed))]
+            pub trait Rpc {
+                /// Get the block with specified block hash, if it exists
+                #[method(name = "get_block")]
+                async fn get_block(
+                    &self,
+                    block_hash: truthcoin_dc_types::BlockHash,
+                    verbose: Option<bool>,
+                ) -> RpcResult<Option<Response>>;
+            }
+
+            #[async_trait]
+            impl<S> RpcServer for S
+            where
+                S: GetBlock<Bool<false>> + GetBlock<Bool<true>>,
+            {
+                async fn get_block(
+                    &self,
+                    block_hash: truthcoin_dc_types::BlockHash,
+                    verbose: Option<bool>,
+                ) -> RpcResult<Option<Response>> {
+                    match verbose {
+                        Some(true) => {
+                            <Self as GetBlock<Bool<true>>>::get_block(
+                                self,
+                                block_hash,
+                                Bool::<true>,
+                            )
+                            .await
+                            .map(|res| res.map(Response::Verbose))
+                        }
+                        Some(false) | None => {
+                            <Self as GetBlock<Bool<false>>>::get_block(
+                                self,
+                                block_hash,
+                                Bool::<false>,
+                            )
+                            .await
+                            .map(|res| res.map(Response::NonVerbose))
+                        }
+                    }
+                }
+            }
+        }
+        pub use untyped::RpcDoc;
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+    pub struct GetTransactionResponse {
+        pub tx: Transaction,
+        /// Block hash, if in the active chain
+        pub block_hash: Option<BlockHash>,
+    }
+
+    /// One transaction the mempool holds
+    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+    pub struct MempoolTx {
+        /// Blake3 over the canonical encoding
+        pub txid: Txid,
+        /// Canonical size in bytes
+        pub size: u64,
+        /// Borsh encoding, as hex
+        pub raw: String,
+        pub tx: Transaction,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+    pub struct GetWithdrawalBundleResponse {
+        pub info: WithdrawalBundleInfo,
+        pub status: WithdrawalBundleStatus,
+    }
+
+    #[open_api(
+        merge_apis[get_block::RpcDoc],
+        ref_schemas[
+            Address, Authorization, BallotItem, BlockHash, BlockIndexDeposit,
+            BlockIndexSpend, BlockIndexTx, Body, ClaimDecisionPayload, Coinbase,
+            CoinbaseTxid, ConsensusResults, DecisionClaimEntry,
+            DecisionContentInfo, DecisionInfo, DecisionState, DecisionSummary,
+            DecisionType, Header, InPoint, M6id, MainchainSyncPhase,
+            MarketDimension, MarketDimensionKind, MarketId, MarketOutcome,
+            MarketResolution, MarketStatus, MerkleRoot, OutPoint, Output,
+            OutputContent, Outputs, ParticipationStats, PeerConnectionStatus,
+            PeriodStats, ScoreChange, SharePosition, Signature, SpentOutput,
+            Transaction, TxData, TxIn, Txid, WinningOutcome, WithdrawalBundle,
+            WithdrawalBundleInfo, WithdrawalBundleStatus, schema::BitcoinAddr,
+            schema::BitcoinBlockHash, schema::BitcoinOutPoint,
+            schema::BitcoinTransaction, schema::SocketAddr,
+            schema::UtreexoNodeHash, schema::UtreexoProof,
+        ],
+    )]
+    #[rpc(
+        client,
+        client_bounds(
+            Self:
+                get_block::RpcClient<Bool<false>>
+                + get_block::RpcClient<Bool<true>>
+        ),
+        server,
+        server_bounds(
+            Self: open_api::RpcServer + get_block::untyped::RpcServer,
+        ),
+    )]
+    pub trait Rpc {
+        /// Connect a block template for which a BMM request was included in the
+        /// specified mainchain block. Returns `true` if it was accepted as the new
+        /// tip.
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "connect_block")]
+        async fn connect_block(
+            &self,
+            block: Block,
+            #[open_api_method_arg(schema(
+                PartialSchema = "schema::BitcoinBlockHash"
+            ))]
+            main_block_hash: bitcoin::BlockHash,
+        ) -> RpcResult<bool>;
+
+        /// Get the block hash at the specified height in the active chain,
+        /// if it exists
+        #[open_api_method(output_schema(
+            PartialSchema = "schema::Optional<truthcoin_dc_types::BlockHash>"
+        ))]
+        #[method(name = "get_block_hash")]
+        async fn get_block_hash(
+            &self,
+            height: u32,
+        ) -> RpcResult<Option<truthcoin_dc_types::BlockHash>>;
+
+        /// Get the transaction ids, sizes and encodings of a block, with the
+        /// mainchain deposits and withdrawal bundle spends it applied
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "get_block_index")]
+        async fn get_block_index(
+            &self,
+            block_hash: truthcoin_dc_types::BlockHash,
+        ) -> RpcResult<BlockIndex>;
+
+        /// Get mainchain blocks that commit to a specified block hash
+        #[open_api_method(output_schema(
+            PartialSchema = "schema::BitcoinBlockHash"
+        ))]
+        #[method(name = "get_bmm_inclusions")]
+        async fn get_bmm_inclusions(
+            &self,
+            block_hash: truthcoin_dc_types::BlockHash,
+        ) -> RpcResult<Vec<bitcoin::BlockHash>>;
+
+        /// Get the best mainchain block hash known by Thunder
+        #[open_api_method(output_schema(
+            PartialSchema = "schema::Optional<schema::BitcoinBlockHash>"
+        ))]
+        #[method(name = "get_best_mainchain_block_hash")]
+        async fn get_best_mainchain_block_hash(
+            &self,
+        ) -> RpcResult<Option<bitcoin::BlockHash>>;
+
+        /// Get the best sidechain block hash known by Thunder
+        #[open_api_method(output_schema(
+            PartialSchema = "schema::Optional<truthcoin_dc_types::BlockHash>"
+        ))]
+        #[method(name = "get_best_sidechain_block_hash")]
+        async fn get_best_sidechain_block_hash(
+            &self,
+        ) -> RpcResult<Option<truthcoin_dc_types::BlockHash>>;
+
+        /// Get stxos for addresses
+        #[method(name = "get_stxos")]
+        async fn get_stxos(
+            &self,
+            addresses: HashSet<Address>,
+        ) -> RpcResult<Vec<PointedOutput<SpentOutput>>>;
+
+        /// Get transaction by txid
+        #[method(name = "get_transaction")]
+        async fn get_transaction(
+            &self,
+            txid: Txid,
+        ) -> RpcResult<Option<GetTransactionResponse>>;
+
+        /// Get the coin movements that a block applied outside its body: a
+        /// mainchain deposit, a withdrawal bundle spend, and the outputs a
+        /// failed bundle returned. The list keeps the order the node applied.
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "get_two_way_peg_events")]
+        async fn get_two_way_peg_events(
+            &self,
+            block_hash: truthcoin_dc_types::BlockHash,
+        ) -> RpcResult<Vec<TwoWayPegEvent>>;
+
+        /// Get utxos for addresses
+        #[method(name = "get_utxos")]
+        async fn get_utxos(
+            &self,
+            addresses: HashSet<Address>,
+        ) -> RpcResult<Vec<PointedOutput>>;
+
+        /// Get withdrawal bundle by M6id
+        #[method(name = "get_withdrawal_bundle")]
+        async fn get_withdrawal_bundle(
+            &self,
+            m6id: M6id,
+        ) -> RpcResult<Option<GetWithdrawalBundleResponse>>;
+
+        /// Get the current block count
+        #[method(name = "getblockcount")]
+        async fn getblockcount(&self) -> RpcResult<u32>;
+
+        /// Get the height of the latest failed withdrawal bundle
+        #[method(name = "latest_failed_withdrawal_bundle_height")]
+        async fn latest_failed_withdrawal_bundle_height(
+            &self,
+        ) -> RpcResult<Option<u32>>;
+
+        /// List the transactions the mempool holds, in no particular order.
+        #[method(name = "list_mempool")]
+        async fn list_mempool(&self) -> RpcResult<Vec<MempoolTx>>;
+
+        /// List peers
+        #[method(name = "list_peers")]
+        async fn list_peers(&self) -> RpcResult<Vec<Peer>>;
+
+        /// List all UTXOs
+        #[method(name = "list_utxos")]
+        async fn list_utxos(&self) -> RpcResult<Vec<PointedOutput>>;
+
+        /// Get the progress of the startup sync with the mainchain
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "mainchain_sync_progress")]
+        async fn mainchain_sync_progress(
+            &self,
+        ) -> RpcResult<MainchainSyncProgress>;
+
+        /// Get pending withdrawal bundle
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "pending_withdrawal_bundle")]
+        async fn pending_withdrawal_bundle(
+            &self,
+        ) -> RpcResult<Option<WithdrawalBundle>>;
+
+        /// Get total sidechain wealth
+        #[method(name = "sidechain_wealth")]
+        async fn sidechain_wealth_sats(&self) -> RpcResult<u64>;
+
+        /// Verify and broadcast a transaction
+        #[method(name = "submit_transaction")]
+        async fn submit_transaction(
+            &self,
+            transaction: Authorized<Transaction>,
+        ) -> RpcResult<Txid>;
+
+        /// Wait until the node reaches a specific block height (for sync)
+        /// Returns the actual height reached (may be higher than requested)
+        /// Times out after the specified milliseconds (default 10000ms)
+        #[method(name = "await_block_height")]
+        async fn await_block_height(
+            &self,
+            target_height: u32,
+            timeout_ms: Option<u64>,
+        ) -> RpcResult<u32>;
+
+        /// Get information about a transaction in the current chain
+        #[method(name = "get_transaction_info")]
+        async fn get_transaction_info(
+            &self,
+            txid: Txid,
+        ) -> RpcResult<Option<TxInfo>>;
+
+        /// Submit a hex-encoded borsh-serialized `AuthorizedTransaction` directly
+        /// to the mempool. Returns the transaction id on success.
+        ///
+        /// Intended for tests and advanced clients that need to submit a
+        /// pre-signed transaction (e.g. to exercise validator paths like
+        /// stale `prev_block_hash` rejection).
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "push_tx")]
+        async fn push_tx(&self, tx_hex: String) -> RpcResult<Txid>;
+
+        /// Calculate initial liquidity required for market creation
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "calculate_initial_liquidity")]
+        async fn calculate_initial_liquidity(
+            &self,
+            request: CalculateInitialLiquidityRequest,
+        ) -> RpcResult<InitialLiquidityCalculation>;
+
+        /// Compute the listing fee (sats) for claiming a specific decision_id.
+        /// The tier (and therefore the price multiplier) is determined by the
+        /// id's decision_index field.
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "decision_fee_for_id")]
+        async fn decision_fee_for_id(
+            &self,
+            decision_id_hex: String,
+        ) -> RpcResult<u64>;
+
+        /// Get a specific decision by ID (includes is_voting status)
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "decision_get")]
+        async fn decision_get(
+            &self,
+            decision_id: String,
+        ) -> RpcResult<Option<DecisionDetails>>;
+
+        /// List decisions with optional filtering by period and state
+        #[open_api_method(output_schema(ToSchema = "Vec<DecisionListItem>"))]
+        #[method(name = "decision_list")]
+        async fn decision_list(
+            &self,
+            filter: Option<DecisionFilter>,
+        ) -> RpcResult<Vec<DecisionListItem>>;
+
+        /// Get listing fee info for a period
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "decision_listing_fee")]
+        async fn decision_listing_fee(
+            &self,
+            period: u32,
+        ) -> RpcResult<DecisionListingFeeInfo>;
+
+        /// Get decision system status and configuration
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "decision_status")]
+        async fn decision_status(&self) -> RpcResult<DecisionPeriodStatus>;
+
+        /// List open voting periods with the price the next claim would pay
+        /// for the cheapest available unlocked slot in each. For the GUI's
+        /// per-dimension period picker.
+        #[open_api_method(output_schema(
+            ToSchema = "Vec<PeriodPricingSummary>"
+        ))]
+        #[method(name = "list_open_periods_with_pricing")]
+        async fn list_open_periods_with_pricing(
+            &self,
+        ) -> RpcResult<Vec<PeriodPricingSummary>>;
+
+        /// Get detailed market information
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "market_get")]
+        async fn market_get(
+            &self,
+            market_id: String,
+        ) -> RpcResult<Option<MarketData>>;
+
+        /// List all markets
+        #[open_api_method(output_schema(ToSchema = "Vec<MarketSummary>"))]
+        #[method(name = "market_list")]
+        async fn market_list(&self) -> RpcResult<Vec<MarketSummary>>;
+
+        /// Get the price history of a market from the active chain: one point
+        /// for the creation block and one for each block that changed its
+        /// prices, oldest first
+        #[open_api_method(output_schema(ToSchema = "Vec<MarketPricePoint>"))]
+        #[method(name = "market_price_history")]
+        async fn market_price_history(
+            &self,
+            market_id: String,
+        ) -> RpcResult<Vec<MarketPricePoint>>;
+
+        /// Get share positions for an address (optionally filtered by market)
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "market_positions")]
+        async fn market_positions(
+            &self,
+            address: Address,
+            market_id: Option<String>,
+        ) -> RpcResult<UserHoldings>;
+
+        /// Query votes with filters (by voter, decision, or period)
+        #[open_api_method(output_schema(ToSchema = "Vec<VoteInfo>"))]
+        #[method(name = "vote_list")]
+        async fn vote_list(
+            &self,
+            filter: VoteFilter,
+        ) -> RpcResult<Vec<VoteInfo>>;
+
+        /// Get full voting period information (null period_id = current)
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "vote_period")]
+        async fn vote_period(
+            &self,
+            period_id: Option<u32>,
+        ) -> RpcResult<Option<VotingPeriodFull>>;
+
+        /// Get full voter information
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "vote_voter")]
+        async fn vote_voter(
+            &self,
+            address: Address,
+        ) -> RpcResult<Option<VoterInfoFull>>;
+
+        /// List all registered voters
+        #[open_api_method(output_schema(ToSchema = "Vec<VoterInfo>"))]
+        #[method(name = "vote_voters")]
+        async fn vote_voters(&self) -> RpcResult<Vec<VoterInfo>>;
+
+        /// Get votecoin balance for an address
+        #[open_api_method(output_schema(ToSchema = "f64"))]
+        #[method(name = "votecoin_balance")]
+        async fn votecoin_balance(&self, address: Address) -> RpcResult<f64>;
     }
 }
 
-impl std::fmt::Display for MarketStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let value = match self {
-            Self::Trading => "trading",
-            Self::Cancelled => "cancelled",
-            Self::Invalid => "invalid",
-            Self::Settled => "settled",
-        };
-        f.write_str(value)
+pub mod wallet {
+    use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+    use l2l_openapi::open_api;
+    use serde::{Deserialize, Serialize};
+    use truthcoin_dc_types::{
+        Address, Authorization, Authorized, Block, BlockHash, Body,
+        ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
+        EncryptionPubKey, Header, MerkleRoot, OutPoint, Output, OutputContent,
+        PointedOutput, Transaction, TxData, Txid, VerifyingKey,
+        authorization::{Dst, Signature},
+        market::MarketId,
+        transaction::Outputs,
+        wallet::{Balance, TransferDests},
+    };
+    use utoipa::ToSchema;
+
+    use crate::{
+        markets::{
+            BallotItem, ClaimedDecisionInfo, CreateTradeRequest,
+            CreateTradeResponse, DecisionClaimItem, DecisionClaimRequest,
+            DecisionClaimResponse, DimensionInput, MarketAmplifyBetaRequest,
+            MarketBuyRequest, MarketBuyResponse, MarketCreateRequest,
+            MarketCreateResponse, MarketSellRequest, MarketSellResponse,
+        },
+        open_api, schema,
+    };
+
+    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+    pub struct GetBlockTemplateResponse {
+        /// Block hash to commit to in a BMM request
+        pub critical_hash: BlockHash,
+        /// Block to pass to `connect_block` once its BMM request is included in a
+        /// mainchain block
+        pub block: Block,
+        /// Fees collected by the transactions in the block, in sats
+        pub fees_sats: u64,
+    }
+
+    #[open_api(ref_schemas[
+        Address, Authorization, BallotItem, Block, BlockHash, Body,
+        ClaimDecisionPayload, ClaimedDecisionInfo, Coinbase, CoinbaseTxid,
+        DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, MarketId,
+        MerkleRoot, OutPoint, Output, OutputContent, Outputs, Signature,
+        Transaction, TxData, Txid, schema::BitcoinAddr,
+        schema::BitcoinBlockHash, schema::BitcoinOutPoint,
+        schema::UtreexoNodeHash, schema::UtreexoProof,
+    ])]
+    #[rpc(client, server, server_bounds(Self: open_api::RpcServer))]
+    pub trait Rpc {
+        /// Get balance in sats
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "balance")]
+        async fn balance(&self) -> RpcResult<Balance>;
+
+        /// Deposit to address
+        #[open_api_method(output_schema(
+            PartialSchema = "schema::BitcoinTxid"
+        ))]
+        #[method(name = "create_deposit")]
+        async fn create_deposit(
+            &self,
+            address: Address,
+            value_sats: u64,
+            fee_sats: u64,
+        ) -> RpcResult<bitcoin::Txid>;
+
+        /// Create a tx that transfers funds to the specified address
+        #[method(name = "create_transfer")]
+        async fn create_transfer(
+            &self,
+            dest: Address,
+            value_sats: u64,
+            fee_sats: u64,
+        ) -> RpcResult<Txid>;
+
+        /// Create a tx that transfers funds to each address in `dests`,
+        /// which maps an address to a value in sats. The outputs come in
+        /// address order, and the change output comes last.
+        #[method(name = "create_transfer_many")]
+        async fn create_transfer_many(
+            &self,
+            dests: TransferDests,
+            fee_sats: u64,
+        ) -> RpcResult<Txid>;
+
+        /// Creates a tx that initiates a withdrawal to the specified mainchain
+        /// address
+        #[method(name = "create_withdrawal")]
+        async fn create_withdrawal(
+            &self,
+            #[open_api_method_arg(schema(
+                PartialSchema = "schema::BitcoinAddr"
+            ))]
+            mainchain_address: bitcoin::Address<
+                bitcoin::address::NetworkUnchecked,
+            >,
+            amount_sats: u64,
+            fee_sats: u64,
+            mainchain_fee_sats: u64,
+        ) -> RpcResult<Txid>;
+
+        /// Format a deposit address
+        #[method(name = "format_deposit_address")]
+        async fn format_deposit_address(
+            &self,
+            address: Address,
+        ) -> RpcResult<String>;
+
+        /// Generate a mnemonic seed phrase
+        #[method(name = "generate_mnemonic")]
+        async fn generate_mnemonic(&self) -> RpcResult<String>;
+
+        /// Assemble a block to blind merge mine, without requesting BMM for it.
+        /// The caller requests BMM for `critical_hash` itself, then passes the
+        /// block back to `connect_block`.
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "get_block_template")]
+        async fn get_block_template(
+            &self,
+        ) -> RpcResult<GetBlockTemplateResponse>;
+
+        /// Get a new address
+        #[method(name = "get_new_address")]
+        async fn get_new_address(&self) -> RpcResult<Address>;
+
+        /// Get wallet addresses, sorted by base58 encoding
+        #[method(name = "get_wallet_addresses")]
+        async fn get_wallet_addresses(&self) -> RpcResult<Vec<Address>>;
+
+        /// Get wallet UTXOs
+        #[method(name = "get_wallet_utxos")]
+        async fn get_wallet_utxos(&self) -> RpcResult<Vec<PointedOutput>>;
+
+        /// Get the unconfirmed wallet UTXOs that the wallet may spend. The
+        /// `--spend-unconfirmed` option decides which ones qualify.
+        #[method(name = "get_unconfirmed_wallet_utxos")]
+        async fn get_unconfirmed_wallet_utxos(
+            &self,
+        ) -> RpcResult<Vec<PointedOutput>>;
+
+        /// Attempt to mine a sidechain block
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "mine")]
+        async fn mine(&self, fee: Option<u64>) -> RpcResult<()>;
+
+        /// Set the wallet seed from a mnemonic seed phrase
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "set_seed_from_mnemonic")]
+        async fn set_seed_from_mnemonic(
+            &self,
+            mnemonic: String,
+        ) -> RpcResult<()>;
+
+        /// Sign a transaction, and optionally broadcast it.
+        #[method(name = "sign_transaction")]
+        async fn sign_transaction(
+            &self,
+            transaction: Transaction,
+            broadcast: Option<bool>,
+        ) -> RpcResult<Authorized<Transaction>>;
+
+        #[method(name = "decrypt_msg")]
+        async fn decrypt_msg(
+            &self,
+            encryption_pubkey: EncryptionPubKey,
+            ciphertext: String,
+        ) -> RpcResult<String>;
+
+        #[method(name = "encrypt_msg")]
+        async fn encrypt_msg(
+            &self,
+            encryption_pubkey: EncryptionPubKey,
+            msg: String,
+        ) -> RpcResult<String>;
+
+        /// Generate new encryption key
+        #[method(name = "get_new_encryption_key")]
+        async fn get_new_encryption_key(&self) -> RpcResult<EncryptionPubKey>;
+
+        /// Generate new verifying/signing key
+        #[method(name = "get_new_verifying_key")]
+        async fn get_new_verifying_key(&self) -> RpcResult<VerifyingKey>;
+
+        /// List unconfirmed owned UTXOs
+        #[method(name = "my_unconfirmed_utxos")]
+        async fn my_unconfirmed_utxos(&self) -> RpcResult<Vec<PointedOutput>>;
+
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "refresh_wallet")]
+        async fn refresh_wallet(&self) -> RpcResult<()>;
+
+        /// Sign an arbitrary message with the specified verifying key
+        #[method(name = "sign_arbitrary_msg")]
+        async fn sign_arbitrary_msg(
+            &self,
+            verifying_key: VerifyingKey,
+            msg: String,
+        ) -> RpcResult<Signature>;
+
+        /// Sign an arbitrary message with the secret key for the specified address
+        #[method(name = "sign_arbitrary_msg_as_addr")]
+        async fn sign_arbitrary_msg_as_addr(
+            &self,
+            address: Address,
+            msg: String,
+        ) -> RpcResult<Authorization>;
+
+        /// Verify a signature on a message against the specified verifying key.
+        /// Returns `true` if the signature is valid
+        #[method(name = "verify_signature")]
+        async fn verify_signature(
+            &self,
+            signature: Signature,
+            verifying_key: VerifyingKey,
+            dst: Dst,
+            msg: String,
+        ) -> RpcResult<bool>;
+
+        /// Get the voter address (index 0), used for reputation
+        /// and voting identity
+        #[method(name = "get_voter_address")]
+        async fn get_voter_address(&self) -> RpcResult<Address>;
+
+        /// Transfer votecoin to the specified address
+        #[method(name = "transfer_votecoin")]
+        async fn transfer_votecoin(
+            &self,
+            dest: Address,
+            amount: f64,
+            fee_sats: u64,
+        ) -> RpcResult<Txid>;
+
+        /// Claim one or more decisions.
+        /// decision_type: "binary", "scaled", or "category"
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "decision_claim")]
+        async fn decision_claim(
+            &self,
+            request: DecisionClaimRequest,
+        ) -> RpcResult<DecisionClaimResponse>;
+
+        /// Create a prediction market, optionally claiming new decisions in
+        /// the same tx. Each dimension references either an existing claimed
+        /// decision or carries new-claim metadata that will be allocated a
+        /// slot and claimed before the market is built.
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "market_create")]
+        async fn market_create(
+            &self,
+            request: MarketCreateRequest,
+        ) -> RpcResult<MarketCreateResponse>;
+
+        /// Buy shares (with dry_run support for cost calculation)
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "market_buy")]
+        async fn market_buy(
+            &self,
+            request: MarketBuyRequest,
+        ) -> RpcResult<MarketBuyResponse>;
+
+        /// Sell shares (with dry_run support for proceeds calculation)
+        /// Payout is created during block connection from market treasury
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "market_sell")]
+        async fn market_sell(
+            &self,
+            request: MarketSellRequest,
+        ) -> RpcResult<MarketSellResponse>;
+
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "market_amplify_beta")]
+        async fn market_amplify_beta(
+            &self,
+            request: MarketAmplifyBetaRequest,
+        ) -> RpcResult<String>;
+
+        /// Submit one or more votes (batch)
+        #[open_api_method(output_schema(ToSchema = "String"))]
+        #[method(name = "vote_submit")]
+        async fn vote_submit(
+            &self,
+            votes: Vec<BallotItem>,
+            fee_sats: u64,
+        ) -> RpcResult<String>;
+
+        /// Build and sign a Trade transaction with a caller-supplied
+        /// `prev_block_hash`, returning the hex-encoded signed
+        /// `AuthorizedTransaction` *without* submitting it to the mempool.
+        ///
+        /// Intended for tests that need to exercise the validator's
+        /// chain-binding behavior (e.g. submitting a trade bound to an
+        /// out-of-window block hash). The returned tx can be submitted via
+        /// [`push_tx`].
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "create_trade")]
+        async fn create_trade(
+            &self,
+            request: CreateTradeRequest,
+        ) -> RpcResult<CreateTradeResponse>;
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketDimension {
-    /// Position in the market's ordered dimension specification.
-    pub dimension_index: usize,
-    /// Hex-encoded decision ID backing this dimension.
-    pub decision_id: String,
-    /// Decision header, kept separate from outcome names.
-    pub name: String,
-    pub kind: MarketDimensionKind,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum MarketDimensionKind {
-    Binary {
-        lower_label: String,
-        upper_label: String,
-    },
-    Scaled {
-        min: f64,
-        max: f64,
-        increment: f64,
-        /// The current protocol does not carry a unit field, so this is null
-        /// until one is added to the decision definition.
-        unit: Option<String>,
-        lower_label: String,
-        upper_label: String,
-    },
-    Category {
-        /// State labels in coordinate order.
-        options: Vec<String>,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketOutcome {
-    /// Dense index used by market_buy and market_sell.
-    pub outcome_index: usize,
-    /// Human-readable description of this joint outcome.
-    pub label: String,
-    /// LMSR price for this outcome. For the current market implementation,
-    /// this is also the outcome probability.
-    pub price: f64,
-    pub volume_sats: u64,
-    /// Index into the full Cartesian state tensor, including non-tradeable
-    /// abstain coordinates.
-    pub full_state_index: usize,
-    /// One coordinate per ordered market dimension.
-    pub coordinates: Vec<usize>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketData {
-    pub market_id: String,
-    pub title: String,
-    pub description: String,
-    pub tags: Vec<String>,
-    pub creator_address: String,
-    pub created_at_height: u32,
-    pub expires_at_height: Option<u32>,
-    /// Ordered dimension metadata. The dimension decision IDs are the
-    /// authoritative decision list for this market.
-    pub dimensions: Vec<MarketDimension>,
-    pub outcomes: Vec<MarketOutcome>,
-    pub state: MarketStatus,
-    /// Effective LMSR beta used for pricing, in satoshis per share unit.
-    pub beta: f64,
-    /// Author-funded LMSR liquidity base, in satoshis.
-    pub liquidity_base_sats: u64,
-    /// Exact market treasury balance, in satoshis.
-    pub treasury_sats: u64,
-    pub total_volume_sats: u64,
-    /// Fractional trading fee applied to buys and sells.
-    pub trading_fee_rate: f64,
-    pub resolution: Option<MarketResolution>,
-    pub tx_pow_hash_selector: u8,
-    pub tx_pow_ordering: u8,
-    pub tx_pow_difficulty: u8,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketResolution {
-    pub winning_outcomes: Vec<WinningOutcome>,
-    pub summary: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct WinningOutcome {
-    pub outcome_index: usize,
-    pub label: String,
-    pub price: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketSummary {
-    pub market_id: String,
-    pub title: String,
-    pub description: String,
-    pub outcome_count: usize,
-    pub state: MarketStatus,
-    pub volume_sats: u64,
-    pub created_at_height: u32,
-}
-
-/// Outcome prices of a market after a block of the active chain.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketPricePoint {
-    pub height: u32,
-    pub block_hash: BlockHash,
-    /// Unix time of the mainchain block that holds the BMM commitment.
-    pub timestamp: u64,
-    /// Price of each tradeable outcome, by outcome index.
-    pub prices: Vec<f64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct SharePosition {
-    pub market_id: String,
-    pub outcome_index: usize,
-    pub outcome_name: String,
-    pub shares: i64,
-    pub avg_purchase_price: f64,
-    pub current_price: f64,
-    pub current_value: f64,
-    pub unrealized_pnl: f64,
-    pub cost_basis: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct UserHoldings {
-    pub address: String,
-    pub positions: Vec<SharePosition>,
-    pub total_value: f64,
-    pub total_cost_basis: f64,
-    pub total_unrealized_pnl: f64,
-    pub active_markets: usize,
-    pub last_updated_height: u32,
-}
-
-/// Per-dimension input for `market_create`. Each dimension is either
-/// a reference to an already-claimed decision (`Existing`) or a request to
-/// claim a new decision (`New`). The wallet derives the `Single` vs
-/// `Categorical` `DimensionSpec` from the decision's type.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum DimensionInput {
-    /// Reuse an existing on-chain decision by ID (hex).
-    Existing { id: String },
-    /// Claim a new decision in this same tx.
-    /// `decision_type` is "binary", "scaled", or "category".
-    /// For "scaled", `min`/`max` are required; `increment` defaults to 1.0.
-    /// For "category", `option_labels` (>= 2) are required.
-    New {
-        period_index: u32,
-        decision_type: String,
-        header: String,
-        #[serde(default)]
-        description: Option<String>,
-        #[serde(default)]
-        option_0_label: Option<String>,
-        #[serde(default)]
-        option_1_label: Option<String>,
-        #[serde(default)]
-        option_labels: Option<Vec<String>>,
-        #[serde(default)]
-        tags: Option<Vec<String>>,
-        #[serde(default)]
-        min: Option<f64>,
-        #[serde(default)]
-        max: Option<f64>,
-        #[serde(default)]
-        increment: Option<f64>,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketCreateRequest {
-    pub title: String,
-    pub description: String,
-    pub dimensions: Vec<DimensionInput>,
-    pub beta: Option<f64>,
-    pub trading_fee: Option<f64>,
-    pub initial_liquidity: Option<u64>,
-    pub tx_pow_hash_selector: Option<u8>,
-    pub tx_pow_ordering: Option<u8>,
-    pub tx_pow_difficulty: Option<u8>,
-    pub tx_fee_sats: u64,
-    /// Optional cap on the total listing fee paid for new claims.
-    /// If the computed total exceeds this, the RPC errors before broadcasting.
-    pub max_listing_fee_sats: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct ClaimedDecisionInfo {
-    pub id: String,
-    pub period_index: u32,
-    pub listing_fee_paid_sats: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct MarketCreateResponse {
-    pub txid: Txid,
-    pub market_id: String,
-    pub claimed_decisions: Vec<ClaimedDecisionInfo>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct PeriodPricingSummary {
-    pub period_index: u32,
-    /// Sats charged for the next claim if dropped into this period
-    /// (cheapest available unlocked slot's tier price).
-    pub cheapest_available_slot_sats: u64,
-    /// Tier index (0..=4) of the cheapest available slot.
-    pub cheapest_available_tier: u8,
-    /// Remaining unlocked slots per tier (length 5).
-    pub slots_available_by_tier: Vec<u32>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct CalculateInitialLiquidityRequest {
-    pub beta: f64,
-    /// Dimension specification in bracket notation (alternative to num_outcomes)
-    pub dimensions: Option<String>,
-    /// Number of outcomes (alternative to dimensions)
-    pub num_outcomes: Option<usize>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct InitialLiquidityCalculation {
-    pub beta: f64,
-    pub num_outcomes: usize,
-    pub initial_liquidity_sats: u64,
-    pub min_treasury_sats: u64,
-    pub market_config: String,
-    pub outcome_breakdown: String,
-}
-
-/// A single vote in a ballot submission.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct BallotItem {
-    pub decision_id: String,
-    /// The vote value in real units (e.g., 270 for electoral votes).
-    /// For scaled decisions, the value must equal `min + k * increment`
-    /// for some non-negative integer `k`, with `vote_value <= max`.
-    /// For binary decisions, use 0.0 (No) or 1.0 (Yes).
-    pub vote_value: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct SubmitBallotRequest {
-    pub votes: Vec<BallotItem>,
-    pub fee_sats: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct VoterInfo {
-    pub address: String,
-    pub votecoin_balance: f64,
-    pub total_votes: u64,
-    pub is_active: bool,
-}
-
-/// Information about a recorded vote.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct VoteInfo {
-    pub voter_address: String,
-    pub decision_id: String,
-    /// The vote value in real units (e.g., 270 for electoral votes).
-    /// For scaled decisions, the denormalized value aligned to the
-    /// decision's increment. For binary decisions, this is 0.0 or 1.0.
-    pub vote_value: f64,
-    pub period_id: u32,
-    pub block_height: u32,
-    pub txid: String,
-    pub is_batch_vote: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct ScoreChange {
-    pub old_score: f64,
-    pub new_score: f64,
-}
-
-#[allow(clippy::double_must_use)]
-mod rpc;
-
-pub use rpc::{node, open_api, wallet};
+#[cfg(test)]
+mod test;

@@ -1,7 +1,7 @@
 use eframe::egui;
 use human_size::{Byte, Kibibyte, Mebibyte, SpecificSize};
 
-use truthcoin_dc::types::{Body, GetBitcoinValue, Header};
+use truthcoin_dc::types::{Body, GetValue, Header};
 
 use crate::app::App;
 
@@ -16,7 +16,7 @@ impl BlockExplorer {
 
     pub fn show(&mut self, app: Option<&App>, ui: &mut egui::Ui) {
         let max_height = app
-            .and_then(|app| app.node.try_get_tip_height().ok().flatten())
+            .and_then(|app| app.node.try_get_height().ok().flatten())
             .unwrap_or(0);
         let block: Option<(Header, Body)> = {
             if let Some(app) = app
@@ -51,11 +51,8 @@ impl BlockExplorer {
                 let prev_main_hash = &format!("{}", header.prev_main_hash);
                 let body_size =
                     bincode::serialize(&body).unwrap_or(vec![]).len();
-                let coinbase_value: bitcoin::Amount = body
-                    .coinbase
-                    .iter()
-                    .map(GetBitcoinValue::get_bitcoin_value)
-                    .sum();
+                let coinbase_value: bitcoin::Amount =
+                    body.coinbase.outputs.iter().map(GetValue::get_value).sum();
                 let num_transactions = body.transactions.len();
                 let body_size = if let Ok(body_size) =
                     SpecificSize::new(body_size as f64, Byte)

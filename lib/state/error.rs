@@ -1,14 +1,98 @@
-//! State errors
-#![allow(clippy::duplicated_attributes)]
+use std::path::PathBuf;
 
 use sneed::{db::error as db, env::error as env, rwtxn::error as rwtxn};
 use thiserror::Error;
 use transitive::Transitive;
 
 use crate::types::{
-    AmountOverflowError, AmountUnderflowError, BlockHash, M6id, MerkleRoot,
-    OutPoint, WithdrawalBundleError,
+    AmountOverflowError, AmountUnderflowError, BlockHash,
+    ComputeMerkleRootError, M6id, MerkleRoot, OutPoint, Txid, UtreexoError,
+    Version, WithdrawalBundleError,
 };
+
+#[derive(Debug, Error)]
+#[error("utxo {outpoint} doesn't exist")]
+pub struct NoUtxo {
+    pub outpoint: OutPoint,
+}
+
+#[derive(Debug, Error)]
+#[error("pending withdrawal bundle {0} unknown in withdrawal_bundles")]
+#[repr(transparent)]
+pub struct PendingWithdrawalBundleUnknown(pub M6id);
+
+#[allow(clippy::duplicated_attributes)]
+#[derive(Debug, Error, Transitive)]
+#[transitive(
+    from(db::Delete, db::Error),
+    from(db::Put, db::Error),
+    from(db::TryGet, db::Error)
+)]
+pub enum ConnectWithdrawalBundleSubmitted {
+    #[error(
+        "confirmed withdrawal bundle {} resubmitted in {}",
+        .m6id,
+        .event_block_hash,
+    )]
+    ConfirmedResubmitted {
+        event_block_hash: bitcoin::BlockHash,
+        m6id: M6id,
+    },
+    #[error(transparent)]
+    Db(Box<db::Error>),
+    #[error(
+        "dropped withdrawal bundle {0} marked as pending in withdrawal_bundles"
+    )]
+    DroppedPending(M6id),
+    #[error(transparent)]
+    NoUtxo(#[from] NoUtxo),
+    #[error(transparent)]
+    PendingWithdrawalBundleUnknown(#[from] PendingWithdrawalBundleUnknown),
+    #[error(
+        "withdrawal bundle {} submitted in {} resubmitted in {}",
+        m6id,
+        submitted_block_height,
+        event_block_hash
+    )]
+    Resubmitted {
+        event_block_hash: bitcoin::BlockHash,
+        m6id: M6id,
+        submitted_block_height: u32,
+    },
+    #[error(
+        "unknown confirmed withdrawal bundle {} marked as failed in {}",
+        .m6id,
+        .failed_block_height,
+    )]
+    UnknownConfirmedFailed {
+        m6id: M6id,
+        failed_block_height: u32,
+    },
+    #[error(
+        "unknown withdrawal bundle {} marked as dropped in {}",
+        .m6id,
+        .dropped_block_height,
+    )]
+    UnknownDropped {
+        m6id: M6id,
+        dropped_block_height: u32,
+    },
+    #[error(
+        "unknown withdrawal bundle {} marked as pending in {}",
+        .m6id,
+        .pending_block_height,
+    )]
+    UnknownPending {
+        m6id: M6id,
+        pending_block_height: u32,
+    },
+}
+
+impl From<db::Error> for ConnectWithdrawalBundleSubmitted {
+    fn from(err: db::Error) -> Self {
+        Self::Db(Box::new(err))
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum InvalidHeader {
@@ -26,32 +110,12 @@ pub enum InvalidHeader {
     },
 }
 
-#[derive(Debug)]
-pub struct FillTxOutputContents(pub Box<crate::types::FilledTransaction>);
-
-impl std::fmt::Display for FillTxOutputContents {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let txid = self.0.txid();
-        write!(
-            f,
-            "failed to fill tx output contents ({txid}): invalid transaction"
-        )?;
-        if f.alternate() {
-            let tx_json = serde_json::to_string(&self.0)
-                .unwrap_or_else(|_| "<unserializable>".to_owned());
-            write!(f, " ({tx_json})")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for FillTxOutputContents {}
-
 #[allow(clippy::duplicated_attributes)]
 #[derive(Debug, Error, Transitive)]
 #[transitive(from(db::Clear, db::Error))]
 #[transitive(from(db::Delete, db::Error))]
 #[transitive(from(db::Error, sneed::Error))]
+#[transitive(from(db::Get, db::Error))]
 #[transitive(from(db::IterInit, db::Error))]
 #[transitive(from(db::IterItem, db::Error))]
 #[transitive(from(db::Last, db::Error))]
@@ -63,14 +127,111 @@ impl std::error::Error for FillTxOutputContents {}
 #[transitive(from(rwtxn::Commit, rwtxn::Error))]
 #[transitive(from(rwtxn::Error, sneed::Error))]
 pub enum Error {
+    #[error("failed to verify authorization")]
+    Authorization,
     #[error(transparent)]
-    Market(#[from] crate::state::markets::MarketError),
+    Archive(Box<crate::archive::Error>),
     #[error(transparent)]
     AmountOverflow(#[from] AmountOverflowError),
     #[error(transparent)]
     AmountUnderflow(#[from] AmountUnderflowError),
-    #[error("failed to verify authorization")]
-    AuthorizationError,
+    #[error("body too large")]
+    BodyTooLarge,
+    #[error(transparent)]
+    BorshSerialize(borsh::io::Error),
+    #[error(transparent)]
+    ConnectWithdrawalBundleSubmitted(#[from] ConnectWithdrawalBundleSubmitted),
+    #[error(transparent)]
+    ComputeMerkleRoot(#[from] ComputeMerkleRootError),
+    #[error(transparent)]
+    Db(#[from] sneed::Error),
+    #[error(
+        "Incompatible DB version ({}). Please clear the DB (`{}`) and re-sync",
+        .version,
+        .db_path.display()
+    )]
+    IncompatibleVersion { version: Version, db_path: PathBuf },
+    #[error(
+        "invalid body: expected merkle root {expected}, but computed {computed}"
+    )]
+    InvalidBody {
+        expected: MerkleRoot,
+        computed: MerkleRoot,
+    },
+    #[error("invalid header: {0}")]
+    InvalidHeader(InvalidHeader),
+    #[error("deposit block doesn't exist")]
+    NoDepositBlock,
+    #[error("total fees less than coinbase value")]
+    NotEnoughFees,
+    #[error("no tip")]
+    NoTip,
+    #[error("stxo {outpoint} doesn't exist")]
+    NoStxo { outpoint: OutPoint },
+    #[error("value in is less than value out")]
+    NotEnoughValueIn,
+    #[error(transparent)]
+    NoUtxo(#[from] NoUtxo),
+    #[error("withdrawal output {outpoint} cannot be spent by a transaction")]
+    SpendWithdrawalOutput { outpoint: OutPoint },
+    #[error("Withdrawal bundle event block doesn't exist")]
+    NoWithdrawalBundleEventBlock,
+    #[error(transparent)]
+    PendingWithdrawalBundleUnknown(#[from] PendingWithdrawalBundleUnknown),
+    #[error(transparent)]
+    Utreexo(#[from] UtreexoError),
+    #[error("Utreexo proof verification failed for tx {txid}")]
+    UtreexoProofFailed { txid: Txid },
+    #[error("Computed Utreexo roots do not match the header roots")]
+    UtreexoRootsMismatch,
+    #[error("utxo double spent")]
+    UtxoDoubleSpent,
+    #[error(
+        "Computed Utxo hash ({}) for input ({}) does not match input hash ({})",
+        const_hex::encode(.computed),
+        .outpoint,
+        const_hex::encode(.input_hash),
+    )]
+    UtxoHashMismatch {
+        computed: crate::types::Hash,
+        outpoint: OutPoint,
+        input_hash: crate::types::Hash,
+    },
+    #[error("too many sigops")]
+    TooManySigops,
+    #[error(
+        "protocol would be insolvent after confirming unexpected withdrawal bundle {} in {}; bundle outpoint {} already spent",
+        .m6id,
+        .event_block_hash,
+        .outpoint,
+    )]
+    UnexpectedWithdrawalBundleInsolvency {
+        event_block_hash: bitcoin::BlockHash,
+        m6id: M6id,
+        outpoint: OutPoint,
+    },
+    #[error("Unknown withdrawal bundle: {m6id}")]
+    UnknownWithdrawalBundle { m6id: M6id },
+    #[error(
+        "Unknown withdrawal bundle confirmed in {event_block_hash}: {m6id}"
+    )]
+    UnknownWithdrawalBundleConfirmed {
+        event_block_hash: bitcoin::BlockHash,
+        m6id: M6id,
+    },
+    #[error(
+        "Unknown confirmed withdrawal bundle reconfirmed in {event_block_hash}: {m6id}"
+    )]
+    UnknownWithdrawalBundleReconfirmed {
+        event_block_hash: bitcoin::BlockHash,
+        m6id: M6id,
+    },
+    #[error("wrong public key for address")]
+    WrongPubKeyForAddress,
+    #[error(transparent)]
+    WithdrawalBundle(#[from] WithdrawalBundleError),
+    #[error(transparent)]
+    Market(#[from] crate::state::markets::MarketError),
     #[error("bad coinbase output content")]
     BadCoinbaseOutputContent,
     #[error("invalid scaled decision: {reason}")]
@@ -92,88 +253,10 @@ pub enum Error {
         decision_id: crate::state::decisions::DecisionId,
         reason: String,
     },
-    #[error("timestamp out of range")]
-    TimestampOutOfRange,
-
-    #[error("bundle too heavy {weight} > {max_weight}")]
-    BundleTooHeavy { weight: u64, max_weight: u64 },
-    #[error("body too large")]
-    BodyTooLarge,
-    #[error(transparent)]
-    BorshSerialize(borsh::io::Error),
-    #[error("Database consistency error: {0}")]
-    DatabaseError(String),
-    #[error(transparent)]
-    Db(Box<sneed::Error>),
-    #[error(transparent)]
-    Archive(Box<crate::archive::Error>),
-    #[error(transparent)]
-    FillTxOutputContents(#[from] FillTxOutputContents),
-    #[error(
-        "invalid body: expected merkle root {expected}, but computed {computed}"
-    )]
-    InvalidBody {
-        expected: MerkleRoot,
-        computed: MerkleRoot,
-    },
-    #[error("invalid header: {0}")]
-    InvalidHeader(InvalidHeader),
-
-    #[error("deposit block doesn't exist")]
-    NoDepositBlock,
-    #[error("total fees less than coinbase value")]
-    NotEnoughFees,
-    #[error("value in is less than value out")]
-    NotEnoughValueIn,
-    #[error("no tip")]
-    NoTip,
-    #[error("stxo {outpoint} doesn't exist")]
-    NoStxo { outpoint: OutPoint },
-    #[error("utxo {outpoint} doesn't exist")]
-    NoUtxo { outpoint: OutPoint },
-    #[error("withdrawal output {outpoint} cannot be spent by a transaction")]
-    SpendWithdrawalOutput { outpoint: OutPoint },
-    #[error("Withdrawal bundle event block doesn't exist")]
-    NoWithdrawalBundleEventBlock,
-
-    #[error(transparent)]
-    SignatureError(#[from] frost_ristretto255::Error),
-
-    #[error("Unknown withdrawal bundle: {m6id}")]
-    UnknownWithdrawalBundle { m6id: M6id },
-    #[error(
-        "Unknown withdrawal bundle confirmed in {event_block_hash}: {m6id}"
-    )]
-    UnknownWithdrawalBundleConfirmed {
-        event_block_hash: bitcoin::BlockHash,
-        m6id: M6id,
-    },
-    #[error(
-        "Unknown confirmed withdrawal bundle reconfirmed in \
-         {event_block_hash}: {m6id}"
-    )]
-    UnknownWithdrawalBundleReconfirmed {
-        event_block_hash: bitcoin::BlockHash,
-        m6id: M6id,
-    },
-    #[error(
-        "protocol would be insolvent after confirming unexpected withdrawal \
-         bundle {m6id} in {event_block_hash}; bundle outpoint {outpoint} \
-         already spent"
-    )]
-    UnexpectedWithdrawalBundleInsolvency {
-        event_block_hash: bitcoin::BlockHash,
-        m6id: M6id,
-        outpoint: OutPoint,
-    },
-    #[error("utxo double spent")]
-    UtxoDoubleSpent,
     #[error("duplicate decision claim in block: {0:?}")]
     DuplicateDecisionClaim([u8; 3]),
-    #[error(transparent)]
-    WithdrawalBundle(#[from] WithdrawalBundleError),
-    #[error("wrong public key for address")]
-    WrongPubKeyForAddress,
+    #[error("Database consistency error: {0}")]
+    DatabaseError(String),
     #[error(
         "consensus not yet calculated for period {0:?} - must be calculated by protocol during block connection"
     )]
@@ -194,14 +277,15 @@ pub enum Error {
     ReputationAnchorViolation { total: f64, anchor: f64, drift: f64 },
 }
 
-impl From<sneed::Error> for Error {
-    fn from(err: sneed::Error) -> Self {
-        Self::Db(Box::new(err))
-    }
-}
-
 impl From<crate::archive::Error> for Error {
     fn from(err: crate::archive::Error) -> Self {
         Self::Archive(Box::new(err))
+    }
+}
+
+impl From<crate::types::error::InvalidDecisionId> for Error {
+    fn from(err: crate::types::error::InvalidDecisionId) -> Self {
+        let crate::types::error::InvalidDecisionId { reason } = err;
+        Self::InvalidDecisionId { reason }
     }
 }

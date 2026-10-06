@@ -1,7 +1,2 @@
 edition = "2021"
 max_width = 80
-
-# unstable features
-# unstable_features = true
-# reorder_impl_items = true
-# group_imports = "StdExternalCrate"

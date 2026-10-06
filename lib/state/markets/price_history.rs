@@ -268,10 +268,8 @@ mod tests {
 
     fn tx(data: TxData) -> Transaction {
         Transaction {
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            memo: Vec::new(),
             data: Some(data),
+            ..Default::default()
         }
     }
 
@@ -314,7 +312,7 @@ mod tests {
     #[test]
     fn market_changes_drop_skipped_and_other_market_txs() {
         let body = Body {
-            coinbase: Vec::new(),
+            coinbase: Default::default(),
             transactions: vec![
                 tx(trade(MARKET_ID, 1, 1_000)),
                 tx(trade(OTHER_MARKET_ID, 0, 500)),

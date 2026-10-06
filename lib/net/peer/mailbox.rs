@@ -28,12 +28,11 @@ use crate::{
     util::join_set,
 };
 
-type BmmVerificationError = crate::node::ResponseError;
+type BmmVerificationError = crate::node::error::mainchain_task::Response;
 
-type MainchainAncestorsError = crate::node::MainchainAncestors;
+type MainchainAncestorsError = crate::node::error::net_task::MainchainAncestors;
 
 /// Message received from the connection task / net task / node
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum InternalMessage {
     /// Indicates if a BMM verification request completed.

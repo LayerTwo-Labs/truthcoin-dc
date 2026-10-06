@@ -7,15 +7,9 @@ use bip300301_enforcer_integration_tests::{
     mine::{self, MiningPolicy},
     setup::{
         Mode, Network, PreSetup as EnforcerPreSetup,
-        SetupOpts as EnforcerSetupOpts, Sidechain, wait_for_tx_in_mempool,
+        SetupOpts as EnforcerSetupOpts, Sidechain as _,
     },
     util::{AbortOnDrop, AsyncTrial, TestFailureCollector, TestFileRegistry},
-};
-use bip300301_enforcer_lib::proto::{
-    self,
-    mainchain::{
-        CreateDepositTransactionRequest, CreateDepositTransactionResponse,
-    },
 };
 use futures::{
     FutureExt as _, StreamExt as _, channel::mpsc, future::BoxFuture,
@@ -52,8 +46,9 @@ async fn wallet_sync_task(
     };
     let miner = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("miner".to_owned()),
+            extra_args: Vec::new(),
         },
         &enforcer_post_setup,
         res_tx.clone(),
@@ -61,8 +56,9 @@ async fn wallet_sync_task(
     .await?;
     let wallet = PostSetup::setup(
         Init {
-            truthcoin_app: bin_paths.truthcoin()?.clone(),
+            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("wallet".to_owned()),
+            extra_args: Vec::new(),
         },
         &enforcer_post_setup,
         res_tx,
@@ -79,36 +75,20 @@ async fn wallet_sync_task(
         .await?;
     sleep(Duration::from_secs(1)).await;
 
-    tracing::info!("Pay a deposit to the wallet node");
-    let deposit_txid: bitcoin::Txid = enforcer_post_setup
-        .wallet_service_client
-        .create_deposit_transaction(CreateDepositTransactionRequest {
-            sidechain_id: proto::wrap_u32(
-                <PostSetup as Sidechain>::SIDECHAIN_NUMBER.0.into(),
-            ),
-            address: proto::wrap_string(wallet.deposit_address.to_string()),
-            value_sats: proto::wrap_u64(DEPOSIT_AMOUNT.to_sat()),
-            fee_sats: proto::wrap_u64(DEPOSIT_FEE.to_sat()),
-        })
-        .await?
-        .into_owned()
-        .txid
-        .into_option()
-        .ok_or_else(|| {
-            proto::Error::missing_field::<CreateDepositTransactionResponse>(
-                "txid",
-            )
-        })?
-        .decode::<CreateDepositTransactionResponse, _>("txid")?;
-    let () = wait_for_tx_in_mempool(
-        &enforcer_post_setup.bitcoind_client,
-        &deposit_txid,
-    )
-    .await?;
+    // The wallet node asks for the deposit itself, which is what the GUI does.
+    tracing::info!("Wallet node: create the deposit");
+    let _txid = wallet
+        .rpc_client
+        .create_deposit(
+            wallet.deposit_address,
+            DEPOSIT_AMOUNT.to_sat(),
+            DEPOSIT_FEE.to_sat(),
+        )
+        .await?;
     let () = mine::mine::<PostSetup>(
         &mut enforcer_post_setup,
         1,
-        MiningPolicy::SILENT,
+        MiningPolicy::VOTE,
     )
     .await?;
 
@@ -116,12 +96,12 @@ async fn wallet_sync_task(
     let () = miner.bmm_single(&mut enforcer_post_setup).await?;
 
     let deadline = tokio::time::Instant::now() + BALANCE_TIMEOUT;
-    let mut balance = wallet.rpc_client.bitcoin_balance().await?;
+    let mut balance = wallet.rpc_client.balance().await?;
     while balance.total != DEPOSIT_AMOUNT
         && tokio::time::Instant::now() < deadline
     {
         sleep(Duration::from_millis(500)).await;
-        balance = wallet.rpc_client.bitcoin_balance().await?;
+        balance = wallet.rpc_client.balance().await?;
     }
     let blocks = wallet.rpc_client.getblockcount().await?;
     anyhow::ensure!(

@@ -1,1022 +1,638 @@
-use std::collections::{HashMap, HashSet};
+//! Connect and disconnect blocks
 
-use sneed::{RoTxn, RwTxn};
+use std::collections::HashMap;
+
+use sneed::{RoTxn, RwTxn, db::error::Error as DbError};
 
 use crate::{
-    math::trading,
-    state::{Error, State, UtxoManager, error, markets::MarketId},
+    state::{Error, PrevalidatedBlock, State, error, markets},
     types::{
-        Address, Body, FilledOutput, FilledOutputContent, FilledTransaction,
-        GetBitcoinValue as _, Header, InPoint, MerkleRoot, OutPoint,
-        OutPointKey, OutputContent, SpentOutput, TxData,
+        AccumulatorDiff, AmountOverflowError, Body, FilledTransaction,
+        GetAddress as _, GetValue as _, Header, InPoint, MerkleRoot, OutPoint,
+        OutPointKey, Output, PointedOutput, SpentOutput, UtreexoNodeHash,
+        authorization::{self, BatchVerificationContext},
     },
 };
 
-#[derive(Default)]
-struct StateUpdate {
-    market_updates: Vec<MarketStateUpdate>,
-    market_creations: Vec<MarketCreation>,
-    share_account_changes: HashMap<(Address, MarketId), HashMap<u32, i64>>,
-    vote_submissions: Vec<VoteSubmission>,
-    pending_sell_payouts: Vec<PendingSellPayout>,
-    pending_buy_settlements: Vec<PendingBuySettlement>,
-    pending_sell_input_changes: Vec<(Address, u64, [u8; 32])>,
-}
-
-struct MarketStateUpdate {
-    market_id: MarketId,
-    share_delta: Option<(usize, i64)>,
-    transaction_id: Option<[u8; 32]>,
-    volume_sats: Option<u64>,
-    fee_sats: Option<u64>,
-}
-
-struct MarketCreation {
-    market: crate::state::Market,
-}
-
-struct VoteSubmission {
-    vote: crate::state::voting::types::Vote,
-}
-
-pub struct PendingSellPayout {
-    pub market_id: MarketId,
-    pub seller_address: Address,
-    pub payout_sats: u64,
-    pub fee_sats: u64,
-    pub outcome_index: u32,
-    pub transaction_id: [u8; 32],
-}
-
-pub struct PendingBuySettlement {
-    pub market_id: MarketId,
-    pub trader_address: Address,
-    pub input_value_sats: u64,
-    pub lmsr_cost_sats: u64,
-    pub market_fee_sats: u64,
-    pub transaction_id: [u8; 32],
-    pub is_amplify: bool,
-}
-
-pub enum TradeApplyResult {
-    Applied,
-    Skipped { reason: String },
-}
-
-impl StateUpdate {
-    fn new() -> Self {
-        Self {
-            market_updates: Vec::new(),
-            market_creations: Vec::new(),
-            share_account_changes: HashMap::new(),
-            vote_submissions: Vec::new(),
-            pending_sell_payouts: Vec::new(),
-            pending_buy_settlements: Vec::new(),
-            pending_sell_input_changes: Vec::new(),
-        }
-    }
-
-    fn verify_internal_consistency(&self) -> Result<(), Error> {
-        let mut created_market_ids = std::collections::HashSet::new();
-        for creation in &self.market_creations {
-            if !created_market_ids.insert(creation.market.id) {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Duplicate market creation for ID: {:?}",
-                        creation.market.id
-                    ),
-                });
-            }
-        }
-
-        for update in &self.market_updates {
-            if created_market_ids.contains(&update.market_id) {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Market {:?} cannot be both created and updated in same block",
-                        update.market_id
-                    ),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_all_changes(
-        &self,
-        state: &State,
-        rotxn: &RoTxn,
-    ) -> Result<(), Error> {
-        self.verify_internal_consistency()?;
-
-        for update in &self.market_updates {
-            if state
-                .markets()
-                .get_market(rotxn, &update.market_id)?
-                .is_none()
-            {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Market {:?} does not exist",
-                        update.market_id
-                    ),
-                });
-            }
-        }
-
-        for creation in &self.market_creations {
-            if state
-                .markets()
-                .get_market(rotxn, &creation.market.id)?
-                .is_some()
-            {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Market {:?} already exists",
-                        creation.market.id
-                    ),
-                });
-            }
-
-            crate::validation::MarketValidator::validate_market_shares(
-                creation.market.shares(),
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn apply_all_changes(
-        &self,
-        state: &State,
-        rwtxn: &mut RwTxn,
-        height: u32,
-    ) -> Result<Option<crate::state::undo::ConsolidationUndoData>, Error> {
-        for creation in &self.market_creations {
-            state
-                .markets()
-                .add_market(rwtxn, &creation.market)
-                .map_err(|_| Error::InvalidTransaction {
-                    reason: "Failed to store market in database".to_string(),
-                })?;
-        }
-
-        let mut aggregated_deltas: super::type_aliases::AggregatedDeltas =
-            std::collections::HashMap::new();
-
-        for update in &self.market_updates {
-            if let Some((outcome_index, delta)) = update.share_delta {
-                aggregated_deltas
-                    .entry(update.market_id)
-                    .or_default()
-                    .push((
-                        outcome_index,
-                        delta,
-                        update.volume_sats,
-                        update.fee_sats,
-                        update.transaction_id,
-                    ));
-            }
-        }
-
-        for (market_id, deltas) in aggregated_deltas {
-            let mut market = state
-                .markets()
-                .get_market(rwtxn, &market_id)?
-                .ok_or_else(|| Error::InvalidTransaction {
-                    reason: format!("Market {market_id:?} not found"),
-                })?;
-
-            let mut new_shares = market.shares().clone();
-
-            for (outcome_index, delta, volume_sats, _fee_sats, _txid) in &deltas
-            {
-                new_shares[*outcome_index] += *delta;
-                if let Some(vol) = volume_sats {
-                    market
-                        .update_trading_volume(*outcome_index, *vol)
-                        .map_err(|e| Error::InvalidTransaction {
-                            reason: format!("Failed to update volume: {e:?}"),
-                        })?;
-                }
-            }
-
-            market
-                .update_state(height, None, Some(new_shares), None)
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!("Failed to update market state: {e:?}"),
-                })?;
-
-            state.markets().update_market(rwtxn, &market)?;
-            state.clear_mempool_shares(rwtxn, &market_id)?;
-        }
-
-        let mut amplify_by_market: std::collections::HashMap<MarketId, u64> =
-            std::collections::HashMap::new();
-        for settlement in &self.pending_buy_settlements {
-            if settlement.is_amplify {
-                *amplify_by_market.entry(settlement.market_id).or_default() +=
-                    settlement.lmsr_cost_sats;
-            }
-        }
-        for (market_id, amount) in amplify_by_market {
-            let mut market = state
-                .markets()
-                .get_market(rwtxn, &market_id)?
-                .ok_or_else(|| Error::InvalidTransaction {
-                    reason: format!("Market {market_id:?} not found"),
-                })?;
-            market.liquidity_base_sats = market
-                .liquidity_base_sats
-                .checked_add(amount)
-                .ok_or_else(|| Error::InvalidTransaction {
-                    reason: format!(
-                        "Liquidity base overflow for market {market_id:?}"
-                    ),
-                })?;
-            state.markets().update_market(rwtxn, &market)?;
-        }
-
-        for ((address, market_id), outcome_changes) in
-            &self.share_account_changes
-        {
-            for (&outcome_index, &share_delta) in outcome_changes {
-                if share_delta != 0 {
-                    if share_delta > 0 {
-                        state.markets().add_shares_to_account(
-                            rwtxn,
-                            address,
-                            *market_id,
-                            outcome_index,
-                            share_delta,
-                            height,
-                        )?;
-                    } else {
-                        state.markets().remove_shares_from_account(
-                            rwtxn,
-                            address,
-                            market_id,
-                            outcome_index,
-                            -share_delta,
-                            height,
-                        )?;
-                    }
-                }
-            }
-        }
-
-        {
-            let traded_markets: std::collections::HashSet<_> = self
-                .share_account_changes
-                .keys()
-                .map(|(_, market_id)| *market_id)
-                .collect();
-            for market_id in &traded_markets {
-                state.markets().verify_share_invariant(rwtxn, market_id)?;
-            }
-        }
-
-        tracing::debug!(
-            "apply_all_changes: Applying {} vote submissions",
-            self.vote_submissions.len()
-        );
-
-        for submission in &self.vote_submissions {
-            state
-                .voting()
-                .databases()
-                .put_vote(rwtxn, &submission.vote)?;
-        }
-
-        let consolidation_undo = Self::consolidate_market_utxos(
-            state,
-            rwtxn,
-            height,
-            &self.pending_sell_payouts,
-            &self.pending_buy_settlements,
-            &self.pending_sell_input_changes,
-        )?;
-
-        Ok(consolidation_undo)
-    }
-
-    pub fn generate_sell_payout_outpoint(
-        market_id: &MarketId,
-        seller_address: &Address,
-        transaction_id: [u8; 32],
-    ) -> OutPoint {
-        use blake3::Hasher;
-
-        let mut hasher = Hasher::new();
-        hasher.update(b"SELL_PAYOUT");
-        hasher.update(&market_id.0);
-        hasher.update(&seller_address.0);
-        hasher.update(&transaction_id);
-
-        let hash = hasher.finalize();
-        let merkle_root = MerkleRoot::from(*hash.as_bytes());
-
-        OutPoint::Payout {
-            hash: merkle_root,
-            vout: 0,
-        }
-    }
-
-    pub fn generate_buy_change_outpoint(
-        market_id: &MarketId,
-        trader_address: &Address,
-        transaction_id: [u8; 32],
-    ) -> OutPoint {
-        use blake3::Hasher;
-
-        let mut hasher = Hasher::new();
-        hasher.update(b"BUY_CHANGE");
-        hasher.update(&market_id.0);
-        hasher.update(&trader_address.0);
-        hasher.update(&transaction_id);
-
-        let hash = hasher.finalize();
-        let merkle_root = MerkleRoot::from(*hash.as_bytes());
-
-        OutPoint::Payout {
-            hash: merkle_root,
-            vout: 0,
-        }
-    }
-
-    pub fn generate_sell_input_change_outpoint(
-        trader_address: &Address,
-        transaction_id: [u8; 32],
-    ) -> OutPoint {
-        use blake3::Hasher;
-
-        let mut hasher = Hasher::new();
-        hasher.update(b"SELL_INPUT_CHANGE");
-        hasher.update(&trader_address.0);
-        hasher.update(&transaction_id);
-
-        let hash = hasher.finalize();
-        let merkle_root = MerkleRoot::from(*hash.as_bytes());
-
-        OutPoint::Payout {
-            hash: merkle_root,
-            vout: 0,
-        }
-    }
-
-    fn consolidate_market_utxos(
-        state: &State,
-        rwtxn: &mut RwTxn,
-        height: u32,
-        pending_sell_payouts: &[PendingSellPayout],
-        pending_buy_settlements: &[PendingBuySettlement],
-        pending_sell_input_changes: &[(Address, u64, [u8; 32])],
-    ) -> Result<Option<crate::state::undo::ConsolidationUndoData>, Error> {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
-        use crate::state::markets::{
-            generate_market_author_fee_address,
-            generate_market_treasury_address,
+/// Prevalidate a block: compute and verify all read-only checks and
+/// prepare data needed for fast connection.
+pub fn prevalidate(
+    batch_verification_ctxt: &BatchVerificationContext,
+    state: &State,
+    rotxn: &RoTxn,
+    header: &Header,
+    body: &Body,
+    archive: &crate::archive::Archive,
+) -> Result<PrevalidatedBlock, Error> {
+    let tip_hash = state.try_get_tip(rotxn)?;
+    if header.prev_side_hash != tip_hash {
+        let err = error::InvalidHeader::PrevSideHash {
+            expected: tip_hash,
+            received: header.prev_side_hash,
         };
-        use crate::types::{BitcoinOutputContent, FilledOutput, OutPoint};
-        use std::collections::HashSet;
+        return Err(Error::InvalidHeader(err));
+    };
+    let next_height = state.try_get_height(rotxn)?.map_or(0, |h| h + 1);
+    if body.authorizations.len() > State::body_sigops_limit(next_height) {
+        return Err(Error::TooManySigops);
+    }
+    let body_size =
+        borsh::object_length(&body).map_err(Error::BorshSerialize)?;
+    if body_size > State::body_size_limit(next_height) {
+        return Err(Error::BodyTooLarge);
+    }
 
-        let sell_payout_markets: HashSet<[u8; 6]> =
-            pending_sell_payouts.iter().map(|p| p.market_id.0).collect();
-        let buy_settlement_markets: HashSet<[u8; 6]> = pending_buy_settlements
-            .iter()
-            .map(|s| s.market_id.0)
-            .collect();
+    let mut accumulator = state
+        .utreexo_accumulator
+        .try_get(rotxn, &())
+        .map_err(DbError::from)?
+        .unwrap_or_default();
 
-        let mut markets_to_consolidate: HashSet<[u8; 6]> = HashSet::new();
-        markets_to_consolidate.extend(sell_payout_markets);
-        markets_to_consolidate.extend(buy_settlement_markets);
-
-        if markets_to_consolidate.is_empty()
-            && pending_sell_input_changes.is_empty()
-        {
-            return Ok(None);
-        }
-
-        let mut undo_entries = Vec::new();
-
-        for market_id_bytes in &markets_to_consolidate {
-            let market_id = MarketId::new(*market_id_bytes);
-
-            let mut treasury_total = 0u64;
-            let mut treasury_utxos_to_consume = Vec::new();
-            let mut fee_total = 0u64;
-            let mut fee_utxos_to_consume = Vec::new();
-
-            let old_treasury_pointer = state
-                .markets()
-                .get_market_funds_utxo(rwtxn, &market_id, false)?;
-            let old_fee_pointer = state
-                .markets()
-                .get_market_funds_utxo(rwtxn, &market_id, true)?;
-            // Capture old treasury UTXOs with their filled outputs
-            let mut old_treasury_utxos_with_outputs = Vec::new();
-            let mut old_fee_utxos_with_outputs = Vec::new();
-
-            if let Some(existing_outpoint) = old_treasury_pointer
-                && let Some(utxo) = state.utxos.try_get(
-                    rwtxn,
-                    &OutPointKey::from_outpoint(&existing_outpoint),
-                )?
-            {
-                treasury_total += utxo.get_bitcoin_value().to_sat();
-                old_treasury_utxos_with_outputs.push((existing_outpoint, utxo));
-                treasury_utxos_to_consume.push(existing_outpoint);
-            }
-
-            if let Some(existing_outpoint) = old_fee_pointer
-                && let Some(utxo) = state.utxos.try_get(
-                    rwtxn,
-                    &OutPointKey::from_outpoint(&existing_outpoint),
-                )?
-            {
-                fee_total += utxo.get_bitcoin_value().to_sat();
-                old_fee_utxos_with_outputs.push((existing_outpoint, utxo));
-                fee_utxos_to_consume.push(existing_outpoint);
-            }
-
-            let market_buy_settlements: Vec<&PendingBuySettlement> =
-                pending_buy_settlements
-                    .iter()
-                    .filter(|s| s.market_id == market_id)
-                    .collect();
-
-            for settlement in &market_buy_settlements {
-                treasury_total += settlement.lmsr_cost_sats;
-                fee_total += settlement.market_fee_sats;
-            }
-
-            let market_sell_payouts: Vec<&PendingSellPayout> =
-                pending_sell_payouts
-                    .iter()
-                    .filter(|p| p.market_id == market_id)
-                    .collect();
-            let total_sell_payouts: u64 =
-                market_sell_payouts.iter().map(|p| p.payout_sats).sum();
-            let total_sell_fees: u64 =
-                market_sell_payouts.iter().map(|p| p.fee_sats).sum();
-            fee_total += total_sell_fees;
-
-            let total_sell_gross = total_sell_payouts + total_sell_fees;
-            if total_sell_gross > treasury_total {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Treasury underflow: sell gross {total_sell_gross} \
-                         (payouts {total_sell_payouts} + fees \
-                         {total_sell_fees}) exceed treasury \
-                         {treasury_total} for market {market_id:?}",
-                    ),
-                });
-            }
-
-            let mut new_treasury_utxo = None;
-            let mut new_fee_utxo = None;
-            let mut sell_payout_utxos = Vec::new();
-            let mut buy_change_utxos = Vec::new();
-
-            let has_treasury_work = !treasury_utxos_to_consume.is_empty()
-                || !market_sell_payouts.is_empty()
-                || !market_buy_settlements.is_empty();
-
-            if has_treasury_work
-                && (treasury_total > 0 || !market_sell_payouts.is_empty())
-            {
-                for outpoint in &treasury_utxos_to_consume {
-                    state.delete_utxo(rwtxn, outpoint)?;
+    // gather and verify transactions
+    let mut total_inputs: usize = 0;
+    let mut total_outputs: usize = 0;
+    for tx in &body.transactions {
+        total_inputs += tx.inputs.len();
+        total_outputs += tx.outputs.len();
+    }
+    let mut all_input_keys: Vec<OutPointKey> = Vec::with_capacity(total_inputs);
+    // Accumulator diff from txs. The bool value is true for insertions, false
+    // for deletions.
+    let mut accumulator_diff_txs =
+        Vec::with_capacity(total_inputs + total_outputs);
+    let mut filled_transactions: Vec<FilledTransaction> =
+        Vec::with_capacity(body.transactions.len());
+    let mut total_fees = bitcoin::Amount::ZERO;
+    // Outputs that earlier transactions in this body made. A transaction may
+    // spend one of them, and the accumulator holds no leaf for it, so it is
+    // never a proof target.
+    let mut body_outputs = HashMap::<OutPoint, Output>::new();
+    for (tx_idx, transaction) in body.transactions.iter().enumerate() {
+        let txid = transaction.txid();
+        let mut spent_utxos = Vec::with_capacity(transaction.inputs.len());
+        let mut spent_utxo_hashes =
+            Vec::<UtreexoNodeHash>::with_capacity(transaction.inputs.len());
+        for (outpoint, utxo_hash) in &transaction.inputs {
+            let key = OutPointKey::from(outpoint);
+            match state.utxos.try_get(rotxn, &key)? {
+                Some(spent_output) => {
+                    spent_utxos.push(spent_output);
+                    spent_utxo_hashes.push(utxo_hash.into());
                 }
-                state
-                    .markets()
-                    .clear_market_funds_utxo(rwtxn, &market_id, false)?;
-
-                for payout in market_sell_payouts.iter() {
-                    let payout_outpoint = Self::generate_sell_payout_outpoint(
-                        &market_id,
-                        &payout.seller_address,
-                        payout.transaction_id,
-                    );
-                    let payout_output = FilledOutput {
-                        address: payout.seller_address,
-                        content: FilledOutputContent::Bitcoin(
-                            BitcoinOutputContent(bitcoin::Amount::from_sat(
-                                payout.payout_sats,
-                            )),
-                        ),
-                        memo: vec![],
-                    };
-                    state.insert_utxo(
-                        rwtxn,
-                        &payout_outpoint,
-                        &payout_output,
-                    )?;
-                    sell_payout_utxos.push(payout_outpoint);
-                }
-
-                for settlement in &market_buy_settlements {
-                    let change = settlement
-                        .input_value_sats
-                        .checked_sub(TRADE_MINER_FEE_SATS)
-                        .and_then(|v| v.checked_sub(settlement.lmsr_cost_sats))
-                        .and_then(|v| v.checked_sub(settlement.market_fee_sats))
-                        .ok_or_else(|| Error::InvalidTransaction {
-                            reason: format!(
-                                "Buy change underflow: input {} < \
-                                 fees {} + cost {} + market_fee {}",
-                                settlement.input_value_sats,
-                                TRADE_MINER_FEE_SATS,
-                                settlement.lmsr_cost_sats,
-                                settlement.market_fee_sats,
-                            ),
+                None => {
+                    let spent_output = body_outputs
+                        .get(outpoint)
+                        .cloned()
+                        .ok_or(error::NoUtxo {
+                            outpoint: *outpoint,
                         })?;
-                    if change > 0 {
-                        let change_outpoint =
-                            Self::generate_buy_change_outpoint(
-                                &market_id,
-                                &settlement.trader_address,
-                                settlement.transaction_id,
-                            );
-                        let change_output = FilledOutput {
-                            address: settlement.trader_address,
-                            content: FilledOutputContent::Bitcoin(
-                                BitcoinOutputContent(
-                                    bitcoin::Amount::from_sat(change),
-                                ),
-                            ),
-                            memo: vec![],
-                        };
-                        state.insert_utxo(
-                            rwtxn,
-                            &change_outpoint,
-                            &change_output,
-                        )?;
-                        buy_change_utxos.push(change_outpoint);
-                    }
-                }
-
-                let remaining_treasury = treasury_total
-                    .checked_sub(total_sell_payouts)
-                    .and_then(|v| v.checked_sub(total_sell_fees))
-                    .ok_or_else(|| Error::InvalidTransaction {
-                        reason: format!(
-                            "Treasury remainder underflow: \
-                             treasury {treasury_total} < \
-                             payouts {total_sell_payouts} + \
-                             fees {total_sell_fees}"
-                        ),
-                    })?;
-
-                if remaining_treasury > 0 {
-                    let treasury_address =
-                        generate_market_treasury_address(&market_id);
-                    let new_outpoint = OutPoint::MarketFunds {
-                        market_id: *market_id_bytes,
-                        block_height: height,
-                        is_fee: false,
-                    };
-                    let new_output = FilledOutput::new(
-                        treasury_address,
-                        FilledOutputContent::MarketFunds {
-                            market_id: *market_id_bytes,
-                            amount: BitcoinOutputContent(
-                                bitcoin::Amount::from_sat(remaining_treasury),
-                            ),
-                            is_fee: false,
-                        },
-                    );
-                    state.insert_utxo(rwtxn, &new_outpoint, &new_output)?;
-                    state.markets().set_market_funds_utxo(
-                        rwtxn,
-                        &market_id,
-                        false,
-                        &new_outpoint,
-                    )?;
-                    new_treasury_utxo = Some(new_outpoint);
+                    spent_utxos.push(spent_output);
                 }
             }
-
-            let has_fee_work = !fee_utxos_to_consume.is_empty()
-                || total_sell_fees > 0
-                || !market_buy_settlements.is_empty();
-
-            if has_fee_work && fee_total > 0 {
-                for outpoint in &fee_utxos_to_consume {
-                    state.delete_utxo(rwtxn, outpoint)?;
-                }
-                state
-                    .markets()
-                    .clear_market_funds_utxo(rwtxn, &market_id, true)?;
-
-                let fee_address =
-                    generate_market_author_fee_address(&market_id);
-                let new_outpoint = OutPoint::MarketFunds {
-                    market_id: *market_id_bytes,
-                    block_height: height,
-                    is_fee: true,
-                };
-                let new_output = FilledOutput::new(
-                    fee_address,
-                    FilledOutputContent::MarketFunds {
-                        market_id: *market_id_bytes,
-                        amount: BitcoinOutputContent(
-                            bitcoin::Amount::from_sat(fee_total),
-                        ),
-                        is_fee: true,
-                    },
-                );
-                state.insert_utxo(rwtxn, &new_outpoint, &new_output)?;
-                state.markets().set_market_funds_utxo(
-                    rwtxn,
-                    &market_id,
-                    true,
-                    &new_outpoint,
-                )?;
-                new_fee_utxo = Some(new_outpoint);
-            }
-
-            undo_entries.push(crate::state::undo::ConsolidationUndoEntry {
-                market_id,
-                old_treasury_utxos: old_treasury_utxos_with_outputs,
-                old_fee_utxos: old_fee_utxos_with_outputs,
-                old_treasury_pointer,
-                old_fee_pointer,
-                new_treasury_utxo,
-                new_fee_utxo,
-                sell_payout_utxos,
-                buy_change_utxos,
-            });
+            all_input_keys.push(OutPointKey::from(outpoint));
+            accumulator_diff_txs.push((false, utxo_hash.into()));
         }
-
-        let mut sell_input_change_utxos = Vec::new();
-        for (address, change_sats, tx_id) in pending_sell_input_changes {
-            if *change_sats > 0 {
-                let change_outpoint =
-                    Self::generate_sell_input_change_outpoint(address, *tx_id);
-                let change_output = FilledOutput {
-                    address: *address,
-                    content: FilledOutputContent::Bitcoin(
-                        BitcoinOutputContent(bitcoin::Amount::from_sat(
-                            *change_sats,
-                        )),
-                    ),
-                    memo: vec![],
-                };
-                state.insert_utxo(rwtxn, &change_outpoint, &change_output)?;
-                sell_input_change_utxos.push(change_outpoint);
-            }
+        for (vout, output) in transaction.outputs.iter().enumerate() {
+            let outpoint = OutPoint::Regular {
+                txid,
+                vout: vout as u32,
+            };
+            let pointed_output = PointedOutput {
+                outpoint,
+                output: output.clone(),
+            };
+            accumulator_diff_txs.push((true, (&pointed_output).into()));
         }
-
-        Ok(Some(crate::state::undo::ConsolidationUndoData {
-            entries: undo_entries,
-            sell_input_change_utxos,
-        }))
+        body_outputs.extend(transaction.outputs_by_outpoint());
+        if !accumulator.verify(&transaction.proof, &spent_utxo_hashes)? {
+            return Err(Error::UtreexoProofFailed { txid });
+        }
+        let filled_tx = FilledTransaction {
+            spent_utxos,
+            transaction: transaction.clone(),
+            actor_address: actor_address(body, tx_idx),
+        };
+        total_fees = total_fees
+            .checked_add(state.validate_filled_transaction(
+                rotxn,
+                &filled_tx,
+                archive,
+                Some(next_height),
+            )?)
+            .ok_or(AmountOverflowError)?;
+        filled_transactions.push(filled_tx);
+    }
+    let () =
+        crate::validation::check_duplicate_decision_claims(&body.transactions)?;
+    let computed_merkle_root = Body::compute_merkle_root(
+        &body.coinbase,
+        filled_transactions.as_slice(),
+    )?;
+    if computed_merkle_root != header.merkle_root {
+        let err = Error::InvalidBody {
+            expected: header.merkle_root,
+            computed: computed_merkle_root,
+        };
+        return Err(err);
+    }
+    {
+        use rayon::prelude::ParallelSliceMut;
+        all_input_keys.par_sort_unstable();
+        if all_input_keys.windows(2).any(|w| w[0] == w[1]) {
+            return Err(Error::UtxoDoubleSpent);
+        }
+    }
+    let coinbase_txid = header.compute_coinbase_txid();
+    let mut coinbase_value = bitcoin::Amount::ZERO;
+    let mut accumulator_diff = AccumulatorDiff::with_capacity(
+        body.coinbase.outputs.len() + accumulator_diff_txs.len(),
+    );
+    for (vout, output) in body.coinbase.outputs.iter().enumerate() {
+        coinbase_value = coinbase_value
+            .checked_add(output.get_value())
+            .ok_or(AmountOverflowError)?;
+        let outpoint = OutPoint::Coinbase {
+            txid: coinbase_txid,
+            vout: vout as u32,
+        };
+        let pointed_output = PointedOutput {
+            outpoint,
+            output: output.clone(),
+        };
+        accumulator_diff.insert((&pointed_output).into());
+    }
+    for (insert, utxo_hash) in accumulator_diff_txs {
+        if insert {
+            accumulator_diff.insert(utxo_hash);
+        } else {
+            accumulator_diff.remove(utxo_hash);
+        }
+    }
+    if coinbase_value > total_fees {
+        return Err(Error::NotEnoughFees);
+    }
+    let spent_utxos = filled_transactions
+        .iter()
+        .flat_map(|t| t.spent_utxos.iter());
+    for (authorization, spent_utxo) in
+        body.authorizations.iter().zip(spent_utxos)
+    {
+        if authorization.get_address() != spent_utxo.address {
+            return Err(Error::WrongPubKeyForAddress);
+        }
+    }
+    if authorization::verify_body(batch_verification_ctxt, body).is_err() {
+        return Err(Error::Authorization);
+    }
+    // Check root consistency without committing to DB
+    let () = accumulator.apply_diff(accumulator_diff.clone())?;
+    let roots: Vec<UtreexoNodeHash> = accumulator.get_roots();
+    if roots != header.roots {
+        return Err(Error::UtreexoRootsMismatch);
     }
 
-    fn add_market_update(&mut self, update: MarketStateUpdate) {
-        self.market_updates.push(update);
-    }
-    fn add_share_account_change(
-        &mut self,
-        address: Address,
-        market_id: MarketId,
-        outcome: u32,
-        delta: i64,
-    ) {
-        *self
-            .share_account_changes
-            .entry((address, market_id))
-            .or_default()
-            .entry(outcome)
-            .or_insert(0) += delta;
-    }
-    fn add_market_creation(&mut self, creation: MarketCreation) {
-        self.market_creations.push(creation);
-    }
-    fn add_vote_submission(&mut self, vote: crate::state::voting::types::Vote) {
-        self.vote_submissions.push(VoteSubmission { vote });
-    }
-
-    fn add_pending_sell_payout(&mut self, payout: PendingSellPayout) {
-        self.pending_sell_payouts.push(payout);
-    }
-
-    fn add_pending_buy_settlement(&mut self, settlement: PendingBuySettlement) {
-        self.pending_buy_settlements.push(settlement);
-    }
-
-    fn add_pending_sell_input_change(
-        &mut self,
-        address: Address,
-        change_sats: u64,
-        tx_id: [u8; 32],
-    ) {
-        self.pending_sell_input_changes
-            .push((address, change_sats, tx_id));
-    }
+    Ok(PrevalidatedBlock {
+        filled_transactions,
+        computed_merkle_root,
+        total_fees,
+        coinbase_value,
+        next_height,
+        accumulator_diff,
+    })
 }
 
+/// Connect a block using the provided prevalidated data.
 pub fn connect_prevalidated(
     state: &State,
     rwtxn: &mut RwTxn,
     header: &Header,
     body: &Body,
+    pre: PrevalidatedBlock,
     mainchain_timestamp: u64,
-    prevalidated: super::PrevalidatedBlock,
-) -> Result<(), Error> {
-    // Use precomputed values — validation already done in prevalidate
-    let height = prevalidated.next_height;
-    let filled_txs = prevalidated.filled_transactions;
-    let validated_coinbase = prevalidated.coinbase_value;
-
-    if height == 0 {
-        state
-            .genesis_timestamp
-            .put(rwtxn, &(), &mainchain_timestamp)?;
-        if let Some(first_coinbase) = body.coinbase.first() {
-            state.reputation().set_reputation(
-                rwtxn,
-                &first_coinbase.address,
-                1.0,
-            )?;
-            tracing::info!(
-                "Genesis block: Initialized reputation for {}",
-                first_coinbase.address.as_base58()
-            );
-        }
+) -> Result<crate::types::MerkleRoot, Error> {
+    let tip_hash = state.try_get_tip(rwtxn)?;
+    if tip_hash != header.prev_side_hash {
+        let err = error::InvalidHeader::PrevSideHash {
+            expected: tip_hash,
+            received: header.prev_side_hash,
+        };
+        return Err(Error::InvalidHeader(err));
     }
-    let genesis_ts = state.try_get_genesis_timestamp(rwtxn)?.unwrap_or(0);
-
-    let prev_highest_minted = state
-        .decisions()
-        .get_highest_minted_period(rwtxn)?
-        .unwrap_or(0);
-
-    state.decisions().snapshot_period_pricing(rwtxn, height)?;
-
-    state
-        .minting_undo
-        .put(rwtxn, &height, &prev_highest_minted)?;
-
-    let current_period =
-        crate::state::voting::period_calculator::get_current_period(
-            mainchain_timestamp,
-            Some(height),
-            genesis_ts,
-            state.decisions().get_config(),
-        )?;
-
-    // Transition Claimed → Voting (all transitions before any resolution)
-    let claimed_needing_voting = state
-        .decisions()
-        .get_claimed_decisions_needing_voting(rwtxn, current_period)?;
-    for decision_id in claimed_needing_voting {
-        state.decisions().transition_decision_to_voting(
-            rwtxn,
-            decision_id,
-            height,
-        )?;
+    if pre.computed_merkle_root != header.merkle_root {
+        let err = Error::InvalidBody {
+            expected: pre.computed_merkle_root,
+            computed: header.merkle_root,
+        };
+        return Err(err);
     }
-
-    crate::validation::BlockValidator::validate_coinbase_outputs(
-        &body.coinbase,
-        height,
+    let market_ctxt = markets::block::connect_begin(
+        state,
+        rwtxn,
+        body,
+        pre.next_height,
+        mainchain_timestamp,
     )?;
+    let coinbase_txid = header.compute_coinbase_txid();
 
-    for (vout, output) in body.coinbase.iter().enumerate() {
+    // Apply UTXO set changes
+    for (vout, output) in body.coinbase.outputs.iter().enumerate() {
         let outpoint = OutPoint::Coinbase {
-            merkle_root: header.merkle_root,
+            txid: coinbase_txid,
             vout: vout as u32,
         };
-        let filled_content = match output.content.clone() {
-            OutputContent::Bitcoin(value) => {
-                FilledOutputContent::Bitcoin(value)
-            }
-            OutputContent::Withdrawal(withdrawal) => {
-                FilledOutputContent::BitcoinWithdrawal(withdrawal)
-            }
-            OutputContent::MarketFunds { .. } => {
-                unreachable!(
-                    "validated by BlockValidator::validate_coinbase_outputs"
-                )
-            }
-        };
-        let filled_output = FilledOutput {
-            address: output.address,
-            content: filled_content,
-            memo: output.memo.clone(),
-        };
-        state.insert_utxo(rwtxn, &outpoint, &filled_output)?;
-    }
-    let mut state_update = StateUpdate::new();
-    let mut skipped_tx_indices: HashSet<usize> = HashSet::new();
-
-    for (idx, filled_tx) in filled_txs.iter().enumerate() {
-        match &filled_tx.transaction.data {
-            Some(TxData::Trade { .. }) => {
-                match apply_trade(state, rwtxn, filled_tx, &mut state_update)? {
-                    TradeApplyResult::Applied => {}
-                    TradeApplyResult::Skipped { reason } => {
-                        tracing::info!(
-                            "Trade tx {} skipped due to slippage: {}",
-                            filled_tx.txid(),
-                            reason
-                        );
-                        skipped_tx_indices.insert(idx);
-                    }
-                }
-            }
-            Some(TxData::CreateMarket { .. }) => {
-                apply_market_creation(
-                    state,
-                    rwtxn,
-                    filled_tx,
-                    &mut state_update,
-                    height,
-                )?;
-            }
-            Some(TxData::ClaimDecision(_)) => {
-                apply_decision_claim(state, rwtxn, filled_tx, height)?;
-            }
-            Some(TxData::SubmitVote { .. }) => {
-                apply_submit_vote(
-                    state,
-                    rwtxn,
-                    filled_tx,
-                    &mut state_update,
-                    height,
-                )?;
-            }
-            Some(TxData::SubmitBallot { .. }) => {
-                apply_submit_ballot(
-                    state,
-                    rwtxn,
-                    filled_tx,
-                    &mut state_update,
-                    height,
-                )?;
-            }
-            Some(TxData::TransferReputation { .. }) => {
-                apply_transfer_reputation(state, rwtxn, filled_tx, height)?;
-            }
-            Some(TxData::AmplifyBeta { .. }) => {
-                apply_amplify_beta(filled_tx, &mut state_update)?;
-            }
-            None => {}
-        }
+        state
+            .utxos
+            .put(rwtxn, &OutPointKey::from(&outpoint), output)
+            .map_err(DbError::from)?;
     }
 
-    state_update.validate_all_changes(state, rwtxn)?;
-
-    crate::validation::BlockValidator::validate_fees(
-        validated_coinbase,
-        &filled_txs,
-        &skipped_tx_indices,
+    let market_txs = markets::block::connect_txs(
+        state,
+        rwtxn,
+        &market_ctxt,
+        &pre.filled_transactions,
+        pre.coinbase_value,
     )?;
-
-    for (idx, filled_tx) in filled_txs.iter().enumerate() {
-        if skipped_tx_indices.contains(&idx) {
+    let mut accumulator_diff = pre.accumulator_diff;
+    for (tx_idx, filled) in pre.filled_transactions.iter().enumerate() {
+        if market_txs.skipped_tx_indices.contains(&tx_idx) {
+            markets::block::unapply_skipped_tx_diff(
+                &mut accumulator_diff,
+                &filled.transaction,
+            );
             continue;
         }
-        apply_utxo_changes(state, rwtxn, filled_tx)?;
-    }
-
-    if let Some(consolidation_undo) =
-        state_update.apply_all_changes(state, rwtxn, height)?
-    {
-        state
-            .consolidation_undo
-            .put(rwtxn, &height, &consolidation_undo)?;
-    }
-
-    if height == 0 {
-        state.decisions().mint_genesis(
-            rwtxn,
-            mainchain_timestamp,
-            height,
-            genesis_ts,
-        )?;
-    } else {
-        state.decisions().process_block_pricing(
-            rwtxn,
-            height,
-            mainchain_timestamp,
-            genesis_ts,
-        )?;
-    }
-
-    // Resolve Voting → Resolved (grouped by period, ascending order).
-    // Runs after transaction application so votes submitted in this block
-    // count toward the closing period's consensus.
-    let voting_ready = state
-        .decisions()
-        .get_voting_decisions_needing_resolution(rwtxn, current_period)?;
-    let mut periods_to_resolve: std::collections::BTreeMap<
-        u32,
-        Vec<crate::state::decisions::DecisionId>,
-    > = std::collections::BTreeMap::new();
-    for decision_id in voting_ready {
-        periods_to_resolve
-            .entry(decision_id.voting_period())
-            .or_default()
-            .push(decision_id);
-    }
-
-    let mut consensus_undo_entries = Vec::new();
-    for (vp_num, decision_ids) in &periods_to_resolve {
-        let (start, end) =
-            crate::state::voting::period_calculator::calculate_period_boundaries(
-                *vp_num,
-                state.decisions().get_config(),
-                genesis_ts,
-            );
-        let period = crate::state::voting::types::VotingPeriod {
-            id: crate::state::voting::types::VotingPeriodId::new(*vp_num),
-            start_timestamp: start,
-            end_timestamp: end,
-            status: crate::state::voting::types::VotingPeriodStatus::Closed,
-            decision_ids: decision_ids.clone(),
-        };
-
-        tracing::info!(
-            "Protocol: Processing closed period {} at block height {} (period ended at timestamp {})",
-            period.id.0,
-            height,
-            period.end_timestamp
-        );
-
-        if let Some(undo_entry) = state.voting().calculate_and_store_consensus(
-            rwtxn,
-            &period,
-            state,
-            mainchain_timestamp,
-            height,
-            state.decisions(),
-        )? {
-            consensus_undo_entries.push(undo_entry);
+        let txid = filled.transaction.txid();
+        for (vin, (outpoint, _)) in filled.transaction.inputs.iter().enumerate()
+        {
+            let spent_output = state
+                .utxos
+                .try_get(rwtxn, &OutPointKey::from(outpoint))
+                .map_err(DbError::from)?
+                .ok_or(error::NoUtxo {
+                    outpoint: *outpoint,
+                })?;
+            state
+                .utxos
+                .delete(rwtxn, &OutPointKey::from(outpoint))
+                .map_err(DbError::from)?;
+            let spent_output = SpentOutput {
+                output: spent_output,
+                inpoint: InPoint::Regular {
+                    txid,
+                    vin: vin as u32,
+                },
+            };
+            state
+                .stxos
+                .put(rwtxn, &OutPointKey::from(outpoint), &spent_output)
+                .map_err(DbError::from)?;
+        }
+        for (vout, output) in filled.transaction.outputs.iter().enumerate() {
+            let outpoint = OutPoint::Regular {
+                txid,
+                vout: vout as u32,
+            };
+            state
+                .utxos
+                .put(rwtxn, &OutPointKey::from(&outpoint), output)
+                .map_err(DbError::from)?;
         }
     }
-    if !consensus_undo_entries.is_empty() {
-        let undo_data = crate::state::undo::ConsensusUndoData {
-            entries: consensus_undo_entries,
+
+    let () = markets::block::connect_end(
+        state,
+        rwtxn,
+        &mut accumulator_diff,
+        market_ctxt,
+        market_txs,
+    )?;
+
+    // Update tip/height
+    let block_hash = header.hash();
+    state
+        .tip
+        .put(rwtxn, &(), &block_hash)
+        .map_err(DbError::from)?;
+    state
+        .height
+        .put(rwtxn, &(), &pre.next_height)
+        .map_err(DbError::from)?;
+
+    // Apply accumulator diff
+    let mut accumulator = state
+        .utreexo_accumulator
+        .try_get(rwtxn, &())
+        .map_err(DbError::from)?
+        .unwrap_or_default();
+    let () = accumulator.apply_diff(accumulator_diff)?;
+    state
+        .utreexo_accumulator
+        .put(rwtxn, &(), &accumulator)
+        .map_err(DbError::from)?;
+
+    Ok(pre.computed_merkle_root)
+}
+
+pub fn validate(
+    batch_verification_context: &BatchVerificationContext,
+    state: &State,
+    rotxn: &RoTxn,
+    header: &Header,
+    body: &Body,
+    archive: &crate::archive::Archive,
+) -> Result<(bitcoin::Amount, MerkleRoot), Error> {
+    let tip_hash = state.try_get_tip(rotxn)?;
+    if header.prev_side_hash != tip_hash {
+        let err = error::InvalidHeader::PrevSideHash {
+            expected: tip_hash,
+            received: header.prev_side_hash,
         };
-        state.consensus_undo.put(rwtxn, &height, &undo_data)?;
+        return Err(Error::InvalidHeader(err));
+    };
+    let height = state.try_get_height(rotxn)?.map_or(0, |height| height + 1);
+    if body.authorizations.len() > State::body_sigops_limit(height) {
+        return Err(Error::TooManySigops);
     }
-
-    {
-        let (payout_results, settlement_undo_entries) =
-            state.markets().transition_and_payout_resolved_markets(
-                rwtxn,
-                state,
-                state.decisions(),
-                height,
-            )?;
-
-        if !payout_results.is_empty() {
-            for (market_id, summary) in &payout_results {
-                let refund_sats = summary
-                    .creator_refund
-                    .as_ref()
-                    .map(|r| r.amount_sats)
-                    .unwrap_or(0);
-                tracing::info!(
-                    "Protocol: Market {} auto-settled with {} sats treasury + {} sats fees distributed to {} shareholders ({} sats refunded to creator)",
-                    market_id,
-                    summary.treasury_distributed,
-                    summary.total_fees_distributed,
-                    summary.shareholder_count,
-                    refund_sats,
-                );
+    let body_size =
+        borsh::object_length(&body).map_err(Error::BorshSerialize)?;
+    if body_size > State::body_size_limit(height) {
+        return Err(Error::BodyTooLarge);
+    }
+    let mut accumulator = state
+        .utreexo_accumulator
+        .try_get(rotxn, &())
+        .map_err(DbError::from)?
+        .unwrap_or_default();
+    // Outputs that earlier transactions in this body made, and the proof
+    // targets each transaction keeps. An input that this body answers has no
+    // leaf in the accumulator, so it is never a proof target.
+    let mut body_outputs = HashMap::<OutPoint, Output>::new();
+    let mut proof_targets: Vec<Vec<UtreexoNodeHash>> =
+        Vec::with_capacity(body.transactions.len());
+    let mut filled_transactions: Vec<FilledTransaction> =
+        Vec::with_capacity(body.transactions.len());
+    for (tx_idx, transaction) in body.transactions.iter().enumerate() {
+        let mut spent_utxos = Vec::with_capacity(transaction.inputs.len());
+        let mut spent_utxo_hashes =
+            Vec::<UtreexoNodeHash>::with_capacity(transaction.inputs.len());
+        for (outpoint, utxo_hash) in &transaction.inputs {
+            let key = OutPointKey::from(outpoint);
+            match state.utxos.try_get(rotxn, &key)? {
+                Some(spent_output) => {
+                    spent_utxos.push(spent_output);
+                    spent_utxo_hashes.push(utxo_hash.into());
+                }
+                None => {
+                    let spent_output = body_outputs
+                        .get(outpoint)
+                        .cloned()
+                        .ok_or(error::NoUtxo {
+                            outpoint: *outpoint,
+                        })?;
+                    spent_utxos.push(spent_output);
+                }
             }
         }
-
-        if !settlement_undo_entries.is_empty() {
-            let undo_data = crate::state::undo::SettlementUndoData {
-                entries: settlement_undo_entries,
+        body_outputs.extend(transaction.outputs_by_outpoint());
+        proof_targets.push(spent_utxo_hashes);
+        filled_transactions.push(FilledTransaction {
+            spent_utxos,
+            transaction: transaction.clone(),
+            actor_address: actor_address(body, tx_idx),
+        });
+    }
+    let merkle_root = Body::compute_merkle_root(
+        &body.coinbase,
+        filled_transactions.as_slice(),
+    )?;
+    if merkle_root != header.merkle_root {
+        let err = Error::InvalidBody {
+            expected: header.merkle_root,
+            computed: merkle_root,
+        };
+        return Err(err);
+    }
+    let coinbase_txid = header.compute_coinbase_txid();
+    let mut accumulator_diff = AccumulatorDiff::default();
+    let mut coinbase_value = bitcoin::Amount::ZERO;
+    for (vout, output) in body.coinbase.outputs.iter().enumerate() {
+        coinbase_value = coinbase_value
+            .checked_add(output.get_value())
+            .ok_or(AmountOverflowError)?;
+        let outpoint = OutPoint::Coinbase {
+            txid: coinbase_txid,
+            vout: vout as u32,
+        };
+        let pointed_output = PointedOutput {
+            outpoint,
+            output: output.clone(),
+        };
+        accumulator_diff.insert((&pointed_output).into());
+    }
+    let mut total_fees = bitcoin::Amount::ZERO;
+    // Gather all input keys to check double-spends via sort-and-scan
+    let total_inputs = body.inputs_len();
+    let mut all_input_keys = Vec::with_capacity(total_inputs);
+    for (filled_transaction, spent_utxo_hashes) in
+        filled_transactions.iter().zip(&proof_targets)
+    {
+        let txid = filled_transaction.transaction.txid();
+        for (outpoint, utxo_hash) in &filled_transaction.transaction.inputs {
+            all_input_keys.push(OutPointKey::from(outpoint));
+            accumulator_diff.remove(utxo_hash.into());
+        }
+        for (vout, output) in
+            filled_transaction.transaction.outputs.iter().enumerate()
+        {
+            let outpoint = OutPoint::Regular {
+                txid,
+                vout: vout as u32,
             };
-            state.settlement_undo.put(rwtxn, &height, &undo_data)?;
+            let pointed_output = PointedOutput {
+                outpoint,
+                output: output.clone(),
+            };
+            accumulator_diff.insert((&pointed_output).into());
+        }
+        total_fees = total_fees
+            .checked_add(state.validate_filled_transaction(
+                rotxn,
+                filled_transaction,
+                archive,
+                Some(height),
+            )?)
+            .ok_or(AmountOverflowError)?;
+        // verify utreexo proof
+        if !accumulator
+            .verify(&filled_transaction.transaction.proof, spent_utxo_hashes)?
+        {
+            return Err(Error::UtreexoProofFailed { txid });
         }
     }
-
-    if !skipped_tx_indices.is_empty() {
-        let mut indices: Vec<u32> =
-            skipped_tx_indices.iter().map(|i| *i as u32).collect();
-        indices.sort_unstable();
-        state
-            .skipped_tx_indices_undo
-            .put(rwtxn, &height, &indices)?;
+    // Sort and check for duplicate outpoints (double-spend detection)
+    {
+        use rayon::prelude::ParallelSliceMut;
+        all_input_keys.par_sort_unstable();
+        if all_input_keys.windows(2).any(|w| w[0] == w[1]) {
+            return Err(Error::UtxoDoubleSpent);
+        }
     }
+    let () =
+        crate::validation::check_duplicate_decision_claims(&body.transactions)?;
+    if coinbase_value > total_fees {
+        return Err(Error::NotEnoughFees);
+    }
+    let spent_utxos = filled_transactions
+        .iter()
+        .flat_map(|t| t.spent_utxos.iter());
+    for (authorization, spent_utxo) in
+        body.authorizations.iter().zip(spent_utxos)
+    {
+        if authorization.get_address() != spent_utxo.address {
+            return Err(Error::WrongPubKeyForAddress);
+        }
+    }
+    if authorization::verify_body(batch_verification_context, body).is_err() {
+        return Err(Error::Authorization);
+    }
+    // Check root consistency without committing to DB
+    let () = accumulator.apply_diff(accumulator_diff)?;
+    let roots: Vec<UtreexoNodeHash> = accumulator.get_roots();
+    if roots != header.roots {
+        return Err(Error::UtreexoRootsMismatch);
+    }
+    Ok((total_fees, merkle_root))
+}
 
+pub fn connect(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    header: &Header,
+    body: &Body,
+    mainchain_timestamp: u64,
+) -> Result<MerkleRoot, Error> {
+    let tip_hash = state.try_get_tip(rwtxn)?;
+    if tip_hash != header.prev_side_hash {
+        let err = error::InvalidHeader::PrevSideHash {
+            expected: tip_hash,
+            received: header.prev_side_hash,
+        };
+        return Err(Error::InvalidHeader(err));
+    }
+    let height = state.try_get_height(rwtxn)?.map_or(0, |height| height + 1);
+    let market_ctxt = markets::block::connect_begin(
+        state,
+        rwtxn,
+        body,
+        height,
+        mainchain_timestamp,
+    )?;
+    let coinbase_txid = header.compute_coinbase_txid();
+    let mut accumulator = state
+        .utreexo_accumulator
+        .try_get(rwtxn, &())?
+        .unwrap_or_default();
+    let mut accumulator_diff = AccumulatorDiff::default();
+    let mut coinbase_value = bitcoin::Amount::ZERO;
+    for (vout, output) in body.coinbase.outputs.iter().enumerate() {
+        coinbase_value = coinbase_value
+            .checked_add(output.get_value())
+            .ok_or(AmountOverflowError)?;
+        let outpoint = OutPoint::Coinbase {
+            txid: coinbase_txid,
+            vout: vout as u32,
+        };
+        let pointed_output = PointedOutput {
+            outpoint,
+            output: output.clone(),
+        };
+        accumulator_diff.insert((&pointed_output).into());
+        let key = OutPointKey::from(&outpoint);
+        state.utxos.put(rwtxn, &key, output)?;
+    }
+    // Outputs that earlier transactions in this body made
+    let mut body_outputs = HashMap::<OutPoint, Output>::new();
+    let mut filled_txs: Vec<FilledTransaction> =
+        Vec::with_capacity(body.transactions.len());
+    for (tx_idx, t) in body.transactions.iter().enumerate() {
+        let mut filled_tx = state.fill_transaction(rwtxn, &body_outputs, t)?;
+        filled_tx.actor_address = actor_address(body, tx_idx);
+        body_outputs.extend(t.outputs_by_outpoint());
+        filled_txs.push(filled_tx);
+    }
+    let market_txs = markets::block::connect_txs(
+        state,
+        rwtxn,
+        &market_ctxt,
+        &filled_txs,
+        coinbase_value,
+    )?;
+    for (tx_idx, transaction) in body.transactions.iter().enumerate() {
+        if market_txs.skipped_tx_indices.contains(&tx_idx) {
+            continue;
+        }
+        let txid = transaction.txid();
+        for (vin, (outpoint, utxo_hash)) in
+            transaction.inputs.iter().enumerate()
+        {
+            let key = OutPointKey::from(outpoint);
+            let spent_output =
+                state.utxos.try_get(rwtxn, &key)?.ok_or(error::NoUtxo {
+                    outpoint: *outpoint,
+                })?;
+
+            accumulator_diff.remove(utxo_hash.into());
+            let key = OutPointKey::from(outpoint);
+            state.utxos.delete(rwtxn, &key)?;
+            let spent_output = SpentOutput {
+                output: spent_output,
+                inpoint: InPoint::Regular {
+                    txid,
+                    vin: vin as u32,
+                },
+            };
+            state
+                .stxos
+                .put(rwtxn, &OutPointKey::from(outpoint), &spent_output)
+                .map_err(DbError::from)?;
+        }
+        for (vout, output) in transaction.outputs.iter().enumerate() {
+            let outpoint = OutPoint::Regular {
+                txid,
+                vout: vout as u32,
+            };
+            let pointed_output = PointedOutput {
+                outpoint,
+                output: output.clone(),
+            };
+            accumulator_diff.insert((&pointed_output).into());
+            let key = OutPointKey::from(&outpoint);
+            state.utxos.put(rwtxn, &key, output)?;
+        }
+    }
+    let () = markets::block::connect_end(
+        state,
+        rwtxn,
+        &mut accumulator_diff,
+        market_ctxt,
+        market_txs,
+    )?;
+    let merkle_root =
+        Body::compute_merkle_root(&body.coinbase, filled_txs.as_slice())?;
+    if merkle_root != header.merkle_root {
+        let err = Error::InvalidBody {
+            expected: header.merkle_root,
+            computed: merkle_root,
+        };
+        return Err(err);
+    }
     let block_hash = header.hash();
     state.tip.put(rwtxn, &(), &block_hash)?;
     state.height.put(rwtxn, &(), &height)?;
-    state
-        .mainchain_timestamp
-        .put(rwtxn, &(), &mainchain_timestamp)?;
-
-    Ok(())
+    let () = accumulator.apply_diff(accumulator_diff)?;
+    state.utreexo_accumulator.put(rwtxn, &(), &accumulator)?;
+    Ok(merkle_root)
 }
 
 pub fn disconnect_tip(
@@ -1025,1953 +641,549 @@ pub fn disconnect_tip(
     header: &Header,
     body: &Body,
 ) -> Result<(), Error> {
-    // 1. Verify tip hash matches
-    let tip_hash = state.tip.try_get(rwtxn, &())?.ok_or(Error::NoTip)?;
-    if tip_hash != header.hash() {
+    let tip_hash = state
+        .tip
+        .try_get(rwtxn, &())
+        .map_err(DbError::from)?
+        .ok_or(Error::NoTip)?;
+    let block_hash = header.hash();
+    if tip_hash != block_hash {
         let err = error::InvalidHeader::BlockHash {
             expected: tip_hash,
-            computed: header.hash(),
+            computed: block_hash,
         };
         return Err(Error::InvalidHeader(err));
     }
-    let merkle_root =
-        Body::compute_merkle_root(&body.coinbase, &body.transactions);
-    if merkle_root != header.merkle_root {
-        let err = Error::InvalidBody {
-            expected: header.merkle_root,
-            computed: merkle_root,
-        };
-        return Err(err);
-    }
-    let height = state.try_get_height(rwtxn)?.ok_or(Error::NoTip)?;
-
-    // 2. Revert market settlement/payouts (runs last in connect, so first here)
-    if let Some(settlement_undo) =
-        state.settlement_undo.try_get(rwtxn, &height)?
-    {
-        revert_settlement(state, rwtxn, &settlement_undo, height)?;
-        state.settlement_undo.delete(rwtxn, &height)?;
-    }
-
-    // 3. Revert consensus voting state
-    if let Some(consensus_undo) =
-        state.consensus_undo.try_get(rwtxn, &height)?
-    {
-        revert_consensus(state, rwtxn, &consensus_undo)?;
-        state.consensus_undo.delete(rwtxn, &height)?;
-    }
-
-    // 4. Revert UTXO consolidation (applied during apply_all_changes)
-    if let Some(consolidation_undo) =
-        state.consolidation_undo.try_get(rwtxn, &height)?
-    {
-        revert_consolidation(state, rwtxn, &consolidation_undo)?;
-        state.consolidation_undo.delete(rwtxn, &height)?;
-    }
-
-    // 5. Revert transaction-level UTXOs and tx-specific state
-    let mut trade_share_deltas: Vec<TradeShareDelta> = Vec::new();
-
-    let skipped_tx_indices: HashSet<u32> = state
-        .skipped_tx_indices_undo
-        .try_get(rwtxn, &height)?
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    for (idx, tx) in body.transactions.iter().enumerate().rev() {
-        if skipped_tx_indices.contains(&(idx as u32)) {
-            continue;
-        }
-        let txid = tx.txid();
-        let filled_tx = state.fill_transaction_from_stxos(rwtxn, tx.clone())?;
-        match &tx.data {
-            None => (),
-            Some(TxData::ClaimDecision(_)) => {
-                let () = revert_decision_claim(state, rwtxn, &filled_tx)?;
+    let mut accumulator = state
+        .utreexo_accumulator
+        .try_get(rwtxn, &())
+        .map_err(DbError::from)?
+        .unwrap_or_default();
+    tracing::debug!("Got acc");
+    let mut accumulator_diff = AccumulatorDiff::default();
+    let height = state
+        .try_get_height(rwtxn)?
+        .expect("Height should not be None");
+    let skipped_tx_indices = markets::block::disconnect_begin(
+        state,
+        rwtxn,
+        &mut accumulator_diff,
+        height,
+    )?;
+    let mut trade_share_deltas = Vec::new();
+    // revert txs, last-to-first
+    body.transactions.iter().enumerate().rev().try_for_each(
+        |(tx_idx, tx)| {
+            if skipped_tx_indices.contains(&(tx_idx as u32)) {
+                return Ok(());
             }
-            Some(TxData::CreateMarket { .. }) => {
-                let () = revert_create_market(state, rwtxn, &filled_tx)?;
-            }
-            Some(TxData::Trade { .. }) => {
-                let delta =
-                    revert_trade_market_state(state, rwtxn, &filled_tx)?;
-                trade_share_deltas.push(delta);
-            }
-            Some(TxData::SubmitVote { .. }) => {
-                let () = revert_submit_vote(state, rwtxn, &filled_tx)?;
-            }
-            Some(TxData::SubmitBallot { .. }) => {
-                let () = revert_submit_ballot(state, rwtxn, &filled_tx)?;
-            }
-            Some(TxData::TransferReputation { .. }) => {}
-            Some(TxData::AmplifyBeta { .. }) => {
-                let () = revert_amplify_beta(state, rwtxn, &filled_tx)?;
-            }
-        }
-
-        tx.outputs.iter().enumerate().rev().try_for_each(
-            |(vout, _output)| {
-                let outpoint = OutPoint::Regular {
-                    txid,
-                    vout: vout as u32,
-                };
-                if state.delete_utxo(rwtxn, &outpoint)? {
-                    Ok(())
-                } else {
-                    Err(Error::NoUtxo { outpoint })
-                }
-            },
-        )?;
-        tx.inputs.iter().rev().try_for_each(|outpoint| {
-            let outpoint_key = OutPointKey::from_outpoint(outpoint);
-            if let Some(spent_output) =
-                state.stxos.try_get(rwtxn, &outpoint_key)?
-            {
-                state.stxos.delete(rwtxn, &outpoint_key)?;
-                state.insert_utxo(rwtxn, outpoint, &spent_output.output)?;
-                Ok(())
-            } else {
-                Err(Error::NoStxo {
-                    outpoint: *outpoint,
+            let () = markets::block::disconnect_tx(
+                state,
+                rwtxn,
+                &mut accumulator_diff,
+                tx,
+                &mut trade_share_deltas,
+            )?;
+            let txid = tx.txid();
+            // delete UTXOs, last-to-first
+            tx.outputs.iter().enumerate().rev().try_for_each(
+                |(vout, output)| {
+                    let outpoint = OutPoint::Regular {
+                        txid,
+                        vout: vout as u32,
+                    };
+                    let pointed_output = PointedOutput {
+                        outpoint,
+                        output: output.clone(),
+                    };
+                    accumulator_diff.remove((&pointed_output).into());
+                    let key = OutPointKey::from(&outpoint);
+                    if state.utxos.delete(rwtxn, &key)? {
+                        Ok::<_, Error>(())
+                    } else {
+                        Err(error::NoUtxo { outpoint }.into())
+                    }
+                },
+            )?;
+            // unspend STXOs, last-to-first
+            tx.inputs
+                .iter()
+                .rev()
+                .try_for_each(|(outpoint, utxo_hash)| {
+                    let key = OutPointKey::from(outpoint);
+                    if let Some(spent_output) =
+                        state.stxos.try_get(rwtxn, &key)?
+                    {
+                        accumulator_diff.insert(utxo_hash.into());
+                        state.stxos.delete(rwtxn, &key)?;
+                        state.utxos.put(rwtxn, &key, &spent_output.output)?;
+                        Ok(())
+                    } else {
+                        Err(Error::NoStxo {
+                            outpoint: *outpoint,
+                        })
+                    }
                 })
-            }
-        })?;
-    }
-
-    if !skipped_tx_indices.is_empty() {
-        state.skipped_tx_indices_undo.delete(rwtxn, &height)?;
-    }
-
-    // 3b. Apply batched share account changes from trade reverts
-    if !trade_share_deltas.is_empty() {
-        let mut batched: std::collections::HashMap<
-            (Address, MarketId),
-            std::collections::HashMap<u32, i64>,
-        > = std::collections::HashMap::new();
-
-        for delta in &trade_share_deltas {
-            batched
-                .entry((delta.address, delta.market_id))
-                .or_default()
-                .entry(delta.outcome_index)
-                .and_modify(|v| *v += delta.share_delta)
-                .or_insert(delta.share_delta);
-        }
-
-        for ((address, market_id), outcome_changes) in &batched {
-            for (&outcome_index, &net_delta) in outcome_changes {
-                if net_delta > 0 {
-                    state.markets().add_shares_to_account(
-                        rwtxn,
-                        address,
-                        *market_id,
-                        outcome_index,
-                        net_delta,
-                        height,
-                    )?;
-                } else if net_delta < 0 {
-                    state.markets().remove_shares_from_account(
-                        rwtxn,
-                        address,
-                        market_id,
-                        outcome_index,
-                        -net_delta,
-                        height,
-                    )?;
-                }
-            }
-        }
-    }
-
-    // 3c. Revert reputation transfers
-    if let Some(rep_undo) =
-        state.reputation_transfer_undo.try_get(rwtxn, &height)?
-    {
-        for entry in rep_undo.entries.iter().rev() {
-            state.reputation().set_reputation(
-                rwtxn,
-                &entry.sender,
-                entry.sender_pre_reputation,
-            )?;
-            state.reputation().set_reputation(
-                rwtxn,
-                &entry.receiver,
-                entry.receiver_pre_reputation,
-            )?;
-        }
-        state.reputation_transfer_undo.delete(rwtxn, &height)?;
-    }
-
-    // 6. Revert coinbase UTXOs
-    body.coinbase.iter().enumerate().rev().try_for_each(
-        |(vout, _output)| {
-            let outpoint = OutPoint::Coinbase {
-                merkle_root: header.merkle_root,
-                vout: vout as u32,
-            };
-            if state.delete_utxo(rwtxn, &outpoint)? {
-                Ok(())
-            } else {
-                Err(Error::NoUtxo { outpoint })
-            }
         },
     )?;
-
-    // 7. Rollback decision states (Claimed → Voting transitions)
-    if height > 0 {
-        state
-            .decisions()
-            .rollback_decision_states_to_height(rwtxn, height - 1)?;
-
-        tracing::info!(
-            "Rolled back decision states to height {} during reorg",
-            height - 1
-        );
+    // delete coinbase UTXOs, last-to-first
+    {
+        let coinbase_txid = header.compute_coinbase_txid();
+        body.coinbase
+            .outputs
+            .iter()
+            .enumerate()
+            .rev()
+            .try_for_each(|(vout, output)| {
+                let outpoint = OutPoint::Coinbase {
+                    txid: coinbase_txid,
+                    vout: vout as u32,
+                };
+                let pointed_output = PointedOutput {
+                    outpoint,
+                    output: output.clone(),
+                };
+                accumulator_diff.remove((&pointed_output).into());
+                let key = OutPointKey::from(&outpoint);
+                if state.utxos.delete(rwtxn, &key)? {
+                    Ok::<_, Error>(())
+                } else {
+                    Err(error::NoUtxo { outpoint }.into())
+                }
+            })?;
     }
-
-    // 7b. Revert minted periods
-    if let Some(prev_highest) = state.minting_undo.try_get(rwtxn, &height)? {
-        state
-            .decisions()
-            .delete_periods_above(rwtxn, prev_highest)?;
-        state.minting_undo.delete(rwtxn, &height)?;
-    }
-
-    // 7c. Restore period_pricing from undo log
-    state
-        .decisions()
-        .restore_period_pricing_undo(rwtxn, height)?;
-
-    // 8. Update tip/height to previous (existing)
+    let () = markets::block::disconnect_end(
+        state,
+        rwtxn,
+        height,
+        &skipped_tx_indices,
+        trade_share_deltas,
+    )?;
     match (header.prev_side_hash, height) {
         (None, 0) => {
-            state.tip.delete(rwtxn, &())?;
-            state.height.delete(rwtxn, &())?;
+            state.tip.delete(rwtxn, &()).map_err(DbError::from)?;
+            state.height.delete(rwtxn, &()).map_err(DbError::from)?;
         }
         (None, _) | (_, 0) => return Err(Error::NoTip),
         (Some(prev_side_hash), height) => {
-            state.tip.put(rwtxn, &(), &prev_side_hash)?;
-            state.height.put(rwtxn, &(), &(height - 1))?;
-        }
-    }
-    Ok(())
-}
-
-fn revert_delete_utxo(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    outpoint: &OutPoint,
-) -> Result<(), Error> {
-    let deleted = state.delete_utxo(rwtxn, outpoint)?;
-    if !deleted {
-        tracing::trace!(
-            "UTXO not found during revert \
-             (expected for zero-value outputs): {outpoint:?}"
-        );
-    }
-    Ok(())
-}
-
-/// Revert UTXO consolidation (C3)
-fn revert_consolidation(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    undo: &crate::state::undo::ConsolidationUndoData,
-) -> Result<(), Error> {
-    // Process entries in reverse order
-    for entry in undo.entries.iter().rev() {
-        // Delete new UTXOs that were created during consolidation
-        if let Some(ref outpoint) = entry.new_treasury_utxo {
-            revert_delete_utxo(state, rwtxn, outpoint)?;
-        }
-        if let Some(ref outpoint) = entry.new_fee_utxo {
-            revert_delete_utxo(state, rwtxn, outpoint)?;
-        }
-        for outpoint in &entry.sell_payout_utxos {
-            revert_delete_utxo(state, rwtxn, outpoint)?;
-        }
-        for outpoint in &entry.buy_change_utxos {
-            revert_delete_utxo(state, rwtxn, outpoint)?;
-        }
-
-        // Restore old treasury UTXOs
-        for (outpoint, filled_output) in &entry.old_treasury_utxos {
-            state.insert_utxo(rwtxn, outpoint, filled_output)?;
-        }
-        // Restore old fee UTXOs
-        for (outpoint, filled_output) in &entry.old_fee_utxos {
-            state.insert_utxo(rwtxn, outpoint, filled_output)?;
-        }
-
-        // Restore market_funds_utxo pointers
-        if let Some(ref outpoint) = entry.old_treasury_pointer {
-            state.markets().set_market_funds_utxo(
-                rwtxn,
-                &entry.market_id,
-                false,
-                outpoint,
-            )?;
-        } else {
-            state.markets().clear_market_funds_utxo(
-                rwtxn,
-                &entry.market_id,
-                false,
-            )?;
-        }
-        if let Some(ref outpoint) = entry.old_fee_pointer {
-            state.markets().set_market_funds_utxo(
-                rwtxn,
-                &entry.market_id,
-                true,
-                outpoint,
-            )?;
-        } else {
-            state.markets().clear_market_funds_utxo(
-                rwtxn,
-                &entry.market_id,
-                true,
-            )?;
-        }
-    }
-
-    // Delete sell input change UTXOs
-    for outpoint in &undo.sell_input_change_utxos {
-        revert_delete_utxo(state, rwtxn, outpoint)?;
-    }
-
-    tracing::info!(
-        "Reverted UTXO consolidation for {} markets",
-        undo.entries.len()
-    );
-    Ok(())
-}
-
-/// Revert market settlement and payouts (C1)
-fn revert_settlement(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    undo: &crate::state::undo::SettlementUndoData,
-    block_height: u32,
-) -> Result<(), Error> {
-    for entry in undo.entries.iter().rev() {
-        // Revert automatic share payouts (deletes payout UTXOs, restores shares)
-        state.markets().revert_automatic_share_payouts(
-            state,
-            rwtxn,
-            &entry.payout_summary,
-            block_height,
-        )?;
-
-        // Restore treasury UTXO
-        if let Some((ref outpoint, ref filled_output)) = entry.treasury_utxo {
-            state.insert_utxo(rwtxn, outpoint, filled_output)?;
-            state.markets().set_market_funds_utxo(
-                rwtxn,
-                &entry.pre_settlement_market.id,
-                false,
-                outpoint,
-            )?;
-        }
-
-        // Restore fee UTXO
-        if let Some((ref outpoint, ref filled_output)) = entry.fee_utxo {
-            state.insert_utxo(rwtxn, outpoint, filled_output)?;
-            state.markets().set_market_funds_utxo(
-                rwtxn,
-                &entry.pre_settlement_market.id,
-                true,
-                outpoint,
-            )?;
-        }
-
-        // Restore market to pre-settlement state (Trading, no final prices)
-        state
-            .markets()
-            .restore_market(rwtxn, &entry.pre_settlement_market)?;
-
-        tracing::info!(
-            "Reverted settlement for market {}",
-            entry.pre_settlement_market.id
-        );
-    }
-    Ok(())
-}
-
-/// Revert consensus voting state (C2)
-fn revert_consensus(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    undo: &crate::state::undo::ConsensusUndoData,
-) -> Result<(), Error> {
-    for entry in undo.entries.iter().rev() {
-        // Delete decision outcomes that were written
-        for decision_id in &entry.decision_outcome_ids {
             state
-                .voting()
-                .databases()
-                .delete_decision_outcome(rwtxn, *decision_id)?;
-        }
-
-        // Delete period stats if they didn't exist before
-        if !entry.had_period_stats {
+                .tip
+                .put(rwtxn, &(), &prev_side_hash)
+                .map_err(DbError::from)?;
             state
-                .voting()
-                .databases()
-                .delete_period_stats(rwtxn, entry.period_id)?;
-        }
-
-        state
-            .reputation()
-            .clear_and_restore(rwtxn, &entry.pre_consensus_reputation)?;
-
-        if !entry.resolved_decision_ids.is_empty() {
-            tracing::info!(
-                "Period {} had {} resolved decisions \
-                 to revert via height rollback",
-                entry.period_id.0,
-                entry.resolved_decision_ids.len(),
-            );
-        }
-
-        tracing::info!("Reverted consensus for period {}", entry.period_id.0);
-    }
-    Ok(())
-}
-
-fn apply_decision_claim(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-    block_height: u32,
-) -> Result<(), Error> {
-    use crate::state::decisions::{Decision, DecisionId};
-
-    let claim = filled_tx.claim_decision().ok_or_else(|| {
-        Error::InvalidTransaction {
-            reason: "Not a decision claim transaction".to_string(),
-        }
-    })?;
-
-    let market_maker_address_bytes = filled_tx
-        .spent_utxos
-        .first()
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "No spent UTXOs found".to_string(),
-        })?
-        .address
-        .0;
-
-    let claiming_txid = filled_tx.transaction.txid();
-
-    for entry in &claim.decisions {
-        let decision_id = DecisionId::from_bytes(entry.decision_id_bytes)?;
-
-        let entry_type = claim.decision_type.clone();
-
-        let decision = Decision::new(
-            market_maker_address_bytes,
-            entry_type,
-            entry.header.clone(),
-            entry.description.clone(),
-            entry.option_0_label.clone(),
-            entry.option_1_label.clone(),
-            entry.tags.clone().unwrap_or_default(),
-        )?;
-
-        state.decisions().claim_decision(
-            rwtxn,
-            decision_id,
-            decision,
-            claiming_txid,
-            Some(block_height),
-        )?;
-
-        tracing::debug!(
-            "Claimed decision {} (type: {:?})",
-            const_hex::encode(decision_id.as_bytes()),
-            claim.decision_type
-        );
-    }
-
-    Ok(())
-}
-
-fn revert_decision_claim(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<(), Error> {
-    use crate::state::decisions::DecisionId;
-
-    let claim = filled_tx.claim_decision().ok_or_else(|| {
-        Error::InvalidTransaction {
-            reason: "Not a decision claim transaction".to_string(),
-        }
-    })?;
-
-    for entry in &claim.decisions {
-        let decision_id = DecisionId::from_bytes(entry.decision_id_bytes)?;
-        state
-            .decisions()
-            .revert_decision_claim(rwtxn, decision_id)?;
-    }
-
-    Ok(())
-}
-
-fn extract_creator_address(
-    filled_tx: &FilledTransaction,
-) -> Result<crate::types::Address, Error> {
-    filled_tx
-        .spent_utxos
-        .first()
-        .map(|utxo| utxo.address)
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "No spent UTXOs found".to_string(),
-        })
-}
-
-fn configure_market_builder(
-    mut builder: crate::state::MarketBuilder,
-    description: &str,
-    trading_fee: Option<f64>,
-) -> crate::state::MarketBuilder {
-    if !description.is_empty() {
-        builder = builder.with_description(description.to_string());
-    }
-
-    if let Some(fee) = trading_fee {
-        builder = builder.with_fee(fee);
-    }
-
-    builder
-}
-
-/// Derive the current effective beta for a market.
-/// `beta = liquidity_base_sats / ln(num_outcomes)`, where the liquidity base is
-/// the creation seed plus confirmed `AmplifyBeta` deposits (ordinary trade
-/// proceeds are excluded). Mempool-pending deposits are not counted until they
-/// confirm.
-fn market_beta(market: &crate::state::Market) -> f64 {
-    trading::derive_beta_from_liquidity(
-        market.liquidity_base_sats,
-        market.shares().len(),
-    )
-}
-
-/// Effective shares and beta for a market, folding in the trades already
-/// applied to `state_update` earlier in this block. Lets same-block trades
-/// price sequentially against running state instead of stale pre-block state.
-/// Beta tracks the liquidity base (seed + confirmed and same-block `AmplifyBeta`
-/// deposits), never ordinary trade proceeds.
-fn running_market_state(
-    market_id: &MarketId,
-    market: &crate::state::Market,
-    state_update: &StateUpdate,
-) -> (ndarray::Array1<i64>, f64) {
-    let mut effective_shares = market.shares().clone();
-    for update in &state_update.market_updates {
-        if update.market_id == *market_id
-            && let Some((outcome_index, delta)) = update.share_delta
-        {
-            effective_shares[outcome_index] += delta;
+                .height
+                .put(rwtxn, &(), &(height - 1))
+                .map_err(DbError::from)?;
         }
     }
-
-    let pending_amplify: u64 = state_update
-        .pending_buy_settlements
-        .iter()
-        .filter(|s| s.market_id == *market_id && s.is_amplify)
-        .map(|s| s.lmsr_cost_sats)
-        .sum();
-    let running_base =
-        market.liquidity_base_sats.saturating_add(pending_amplify);
-
-    let beta = trading::derive_beta_from_liquidity(
-        running_base,
-        effective_shares.len(),
-    );
-    (effective_shares, beta)
-}
-
-pub fn compute_market_tags(
-    decisions: &std::collections::HashMap<
-        crate::state::decisions::DecisionId,
-        crate::state::decisions::Decision,
-    >,
-) -> Vec<String> {
-    let mut tags = std::collections::BTreeSet::new();
-    for decision in decisions.values() {
-        for tag in &decision.tags {
-            tags.insert(tag.clone());
-        }
-    }
-    tags.into_iter().collect()
-}
-
-fn revert_create_market(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<(), Error> {
-    use crate::state::{decisions::DecisionId, markets::compute_market_id};
-
-    let view = filled_tx.as_market_creation().ok_or_else(|| {
-        Error::InvalidTransaction {
-            reason: "Not a market creation transaction".to_string(),
-        }
-    })?;
-
-    let creator_address = extract_creator_address(filled_tx)?;
-
-    let market_id = compute_market_id(
-        view.title,
-        view.description,
-        &creator_address,
-        view.dimension_specs,
-    );
-
-    state.markets().delete_market(rwtxn, &market_id)?;
-
-    for payload in view.new_claims {
-        for entry in &payload.decisions {
-            let decision_id = DecisionId::from_bytes(entry.decision_id_bytes)?;
-            state
-                .decisions()
-                .revert_decision_claim(rwtxn, decision_id)?;
-        }
-    }
-
-    Ok(())
-}
-
-struct TradeShareDelta {
-    address: Address,
-    market_id: MarketId,
-    outcome_index: u32,
-    share_delta: i64,
-}
-
-fn revert_trade_market_state(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<TradeShareDelta, Error> {
-    let trade = filled_tx.trade().ok_or_else(|| Error::InvalidTransaction {
-        reason: "Not a trade transaction".to_string(),
-    })?;
-
-    let is_buy = trade.is_buy();
-    let height = state.try_get_height(rwtxn)?.unwrap_or(0);
-
-    let mut market = state
-        .markets()
-        .get_market(rwtxn, &trade.market_id)?
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "Market not found during trade revert".to_string(),
-        })?;
-
-    let shares_delta = trade.shares_abs() as i64;
-    let outcome = trade.outcome_index as usize;
-
-    let beta = market_beta(&market);
-
-    if is_buy {
-        let mut pre_trade_shares = market.shares().clone();
-        pre_trade_shares[outcome] -= shares_delta;
-
-        let base_cost = trading::calculate_update_cost(
-            &pre_trade_shares,
-            market.shares(),
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("LMSR calc failed during buy trade revert: {e:?}"),
-        })?;
-        let buy_cost =
-            trading::calculate_buy_cost(base_cost, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!(
-                        "Buy cost calc failed during trade revert: {e}"
-                    ),
-                })?;
-        market
-            .revert_trading_volume(outcome, buy_cost.total_cost_sats)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!(
-                    "Volume revert failed during buy trade revert: \
-                     {e:?}"
-                ),
-            })?;
-
-        market
-            .update_shares(pre_trade_shares, height)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Failed to revert market shares: {e:?}"),
-            })?;
-    } else {
-        let mut pre_trade_shares = market.shares().clone();
-        pre_trade_shares[outcome] += shares_delta;
-
-        let base_cost = trading::calculate_update_cost(
-            market.shares(),
-            &pre_trade_shares,
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("LMSR calc failed during sell trade revert: {e:?}"),
-        })?;
-        let sell_proceeds =
-            trading::calculate_sell_proceeds(base_cost, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                reason: format!(
-                    "Sell proceeds calc failed during trade \
-                         revert: {e}"
-                ),
-            })?;
-        market
-            .revert_trading_volume(outcome, sell_proceeds.gross_proceeds_sats)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!(
-                    "Volume revert failed during sell trade revert: \
-                     {e:?}"
-                ),
-            })?;
-
-        market
-            .update_shares(pre_trade_shares, height)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Failed to revert market shares: {e:?}"),
-            })?;
-    }
-
-    state.markets().update_market(rwtxn, &market)?;
-
-    if is_buy {
-        let change_outpoint = StateUpdate::generate_buy_change_outpoint(
-            &trade.market_id,
-            &trade.trader,
-            filled_tx.txid().0,
-        );
-        if let Err(e) = state.delete_utxo(rwtxn, &change_outpoint) {
-            tracing::trace!(
-                "UTXO not found during trade revert (expected if 0 change): {e:?}"
-            );
-        }
-    } else {
-        let payout_outpoint = StateUpdate::generate_sell_payout_outpoint(
-            &trade.market_id,
-            &trade.trader,
-            filled_tx.txid().0,
-        );
-        if let Err(e) = state.delete_utxo(rwtxn, &payout_outpoint) {
-            tracing::trace!(
-                "UTXO not found during trade revert (expected if 0 change): {e:?}"
-            );
-        }
-
-        let change_outpoint = StateUpdate::generate_sell_input_change_outpoint(
-            &trade.trader,
-            filled_tx.txid().0,
-        );
-        if let Err(e) = state.delete_utxo(rwtxn, &change_outpoint) {
-            tracing::trace!(
-                "UTXO not found during trade revert (expected if 0 change): {e:?}"
-            );
-        }
-    }
-
-    let account_delta = if is_buy { -shares_delta } else { shares_delta };
-
-    Ok(TradeShareDelta {
-        address: trade.trader,
-        market_id: trade.market_id,
-        outcome_index: trade.outcome_index,
-        share_delta: account_delta,
-    })
-}
-
-fn apply_utxo_changes(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<(), Error> {
-    let txid = filled_tx.txid();
-
-    for (vin, input) in filled_tx.inputs().iter().enumerate() {
-        let input_key = OutPointKey::from_outpoint(input);
-        let spent_output = state
-            .utxos
-            .try_get(rwtxn, &input_key)?
-            .ok_or(Error::NoUtxo { outpoint: *input })?;
-
-        let spent_output = SpentOutput {
-            output: spent_output,
-            inpoint: InPoint::Regular {
-                txid,
-                vin: vin as u32,
-            },
-        };
-        state.delete_utxo(rwtxn, input)?;
-        state.stxos.put(rwtxn, &input_key, &spent_output)?;
-    }
-
-    let Some(filled_outputs) = filled_tx.filled_outputs() else {
-        let err = error::FillTxOutputContents(Box::new(filled_tx.clone()));
-        return Err(err.into());
-    };
-
-    for (vout, filled_output) in filled_outputs.iter().enumerate() {
-        let outpoint = OutPoint::Regular {
-            txid,
-            vout: vout as u32,
-        };
-
-        state.insert_utxo(rwtxn, &outpoint, filled_output)?;
-    }
-
-    Ok(())
-}
-
-/// Trades and `AmplifyBeta` deposits of a block under construction, applied
-/// in block order with the same rules as block connect.
-#[derive(Default)]
-pub struct TradeSimulation(StateUpdate);
-
-impl TradeSimulation {
-    pub fn apply(
-        &mut self,
-        state: &State,
-        archive: &crate::archive::Archive,
-        rotxn: &RoTxn,
-        filled_tx: &FilledTransaction,
-    ) -> Result<TradeApplyResult, Error> {
-        match &filled_tx.transaction.data {
-            Some(TxData::Trade { .. }) => {
-                crate::validation::MarketValidator::validate_trade(
-                    state, archive, rotxn, filled_tx, None,
-                )?;
-                apply_trade(state, rotxn, filled_tx, &mut self.0)
-            }
-            Some(TxData::AmplifyBeta { .. }) => {
-                apply_amplify_beta(filled_tx, &mut self.0)?;
-                Ok(TradeApplyResult::Applied)
-            }
-            _ => Ok(TradeApplyResult::Applied),
-        }
-    }
-}
-
-/// Returns `TradeApplyResult::Skipped` for slippage failures (soft-fail).
-fn apply_trade(
-    state: &State,
-    rotxn: &RoTxn,
-    filled_tx: &FilledTransaction,
-    state_update: &mut StateUpdate,
-) -> Result<TradeApplyResult, Error> {
-    use crate::math::trading::TRADE_MINER_FEE_SATS;
-
-    let trade = filled_tx.trade().ok_or_else(|| Error::InvalidTransaction {
-        reason: "Not a trade transaction".to_string(),
-    })?;
-
-    let is_buy = trade.is_buy();
-    let shares_abs = trade.shares_abs();
-    let outcome_index = trade.outcome_index as usize;
-
-    let market = state
-        .markets()
-        .get_market(rotxn, &trade.market_id)?
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: format!("Market {:?} does not exist", trade.market_id),
-        })?;
-
-    let market_state = market.state();
-    if !market_state.allows_trading() {
-        return Err(Error::InvalidTransaction {
-            reason: format!(
-                "Cannot trade: market is in {market_state:?} state"
-            ),
-        });
-    }
-
-    let (effective_shares, beta) =
-        running_market_state(&trade.market_id, &market, state_update);
-
-    let mut new_shares = effective_shares.clone();
-    new_shares[outcome_index] += trade.shares;
-
-    if new_shares[outcome_index] < 0 {
-        return Err(Error::InvalidTransaction {
-            reason: format!(
-                "Trade would result in negative market shares: {} for outcome {}",
-                new_shares[outcome_index], outcome_index
-            ),
-        });
-    }
-
-    let input_value_sats = filled_tx
-        .spent_bitcoin_value()
-        .map_err(|_| Error::InvalidTransaction {
-            reason: "Failed to compute input value".to_string(),
-        })?
-        .to_sat();
-
-    let (volume_sats, fee_sats) = if is_buy {
-        // Buy: cost = LMSR(current -> new)
-        let base_cost = trading::calculate_update_cost(
-            &effective_shares,
-            &new_shares,
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Failed to calculate trade cost: {e:?}"),
-        })?;
-
-        let buy_cost =
-            trading::calculate_buy_cost(base_cost, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!("Buy cost calculation failed: {e}"),
-                })?;
-
-        if buy_cost.exceeds_limit(trade.limit_sats) {
-            return Ok(TradeApplyResult::Skipped {
-                reason: format!(
-                    "Buy cost {} sats + miner fee {} sats exceeds max cost {} sats",
-                    buy_cost.total_cost_sats,
-                    TRADE_MINER_FEE_SATS,
-                    trade.limit_sats
-                ),
-            });
-        }
-
-        state_update.add_pending_buy_settlement(PendingBuySettlement {
-            market_id: trade.market_id,
-            trader_address: trade.trader,
-            input_value_sats,
-            lmsr_cost_sats: buy_cost.base_cost_sats,
-            market_fee_sats: buy_cost.trading_fee_sats,
-            transaction_id: filled_tx.transaction.txid().0,
-            is_amplify: false,
-        });
-
-        (buy_cost.total_cost_sats, buy_cost.trading_fee_sats)
-    } else {
-        let seller_account = state
-            .markets()
-            .get_user_share_account(rotxn, &trade.trader)?;
-
-        let owned_shares = seller_account
-            .as_ref()
-            .and_then(|account| {
-                account
-                    .positions
-                    .get(&(trade.market_id, trade.outcome_index))
-                    .copied()
-            })
-            .unwrap_or(0);
-
-        // Check pending share changes from earlier transactions in this block
-        let pending_delta = state_update
-            .share_account_changes
-            .get(&(trade.trader, trade.market_id))
-            .and_then(|outcomes| outcomes.get(&trade.outcome_index))
-            .copied()
-            .unwrap_or(0);
-
-        let effective_owned = owned_shares + pending_delta;
-
-        if effective_owned < shares_abs as i64 {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Insufficient shares: trying to sell {} but only own {} (effective: {}) for outcome {}",
-                    shares_abs,
-                    owned_shares,
-                    effective_owned,
-                    trade.outcome_index
-                ),
-            });
-        }
-
-        // Sell: proceeds = LMSR(new -> current) since shares decreased
-        let proceeds = trading::calculate_update_cost(
-            &new_shares,
-            &effective_shares,
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Failed to calculate sell proceeds: {e:?}"),
-        })?;
-
-        let sell_proceeds =
-            trading::calculate_sell_proceeds(proceeds, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!("Sell proceeds calculation failed: {e}"),
-                })?;
-
-        let net_proceeds_sats = sell_proceeds.net_proceeds_sats;
-        let fee_sats = sell_proceeds.trading_fee_sats;
-
-        if net_proceeds_sats < trade.limit_sats {
-            return Ok(TradeApplyResult::Skipped {
-                reason: format!(
-                    "Sell proceeds {} sats below minimum {} sats",
-                    net_proceeds_sats, trade.limit_sats
-                ),
-            });
-        }
-
-        state_update.add_pending_sell_payout(PendingSellPayout {
-            market_id: trade.market_id,
-            seller_address: trade.trader,
-            payout_sats: net_proceeds_sats,
-            fee_sats,
-            outcome_index: trade.outcome_index,
-            transaction_id: filled_tx.transaction.txid().0,
-        });
-
-        // Record sell input change (input_value - miner_fee)
-        let sell_input_change =
-            input_value_sats.saturating_sub(TRADE_MINER_FEE_SATS);
-        if sell_input_change > 0 {
-            state_update.add_pending_sell_input_change(
-                trade.trader,
-                sell_input_change,
-                filled_tx.transaction.txid().0,
-            );
-        }
-
-        (net_proceeds_sats, fee_sats)
-    };
-
-    state_update.add_market_update(MarketStateUpdate {
-        market_id: trade.market_id,
-        share_delta: Some((outcome_index, trade.shares)),
-        transaction_id: Some(filled_tx.transaction.txid().0),
-        volume_sats: Some(volume_sats),
-        fee_sats: Some(fee_sats),
-    });
-
-    state_update.add_share_account_change(
-        trade.trader,
-        trade.market_id,
-        trade.outcome_index,
-        trade.shares,
-    );
-
-    Ok(TradeApplyResult::Applied)
-}
-
-fn apply_market_creation(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-    state_update: &mut StateUpdate,
-    height: u32,
-) -> Result<(), Error> {
-    use crate::state::{
-        MarketBuilder,
-        decisions::{Decision, DecisionId},
-        markets::{DimensionSpec, generate_market_treasury_address},
-    };
-    use std::collections::HashMap;
-
-    let view = filled_tx.as_market_creation().ok_or_else(|| {
-        Error::InvalidTransaction {
-            reason: "Not a market creation transaction".to_string(),
-        }
-    })?;
-
-    let creator_address = extract_creator_address(filled_tx)?;
-    let creator_address_bytes = creator_address.0;
-    let claiming_txid = filled_tx.transaction.txid();
-
-    for payload in view.new_claims {
-        for entry in &payload.decisions {
-            let decision_id = DecisionId::from_bytes(entry.decision_id_bytes)?;
-            let decision = Decision::new(
-                creator_address_bytes,
-                payload.decision_type.clone(),
-                entry.header.clone(),
-                entry.description.clone(),
-                entry.option_0_label.clone(),
-                entry.option_1_label.clone(),
-                entry.tags.clone().unwrap_or_default(),
-            )?;
-            state.decisions().claim_decision(
-                rwtxn,
-                decision_id,
-                decision,
-                claiming_txid,
-                Some(height),
-            )?;
-        }
-    }
-
-    let dimension_specs = view.dimension_specs.to_vec();
-
-    let mut decisions = HashMap::new();
-    for spec in &dimension_specs {
-        let decision_id = match spec {
-            DimensionSpec::Single(decision_id)
-            | DimensionSpec::Categorical(decision_id) => *decision_id,
-        };
-
-        let decision_entry = state
-            .decisions()
-            .get_decision_entry(rwtxn, decision_id)?
-            .ok_or_else(|| Error::InvalidDecisionId {
-                reason: format!("Decision {decision_id:?} does not exist"),
-            })?;
-
-        let decision = decision_entry.decision.ok_or_else(|| {
-            Error::InvalidDecisionId {
-                reason: format!("Decision {decision_id:?} has no decision"),
-            }
-        })?;
-
-        decisions.insert(decision_id, decision);
-    }
-
-    let mut builder =
-        MarketBuilder::new(view.title.to_string(), creator_address);
-    builder =
-        configure_market_builder(builder, view.description, view.trading_fee);
-
-    let computed_tags = compute_market_tags(&decisions);
-    builder = builder.with_tags(computed_tags);
-
-    let builder = builder
-        .with_dimensions(dimension_specs.clone())
-        .with_tx_pow(
-            view.tx_pow_hash_selector.unwrap_or(0),
-            view.tx_pow_ordering.unwrap_or(0),
-            view.tx_pow_difficulty.unwrap_or(0),
-        );
-
-    let mut market = builder.build(height, None, &decisions).map_err(|e| {
-        tracing::warn!("Market creation failed for '{}': {e}", view.title);
-        Error::InvalidTransaction {
-            reason: format!("Market creation failed: {e}"),
-        }
-    })?;
-    tracing::info!(
-        "Market built: id={} states={} tradeable={}",
-        market.id,
-        market.shares().len(),
-        market.get_outcome_count()
-    );
-
-    let market_id = market.id;
-    let market_id_bytes = *market_id.as_bytes();
-    let txid = filled_tx.txid();
-    let treasury_address = generate_market_treasury_address(&market_id);
-
-    for (vout, output) in filled_tx.outputs().iter().enumerate() {
-        if let OutputContent::MarketFunds {
-            market_id: output_market_id,
-            amount,
-            is_fee: false,
-        } = &output.content
-            && output_market_id == &market_id_bytes
-            && output.address == treasury_address
-        {
-            let outpoint = OutPoint::Regular {
-                txid,
-                vout: vout as u32,
-            };
-            state
-                .markets()
-                .set_market_funds_utxo(rwtxn, &market_id, false, &outpoint)?;
-
-            market.liquidity_base_sats = amount.0.to_sat();
-
-            tracing::debug!(
-                "Registered MarketFunds (treasury) UTXO for market {:?} with {} sats at {:?}",
-                market_id,
-                amount.0.to_sat(),
-                outpoint
-            );
-            break;
-        }
-    }
-
-    state_update.add_market_creation(MarketCreation {
-        market: market.clone(),
-    });
-
-    Ok(())
-}
-
-fn apply_amplify_beta(
-    filled_tx: &FilledTransaction,
-    state_update: &mut StateUpdate,
-) -> Result<(), Error> {
-    let amplify =
-        filled_tx
-            .amplify_beta()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not an amplify_beta transaction".to_string(),
-            })?;
-
-    let input_value_sats = filled_tx
-        .spent_bitcoin_value()
-        .map_err(|_| Error::InvalidTransaction {
-            reason: "Failed to compute input value".to_string(),
-        })?
-        .to_sat();
-
-    state_update.add_pending_buy_settlement(PendingBuySettlement {
-        market_id: amplify.market_id,
-        trader_address: amplify.market_author,
-        input_value_sats,
-        lmsr_cost_sats: amplify.amount,
-        market_fee_sats: 0,
-        transaction_id: filled_tx.transaction.txid().0,
-        is_amplify: true,
-    });
-
-    Ok(())
-}
-
-fn revert_amplify_beta(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<(), Error> {
-    let amplify =
-        filled_tx
-            .amplify_beta()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not an amplify_beta transaction".to_string(),
-            })?;
-
-    let mut market = state
-        .markets()
-        .get_market(rwtxn, &amplify.market_id)?
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "Market not found during amplify_beta revert".to_string(),
-        })?;
-    market.liquidity_base_sats = market
-        .liquidity_base_sats
-        .checked_sub(amplify.amount)
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "Liquidity base underflow during amplify_beta revert"
-                .to_string(),
-        })?;
-    state.markets().update_market(rwtxn, &market)?;
-
-    Ok(())
-}
-
-fn apply_submit_vote(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-    state_update: &mut StateUpdate,
-    height: u32,
-) -> Result<(), Error> {
-    use crate::state::{
-        decisions::DecisionId,
-        voting::types::{Vote, VotingPeriodId},
-    };
-
-    let vote_data =
-        filled_tx
-            .submit_vote()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a vote submission transaction".to_string(),
-            })?;
-
-    let voter_address = vote_data.voter;
-
-    let decision_id = DecisionId::from_bytes(vote_data.decision_id_bytes)?;
-
-    let decision_claim_period = decision_id.period_index();
-    let voting_period = decision_id.voting_period();
-    let period_id = VotingPeriodId::new(voting_period);
-
-    if vote_data.voting_period != voting_period {
-        return Err(Error::InvalidTransaction {
-            reason: format!(
-                "Vote period mismatch: decision {} was claimed in period {} and must be voted on in period {}, but transaction specifies period {}",
-                const_hex::encode(vote_data.decision_id_bytes),
-                decision_claim_period,
-                voting_period,
-                vote_data.voting_period
-            ),
-        });
-    }
-
-    let timestamp =
-        state.try_get_mainchain_timestamp(rwtxn)?.ok_or_else(|| {
-            Error::InvalidTransaction {
-                reason: "No mainchain timestamp available".to_string(),
-            }
-        })?;
-
-    let decision_ref = state
-        .decisions()
-        .get_decision_entry(rwtxn, decision_id)?
-        .and_then(|e| e.decision);
-
-    let vote_value =
-        crate::validation::VoteValidator::convert_vote_value_with_decision(
-            vote_data.vote_value,
-            decision_ref.as_ref(),
-        );
-
-    let vote = Vote::new(
-        voter_address,
-        period_id,
-        decision_id,
-        vote_value,
-        timestamp,
-        height,
-        filled_tx.txid().0,
-    );
-
-    state_update.add_vote_submission(vote);
-
-    Ok(())
-}
-
-fn revert_submit_vote(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<(), Error> {
-    use crate::state::{decisions::DecisionId, voting::types::VotingPeriodId};
-
-    let vote_data =
-        filled_tx
-            .submit_vote()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a vote submission transaction".to_string(),
-            })?;
-
-    let voter_address = vote_data.voter;
-
-    let decision_id = DecisionId::from_bytes(vote_data.decision_id_bytes)?;
-
-    let voting_period = decision_id.voting_period();
-    let period_id = VotingPeriodId::new(voting_period);
-
-    state.voting().databases().delete_vote(
-        rwtxn,
-        period_id,
-        voter_address,
-        decision_id,
-    )?;
-
-    Ok(())
-}
-
-fn apply_submit_ballot(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-    state_update: &mut StateUpdate,
-    height: u32,
-) -> Result<(), Error> {
-    use crate::state::{
-        decisions::DecisionId,
-        voting::types::{Vote, VotingPeriodId},
-    };
-
-    let ballot_data =
-        filled_tx
-            .submit_ballot()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a ballot submission transaction".to_string(),
-            })?;
-
-    let voter_address = ballot_data.voter;
-
-    let timestamp =
-        state.try_get_mainchain_timestamp(rwtxn)?.ok_or_else(|| {
-            Error::InvalidTransaction {
-                reason: "No mainchain timestamp available".to_string(),
-            }
-        })?;
-
-    let mut expected_voting_period: Option<u32> = None;
-
-    for vote_item in &ballot_data.votes {
-        let decision_id = DecisionId::from_bytes(vote_item.decision_id_bytes)?;
-
-        let voting_period = decision_id.voting_period();
-
-        if let Some(expected) = expected_voting_period {
-            if voting_period != expected {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Ballot period mismatch: decision {} requires period {} but ballot expects period {}",
-                        const_hex::encode(vote_item.decision_id_bytes),
-                        voting_period,
-                        expected
-                    ),
-                });
-            }
-        } else {
-            expected_voting_period = Some(voting_period);
-
-            if ballot_data.voting_period != voting_period {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Ballot period mismatch: decisions require period {} but transaction specifies period {}",
-                        voting_period, ballot_data.voting_period
-                    ),
-                });
-            }
-        }
-
-        let period_id = VotingPeriodId::new(voting_period);
-
-        let decision_ref = state
-            .decisions()
-            .get_decision_entry(rwtxn, decision_id)?
-            .and_then(|e| e.decision);
-
-        let vote_value =
-            crate::validation::VoteValidator::convert_vote_value_with_decision(
-                vote_item.vote_value,
-                decision_ref.as_ref(),
-            );
-
-        let vote = Vote::new(
-            voter_address,
-            period_id,
-            decision_id,
-            vote_value,
-            timestamp,
-            height,
-            filled_tx.txid().0,
-        );
-
-        state_update.add_vote_submission(vote);
-    }
-
-    Ok(())
-}
-
-fn revert_submit_ballot(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<(), Error> {
-    use crate::state::{decisions::DecisionId, voting::types::VotingPeriodId};
-
-    let ballot_data =
-        filled_tx
-            .submit_ballot()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a ballot submission transaction".to_string(),
-            })?;
-
-    let voter_address = ballot_data.voter;
-
-    for vote_item in &ballot_data.votes {
-        let decision_id = DecisionId::from_bytes(vote_item.decision_id_bytes)?;
-
-        let voting_period = decision_id.voting_period();
-        let period_id = VotingPeriodId::new(voting_period);
-
-        state.voting().databases().delete_vote(
-            rwtxn,
-            period_id,
-            voter_address,
-            decision_id,
-        )?;
-    }
-
-    Ok(())
-}
-
-fn apply_transfer_reputation(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-    height: u32,
-) -> Result<(), Error> {
-    let transfer = filled_tx.transfer_reputation().ok_or_else(|| {
-        Error::InvalidTransaction {
-            reason: "Not a reputation transfer transaction".to_string(),
-        }
-    })?;
-
-    let sender_address = transfer.sender;
-
-    let sender_rep =
-        state.reputation().get_reputation(rwtxn, &sender_address)?;
-    if sender_rep < transfer.amount {
-        return Err(Error::InvalidTransaction {
-            reason: format!(
-                "Insufficient reputation at apply: have {sender_rep}, \
-                 need {}",
-                transfer.amount
-            ),
-        });
-    }
-    let receiver_rep =
-        state.reputation().get_reputation(rwtxn, &transfer.dest)?;
-
-    let undo_entry = crate::state::undo::ReputationTransferUndoEntry {
-        sender: sender_address,
-        sender_pre_reputation: sender_rep,
-        receiver: transfer.dest,
-        receiver_pre_reputation: receiver_rep,
-    };
-
-    let mut undo_data = state
-        .reputation_transfer_undo
-        .try_get(rwtxn, &height)?
-        .unwrap_or_else(|| crate::state::undo::ReputationTransferUndoData {
-            entries: Vec::new(),
-        });
-    undo_data.entries.push(undo_entry);
+    let () = accumulator.apply_diff(accumulator_diff)?;
     state
-        .reputation_transfer_undo
-        .put(rwtxn, &height, &undo_data)?;
-
-    state.reputation().set_reputation(
-        rwtxn,
-        &sender_address,
-        sender_rep - transfer.amount,
-    )?;
-    state.reputation().set_reputation(
-        rwtxn,
-        &transfer.dest,
-        receiver_rep + transfer.amount,
-    )?;
-
+        .utreexo_accumulator
+        .put(rwtxn, &(), &accumulator)
+        .map_err(DbError::from)?;
     Ok(())
+}
+
+/// Address that the actor proof of a transaction proves, if any
+fn actor_address(body: &Body, tx_idx: usize) -> Option<crate::types::Address> {
+    body.actor_proofs
+        .get(tx_idx)
+        .and_then(|proof| proof.as_ref())
+        .map(|auth| auth.get_address())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod test {
+    use std::collections::HashMap;
 
-    fn bitcoin_input(sats: u64) -> FilledOutput {
-        FilledOutput {
-            address: Address::ALL_ZEROS,
-            content: FilledOutputContent::Bitcoin(
-                crate::types::BitcoinOutputContent(bitcoin::Amount::from_sat(
-                    sats,
-                )),
-            ),
-            memo: vec![],
-        }
-    }
+    use truthcoin_dc_types::Coinbase;
 
-    fn filled_tx(data: TxData, input_sats: u64) -> FilledTransaction {
-        FilledTransaction {
-            transaction: crate::types::Transaction {
-                inputs: vec![OutPoint::Regular {
-                    txid: crate::types::Txid([0; 32]),
-                    vout: 0,
-                }],
-                data: Some(data),
-                ..Default::default()
-            },
-            spent_utxos: vec![bitcoin_input(input_sats)],
-            actor_address: None,
-        }
-    }
+    use crate::{
+        state::test::{fresh_state, value_output},
+        types::FilledTransaction,
+    };
 
-    struct TradingFixture {
-        _dir: tempfile::TempDir,
-        env: sneed::Env,
-        state: State,
-        archive: crate::archive::Archive,
-        market: crate::state::Market,
-        tip: crate::types::BlockHash,
-    }
-
-    fn trading_fixture() -> TradingFixture {
-        use crate::archive::Archive;
-        use crate::state::MarketBuilder;
-        use crate::state::decisions::{Decision, DecisionId, DecisionType};
-        use crate::state::markets::DimensionSpec;
+    #[test]
+    fn validation_rejects_outpoint_utxo_hash_mismatch() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
-        let dir = tempfile::tempdir().unwrap();
-        let mut opts = heed::EnvOpenOptions::new();
-        opts.map_size(64 * 1024 * 1024)
-            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
-        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
-        let state = State::new(&env, None).unwrap();
-        let archive = Archive::new(&env).unwrap();
-
-        let decision_id = DecisionId::new(true, 0, 0).unwrap();
-        let decision = Decision::new(
-            Address::ALL_ZEROS.0,
-            DecisionType::Binary,
-            "Header".to_string(),
-            "Desc".to_string(),
-            None,
-            None,
-            vec![],
-        )
-        .unwrap();
-        let mut market =
-            MarketBuilder::new("Market".to_string(), Address::ALL_ZEROS)
-                .with_dimensions(vec![DimensionSpec::Single(decision_id)])
-                .build(0, None, &HashMap::from([(decision_id, decision)]))
-                .unwrap();
-        market.liquidity_base_sats = 10_000;
-        market.shares = ndarray::Array1::from(vec![0, 20_000]);
-
-        let header = Header {
-            merkle_root: MerkleRoot::default(),
-            prev_side_hash: None,
-            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+        use crate::types::{
+            Accumulator, AccumulatorDiff, Body, Header, OutPoint, OutPointKey,
+            PointedOutput, Transaction, UtreexoNodeHash,
+            authorization::{
+                self, BatchVerificationContext, SigningKey, get_address,
+            },
+            hash,
         };
-        let tip = header.hash();
-        let mut rwtxn = env.write_txn().unwrap();
-        archive.put_header(&mut rwtxn, &header).unwrap();
-        state.tip.put(&mut rwtxn, &(), &tip).unwrap();
-        state.height.put(&mut rwtxn, &(), &0).unwrap();
-        state.markets().add_market(&mut rwtxn, &market).unwrap();
-        rwtxn.commit().unwrap();
 
-        TradingFixture {
-            _dir: dir,
-            env,
-            state,
-            archive,
-            market,
-            tip,
+        let (_temp_dir, env, state) =
+            fresh_state("validation_rejects_outpoint_utxo_hash_mismatch")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let mut rng = rand::rng();
+        let batch_verification_ctxt = BatchVerificationContext::new(&mut rng);
+
+        // Attacker key (owns A). Victim key (owns B).
+        let attacker = SigningKey::new(&mut rng);
+        let attacker_addr = get_address(&(&attacker).into());
+        let victim = SigningKey::new(&mut rng);
+        let victim_addr = get_address(&(&victim).into());
+
+        // UTXO A (attacker, 10_000) and victim UTXO B (20_000).
+        let outpoint_a = OutPoint::Deposit(bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xAA; 32]),
+            vout: 0,
+        });
+        let output_a = value_output(attacker_addr, 10_000);
+        let outpoint_b = OutPoint::Deposit(bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xBB; 32]),
+            vout: 0,
+        });
+        let output_b = value_output(victim_addr, 20_000);
+
+        // Leaf hashes for A and B (the Utreexo commitments).
+        let pointed_a = PointedOutput {
+            outpoint: outpoint_a,
+            output: output_a.clone(),
+        };
+        let pointed_b = PointedOutput {
+            outpoint: outpoint_b,
+            output: output_b.clone(),
+        };
+        let leaf_a: UtreexoNodeHash = (&pointed_a).into();
+        let leaf_b: UtreexoNodeHash = (&pointed_b).into();
+        let hash_b: crate::types::Hash = hash(&pointed_b); // input's utxo_hash
+
+        // Helper: build a fresh accumulator seeded with leaves A and B
+        // (Accumulator is not Clone, so re-seed when a fresh copy is needed).
+        let seeded_accumulator = || -> anyhow::Result<_> {
+            let mut acc = Accumulator::default();
+            let mut diff = AccumulatorDiff::default();
+            diff.insert(leaf_a);
+            diff.insert(leaf_b);
+            acc.apply_diff(diff)?;
+            Ok(acc)
+        };
+
+        // Seed UTXO DB with A and B; seed the accumulator with both leaves.
+        let pre_accumulator = seeded_accumulator()?;
+        {
+            let mut rwtxn = env.write_txn()?;
+            state.utxos.put(
+                &mut rwtxn,
+                &OutPointKey::from(&outpoint_a),
+                &output_a,
+            )?;
+            state.utxos.put(
+                &mut rwtxn,
+                &OutPointKey::from(&outpoint_b),
+                &output_b,
+            )?;
+            state
+                .utreexo_accumulator
+                .put(&mut rwtxn, &(), &pre_accumulator)?;
+            // tip stays unset (None) so validate's prev_side_hash check
+            // expects header.prev_side_hash == None.
+            rwtxn.commit()?;
         }
+
+        // Build the malicious tx: input = (outpoint_A, hash_B) + proof for B;
+        // output C = 9_000 to the attacker.
+        let proof_for_b = pre_accumulator.prove(&[leaf_b])?;
+        let output_c = value_output(attacker_addr, 9_000);
+        let tx = Transaction {
+            inputs: vec![(outpoint_a, hash_b)].into(),
+            proof: proof_for_b,
+            outputs: vec![output_c.clone()].into(),
+            data: None,
+        };
+        // Sign with A's key (the spender of outpoint A authorizes the tx).
+        let authorized = authorization::authorize(
+            &mut rng,
+            &[(attacker_addr, &attacker)],
+            tx,
+        )?;
+
+        // Assemble body.
+        let body = Body::new(vec![authorized], Coinbase::default());
+
+        // Compute the header the validator expects:
+        //   merkle_root from the filled tx, roots = post-block accumulator
+        //   (B's leaf removed, C's leaf inserted) -- exactly the diff validate
+        //   builds from the SUPPLIED utxo_hash.
+        let filled = {
+            let rotxn = env.read_txn()?;
+            state.fill_transaction(
+                &rotxn,
+                &HashMap::new(),
+                &body.transactions[0],
+            )?
+        };
+
+        // tx validation REJECTS the outpoint/utxo_hash mismatch.
+        {
+            let rotxn = env.read_txn()?;
+            anyhow::ensure!(
+                state
+                    .validate_filled_transaction(
+                        &rotxn, &filled, &archive, None
+                    )
+                    .is_err()
+            );
+        }
+        let merkle_root = Body::compute_merkle_root(&body.coinbase, &[filled])?;
+        let mut post_accumulator = seeded_accumulator()?;
+        {
+            let mut diff = AccumulatorDiff::default();
+            // validate removes the SUPPLIED utxo_hash (B), inserts output C.
+            diff.remove(leaf_b);
+            let txid = body.transactions[0].txid();
+            let pointed_c = PointedOutput {
+                outpoint: OutPoint::Regular { txid, vout: 0 },
+                output: output_c.clone(),
+            };
+            diff.insert((&pointed_c).into());
+            post_accumulator.apply_diff(diff)?;
+        }
+        let header = Header {
+            merkle_root,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+            roots: post_accumulator.get_roots(),
+        };
+
+        // block validation REJECTS the outpoint/utxo_hash mismatch.
+        {
+            let rotxn = env.read_txn()?;
+            anyhow::ensure!(
+                state
+                    .validate_block(
+                        &rotxn,
+                        &batch_verification_ctxt,
+                        &header,
+                        &body,
+                        &archive,
+                    )
+                    .is_err(),
+                "BUG: real validate_block accepts an input whose outpoint (A) \
+                and utxo_hash (B) refer to different UTXOs",
+            );
+        }
+        Ok(())
     }
 
-    fn buy_cost(market: &crate::state::Market, shares: i64) -> u64 {
-        let mut new_shares = market.shares.clone();
-        new_shares[0] += shares;
-        let base_cost = trading::calculate_update_cost(
-            &market.shares,
-            &new_shares,
-            market_beta(market),
-        )
-        .unwrap();
-        trading::calculate_buy_cost(base_cost, market.trading_fee())
-            .unwrap()
-            .total_cost_sats
-    }
+    /// Build a block that carries a parent and its child, and the state that
+    /// validates it. `order` names the body order.
+    fn chained_block(
+        test_name: &str,
+        child_first: bool,
+    ) -> anyhow::Result<(
+        temp_dir::TempDir,
+        sneed::Env,
+        crate::state::State,
+        crate::types::Header,
+        crate::types::Body,
+        crate::types::authorization::BatchVerificationContext,
+    )> {
+        use bitcoin::hashes::Hash as _;
 
-    #[test]
-    fn trade_simulation_prices_at_same_block_amplified_beta() {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
+        use crate::types::{
+            Accumulator, AccumulatorDiff, Body, Header, OutPoint, OutPointKey,
+            PointedOutput, Transaction, UtreexoNodeHash,
+            authorization::{SigningKey, authorize, get_address},
+            hash,
+        };
 
-        let TradingFixture {
-            env,
-            state,
-            archive,
-            market,
-            tip,
-            ..
-        } = trading_fixture();
-        let rotxn = env.read_txn().unwrap();
+        let (temp_dir, env, state) = fresh_state(test_name)?;
+        let mut rng = rand::rng();
+        let batch_verification_ctxt =
+            crate::types::authorization::BatchVerificationContext::new(
+                &mut rng,
+            );
+        let owner = SigningKey::new(&mut rng);
+        let owner_addr = get_address(&(&owner).into());
 
-        let shares = 1_000;
-        let trade = filled_tx(
-            TxData::Trade {
-                market_id: market.id,
-                outcome_index: 0,
-                shares,
-                trader: Address::ALL_ZEROS,
-                limit_sats: buy_cost(&market, shares) + TRADE_MINER_FEE_SATS,
-                tx_pow_nonce: None,
-                prev_block_hash: tip,
-            },
-            100_000,
-        );
-        let amount = 1_000_000;
-        let amplify = filled_tx(
-            TxData::AmplifyBeta {
-                market_id: market.id,
-                amount,
-                market_author: Address::ALL_ZEROS,
-            },
-            amount + TRADE_MINER_FEE_SATS,
-        );
+        // One confirmed deposit funds the chain.
+        let deposit_outpoint = OutPoint::Deposit(bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([0xCC; 32]),
+            vout: 0,
+        });
+        let deposit_output = value_output(owner_addr, 10_000);
+        let deposit_pointed = PointedOutput {
+            outpoint: deposit_outpoint,
+            output: deposit_output.clone(),
+        };
+        let deposit_leaf: UtreexoNodeHash = (&deposit_pointed).into();
+        let deposit_hash = hash(&deposit_pointed);
 
-        let mut trades = TradeSimulation::default();
-        assert!(matches!(
-            trades.apply(&state, &archive, &rotxn, &trade).unwrap(),
-            TradeApplyResult::Applied
-        ));
+        let mut accumulator = Accumulator::default();
+        {
+            let mut diff = AccumulatorDiff::default();
+            diff.insert(deposit_leaf);
+            accumulator.apply_diff(diff)?;
+        }
+        {
+            let mut rwtxn = env.write_txn()?;
+            state.utxos.put(
+                &mut rwtxn,
+                &OutPointKey::from(&deposit_outpoint),
+                &deposit_output,
+            )?;
+            state
+                .utreexo_accumulator
+                .put(&mut rwtxn, &(), &accumulator)?;
+            rwtxn.commit()?;
+        }
 
-        let mut trades = TradeSimulation::default();
-        assert!(matches!(
-            trades.apply(&state, &archive, &rotxn, &amplify).unwrap(),
-            TradeApplyResult::Applied
-        ));
-        assert!(matches!(
-            trades.apply(&state, &archive, &rotxn, &trade).unwrap(),
-            TradeApplyResult::Skipped { .. }
-        ));
-    }
+        // Parent spends the deposit. Child spends the parent's output.
+        let parent_output = value_output(owner_addr, 9_000);
+        let parent = Transaction {
+            inputs: vec![(deposit_outpoint, deposit_hash)].into(),
+            proof: accumulator.prove(&[deposit_leaf])?,
+            outputs: vec![parent_output.clone()].into(),
+            data: None,
+        };
+        let parent_outpoint = OutPoint::Regular {
+            txid: parent.txid(),
+            vout: 0,
+        };
+        let parent_pointed = PointedOutput {
+            outpoint: parent_outpoint,
+            output: parent_output.clone(),
+        };
+        let child_output = value_output(owner_addr, 8_000);
+        let child = Transaction {
+            inputs: vec![(parent_outpoint, hash(&parent_pointed))].into(),
+            // The accumulator holds no leaf for the parent's output, so the
+            // child proves nothing.
+            proof: accumulator.prove(&[])?,
+            outputs: vec![child_output.clone()].into(),
+            data: None,
+        };
 
-    #[test]
-    fn trade_simulation_rejects_sell_of_same_block_buy() {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
-
-        let TradingFixture {
-            env,
-            state,
-            archive,
-            market,
-            tip,
-            ..
-        } = trading_fixture();
-        let rotxn = env.read_txn().unwrap();
-
-        let shares = 20_000;
-        let trade = |shares, limit_sats| {
-            filled_tx(
-                TxData::Trade {
-                    market_id: market.id,
-                    outcome_index: 0,
-                    shares,
-                    trader: Address::ALL_ZEROS,
-                    limit_sats,
-                    tx_pow_nonce: None,
-                    prev_block_hash: tip,
-                },
-                100_000,
+        let authorized_parent =
+            authorize(&mut rng, &[(owner_addr, &owner)], parent)?;
+        let authorized_child =
+            authorize(&mut rng, &[(owner_addr, &owner)], child)?;
+        let body = if child_first {
+            Body::new(
+                vec![authorized_child, authorized_parent],
+                Coinbase::default(),
+            )
+        } else {
+            Body::new(
+                vec![authorized_parent, authorized_child],
+                Coinbase::default(),
             )
         };
-        let buy =
-            trade(shares, buy_cost(&market, shares) + TRADE_MINER_FEE_SATS);
-        let sell = trade(-shares, 0);
 
-        let mut trades = TradeSimulation::default();
-        assert!(matches!(
-            trades.apply(&state, &archive, &rotxn, &buy).unwrap(),
-            TradeApplyResult::Applied
-        ));
-        let result = trades.apply(&state, &archive, &rotxn, &sell);
-        assert!(
-            matches!(
-                &result,
-                Err(Error::InvalidTransaction { reason })
-                    if reason.starts_with("Insufficient shares")
-            ),
-            "sell of same-block shares must fail prevalidation: {:?}",
-            result.as_ref().err()
-        );
-    }
-
-    #[test]
-    fn test_double_spend_protection_same_block() {
-        let mut state_update = StateUpdate::new();
-        let trader = Address::ALL_ZEROS;
-        let market_id = MarketId::new([1u8; 6]);
-        let outcome_index: u32 = 0;
-
-        let owned_shares_from_db: i64 = 100;
-
-        state_update.add_share_account_change(
-            trader,
-            market_id,
-            outcome_index,
-            -60,
-        );
-
-        let pending_delta = state_update
-            .share_account_changes
-            .get(&(trader, market_id))
-            .and_then(|outcomes| outcomes.get(&outcome_index))
-            .copied()
-            .unwrap_or(0);
-
-        let effective_owned = owned_shares_from_db + pending_delta;
-        assert_eq!(effective_owned, 40);
-
-        let shares_to_sell: i64 = 50;
-        assert!(
-            effective_owned < shares_to_sell,
-            "Double-spend protection: should reject sell of {shares_to_sell} when only {effective_owned} effectively owned"
-        );
-
-        let valid_sell: i64 = 40;
-        assert!(
-            effective_owned >= valid_sell,
-            "Should allow selling {valid_sell} when {effective_owned} effectively owned"
-        );
-    }
-
-    #[test]
-    fn test_buy_then_sell_same_block_allowed() {
-        let mut state_update = StateUpdate::new();
-        let trader = Address::ALL_ZEROS;
-        let market_id = MarketId::new([2u8; 6]);
-        let outcome_index: u32 = 1;
-
-        let owned_shares_from_db: i64 = 0;
-
-        state_update.add_share_account_change(
-            trader,
-            market_id,
-            outcome_index,
-            100,
-        );
-
-        let pending_delta = state_update
-            .share_account_changes
-            .get(&(trader, market_id))
-            .and_then(|outcomes| outcomes.get(&outcome_index))
-            .copied()
-            .unwrap_or(0);
-
-        let effective_owned = owned_shares_from_db + pending_delta;
-        assert_eq!(effective_owned, 100);
-
-        let shares_to_sell: i64 = 50;
-        assert!(
-            effective_owned >= shares_to_sell,
-            "Should allow selling {shares_to_sell} after buying 100 in same block"
-        );
-    }
-
-    #[test]
-    fn test_multiple_sells_different_outcomes_same_block() {
-        let mut state_update = StateUpdate::new();
-        let trader = Address::ALL_ZEROS;
-        let market_id = MarketId::new([3u8; 6]);
-
-        let owned_outcome_0: i64 = 100;
-        let owned_outcome_1: i64 = 100;
-
-        state_update.add_share_account_change(trader, market_id, 0, -80);
-
-        let pending_delta_0 = state_update
-            .share_account_changes
-            .get(&(trader, market_id))
-            .and_then(|outcomes| outcomes.get(&0))
-            .copied()
-            .unwrap_or(0);
-        let effective_owned_0 = owned_outcome_0 + pending_delta_0;
-        assert_eq!(effective_owned_0, 20);
-
-        let pending_delta_1 = state_update
-            .share_account_changes
-            .get(&(trader, market_id))
-            .and_then(|outcomes| outcomes.get(&1))
-            .copied()
-            .unwrap_or(0);
-        let effective_owned_1 = owned_outcome_1 + pending_delta_1;
-        assert_eq!(effective_owned_1, 100);
-
-        assert!(effective_owned_1 >= 100);
-    }
-
-    #[test]
-    fn test_cumulative_sells_same_outcome_same_block() {
-        let mut state_update = StateUpdate::new();
-        let trader = Address::ALL_ZEROS;
-        let market_id = MarketId::new([4u8; 6]);
-        let outcome_index: u32 = 0;
-
-        let owned_shares_from_db: i64 = 100;
-
-        state_update.add_share_account_change(
-            trader,
-            market_id,
-            outcome_index,
-            -30,
-        );
-
-        state_update.add_share_account_change(
-            trader,
-            market_id,
-            outcome_index,
-            -40,
-        );
-
-        let pending_delta = state_update
-            .share_account_changes
-            .get(&(trader, market_id))
-            .and_then(|outcomes| outcomes.get(&outcome_index))
-            .copied()
-            .unwrap_or(0);
-
-        assert_eq!(pending_delta, -70);
-
-        let effective_owned = owned_shares_from_db + pending_delta;
-        assert_eq!(effective_owned, 30);
-
-        let third_sell: i64 = 40;
-        assert!(
-            effective_owned < third_sell,
-            "Should reject third sell: {third_sell} > {effective_owned} effective"
-        );
-
-        assert!(effective_owned >= 30);
-    }
-
-    #[test]
-    fn same_block_buys_fold_shares_not_beta() {
-        use crate::math::trading;
-        use ndarray::array;
-
-        let outcomes = 2usize;
-        let liquidity_base =
-            trading::calculate_lmsr_liquidity(10_000_000.0, outcomes).round()
-                as u64;
-        let beta =
-            trading::derive_beta_from_liquidity(liquidity_base, outcomes);
-
-        let s0 = array![0i64, 0i64];
-        let after_one = array![100_000i64, 0i64];
-        let after_two = array![200_000i64, 0i64];
-
-        let market_id = MarketId::new([7u8; 6]);
-        let mut state_update = StateUpdate::new();
-        state_update.add_market_update(MarketStateUpdate {
-            market_id,
-            share_delta: Some((0, 100_000)),
-            transaction_id: None,
-            volume_sats: None,
-            fee_sats: None,
-        });
-        state_update.add_pending_buy_settlement(PendingBuySettlement {
-            market_id,
-            trader_address: Address::ALL_ZEROS,
-            input_value_sats: 0,
-            lmsr_cost_sats: 12_345,
-            market_fee_sats: 0,
-            transaction_id: [0u8; 32],
-            is_amplify: false,
-        });
-
-        let mut effective = s0.clone();
-        for update in &state_update.market_updates {
-            if update.market_id == market_id
-                && let Some((oi, d)) = update.share_delta
-            {
-                effective[oi] += d;
-            }
+        // The parent's output is made and spent inside the block, so the
+        // accumulator only loses the deposit and gains the child's output.
+        let mut post_accumulator = Accumulator::default();
+        {
+            let mut diff = AccumulatorDiff::default();
+            diff.insert(deposit_leaf);
+            post_accumulator.apply_diff(diff)?;
+            let mut diff = AccumulatorDiff::default();
+            diff.remove(deposit_leaf);
+            diff.insert(
+                (&PointedOutput {
+                    outpoint: OutPoint::Regular {
+                        txid: body.transactions
+                            [if child_first { 1 } else { 0 }]
+                        .txid(),
+                        vout: 0,
+                    },
+                    output: parent_output.clone(),
+                })
+                    .into(),
+            );
+            diff.remove(
+                (&PointedOutput {
+                    outpoint: parent_outpoint,
+                    output: parent_output,
+                })
+                    .into(),
+            );
+            diff.insert(
+                (&PointedOutput {
+                    outpoint: OutPoint::Regular {
+                        txid: body.transactions
+                            [if child_first { 0 } else { 1 }]
+                        .txid(),
+                        vout: 0,
+                    },
+                    output: child_output,
+                })
+                    .into(),
+            );
+            post_accumulator.apply_diff(diff)?;
         }
-        assert_eq!(effective, after_one);
 
-        let base1 = trading::calculate_buy_cost(
-            trading::calculate_update_cost(&s0, &after_one, beta).unwrap(),
-            0.0,
-        )
-        .unwrap()
-        .base_cost_sats;
+        let filled = vec![
+            FilledTransaction {
+                spent_utxos: vec![if child_first {
+                    parent_pointed.output.clone()
+                } else {
+                    deposit_output.clone()
+                }],
+                transaction: body.transactions[0].clone(),
+                actor_address: None,
+            },
+            FilledTransaction {
+                spent_utxos: vec![if child_first {
+                    deposit_output
+                } else {
+                    parent_pointed.output
+                }],
+                transaction: body.transactions[1].clone(),
+                actor_address: None,
+            },
+        ];
+        let header = Header {
+            merkle_root: Body::compute_merkle_root(
+                &body.coinbase,
+                filled.as_slice(),
+            )?,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+            roots: post_accumulator.get_roots(),
+        };
+        Ok((temp_dir, env, state, header, body, batch_verification_ctxt))
+    }
 
-        let base2_sequential = trading::calculate_buy_cost(
-            trading::calculate_update_cost(&after_one, &after_two, beta)
-                .unwrap(),
-            0.0,
-        )
-        .unwrap()
-        .base_cost_sats;
+    #[test]
+    fn a_block_carries_a_parent_and_its_child() -> anyhow::Result<()> {
+        let (_temp_dir, env, state, header, body, ctxt) =
+            chained_block("a_block_carries_a_parent_and_its_child", false)?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let rotxn = env.read_txn()?;
+        let (fees, _) =
+            state.validate_block(&rotxn, &ctxt, &header, &body, &archive)?;
+        anyhow::ensure!(fees == bitcoin::Amount::from_sat(2_000));
+        let () = state
+            .prevalidate_block(&rotxn, &ctxt, &header, &body, &archive)
+            .map(|_| ())?;
+        Ok(())
+    }
 
-        assert!(base2_sequential > base1);
+    #[test]
+    fn a_child_before_its_parent_is_rejected() -> anyhow::Result<()> {
+        let (_temp_dir, env, state, header, body, ctxt) =
+            chained_block("a_child_before_its_parent_is_rejected", true)?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let rotxn = env.read_txn()?;
+        anyhow::ensure!(
+            state
+                .validate_block(&rotxn, &ctxt, &header, &body, &archive)
+                .is_err(),
+            "a body that puts a child before its parent must not validate",
+        );
+        anyhow::ensure!(
+            state
+                .prevalidate_block(&rotxn, &ctxt, &header, &body, &archive)
+                .is_err(),
+            "prevalidate must reject the same body",
+        );
+        Ok(())
     }
 }

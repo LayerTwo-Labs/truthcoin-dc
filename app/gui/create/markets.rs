@@ -6,7 +6,7 @@ use truthcoin_dc::state::markets::DEFAULT_TRADING_FEE;
 use truthcoin_dc::state::voting::types::VotingPeriodId;
 use truthcoin_dc::types::ClaimDecisionPayload;
 use truthcoin_dc::wallet::CreateMarketInput;
-use truthcoin_dc_app_rpc_api::PeriodPricingSummary;
+use truthcoin_dc_app_rpc_api::markets::PeriodPricingSummary;
 
 use crate::app::App;
 use crate::rpc_server::{SlotRequest, allocate_decision_slots};
@@ -689,7 +689,11 @@ impl CreateMarket {
             1000u64.saturating_add(total_listing_fee),
         );
 
-        match app.wallet.create_market(input, tx_fee) {
+        match app.wallet.create_market(
+            app.spend_zero_conf_change,
+            input,
+            tx_fee,
+        ) {
             Ok((tx, _market_id)) => {
                 if let Err(e) = app.sign_and_send(tx) {
                     self.error = Some(format!("Failed to send: {e:#}"));

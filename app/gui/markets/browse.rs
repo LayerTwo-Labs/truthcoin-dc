@@ -915,14 +915,14 @@ impl Browse {
                 Err(_) => return,
             };
 
-        use truthcoin_dc::types::GetBitcoinValue;
+        use truthcoin_dc::types::GetValue;
         let confirmed_total: bitcoin::Amount =
-            utxos.values().map(|utxo| utxo.get_bitcoin_value()).sum();
+            utxos.values().map(|utxo| utxo.get_value()).sum();
 
         let pending_spent: bitcoin::Amount = spent_in_mempool
             .iter()
             .filter_map(|(outpoint, _)| {
-                utxos.get(outpoint).map(|utxo| utxo.get_bitcoin_value())
+                utxos.get(outpoint).map(|utxo| utxo.get_value())
             })
             .sum();
 
@@ -2456,6 +2456,7 @@ impl Browse {
                     }
                 };
                 match app.wallet.amplify_beta(
+                    app.spend_zero_conf_change,
                     market.id,
                     amount,
                     market.creator_address,
@@ -2533,6 +2534,7 @@ impl Browse {
             }
         };
         match app.wallet.trade(
+            app.spend_zero_conf_change,
             market.id,
             actual_idx,
             preview.shares as i64,
@@ -2604,6 +2606,7 @@ impl Browse {
             }
         };
         match app.wallet.trade(
+            app.spend_zero_conf_change,
             market.id,
             actual_idx,
             -(preview.shares as i64),

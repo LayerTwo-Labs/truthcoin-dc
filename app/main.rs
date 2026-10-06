@@ -1,10 +1,10 @@
-use std::{path::Path, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use clap::Parser as _;
 use mimalloc::MiMalloc;
 use tokio::{signal::ctrl_c, sync::oneshot};
 use tracing_subscriber::{
-    Layer, filter as tracing_filter, layer::SubscriberExt,
+    Layer, filter as tracing_filter, fmt::format, layer::SubscriberExt,
 };
 
 mod app;
@@ -92,6 +92,7 @@ where
     let (non_blocking_rolling_log_writer, rolling_log_guard) =
         tracing_appender::non_blocking(rolling_log_appender);
     let level_filter = tracing_filter::Targets::new().with_default(log_level);
+
     let rolling_log_layer = tracing_subscriber::fmt::layer()
         .compact()
         .with_ansi(false)
@@ -104,9 +105,9 @@ where
 // If the file logger is set, returns a guard that must be held for the
 // lifetime of the program in order to keep the file logger alive.
 fn set_tracing_subscriber(
-    file_log_level: tracing::Level,
     log_dir: Option<&Path>,
     log_level: tracing::Level,
+    log_level_file: tracing::Level,
 ) -> anyhow::Result<(LineBuffer, Option<RollingLoggerGuard>)> {
     let targets_filter = {
         let default_directives_str = targets_directive_str([
@@ -141,21 +142,22 @@ fn set_tracing_subscriber(
     // Adding source location here means that the file name + line number
     // is included, in such a way that it can be clicked on from within
     // the IDE, and you're sent right to the specific line of code. Very handy!
-    let stdout_format =
-        tracing_subscriber::fmt::format().with_source_location(true);
+    let stdout_format = format().with_source_location(true);
     let mut stdout_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .event_format(stdout_format);
+
     let is_terminal =
         std::io::IsTerminal::is_terminal(&stdout_layer.writer()());
     stdout_layer.set_ansi(is_terminal);
     let (rolling_log_layer, rolling_log_guard) = match log_dir {
         None => (None, None),
         Some(log_dir) => {
-            let (layer, guard) = rolling_logger(log_dir, file_log_level)?;
+            let (layer, guard) = rolling_logger(log_dir, log_level_file)?;
             (Some(layer), Some(guard))
         }
     };
+
     let line_buffer = LineBuffer::default();
     let capture_layer = tracing_subscriber::fmt::layer()
         .compact()
@@ -172,26 +174,33 @@ fn set_tracing_subscriber(
     Ok((line_buffer, rolling_log_guard))
 }
 
+#[derive(Debug)]
+struct EguiAppConfig {
+    network: truthcoin_dc::types::Network,
+    rpc_addr: SocketAddr,
+}
+
 fn run_egui_app(
-    config: &crate::cli::Config,
+    config: EguiAppConfig,
     line_buffer: LineBuffer,
-    app: Option<crate::app::App>,
+    app: Result<crate::app::App, crate::app::Error>,
 ) -> Result<(), eframe::Error> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size(eframe::egui::vec2(1280.0, 720.0)),
         ..Default::default()
     };
+    let rpc_addr = url::Url::parse(&format!("http://{}", config.rpc_addr))
+        .expect("failed to parse rpc addr");
     eframe::run_native(
-        "Plain Truthcoin",
+        "Truthcoin",
         native_options,
         Box::new(move |cc| {
             Ok(Box::new(gui::EguiApp::new(
-                app,
+                app.ok(),
                 cc,
                 line_buffer,
-                config.rpc_host.clone(),
-                config.rpc_port,
+                rpc_addr,
                 config.network,
             )))
         }),
@@ -199,56 +208,77 @@ fn run_egui_app(
 }
 
 fn main() -> anyhow::Result<()> {
+    // Configure the allocator before Tokio spins up worker threads.
     configure_mimalloc();
     let cli = cli::Cli::parse();
     let config = cli.get_config()?;
     let (line_buffer, _rolling_log_guard) = set_tracing_subscriber(
-        config.file_log_level,
         config.log_dir.as_deref(),
         config.log_level,
+        config.log_level_file,
     )?;
     let () = config.log_all_fields("Loaded config");
+
     let (app_tx, app_rx) = oneshot::channel::<anyhow::Error>();
-    let app = app::App::new(&config).inspect(|app| {
+
+    let app_config = app::Config {
+        add_peers: config.add_peers,
+        datadir: config.datadir,
+        decision_config_testing: config.decision_config_testing,
+        mainchain_grpc_url: config.mainchain_grpc_url,
+        mnemonic_seed_phrase_path: config.mnemonic_seed_phrase_path,
+        net_addr: config.net_addr,
+        network: config.network,
+        network_magic_override: config.network_magic_override,
+        server_names: config.server_names,
+        spend_zero_conf_change: config.spend_zero_conf_change,
+        wallet_dir: config.wallet_dir,
+    };
+    let app = app::App::new(app_config).inspect(|app| {
         // spawn rpc server
         app.runtime.spawn({
             let app = app.clone();
-            let private_rpc_url = config.private_rpc_url();
-            let rpc_url = config.rpc_url();
             async move {
-                tracing::info!("starting RPC server at `{rpc_url}`");
-                if let Err(err) =
-                    rpc_server::run_server(app, private_rpc_url, rpc_url).await
+                tracing::info!("starting RPC server at `{}`", config.rpc_addr);
+                if let Err(err) = rpc_server::run_server(
+                    app,
+                    config.private_rpc_addr,
+                    config.rpc_addr,
+                )
+                .await
                 {
                     app_tx.send(err).expect("failed to send error to app");
                 }
             }
         });
     });
+
     if !config.headless {
-        let (app, rt) = match app {
-            Ok(app) => {
-                let rt = Arc::clone(&app.runtime);
-                (Some(app), rt)
-            }
-            Err(err) => {
-                let err = anyhow::Error::from(err);
-                tracing::error!("{err:#}");
+        let rt = match &app {
+            Ok(app) => Arc::clone(&app.runtime),
+            Err(_) => {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
-                (None, Arc::new(rt))
+                Arc::new(rt)
             }
+        };
+        let egui_app_config = EguiAppConfig {
+            network: config.network,
+            rpc_addr: config.rpc_addr,
         };
         let _rt_guard = rt.enter();
         // For GUI mode we want the GUI to start, even if the app fails to start.
-        return run_egui_app(&config, line_buffer, app)
+        return run_egui_app(egui_app_config, line_buffer, app)
             .map_err(|e| anyhow::anyhow!("failed to run egui app: {e:#}"));
-    };
+    }
+
     tracing::info!("Running in headless mode");
     drop(line_buffer);
+
     // If we're headless, we want to exit hard if the app fails to start.
     let app = app?;
+
     app.runtime.block_on(async move {
         tokio::select! {
             Ok(_) = ctrl_c() => {

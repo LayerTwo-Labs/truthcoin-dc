@@ -10,6 +10,7 @@ use fallible_iterator::FallibleIterator;
 use futures::{StreamExt as _, channel::mpsc};
 use quinn::SendStream;
 use sneed::EnvError;
+use truthcoin_dc_types::Block;
 
 use crate::{
     archive,
@@ -638,7 +639,7 @@ impl ConnectionTask {
         };
         let resp = match (header, body) {
             (Some(header), Some(body)) => {
-                ResponseMessage::Block { header, body }
+                ResponseMessage::Block(Box::new(Block { header, body }))
             }
             (_, _) => ResponseMessage::NoBlock { block_hash },
         };
@@ -690,11 +691,14 @@ impl ConnectionTask {
         let txid = tx.transaction.txid();
         let validate_tx_result = {
             let rotxn = ctxt.env.read_txn().map_err(EnvError::from)?;
+            let unconfirmed =
+                ctxt.mempool.unconfirmed_outputs(&rotxn, &tx.transaction)?;
             ctxt.state.validate_transaction(
-                &ctxt.archive,
                 &rotxn,
                 &ctxt.batch_verification_ctxt,
+                &unconfirmed,
                 &tx,
+                &ctxt.archive,
             )
         };
         match validate_tx_result {
@@ -952,7 +956,7 @@ impl ConnectionTask {
                         ))),
                         Err(err) => Info::Error {
                             err: err.into(),
-                            resolved_addr: ctxt.resolved_address.clone(),
+                            resolved_peer_addr: ctxt.resolved_address.clone(),
                         },
                     };
                     if self.info_tx.unbounded_send(info).is_err() {

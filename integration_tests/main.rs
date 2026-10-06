@@ -5,12 +5,14 @@ use clap::Parser;
 use tracing_subscriber::{filter as tracing_filter, layer::SubscriberExt};
 
 mod block_template;
+mod block_template_address;
 mod ibd;
 mod integration_test;
 mod list_mempool;
 mod receive_address;
 mod roundtrip;
 mod setup;
+mod spend_unconfirmed;
 mod transfer_many;
 mod unknown_withdrawal;
 mod util;
@@ -57,6 +59,7 @@ fn set_tracing_subscriber(log_level: tracing::Level) -> anyhow::Result<()> {
     let targets_filter = {
         let default_directives_str = targets_directive_str([
             ("", saturating_pred_level(log_level)),
+            ("bip300301_enforcer_integration_tests", log_level),
             ("integration_tests", log_level),
         ]);
         let directives_str =
@@ -84,33 +87,17 @@ fn set_tracing_subscriber(log_level: tracing::Level) -> anyhow::Result<()> {
     })
 }
 
-const STACK_SIZE: usize = 32 * 1024 * 1024;
-
-fn main() -> anyhow::Result<std::process::ExitCode> {
-    // Set minimum stack size for all spawned threads (including
-    // those created by the enforcer's run_blocking via std::thread::spawn)
-    // SAFETY: called at the very start of main before any threads are
-    // spawned, so no concurrent access to the environment.
-    unsafe {
-        std::env::set_var("RUST_MIN_STACK", STACK_SIZE.to_string());
-    }
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(STACK_SIZE)
-        .build()?;
-
-    runtime.block_on(async_main())
-}
-
-/// Env file in the repo root. dotenvy looks for it in the working directory,
-/// and then in each parent directory.
+/// Written to the repo root by `scripts/setup_integration_tests.sh`. Resolved
+/// relative to the working directory, walking up through parent directories, so
+/// it is found from anywhere within the repo.
 const DEFAULT_ENV_FILE: &str = "integrationtests.env";
 
-/// Variables that are already set take precedence over [`DEFAULT_ENV_FILE`].
+/// Env files are a convenience only: setting the variables in the environment
+/// works just as well, and takes precedence over [`DEFAULT_ENV_FILE`].
 ///
-/// `TRUTHCOIN_INTEGRATION_TEST_ENV` names an env file to load instead. That
-/// file must exist, and its values override the environment.
+/// `TRUTHCOIN_INTEGRATION_TEST_ENV` names an env file to load instead. That one
+/// was asked for explicitly, so it must exist, and its values do override the
+/// environment.
 fn load_env_file() -> anyhow::Result<()> {
     if let Some(env_filepath) =
         std::env::var_os("TRUTHCOIN_INTEGRATION_TEST_ENV")
@@ -134,6 +121,25 @@ fn load_env_file() -> anyhow::Result<()> {
         }
         Err(err) => Err(err.into()),
     }
+}
+
+const STACK_SIZE: usize = 32 * 1024 * 1024;
+
+fn main() -> anyhow::Result<std::process::ExitCode> {
+    // Set minimum stack size for all spawned threads (including
+    // those created by the enforcer's run_blocking via std::thread::spawn)
+    // SAFETY: called at the very start of main before any threads are
+    // spawned, so no concurrent access to the environment.
+    unsafe {
+        std::env::set_var("RUST_MIN_STACK", STACK_SIZE.to_string());
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(STACK_SIZE)
+        .build()?;
+
+    runtime.block_on(async_main())
 }
 
 async fn async_main() -> anyhow::Result<std::process::ExitCode> {

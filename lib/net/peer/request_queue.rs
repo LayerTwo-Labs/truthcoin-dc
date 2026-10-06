@@ -13,7 +13,7 @@ use crate::{
         error,
         message::{Heartbeat, Request},
     },
-    types::{Hash, hashes::hash},
+    types::{Hash, hash},
 };
 
 const REQUEST_QUOTA: Quota =

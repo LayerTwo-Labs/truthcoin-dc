@@ -213,6 +213,7 @@ impl SellShares {
             }
         };
         match app.wallet.trade(
+            app.spend_zero_conf_change,
             self.market_id,
             actual_idx,
             -preview.shares, // Negative for sell

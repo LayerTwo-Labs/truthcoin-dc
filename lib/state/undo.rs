@@ -6,7 +6,7 @@
 
 use crate::state::markets::{Market, MarketId, MarketPayoutSummary};
 use crate::state::voting::types::VotingPeriodId;
-use crate::types::{Address, FilledOutput, OutPoint};
+use crate::types::{Address, OutPoint, Output};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -26,9 +26,9 @@ pub struct SettlementUndoEntry {
     /// The payout summary that was applied (needed for revert_automatic_share_payouts)
     pub payout_summary: MarketPayoutSummary,
     /// Treasury UTXO that existed before payouts consumed it
-    pub treasury_utxo: Option<(OutPoint, FilledOutput)>,
+    pub treasury_utxo: Option<(OutPoint, Output)>,
     /// Fee UTXO that existed before payouts consumed it
-    pub fee_utxo: Option<(OutPoint, FilledOutput)>,
+    pub fee_utxo: Option<(OutPoint, Output)>,
 }
 
 /// Undo data for consensus voting state commit (C2).
@@ -83,9 +83,9 @@ pub struct ConsolidationUndoData {
 pub struct ConsolidationUndoEntry {
     pub market_id: MarketId,
     /// Old treasury UTXOs that were consumed (outpoint + filled output)
-    pub old_treasury_utxos: Vec<(OutPoint, FilledOutput)>,
+    pub old_treasury_utxos: Vec<(OutPoint, Output)>,
     /// Old fee UTXOs that were consumed
-    pub old_fee_utxos: Vec<(OutPoint, FilledOutput)>,
+    pub old_fee_utxos: Vec<(OutPoint, Output)>,
     /// Old market_funds_utxo pointer for treasury (to restore)
     pub old_treasury_pointer: Option<OutPoint>,
     /// Old market_funds_utxo pointer for fees (to restore)

@@ -1,3 +1,4 @@
+
 on:
   pull_request:
   push:
@@ -6,34 +7,49 @@ on:
     tags:
       - '*'
   workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch to diff against (only used when cargo_deny_check=auto)"
+        type: string
+        default: master
+      cargo_deny_check:
+        description: "Run or skip the `cargo deny` step"
+        type: choice
+        options:
+          - auto
+          - force-run
+          - force-skip
+        default: auto
 
 name: Check, Lint, Build
 
 env:
   CARGO_TERM_COLOR: always
+  ELECTRS_VERSION: v3.2.0
+  BITCOIND_UNPATCHED_VERSION: "30.2"
 
 jobs:
   check-lint:
     name: Check, Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
-
-      - name: Install latest nightly toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
-          components: rustfmt, clippy
+      
+      - name: Install pinned Rust toolchain
+        # Channel and components come from rust-toolchain.toml, which is the
+        # single source of truth for the Rust version.
+        run: rustup toolchain install
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2.5.1
+        uses: Swatinem/rust-cache@v2.9.1
         with:
-          shared-key: x86_64-unknown-linux-gnu
+          cache-all-crates: "true"
+          shared-key: debug-x86_64-unknown-linux-gnu
 
       - name: Rustfmt
-        run: cargo fmt --all -- --check
+        run: cargo fmt -- --check
       
       - name: Cargo check
         run: cargo check --all-targets --all-features
@@ -41,68 +57,179 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features
       
+      - name: Check changed files
+        id: changed-files
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.cargo_deny_check == 'auto')
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            cargo_lock:
+              - 'Cargo.lock'
+            deny_toml:
+              - 'deny.toml'
+
       - name: Deny
+        if: >-
+          (github.event_name == 'pull_request' && (steps.changed-files.outputs.cargo_lock == 'true' || steps.changed-files.outputs.deny_toml == 'true')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.cargo_deny_check == 'force-run') ||
+          (github.event_name == 'workflow_dispatch' && inputs.cargo_deny_check == 'auto' && (steps.changed-files.outputs.cargo_lock == 'true' || steps.changed-files.outputs.deny_toml == 'true'))
         uses: EmbarkStudios/cargo-deny-action@v2
-  
+
+  cache-electrs:
+    name: Build electrs if not cached
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check cache
+        id: check-cache
+        uses: actions/cache/restore@v6
+        with:
+          lookup-only: true
+          path: ${{ runner.temp }}/electrs/target/release/electrs
+          key: electrs-${{ env.ELECTRS_VERSION }}
+
+      - name: Build electrs
+        if: steps.check-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch ${{ env.ELECTRS_VERSION }} --depth 1 https://github.com/mempool/electrs.git ${{ runner.temp }}/electrs
+          pushd ${{ runner.temp }}/electrs
+          cargo build --locked --release
+          popd
+
+      - name: Save cache
+        if: steps.check-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/electrs/target/release/electrs
+          key: electrs-${{ env.ELECTRS_VERSION }}
+
+
   integration-test:
     name: Integration test
     runs-on: ubuntu-latest
-    needs: [check-lint]
+    needs: [cache-electrs, check-lint]
     steps:
-      - name: Download latest bitcoin-patched
+      # The `-latest-` artifacts are republished in place, so there is no
+      # version to key a cache on. Key on the server's ETag instead: a hit means
+      # the build is byte-identical, and a new release invalidates the cache by
+      # itself. Falls back to a per-run key so a failed HEAD downloads fresh.
+      - name: Resolve dependency cache keys
+        id: dep-keys
         run: |
-          pushd ..
-          wget https://releases.drivechain.info/L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
-          unzip L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
-          rm L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
-          mv L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu bitcoin-patched-bins
-          chmod +x bitcoin-patched-bins/bitcoind
-          chmod +x bitcoin-patched-bins/bitcoin-cli
-          popd
-      - name: Download latest bip300301_enforcer
-        run: |
-          pushd ..
-          wget https://releases.drivechain.info/bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip
-          unzip bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip
-          rm bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip
-          mv bip300301-enforcer-latest-x86_64-unknown-linux-gnu/bip300301-enforcer-*-x86_64-unknown-linux-gnu bip300301-enforcer
-          rm -r bip300301-enforcer-latest-x86_64-unknown-linux-gnu
-          chmod +x bip300301-enforcer
-          popd
-      - name: Download latest electrs
-        run: |
-          pushd ..
-          wget https://releases.drivechain.info/electrs-latest-x86_64-unknown-linux-gnu.zip
-          unzip electrs-latest-x86_64-unknown-linux-gnu.zip
-          rm electrs-latest-x86_64-unknown-linux-gnu.zip
-          mv electrs-latest-x86_64-unknown-linux-gnu electrs
-          chmod +x electrs
-          popd
-      - name: Install latest nightly toolchain
-        uses: dtolnay/rust-toolchain@master
+          etag() {
+            curl -fsSLI "$1" \
+              | tr -d '\r' \
+              | awk 'tolower($1) == "etag:" { gsub(/"/, "", $2); print $2 }' \
+              | tail -1
+          }
+          for dep in patched:"$BITCOIN_PATCHED_URL" enforcer:"$ENFORCER_URL"; do
+            name="${dep%%:*}"
+            tag="$(etag "${dep#*:}" || true)"
+            if [ -z "$tag" ]; then
+              tag="unknown-${{ github.run_id }}-${{ github.run_attempt }}"
+              echo "::warning::Could not read ETag for $name; skipping its cache"
+            fi
+            echo "$name=$tag" >> "$GITHUB_OUTPUT"
+          done
+        env:
+          BITCOIN_PATCHED_URL: https://releases.drivechain.info/L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
+          ENFORCER_URL: https://releases.drivechain.info/bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip
+
+      - name: Cache bitcoin-patched
+        id: cache-bitcoin-patched
+        uses: actions/cache@v6
         with:
-          toolchain: nightly
-          target: x86_64-pc-windows-gnu
-      - uses: actions/checkout@v4
+          path: ${{ runner.temp }}/deps/bitcoin-patched
+          key: bitcoin-patched-x86_64-linux-${{ steps.dep-keys.outputs.patched }}
+
+      - name: Download bitcoin-patched
+        if: steps.cache-bitcoin-patched.outputs.cache-hit != 'true'
+        run: |
+          cd "${{ runner.temp }}"
+          wget -q https://releases.drivechain.info/L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
+          unzip -q L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
+          rm L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
+          mkdir -p deps
+          rm -rf deps/bitcoin-patched
+          mv L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu deps/bitcoin-patched
+          chmod +x deps/bitcoin-patched/bitcoind deps/bitcoin-patched/bitcoin-cli
+
+      - name: Cache bitcoin unpatched
+        id: cache-bitcoin-unpatched
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/deps/bitcoin-unpatched
+          key: bitcoin-unpatched-x86_64-linux-${{ env.BITCOIND_UNPATCHED_VERSION }}
+
+      - name: Download bitcoin unpatched
+        if: steps.cache-bitcoin-unpatched.outputs.cache-hit != 'true'
+        run: |
+          cd "${{ runner.temp }}"
+          VERSION='${{ env.BITCOIND_UNPATCHED_VERSION }}'
+          TARBALL="bitcoin-${VERSION}-x86_64-linux-gnu.tar.gz"
+          wget -q "https://bitcoincore.org/bin/bitcoin-core-${VERSION}/${TARBALL}"
+          tar -xf "${TARBALL}"
+          rm "${TARBALL}"
+          mkdir -p deps
+          rm -rf deps/bitcoin-unpatched
+          mv "bitcoin-${VERSION}/bin" deps/bitcoin-unpatched
+          rm -r "bitcoin-${VERSION}"
+
+      - name: Cache bip300301_enforcer
+        id: cache-enforcer
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/deps/bip300301-enforcer
+          key: bip300301-enforcer-x86_64-linux-${{ steps.dep-keys.outputs.enforcer }}
+
+      - name: Download bip300301_enforcer
+        if: steps.cache-enforcer.outputs.cache-hit != 'true'
+        run: |
+          cd "${{ runner.temp }}"
+          wget -q https://releases.drivechain.info/bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip
+          unzip -q bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip
+          rm bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip
+          mkdir -p deps
+          rm -f deps/bip300301-enforcer
+          mv bip300301-enforcer-latest-x86_64-unknown-linux-gnu/bip300301-enforcer-*-x86_64-unknown-linux-gnu deps/bip300301-enforcer
+          rm -r bip300301-enforcer-latest-x86_64-unknown-linux-gnu
+          chmod +x deps/bip300301-enforcer
+
+      - name: Restore electrs from cache
+        uses: actions/cache/restore@v6
+        with:
+          fail-on-cache-miss: true
+          path: ${{ runner.temp }}/electrs/target/release/electrs
+          key: electrs-${{ env.ELECTRS_VERSION }}
+
+      - uses: actions/checkout@v6
         with:
           submodules: "recursive"
+
+      - name: Install pinned Rust toolchain
+        # Channel comes from rust-toolchain.toml.
+        run: rustup toolchain install
+
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.1
         with:
-          shared-key: x86_64-unknown-linux-gnu
+          cache-all-crates: "true"
+          shared-key: debug-x86_64-unknown-linux-gnu
+
       - name: Build (debug)
-        run: cargo build
+        run: cargo build --bin truthcoin_dc_app --example integration_tests
+
       - name: Run integration tests
         id: runIntegrationTests
         run: |
-          export BIP300301_ENFORCER='../bip300301-enforcer'
-          export BITCOIND='../bitcoin-patched-bins/bitcoind'
-          export BITCOIN_CLI='../bitcoin-patched-bins/bitcoin-cli'
-          export ELECTRS='../electrs'
+          export BIP300301_ENFORCER='${{ runner.temp }}/deps/bip300301-enforcer'
+          export BITCOIND='${{ runner.temp }}/deps/bitcoin-patched/bitcoind'
+          export BITCOIND_UNPATCHED='${{ runner.temp }}/deps/bitcoin-unpatched/bitcoind'
+          export BITCOIN_CLI='${{ runner.temp }}/deps/bitcoin-patched/bitcoin-cli'
+          export ELECTRS='${{ runner.temp }}/electrs/target/release/electrs'
           export TRUTHCOIN_APP='target/debug/truthcoin_dc_app'
-          cargo run --example integration_tests
+          target/debug/examples/integration_tests
 
-  build-release:
+  test-build-release:
     strategy:
       fail-fast: false
       matrix:
@@ -111,7 +238,9 @@ jobs:
             name: x86_64-unknown-linux-gnu
             binary-suffix: ""
             rustflags: ""
-          - os: macos-latest-large
+          # An Apple Silicon runner cross-compiles this target, and the
+          # larger Intel runner is not available on every account.
+          - os: macos-latest
             name: x86_64-apple-darwin
             binary-suffix: ""
             rustflags: ""
@@ -123,30 +252,35 @@ jobs:
             name: x86_64-pc-windows-gnu
             binary-suffix: .exe
             rustflags: "-C linker=/usr/bin/x86_64-w64-mingw32-gcc"
-    name: Build, Release ((${{ matrix.name }}))
+    name: Test, Build, Release ((${{ matrix.name }}))
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install latest nightly toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
-          target: ${{ matrix.name }}
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2.5.1
-        with:
-          key: ${{ matrix.name }}
-
       - name: Install windows-specific deps
         run: sudo apt install mingw-w64
         if: ${{ matrix.name == 'x86_64-pc-windows-gnu' }}
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      
+      - name: Install pinned Rust toolchain
+        # Channel comes from rust-toolchain.toml; the cross-compilation
+        # target comes from the build matrix.
+        run: |
+          rustup toolchain install
+          rustup target add '${{ matrix.name }}'
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          cache-all-crates: "true"
+          shared-key: ${{ matrix.name }}
+
+      - name: Test
+        run: cargo test --tests
 
       - name: Build
         run: cargo build --release --target ${{ matrix.name }}
@@ -159,9 +293,11 @@ jobs:
             jq -er '.packages | map(select(.name == "truthcoin_dc_app") | .version) | .[0]')
           TRUTHCOIN_APP_FILENAME="truthcoin-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
           TRUTHCOIN_CLI_FILENAME="truthcoin-cli-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
+          TRUTHCOIN_ZIP_FILENAME="truthcoin-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}.zip"
           echo "TRUTHCOIN_APP_VERSION=$TRUTHCOIN_APP_VERSION" >> "$GITHUB_ENV"
           echo "TRUTHCOIN_APP_FILENAME=$TRUTHCOIN_APP_FILENAME" >> "$GITHUB_ENV"
           echo "TRUTHCOIN_CLI_FILENAME=$TRUTHCOIN_CLI_FILENAME" >> "$GITHUB_ENV"
+          echo "TRUTHCOIN_ZIP_FILENAME=$TRUTHCOIN_ZIP_FILENAME" >> "$GITHUB_ENV"
 
       - name: 'Set filenames for release binaries'
         run: |
@@ -170,8 +306,21 @@ jobs:
           ln -fs "truthcoin_dc_app_cli${{ matrix.binary-suffix }}" "${TRUTHCOIN_CLI_FILENAME}"
           popd
 
+      - name: 'Pack the release zip'
+        # BitWindow downloads one archive per platform and takes the daemon and
+        # its CLI from it. The names inside are bare, which is what its
+        # extractor looks for.
+        run: |
+          pushd "target/${{ matrix.name }}/release/"
+          cp "truthcoin_dc_app${{ matrix.binary-suffix }}" "truthcoin${{ matrix.binary-suffix }}"
+          cp "truthcoin_dc_app_cli${{ matrix.binary-suffix }}" "truthcoin-cli${{ matrix.binary-suffix }}"
+          zip -j "${TRUTHCOIN_ZIP_FILENAME}" \
+            "truthcoin${{ matrix.binary-suffix }}" \
+            "truthcoin-cli${{ matrix.binary-suffix }}"
+          popd
+
       - name: 'Upload Artifacts (truthcoin)'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.TRUTHCOIN_APP_FILENAME }}
           if-no-files-found: error
@@ -179,56 +328,26 @@ jobs:
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_APP_FILENAME }}
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_CLI_FILENAME }}
 
+      - name: Extract Git tag name
+        id: git-tag-name
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "git_tag_name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Parse Git tag name as semver
+        uses: madhead/semver-utils@v5.0.0
+        if: startsWith(github.ref, 'refs/tags/')
+        id: parse-git-tag-name-semver
+        with:
+          version: ${{ steps.git-tag-name.outputs.git_tag_name }}
+
       - name: Release
-        uses: softprops/action-gh-release@v2.0.2
+        uses: softprops/action-gh-release@v3.0.1
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_APP_FILENAME }}
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_CLI_FILENAME }}
+            target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_ZIP_FILENAME }}
           fail_on_unmatched_files: true
-
-  upload-releases-to-releases-drivechain-info:
-    name: Upload releases to releases.drivechain.info
-    runs-on: ubuntu-latest
-    needs: [build-release, integration-test]
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Download release assets
-        uses: robinraju/release-downloader@v1.9
-        with:
-          tag: ${{ github.ref_name }}
-
-      - name: Create zip files for releases.drivechain.info
-        run: |
-          shopt -s extglob
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-latest-x86_64-apple-darwin
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-cli-latest-x86_64-apple-darwin
-          zip L2-S13-Truthcoin-latest-x86_64-apple-darwin.zip \
-            truthcoin-latest-x86_64-apple-darwin \
-            truthcoin-cli-latest-x86_64-apple-darwin
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-aarch64-apple-darwin truthcoin-latest-aarch64-apple-darwin
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-aarch64-apple-darwin truthcoin-cli-latest-aarch64-apple-darwin
-          zip L2-S13-Truthcoin-latest-aarch64-apple-darwin.zip \
-            truthcoin-latest-aarch64-apple-darwin \
-            truthcoin-cli-latest-aarch64-apple-darwin
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-latest-x86_64-pc-windows-gnu.exe
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
-          zip L2-S13-Truthcoin-latest-x86_64-pc-windows-gnu.zip \
-            truthcoin-latest-x86_64-pc-windows-gnu.exe \
-            truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
-          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-latest-x86_64-unknown-linux-gnu
-          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-cli-latest-x86_64-unknown-linux-gnu
-          zip L2-S13-Truthcoin-latest-x86_64-unknown-linux-gnu.zip \
-            truthcoin-latest-x86_64-unknown-linux-gnu \
-            truthcoin-cli-latest-x86_64-unknown-linux-gnu
-
-      - name: Upload release assets to releases.drivechain.info
-        uses: appleboy/scp-action@v1
-        with:
-          host: 45.33.96.47
-          username: root
-          password: ${{ secrets.RELEASES_SERVER_PW }}
-          port: 22
-          source: 'L2-S13-Truthcoin-latest-*.zip'
-          target: '/var/www/html/'
+          prerelease: ${{ steps.parse-git-tag-name-semver.outputs.prerelease != '' }}

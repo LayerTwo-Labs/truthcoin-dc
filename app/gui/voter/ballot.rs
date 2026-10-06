@@ -57,8 +57,9 @@ impl Default for Ballot {
 impl Ballot {
     fn ensure_subscribed(&mut self, app: &App) {
         if self.node_updated.is_none() {
-            let stream: Pin<Box<dyn Stream<Item = ()> + Send>> =
-                Box::pin(app.node.watch_state());
+            let stream: Pin<Box<dyn Stream<Item = ()> + Send>> = Box::pin(
+                truthcoin_dc::util::Watchable::watch(app.node.state()),
+            );
             self.node_updated =
                 Some(PromiseStream::new(stream, app.runtime.handle().clone()));
         }
@@ -326,7 +327,12 @@ impl Ballot {
         let fee = bitcoin::Amount::from_sat(fee_sats);
         let period = self.current_period;
 
-        let tx = match app.wallet.submit_ballot(items, period, fee) {
+        let tx = match app.wallet.submit_ballot(
+            app.spend_zero_conf_change,
+            items,
+            period,
+            fee,
+        ) {
             Ok(tx) => tx,
             Err(err) => {
                 self.error = Some(format!("Failed to build ballot: {err:#}"));

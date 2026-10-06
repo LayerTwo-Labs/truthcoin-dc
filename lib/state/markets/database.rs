@@ -5,9 +5,9 @@ use sneed::{DatabaseUnique, Env, RoTxn, RwTxn};
 use std::collections::{HashMap, HashSet};
 
 use crate::state::Error;
-use crate::state::UtxoManager;
 use crate::state::decisions::{Decision, DecisionId};
-use crate::types::{Address, GetBitcoinValue, OutPoint, OutPointKey};
+use crate::state::markets::utxos::UtxoManager;
+use crate::types::{AccumulatorDiff, Address, GetValue, OutPoint, OutPointKey};
 
 use super::market::Market;
 use super::payouts::{
@@ -356,6 +356,7 @@ impl MarketsDatabase {
     pub fn transition_and_payout_resolved_markets(
         &self,
         txn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
         state: &crate::state::State,
         decisions_db: &crate::state::decisions::Dbs,
         current_height: u32,
@@ -368,8 +369,10 @@ impl MarketsDatabase {
     > {
         let mut results = Vec::new();
         let mut undo_entries = Vec::new();
-        let trading_markets =
+        let mut trading_markets =
             self.get_markets_by_state(txn, MarketState::Trading)?;
+        // Accumulator insertion order must match on every node.
+        trading_markets.sort_by_key(|market| market.id);
 
         for mut market in trading_markets {
             if market.decision_ids.is_empty() {
@@ -428,7 +431,7 @@ impl MarketsDatabase {
                 {
                     state
                         .utxos
-                        .try_get(txn, &OutPointKey::from_outpoint(&outpoint))?
+                        .try_get(txn, &OutPointKey::from(&outpoint))?
                         .map(|output| (outpoint, output))
                 } else {
                     None
@@ -438,7 +441,7 @@ impl MarketsDatabase {
                 {
                     state
                         .utxos
-                        .try_get(txn, &OutPointKey::from_outpoint(&outpoint))?
+                        .try_get(txn, &OutPointKey::from(&outpoint))?
                         .map(|output| (outpoint, output))
                 } else {
                     None
@@ -478,6 +481,7 @@ impl MarketsDatabase {
                 self.apply_automatic_share_payouts(
                     state,
                     txn,
+                    accumulator_diff,
                     &payout_summary,
                     current_height,
                 )?;
@@ -968,12 +972,11 @@ impl MarketsDatabase {
         &self,
         state: &crate::state::State,
         txn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
         payout_summary: &MarketPayoutSummary,
         block_height: u32,
     ) -> Result<(), Error> {
-        use crate::types::{
-            BitcoinOutputContent, FilledOutput, FilledOutputContent,
-        };
+        use crate::types::{Output, OutputContent};
 
         let mut sequence = 0u32;
 
@@ -986,17 +989,14 @@ impl MarketsDatabase {
                     sequence,
                 );
 
-                let output = FilledOutput {
+                let output = Output {
                     address: payout.address,
-                    content: FilledOutputContent::Bitcoin(
-                        BitcoinOutputContent(bitcoin::Amount::from_sat(
-                            payout.payout_sats,
-                        )),
-                    ),
-                    memo: vec![],
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        payout.payout_sats,
+                    )),
                 };
 
-                state.insert_utxo(txn, &outpoint, &output)?;
+                state.insert_utxo(txn, &outpoint, &output, accumulator_diff)?;
             }
 
             self.remove_shares_from_account(
@@ -1019,15 +1019,19 @@ impl MarketsDatabase {
                 sequence,
             );
 
-            let fee_output = FilledOutput {
+            let fee_output = Output {
                 address: fee_payout.address,
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(fee_payout.amount_sats),
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    fee_payout.amount_sats,
                 )),
-                memo: vec![],
             };
 
-            state.insert_utxo(txn, &fee_outpoint, &fee_output)?;
+            state.insert_utxo(
+                txn,
+                &fee_outpoint,
+                &fee_output,
+                accumulator_diff,
+            )?;
             sequence += 1;
         }
 
@@ -1038,21 +1042,25 @@ impl MarketsDatabase {
                 block_height,
                 sequence,
             );
-            let refund_output = FilledOutput {
+            let refund_output = Output {
                 address: refund.address,
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(refund.amount_sats),
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    refund.amount_sats,
                 )),
-                memo: vec![],
             };
-            state.insert_utxo(txn, &refund_outpoint, &refund_output)?;
+            state.insert_utxo(
+                txn,
+                &refund_outpoint,
+                &refund_output,
+                accumulator_diff,
+            )?;
         }
 
         // Consume the Market UTXO (treasury is now distributed to shareholders)
         if let Some(market_utxo) =
             self.get_market_funds_utxo(txn, &payout_summary.market_id, false)?
         {
-            state.delete_utxo(txn, &market_utxo)?;
+            state.delete_utxo(txn, &market_utxo, accumulator_diff)?;
             self.clear_market_funds_utxo(
                 txn,
                 &payout_summary.market_id,
@@ -1064,7 +1072,7 @@ impl MarketsDatabase {
         if let Some(fee_utxo) =
             self.get_market_funds_utxo(txn, &payout_summary.market_id, true)?
         {
-            state.delete_utxo(txn, &fee_utxo)?;
+            state.delete_utxo(txn, &fee_utxo, accumulator_diff)?;
             self.clear_market_funds_utxo(txn, &payout_summary.market_id, true)?;
         }
 
@@ -1075,6 +1083,7 @@ impl MarketsDatabase {
         &self,
         state: &crate::state::State,
         txn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
         payout_summary: &MarketPayoutSummary,
         block_height: u32,
     ) -> Result<(), Error> {
@@ -1089,7 +1098,7 @@ impl MarketsDatabase {
                     sequence,
                 );
 
-                state.delete_utxo(txn, &outpoint)?;
+                state.delete_utxo(txn, &outpoint, accumulator_diff)?;
             }
 
             self.add_shares_to_account(
@@ -1112,7 +1121,7 @@ impl MarketsDatabase {
                 sequence,
             );
 
-            state.delete_utxo(txn, &fee_outpoint)?;
+            state.delete_utxo(txn, &fee_outpoint, accumulator_diff)?;
             sequence += 1;
         }
 
@@ -1123,7 +1132,7 @@ impl MarketsDatabase {
                 block_height,
                 sequence,
             );
-            state.delete_utxo(txn, &refund_outpoint)?;
+            state.delete_utxo(txn, &refund_outpoint, accumulator_diff)?;
         }
 
         tracing::info!(
@@ -1184,9 +1193,9 @@ impl MarketsDatabase {
             Some(outpoint) => {
                 let utxo = state
                     .utxos
-                    .try_get(txn, &OutPointKey::from_outpoint(&outpoint))?
-                    .ok_or(Error::NoUtxo { outpoint })?;
-                Ok(utxo.get_bitcoin_value().to_sat())
+                    .try_get(txn, &OutPointKey::from(&outpoint))?
+                    .ok_or(crate::state::error::NoUtxo { outpoint })?;
+                Ok(utxo.get_value().to_sat())
             }
             None => Ok(0),
         }

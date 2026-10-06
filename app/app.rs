@@ -1,8 +1,16 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    borrow::BorrowMut,
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use fallible_iterator::FallibleIterator as _;
-use futures::{StreamExt as _, TryFutureExt as _};
+use futures::{StreamExt, TryFutureExt};
 use parking_lot::RwLock;
+use rustreexo::accumulator::proof::Proof;
 use tokio::{spawn, sync::RwLock as TokioRwLock, task::JoinHandle};
 use tokio_util::task::LocalPoolHandle;
 use tonic_health::{
@@ -13,8 +21,8 @@ use truthcoin_dc::{
     miner::{self, Miner},
     node::{self, Node},
     types::{
-        self, Address, AmountOverflowError, BitcoinOutputContent, Body,
-        FilledOutput, InPoint, OutPoint, Output, Transaction,
+        self, Address, Coinbase, FilledTransaction, InPoint, OutPoint, Output,
+        Transaction,
         proto::mainchain::{
             self,
             generated::{
@@ -26,25 +34,25 @@ use truthcoin_dc::{
     wallet::{self, Wallet},
 };
 
-use crate::cli::Config;
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    AmountOverflow(#[from] AmountOverflowError),
-    #[error("CUSF mainchain proto error: {0}")]
+    ComputeMerkleRoot(#[from] truthcoin_dc::types::ComputeMerkleRootError),
+    #[error("CUSF mainchain proto error")]
     CusfMainchain(#[from] truthcoin_dc::types::proto::Error),
-    #[error("io error: {0}")]
+    #[error("io error")]
     Io(#[from] std::io::Error),
-    #[error("miner error: {0}")]
+    #[error("miner error")]
     Miner(#[from] miner::Error),
-    #[error("node error: {0}")]
+    #[error("node error")]
     Node(#[source] Box<node::Error>),
     #[error("No CUSF mainchain wallet client")]
     NoCusfMainchainWalletClient,
     #[error("Failed to request mainchain ancestor info for {block_hash}")]
     RequestMainchainAncestorInfos { block_hash: bitcoin::BlockHash },
-    #[error("wallet error: {0}")]
+    #[error(transparent)]
+    Utreexo(#[from] truthcoin_dc::types::UtreexoError),
+    #[error("wallet error")]
     Wallet(#[from] wallet::Error),
 }
 
@@ -54,76 +62,91 @@ impl From<node::Error> for Error {
     }
 }
 
+fn update_wallet(node: &Node, wallet: &Wallet) -> Result<(), Error> {
+    tracing::trace!("starting wallet update");
+    let addresses = wallet.get_addresses()?;
+    let utxos = node.get_utxos_by_addresses(&addresses)?;
+    let wallet_utxos = wallet.get_utxos()?;
+    // A market payout or a reputation redistribution can remove a wallet
+    // UTXO from the state without a transaction.
+    let redistributed: Vec<_> = wallet_utxos
+        .keys()
+        .filter(|outpoint| !utxos.contains_key(outpoint))
+        .map(|outpoint| (*outpoint, InPoint::Redistribution))
+        .collect();
+    wallet.spend_utxos(&redistributed)?;
+    let outpoints: Vec<_> = wallet_utxos.into_keys().collect();
+    let spent: Vec<_> = node
+        .get_spent_utxos(&outpoints)?
+        .into_iter()
+        .map(|(outpoint, spent_output)| (outpoint, spent_output.inpoint))
+        .collect();
+    wallet.sync_confirmed(&utxos, &spent)?;
+    let confirmed: HashSet<OutPoint> =
+        wallet.get_utxos()?.into_keys().collect();
+    let (unconfirmed, mempool_spent) =
+        node.get_mempool_view(&addresses, &confirmed)?;
+    wallet.set_mempool_view(&unconfirmed, &mempool_spent)?;
+
+    tracing::debug!("finished wallet update");
+    Ok(())
+}
+
+/// Update utxos & wallet
+fn update(
+    node: &Node,
+    utxos: &mut HashMap<OutPoint, Output>,
+    unconfirmed_utxos: &mut HashMap<OutPoint, Output>,
+    wallet: &Wallet,
+    spend_zero_conf_change: bool,
+) -> Result<(), Error> {
+    tracing::trace!("Updating wallet");
+    let () = update_wallet(node, wallet)?;
+    *utxos = spendable_utxos(wallet, spend_zero_conf_change)?;
+    *unconfirmed_utxos = unspendable_unconfirmed_utxos(node, wallet, utxos)?;
+    tracing::trace!("Updated wallet");
+    Ok(())
+}
+
+/// The coins the wallet may put in a new transaction. It matches what
+/// `Wallet::select_coins` takes under the same option.
+fn spendable_utxos(
+    wallet: &Wallet,
+    spend_zero_conf_change: bool,
+) -> Result<HashMap<OutPoint, Output>, Error> {
+    let mut utxos = wallet.get_utxos()?;
+    let spent = wallet.get_mempool_spent_utxos()?;
+    if spend_zero_conf_change {
+        utxos.extend(wallet.get_unconfirmed_utxos()?);
+    }
+    // A withdrawal output belongs to a bundle, and the state refuses a
+    // transaction that spends one, so `select_coins` skips it too.
+    utxos.retain(|outpoint, output| {
+        !spent.contains(outpoint) && !output.content.is_withdrawal()
+    });
+    Ok(utxos)
+}
+
+/// Outputs of mempool transactions that pay the wallet, and that the wallet
+/// may not spend
+fn unspendable_unconfirmed_utxos(
+    node: &Node,
+    wallet: &Wallet,
+    spendable: &HashMap<OutPoint, Output>,
+) -> Result<HashMap<OutPoint, Output>, Error> {
+    let addresses = wallet.get_addresses()?;
+    let mut utxos = node.get_unconfirmed_utxos_by_addresses(&addresses)?;
+    for (outpoint, _) in node.get_unconfirmed_spent_utxos(utxos.keys())? {
+        utxos.remove(&outpoint);
+    }
+    utxos.retain(|outpoint, _| !spendable.contains_key(outpoint));
+    Ok(utxos)
+}
+
 struct ProtoSupport {
     block_producer: bool,
     miner: bool,
     wallet: bool,
-}
-
-fn update_wallet(node: &Node, wallet: &Wallet) -> Result<(), Error> {
-    let addresses = wallet.get_addresses()?;
-    let unconfirmed_utxos =
-        node.get_unconfirmed_utxos_by_addresses(&addresses)?;
-    let utxos_from_state = node.get_utxos_by_addresses(&addresses)?;
-
-    // Get current wallet UTXOs to detect which ones no longer exist in state
-    let wallet_utxos = wallet.get_utxos()?;
-
-    // Find UTXOs that are in wallet but NOT in state (these were removed, e.g., by redistribution)
-    let mut utxos_to_remove = Vec::new();
-    for outpoint in wallet_utxos.keys() {
-        if !utxos_from_state.contains_key(outpoint) {
-            utxos_to_remove.push(*outpoint);
-        }
-    }
-
-    // Remove stale UTXOs from wallet (e.g., spent by redistribution)
-    if !utxos_to_remove.is_empty() {
-        tracing::debug!(
-            "Removing {} stale UTXOs from wallet (spent by redistribution or otherwise removed from state)",
-            utxos_to_remove.len()
-        );
-        wallet.spend_utxos(
-            &utxos_to_remove
-                .iter()
-                .map(|outpoint| (*outpoint, InPoint::Redistribution))
-                .collect::<Vec<_>>(),
-        )?;
-    }
-
-    let confirmed_outpoints: Vec<_> = wallet_utxos.into_keys().collect();
-    let confirmed_spent = node
-        .get_spent_utxos(&confirmed_outpoints)?
-        .into_iter()
-        .map(|(outpoint, spent_output)| (outpoint, spent_output.inpoint));
-    let unconfirmed_outpoints: Vec<_> =
-        wallet.get_unconfirmed_utxos()?.into_keys().collect();
-    // Check ALL state UTXOs against mempool.spent_utxos, not just wallet UTXOs.
-    // This prevents "resurrecting" UTXOs that are spent in mempool but were
-    // already moved to wallet.stxos in a previous update cycle.
-    let state_outpoints: Vec<_> = utxos_from_state.keys().copied().collect();
-    let unconfirmed_spent = node
-        .get_unconfirmed_spent_utxos(
-            state_outpoints.iter().chain(&unconfirmed_outpoints),
-        )?
-        .into_iter();
-    let spent: Vec<_> = confirmed_spent.chain(unconfirmed_spent).collect();
-    wallet.put_utxos(&utxos_from_state)?;
-    wallet.put_unconfirmed_utxos(&unconfirmed_utxos)?;
-    wallet.spend_utxos(&spent)?;
-    Ok(())
-}
-
-fn update(
-    node: &Node,
-    utxos: &mut HashMap<OutPoint, FilledOutput>,
-    unconfirmed_utxos: &mut HashMap<OutPoint, Output>,
-    wallet: &Wallet,
-) -> Result<(), Error> {
-    let () = update_wallet(node, wallet)?;
-    *utxos = wallet.get_utxos()?;
-    *unconfirmed_utxos = wallet.get_unconfirmed_utxos()?;
-    Ok(())
 }
 
 /// A block that is ready to be blind merged mined
@@ -132,19 +155,25 @@ pub struct BlockTemplate {
     pub bribe: bitcoin::Amount,
     pub header: types::Header,
     pub body: types::Body,
-    pub height: u32,
     /// Fees collected by the transactions in the block
     pub fees: bitcoin::Amount,
 }
 
-/// Aborts the task when the last holder drops it. A dropped `App` clone
-/// must not stop the task that the other clones still use.
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort()
-    }
+#[derive(Debug)]
+pub struct Config {
+    pub add_peers: HashSet<truthcoin_dc::types::net::PeerAddress>,
+    pub datadir: PathBuf,
+    /// Blocks per voting period, for a test network
+    pub decision_config_testing: Option<u32>,
+    pub mainchain_grpc_url: url::Url,
+    pub mnemonic_seed_phrase_path: Option<PathBuf>,
+    pub net_addr: SocketAddr,
+    pub network: truthcoin_dc::types::Network,
+    pub network_magic_override:
+        Option<truthcoin_dc::net::peer_message::MagicBytes>,
+    pub server_names: HashSet<String>,
+    pub spend_zero_conf_change: bool,
+    pub wallet_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -152,45 +181,64 @@ pub struct App {
     pub node: Arc<Node>,
     pub wallet: Wallet,
     pub miner: Option<Arc<TokioRwLock<Miner>>>,
-    pub utxos: Arc<RwLock<HashMap<OutPoint, FilledOutput>>>,
+    pub utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
+    /// Outputs of mempool transactions that pay the wallet, and that the
+    /// wallet may not spend
     pub unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
+    pub spend_zero_conf_change: bool,
+    task: Arc<JoinHandle<()>>,
+    pub transaction: Arc<RwLock<Transaction>>,
     pub runtime: Arc<tokio::runtime::Runtime>,
-    _task: Arc<AbortOnDrop>,
     pub local_pool: LocalPoolHandle,
 }
 
 impl App {
     async fn task(
         node: Arc<Node>,
-        utxos: Arc<RwLock<HashMap<OutPoint, FilledOutput>>>,
+        utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         wallet: Wallet,
+        spend_zero_conf_change: bool,
     ) -> Result<(), Error> {
-        let mut state_changes = node.watch_state();
-        while let Some(()) = state_changes.next().await {
-            let () = update(
+        // The mempool signal matters as much as the tip: a payment that a peer
+        // sends appears without a block, and a coin that a transaction spends
+        // leaves the spendable set the moment the mempool takes it.
+        let mut changes = node.watch();
+        while let Some(()) = changes.next().await {
+            let update_result = update(
                 &node,
                 &mut utxos.write(),
                 &mut unconfirmed_utxos.write(),
                 &wallet,
-            )?;
+                spend_zero_conf_change,
+            );
+            if let Err(err) = update_result {
+                let err = anyhow::Error::from(err);
+                tracing::warn!("Failed to update wallet: {err:#}");
+            }
         }
         Ok(())
     }
 
     fn spawn_task(
         node: Arc<Node>,
-        utxos: Arc<RwLock<HashMap<OutPoint, FilledOutput>>>,
+        utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         wallet: Wallet,
+        spend_zero_conf_change: bool,
     ) -> JoinHandle<()> {
         spawn(
-            Self::task(node, utxos, unconfirmed_utxos, wallet).unwrap_or_else(
-                |err| {
-                    let err = anyhow::Error::from(err);
-                    tracing::error!("{err:#}")
-                },
-            ),
+            Self::task(
+                node,
+                utxos,
+                unconfirmed_utxos,
+                wallet,
+                spend_zero_conf_change,
+            )
+            .unwrap_or_else(|err| {
+                let err = anyhow::Error::from(err);
+                tracing::error!("{err:#}")
+            }),
         )
     }
 
@@ -198,13 +246,16 @@ impl App {
         client: &mut HealthClient<tonic::transport::Channel>,
         service_name: &str,
     ) -> Result<bool, tonic::Status> {
-        let health_check_request = HealthCheckRequest {
-            service: service_name.to_string(),
-        };
-        match client.check(health_check_request).await {
+        match client
+            .check(HealthCheckRequest {
+                service: service_name.to_string(),
+            })
+            .await
+        {
             Ok(res) => {
                 let expected_status = ServingStatus::Serving;
                 let status = res.into_inner().status;
+
                 let as_expected = status == expected_status as i32;
                 if !as_expected {
                     tracing::warn!(
@@ -221,37 +272,43 @@ impl App {
         }
     }
 
+    /// Returns `Ok(_)` iff validator service is available, and error if validator
+    /// service is unavailable.
     async fn check_proto_support(
         transport: tonic::transport::channel::Channel,
     ) -> Result<ProtoSupport, tonic::Status> {
-        let mut health_client = HealthClient::new(transport);
+        let mut client = HealthClient::new(transport);
+
         let block_producer_service_name =
             block_producer_service_server::SERVICE_NAME;
         let mining_service_name = mining_service_server::SERVICE_NAME;
         let validator_service_name = validator_service_server::SERVICE_NAME;
         let wallet_service_name = wallet_service_server::SERVICE_NAME;
-        if !Self::check_status_serving(
-            &mut health_client,
-            validator_service_name,
-        )
-        .await?
+
+        // The validator service MUST exist. We therefore error out here directly.
+        if !Self::check_status_serving(&mut client, validator_service_name)
+            .await?
         {
             return Err(tonic::Status::aborted(format!(
                 "{validator_service_name} is not supported in mainchain client",
             )));
         }
+
         tracing::info!("Verified existence of {}", validator_service_name);
+
+        // The block producer, mining and wallet services are optional.
         let has_block_producer_service = Self::check_status_serving(
-            &mut health_client,
+            &mut client,
             block_producer_service_name,
         )
         .await?;
         let has_mining_service =
-            Self::check_status_serving(&mut health_client, mining_service_name)
+            Self::check_status_serving(&mut client, mining_service_name)
                 .await?;
         let has_wallet_service =
-            Self::check_status_serving(&mut health_client, wallet_service_name)
+            Self::check_status_serving(&mut client, wallet_service_name)
                 .await?;
+
         tracing::info!(
             %has_block_producer_service,
             %has_mining_service,
@@ -261,11 +318,12 @@ impl App {
             mining_service_name,
             wallet_service_name,
         );
-        Ok(ProtoSupport {
+        let res = ProtoSupport {
             block_producer: has_block_producer_service,
             miner: has_mining_service,
             wallet: has_wallet_service,
-        })
+        };
+        Ok(res)
     }
 
     /// Ask the mainchain node for its services until it answers. The node may
@@ -289,110 +347,150 @@ impl App {
         }
     }
 
-    pub fn new(config: &Config) -> Result<Self, Error> {
+    pub fn new(config: Config) -> Result<Self, Error> {
+        let mut rng = rand::rng();
+        // Node launches some tokio tasks for p2p networking, that is why we need a tokio runtime
+        // here.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
+
         let wallet = Wallet::new(&config.wallet_dir.join("wallet.mdb"))?;
         if let Some(seed_phrase_path) = &config.mnemonic_seed_phrase_path {
             let mnemonic = std::fs::read_to_string(seed_phrase_path)?;
             let () = wallet.set_seed_from_mnemonic(mnemonic.as_str())?;
         }
+
         tracing::info!(
-            url = %config.mainchain_grpc_url,
-            "Connecting to mainchain"
+            "Connecting to mainchain at {}",
+            config.mainchain_grpc_url
         );
         let rt_guard = runtime.enter();
         let transport = tonic::transport::channel::Channel::from_shared(
-            config.mainchain_grpc_url.to_string(),
+            format!("{}", config.mainchain_grpc_url),
         )
         .unwrap()
         .concurrency_limit(256)
         .connect_lazy();
-        let ProtoSupport {
-            block_producer: has_block_producer,
-            miner: has_miner,
-            wallet: has_wallet,
-        } = runtime.block_on(Self::wait_for_proto_support(
-            transport.clone(),
-            &config.mainchain_grpc_url,
-        ));
-        let cusf_mainchain_block_producer = has_block_producer
-            .then(|| mainchain::BlockProducerClient::new(transport.clone()));
-        let cusf_mainchain_miner =
-            has_miner.then(|| mainchain::MiningClient::new(transport.clone()));
-        let cusf_mainchain_wallet =
-            has_wallet.then(|| mainchain::WalletClient::new(transport.clone()));
-        let cusf_mainchain = mainchain::ValidatorClient::new(transport);
+        let (
+            cusf_mainchain,
+            cusf_mainchain_miner,
+            cusf_mainchain_wallet,
+            cusf_mainchain_block_producer,
+        ) = {
+            let ProtoSupport {
+                block_producer,
+                miner,
+                wallet,
+            } = runtime.block_on(Self::wait_for_proto_support(
+                transport.clone(),
+                &config.mainchain_grpc_url,
+            ));
+            let mining_client = if miner {
+                Some(mainchain::MiningClient::new(transport.clone()))
+            } else {
+                None
+            };
+            let wallet_client = if wallet {
+                Some(mainchain::WalletClient::new(transport.clone()))
+            } else {
+                None
+            };
+            let block_producer_client = if block_producer {
+                Some(mainchain::BlockProducerClient::new(transport.clone()))
+            } else {
+                None
+            };
+            let validator_client = mainchain::ValidatorClient::new(transport);
+            (
+                validator_client,
+                mining_client,
+                wallet_client,
+                block_producer_client,
+            )
+        };
         let miner = cusf_mainchain_wallet
+            .clone()
             .map(|wallet| {
-                Miner::new(cusf_mainchain.clone(), cusf_mainchain_miner, wallet)
+                Miner::new(
+                    cusf_mainchain.clone(),
+                    cusf_mainchain_miner.clone(),
+                    wallet,
+                )
             })
             .transpose()?;
         let local_pool = LocalPoolHandle::new(1);
-        let node = runtime.block_on(Node::new(
-            config.net_addr,
-            &config.datadir,
-            config.network_magic_override,
-            config.network,
-            config.add_peers.clone(),
-            config.server_names.clone(),
+
+        tracing::debug!("Instantiating node struct");
+        let node = Node::new(
+            truthcoin_dc::node::Config {
+                add_peers: config.add_peers,
+                bind_addr: config.net_addr,
+                datadir: config.datadir,
+                magic_bytes_override: config.network_magic_override,
+                network: config.network,
+                server_names: config.server_names,
+                decision_config_testing: config.decision_config_testing,
+            },
             cusf_mainchain,
             cusf_mainchain_block_producer,
-            &mut rand::rng(),
+            &mut rng,
             &runtime,
-            config.decision_config_testing,
-            #[cfg(feature = "zmq")]
-            config.zmq_addr,
-        ))?;
-        let (unconfirmed_utxos, utxos) = {
-            let mut utxos = wallet.get_utxos()?;
-            let mut unconfirmed_utxos = wallet.get_unconfirmed_utxos()?;
-            let transactions = node.get_all_transactions()?;
-            for transaction in &transactions {
-                for input in &transaction.transaction.inputs {
-                    utxos.remove(input);
-                    unconfirmed_utxos.remove(input);
-                }
-            }
-            let unconfirmed_utxos = Arc::new(RwLock::new(unconfirmed_utxos));
-            let utxos = Arc::new(RwLock::new(utxos));
-            (unconfirmed_utxos, utxos)
-        };
+        )?;
         let node = Arc::new(node);
+        let spend_zero_conf_change = config.spend_zero_conf_change;
+        let () = update_wallet(&node, &wallet)?;
+        let utxos = Arc::new(RwLock::new(spendable_utxos(
+            &wallet,
+            spend_zero_conf_change,
+        )?));
+        let unconfirmed_utxos = Arc::new(RwLock::new(
+            unspendable_unconfirmed_utxos(&node, &wallet, &utxos.read())?,
+        ));
         let miner = miner.map(|miner| Arc::new(TokioRwLock::new(miner)));
         let task = Self::spawn_task(
             node.clone(),
             utxos.clone(),
             unconfirmed_utxos.clone(),
             wallet.clone(),
+            spend_zero_conf_change,
         );
         drop(rt_guard);
         Ok(Self {
             node,
             wallet,
             miner,
-            unconfirmed_utxos,
             utxos,
+            unconfirmed_utxos,
+            spend_zero_conf_change,
+            task: Arc::new(task),
+            transaction: Arc::new(RwLock::new(Transaction {
+                inputs: vec![].into(),
+                proof: Proof::default(),
+                outputs: vec![].into(),
+                data: None,
+            })),
             runtime: Arc::new(runtime),
-            _task: Arc::new(AbortOnDrop(task)),
             local_pool,
         })
     }
 
+    /// Update utxos & wallet
     pub fn update(&self) -> Result<(), Error> {
         update(
             self.node.as_ref(),
             &mut self.utxos.write(),
             &mut self.unconfirmed_utxos.write(),
             &self.wallet,
+            self.spend_zero_conf_change,
         )
     }
 
-    pub fn submit_transaction(
-        &self,
-        tx: &truthcoin_dc::types::AuthorizedTransaction,
-    ) -> Result<(), Error> {
+    /// Regenerate proofs and submit transaction
+    pub fn submit_transaction<Tx>(&self, tx: Tx) -> Result<(), Error>
+    where
+        Tx: BorrowMut<truthcoin_dc::types::AuthorizedTransaction>,
+    {
         self.node.submit_transaction(tx)?;
         let () = self.update()?;
         Ok(())
@@ -400,7 +498,7 @@ impl App {
 
     pub fn sign_and_send(&self, tx: Transaction) -> Result<(), Error> {
         let authorized_transaction = self.wallet.authorize(rand::rng(), tx)?;
-        self.submit_transaction(&authorized_transaction)
+        self.submit_transaction(authorized_transaction)
     }
 
     pub async fn get_new_main_address(
@@ -442,7 +540,7 @@ impl App {
             .get_chain_tip()
             .await?
             .block_hash;
-        let tip_hash = self.node.try_get_tip()?;
+        let tip_hash = self.node.try_get_best_hash()?;
         // If `prev_side_hash` is not the best tip to mine on, then mine an
         // empty block.
         // This is a temporary fix, ideally we always choose the best tip to
@@ -507,44 +605,69 @@ impl App {
             const NUM_TRANSACTIONS: usize = 1000;
             let (txs, tx_fees) =
                 self.node.get_transactions(NUM_TRANSACTIONS)?;
-            let new_block_height =
-                self.node.try_get_tip_height()?.map_or(0, |h| h + 1);
-            let coinbase_address = if new_block_height == 0 {
-                self.wallet.voter_address()?
-            } else {
-                // A template is built on every poll and mostly thrown
-                // away, so it must not derive an address each time.
-                self.wallet.get_receive_address()?
-            };
-            let coinbase =
-                if tx_fees > bitcoin::Amount::ZERO || new_block_height == 0 {
-                    vec![types::Output::new(
-                        coinbase_address,
-                        types::OutputContent::Bitcoin(BitcoinOutputContent(
-                            tx_fees,
-                        )),
-                    )]
-                } else {
-                    Vec::new()
+            let coinbase = {
+                // The first coinbase output of the genesis block takes the
+                // initial reputation, so the genesis block always has one.
+                let is_genesis = self.node.try_get_height()?.is_none();
+                let outputs = match tx_fees {
+                    bitcoin::Amount::ZERO if !is_genesis => Vec::new(),
+                    _ if is_genesis => vec![types::Output {
+                        address: self.wallet.voter_address()?,
+                        content: types::OutputContent::Value(tx_fees),
+                    }],
+                    // A template is built on every poll and mostly thrown
+                    // away, so it must not derive an address each time.
+                    _ => vec![types::Output {
+                        address: self.wallet.get_or_generate_last_address()?,
+                        content: types::OutputContent::Value(tx_fees),
+                    }],
                 };
-            if new_block_height == 0 {
-                tracing::info!(
-                    "Genesis block: Reputation initialized during \
-                     block connection"
+                Coinbase {
+                    memo: Vec::new(),
+                    outputs: outputs.into(),
+                }
+            };
+            let merkle_root =
+                types::Body::compute_merkle_root(&coinbase, &txs)?;
+            let roots = {
+                let mut accumulator = if let Some(tip_hash) = tip_hash {
+                    let rotxn = self
+                        .node
+                        .env()
+                        .read_txn()
+                        .map_err(node::Error::from)?;
+                    self.node
+                        .archive()
+                        .get_accumulator(&rotxn, tip_hash)
+                        .map_err(node::Error::from)?
+                } else {
+                    types::Accumulator::default()
+                };
+                let coinbase_txid = Coinbase::compute_txid(
+                    &merkle_root,
+                    &prev_main_hash,
+                    prev_side_hash.as_ref(),
                 );
-            }
-            let merkle_root = Body::compute_merkle_root(
-                &coinbase,
-                &txs.iter()
-                    .map(|tx| tx.transaction.transaction.clone())
-                    .collect::<Vec<_>>(),
-            );
-            let body = Body::new(
+                let () = types::Body::modify_memforest(
+                    coinbase_txid,
+                    coinbase.outputs.as_slice(),
+                    &txs,
+                    &mut accumulator.0,
+                )?;
+                accumulator
+                    .0
+                    .get_roots()
+                    .iter()
+                    .map(|root| root.get_data())
+                    .collect()
+            };
+            let body = types::Body::new(
                 txs.into_iter().map(|tx| tx.into()).collect(),
                 coinbase,
             );
             let header = types::Header {
                 merkle_root,
+                roots,
                 prev_side_hash,
                 prev_main_hash,
             };
@@ -557,26 +680,57 @@ impl App {
             });
             (bribe, header, body, tx_fees)
         } else {
-            let coinbase = Vec::new();
-            let merkle_root = Body::compute_merkle_root(&coinbase, &[]);
-            let body = Body::new(Vec::new(), coinbase);
+            let coinbase = Default::default();
+            let txs: [FilledTransaction; 0] = [];
+            let merkle_root =
+                types::Body::compute_merkle_root(&coinbase, &txs)?;
+            let roots = {
+                let mut accumulator =
+                    if let Some(prev_side_hash) = prev_side_hash {
+                        let rotxn = self
+                            .node
+                            .env()
+                            .read_txn()
+                            .map_err(node::Error::from)?;
+                        self.node
+                            .archive()
+                            .get_accumulator(&rotxn, prev_side_hash)
+                            .map_err(node::Error::from)?
+                    } else {
+                        types::Accumulator::default()
+                    };
+                let coinbase_txid = Coinbase::compute_txid(
+                    &merkle_root,
+                    &prev_main_hash,
+                    prev_side_hash.as_ref(),
+                );
+                let () = types::Body::modify_memforest(
+                    coinbase_txid,
+                    coinbase.outputs.as_slice(),
+                    &txs,
+                    &mut accumulator.0,
+                )?;
+                accumulator
+                    .0
+                    .get_roots()
+                    .iter()
+                    .map(|root| root.get_data())
+                    .collect()
+            };
+            let body = types::Body::new(Vec::new(), coinbase);
             let header = types::Header {
                 merkle_root,
+                roots,
                 prev_side_hash,
                 prev_main_hash,
             };
             let bribe = Self::EMPTY_BLOCK_BMM_BRIBE;
             (bribe, header, body, bitcoin::Amount::ZERO)
         };
-        let height = match prev_side_hash {
-            None => 0,
-            Some(prev_side_hash) => self.node.get_height(prev_side_hash)? + 1,
-        };
         Ok(BlockTemplate {
             bribe,
             header,
             body,
-            height,
             fees,
         })
     }
@@ -595,7 +749,7 @@ impl App {
         block: types::Block,
         main_block_hash: bitcoin::BlockHash,
     ) -> Result<bool, Error> {
-        let types::Block { header, body, .. } = block;
+        let types::Block { header, body } = block;
         let accepted = self
             .node
             .submit_block(main_block_hash, &header, &body)
@@ -621,9 +775,11 @@ impl App {
             ..
         } = self.build_block_template(fee).await?;
         let mut miner_write = miner.write().await;
-        miner_write
+        let bmm_txid = miner_write
             .attempt_bmm(bribe.to_sat(), 0, header, body)
             .await?;
+
+        tracing::debug!(%bmm_txid, "mine: confirming BMM...");
         if let Some((main_hash, header, body)) =
             miner_write.confirm_bmm().await.inspect_err(|err| {
                 tracing::error!(
@@ -632,28 +788,9 @@ impl App {
                 )
             })?
         {
-            tracing::info!(
-                %main_hash,
-                side_hash = %header.hash(),
-                num_txs = body.transactions.len(),
-                "mine: confirmed BMM, submitting block with {} transactions",
-                body.transactions.len()
+            tracing::debug!(
+                %main_hash, side_hash = %header.hash(), "mine: confirmed BMM, submitting block",
             );
-            // Log transaction types in the block
-            for (i, tx) in body.transactions.iter().enumerate() {
-                let tx_type = match &tx.data {
-                    None => "transfer",
-                    Some(d) if d.is_trade() => "trade",
-                    Some(d) if d.is_create_market() => "create_market",
-                    Some(_) => "other",
-                };
-                tracing::info!(
-                    "mine:   tx[{}] = {:?} type={}",
-                    i,
-                    tx.txid(),
-                    tx_type
-                );
-            }
             match self
                 .node
                 .submit_block(main_hash, &header, &body)
@@ -665,22 +802,26 @@ impl App {
                     )
                 })? {
                 true => {
-                    tracing::info!(
+                    tracing::debug!(
                          %main_hash, "mine: BMM accepted as new tip",
                     );
                 }
                 false => {
-                    tracing::error!(
-                        %main_hash, "mine: BMM NOT ACCEPTED as new tip - block rejected!",
+                    tracing::warn!(
+                        %main_hash, "mine: BMM not accepted as new tip",
                     );
                 }
             }
-        } else {
-            tracing::info!(
-                "mine: confirm_bmm returned None - no BMM confirmed on mainchain"
-            );
         }
+
+        drop(miner_write);
         let () = self.update()?;
+
+        self.node
+            .regenerate_proof(&mut self.transaction.write())
+            .inspect_err(|err| {
+                tracing::error!("mine: unable to regenerate proof: {err:#}");
+            })?;
         Ok(())
     }
 
@@ -701,6 +842,27 @@ impl App {
         drop(miner_write);
         Ok(txid)
     }
+
+    pub fn deposit_blocking(
+        &self,
+        address: Address,
+        amount: bitcoin::Amount,
+        fee: bitcoin::Amount,
+    ) -> Result<bitcoin::Txid, Error> {
+        self.runtime.block_on(self.deposit(address, amount, fee))
+    }
+}
+
+impl Drop for App {
+    // If only one reference exists (ie. within self), abort the wallet update
+    // task. A dropped clone must not stop the task the other clones use.
+    fn drop(&mut self) {
+        // use `Arc::get_mut` since `Arc::into_inner` requires ownership of the
+        // Arc, and cloning would increase the reference count
+        if let Some(task) = Arc::get_mut(&mut self.task) {
+            task.abort()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -711,7 +873,7 @@ mod test {
     use tonic_health::ServingStatus;
     use truthcoin_dc::types::proto::mainchain::generated::validator_service_server;
 
-    use super::{App, ProtoSupport};
+    use crate::app::App;
 
     fn transport(addr: SocketAddr) -> tonic::transport::channel::Channel {
         tonic::transport::channel::Channel::from_shared(format!(
@@ -753,51 +915,10 @@ mod test {
                 .is_err()
         );
         let () = serve_validator_service(addr).await;
-        let ProtoSupport {
-            block_producer,
-            miner,
-            wallet,
-        } = timeout(Duration::from_secs(30), proto_support).await?;
-        assert!(!block_producer && !miner && !wallet);
+        let proto_support =
+            timeout(Duration::from_secs(30), proto_support).await?;
+        assert!(!proto_support.miner);
+        assert!(!proto_support.wallet);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use tokio::sync::oneshot;
-
-    use super::AbortOnDrop;
-
-    /// Spawn a task that waits for a start signal, then reports that it ran.
-    fn gated_task() -> (oneshot::Sender<()>, oneshot::Receiver<()>, AbortOnDrop)
-    {
-        let (start_tx, start_rx) = oneshot::channel::<()>();
-        let (done_tx, done_rx) = oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
-            let _: Result<(), _> = start_rx.await;
-            let _: Result<(), _> = done_tx.send(());
-        });
-        (start_tx, done_rx, AbortOnDrop(task))
-    }
-
-    #[tokio::test]
-    async fn a_dropped_clone_keeps_the_task() {
-        let (start_tx, done_rx, guard) = gated_task();
-        let guard = Arc::new(guard);
-        drop(guard.clone());
-        let _: Result<(), _> = start_tx.send(());
-        assert!(done_rx.await.is_ok(), "a dropped clone stopped the task");
-    }
-
-    #[tokio::test]
-    async fn the_last_drop_stops_the_task() {
-        let (start_tx, done_rx, guard) = gated_task();
-        let guard = Arc::new(guard);
-        drop(guard);
-        let _: Result<(), _> = start_tx.send(());
-        assert!(done_rx.await.is_err(), "the last drop kept the task");
     }
 }

@@ -14,7 +14,7 @@ impl MarketValidator {
     pub fn validate_maker_auth(
         tx: &FilledTransaction,
     ) -> Result<Address, Error> {
-        if tx.inputs().is_empty() {
+        if tx.transaction.inputs.is_empty() {
             return Err(Error::InvalidTransaction {
                 reason: "Transaction must have at least one input".to_string(),
             });
@@ -229,7 +229,8 @@ impl MarketValidator {
             generate_market_treasury_address(&expected_market_id);
 
         let treasury_amount_sats = tx
-            .outputs()
+            .transaction
+            .outputs
             .iter()
             .find_map(|output| match &output.content {
                 crate::types::OutputContent::MarketFunds {
@@ -239,7 +240,7 @@ impl MarketValidator {
                 } if market_id == &expected_market_id_bytes
                     && output.address == treasury_address =>
                 {
-                    Some(amount.0.to_sat())
+                    Some(amount.to_sat())
                 }
                 _ => None,
             })
@@ -258,12 +259,7 @@ impl MarketValidator {
         }
 
         if total_listing_fee > 0 {
-            let tx_fee = tx
-                .bitcoin_fee()
-                .map_err(|_| Error::InvalidTransaction {
-                    reason: "Failed to compute tx fee".to_string(),
-                })?
-                .ok_or(Error::NotEnoughValueIn)?;
+            let tx_fee = crate::validation::tx_fee(tx)?;
             if tx_fee.to_sat() < total_listing_fee {
                 return Err(Error::InvalidTransaction {
                     reason: format!(
@@ -399,7 +395,7 @@ impl MarketValidator {
             });
         }
 
-        if !tx.outputs().is_empty() {
+        if !tx.transaction.outputs.is_empty() {
             return Err(Error::InvalidTransaction {
                 reason: "Trade transactions must have no outputs".to_string(),
             });
@@ -408,7 +404,7 @@ impl MarketValidator {
         Self::validate_maker_auth(tx)?;
 
         let input_value = tx
-            .spent_bitcoin_value()
+            .get_value_in()
             .map_err(|_| Error::InvalidTransaction {
                 reason: "Failed to compute input value".to_string(),
             })?
@@ -539,7 +535,7 @@ impl MarketValidator {
             });
         }
 
-        if !tx.outputs().is_empty() {
+        if !tx.transaction.outputs.is_empty() {
             return Err(Error::InvalidTransaction {
                 reason: "AmplifyBeta transactions must have no outputs"
                     .to_string(),
@@ -547,7 +543,7 @@ impl MarketValidator {
         }
 
         let input_value = tx
-            .spent_bitcoin_value()
+            .get_value_in()
             .map_err(|_| Error::InvalidTransaction {
                 reason: "Failed to compute input value".to_string(),
             })?
@@ -630,9 +626,8 @@ mod tests {
             markets::{compute_market_id, generate_market_treasury_address},
         },
         types::{
-            BitcoinOutputContent, FilledOutput, FilledOutputContent, Hash,
-            OutPoint, Output, OutputContent, Transaction, TransactionData,
-            Txid,
+            Hash, OutPoint, Output, OutputContent, Transaction,
+            TransactionData, Txid,
         },
     };
     use ndarray::Array1;
@@ -660,8 +655,7 @@ mod tests {
         use crate::state::decisions::Decision;
         use crate::state::markets::compute_market_id;
         use crate::types::{
-            BitcoinOutputContent, FilledOutputContent, OutPoint, Output,
-            OutputContent, Transaction, TransactionData, Txid,
+            OutPoint, Output, OutputContent, Transaction, TransactionData, Txid,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -704,21 +698,24 @@ mod tests {
         let market_id = compute_market_id("t", "", &maker, &dimension_specs);
         let tx = FilledTransaction {
             transaction: Transaction {
-                inputs: vec![OutPoint::Regular {
-                    txid: Txid::default(),
-                    vout: 0,
-                }],
-                outputs: vec![Output::new(
-                    maker,
-                    OutputContent::MarketFunds {
+                inputs: vec![(
+                    OutPoint::Regular {
+                        txid: Txid::default(),
+                        vout: 0,
+                    },
+                    [0; 32],
+                )]
+                .into(),
+                proof: Default::default(),
+                outputs: vec![Output {
+                    address: maker,
+                    content: OutputContent::MarketFunds {
                         market_id: *market_id.as_bytes(),
-                        amount: BitcoinOutputContent(
-                            bitcoin::Amount::from_sat(1000),
-                        ),
+                        amount: bitcoin::Amount::from_sat(1000),
                         is_fee: false,
                     },
-                )],
-                memo: Vec::new(),
+                }]
+                .into(),
                 data: Some(TransactionData::CreateMarket {
                     title: "t".to_string(),
                     description: String::new(),
@@ -730,12 +727,10 @@ mod tests {
                     tx_pow_difficulty: None,
                 }),
             },
-            spent_utxos: vec![Output::new(
-                maker,
-                FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(2000),
-                )),
-            )],
+            spent_utxos: vec![Output {
+                address: maker,
+                content: OutputContent::Value(bitcoin::Amount::from_sat(2000)),
+            }],
             actor_address: None,
         };
 
@@ -807,22 +802,24 @@ mod tests {
             compute_market_id("title", "", &maker, &dimension_specs);
         FilledTransaction {
             transaction: Transaction {
-                inputs: vec![OutPoint::Regular {
-                    txid: Txid(Hash::from([1; 32])),
-                    vout: 0,
-                }],
+                inputs: vec![(
+                    OutPoint::Regular {
+                        txid: Txid(Hash::from([1; 32])),
+                        vout: 0,
+                    },
+                    [0; 32],
+                )]
+                .into(),
+                proof: Default::default(),
                 outputs: vec![Output {
                     address: treasury_address,
                     content: OutputContent::MarketFunds {
                         market_id: *market_id.as_bytes(),
-                        amount: BitcoinOutputContent(
-                            bitcoin::Amount::from_sat(10_000),
-                        ),
+                        amount: bitcoin::Amount::from_sat(10_000),
                         is_fee: false,
                     },
-                    memo: vec![],
-                }],
-                memo: vec![],
+                }]
+                .into(),
                 data: Some(TransactionData::CreateMarket {
                     title: "title".to_string(),
                     description: String::new(),
@@ -834,12 +831,11 @@ mod tests {
                     tx_pow_difficulty: None,
                 }),
             },
-            spent_utxos: vec![FilledOutput {
+            spent_utxos: vec![Output {
                 address: maker,
-                content: FilledOutputContent::Bitcoin(BitcoinOutputContent(
-                    bitcoin::Amount::from_sat(20_000),
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    20_000,
                 )),
-                memo: vec![],
             }],
             actor_address: None,
         }
