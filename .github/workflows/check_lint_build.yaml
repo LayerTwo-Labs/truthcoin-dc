@@ -350,3 +350,67 @@ jobs:
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_ZIP_FILENAME }}
           fail_on_unmatched_files: true
           prerelease: ${{ steps.parse-git-tag-name-semver.outputs.prerelease != '' }}
+
+  parse-semver:
+    name: Parse version info
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    outputs:
+      prerelease: ${{ steps.parse-git-tag-name-semver.outputs.prerelease }}
+    steps:
+      - name: Extract Git tag name
+        id: git-tag-name
+        run: |
+          echo "git_tag_name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Parse Git tag name as semver
+        uses: madhead/semver-utils@v5.0.0
+        id: parse-git-tag-name-semver
+        with:
+          version: ${{ steps.git-tag-name.outputs.git_tag_name }}
+
+  upload-releases-to-releases-drivechain-info:
+    name: Upload releases to releases.drivechain.info
+    runs-on: ubuntu-latest
+    needs: [integration-test, test-build-release, parse-semver]
+    if: startsWith(github.ref, 'refs/tags/') && needs.parse-semver.outputs.prerelease == ''
+    steps:
+      - name: Download release assets
+        uses: robinraju/release-downloader@v1.13
+        with:
+          fileName: '*'
+          tag: ${{ github.ref_name }}
+
+      - name: Create zip files for releases.drivechain.info
+        run: |
+          shopt -s extglob
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-latest-x86_64-apple-darwin
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-apple-darwin truthcoin-cli-latest-x86_64-apple-darwin
+          zip L2-S13-Truthcoin-latest-x86_64-apple-darwin.zip \
+            truthcoin-latest-x86_64-apple-darwin \
+            truthcoin-cli-latest-x86_64-apple-darwin
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-aarch64-apple-darwin truthcoin-latest-aarch64-apple-darwin
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-aarch64-apple-darwin truthcoin-cli-latest-aarch64-apple-darwin
+          zip L2-S13-Truthcoin-latest-aarch64-apple-darwin.zip \
+            truthcoin-latest-aarch64-apple-darwin \
+            truthcoin-cli-latest-aarch64-apple-darwin
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-latest-x86_64-pc-windows-gnu.exe
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-pc-windows-gnu.exe truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
+          zip L2-S13-Truthcoin-latest-x86_64-pc-windows-gnu.zip \
+            truthcoin-latest-x86_64-pc-windows-gnu.exe \
+            truthcoin-cli-latest-x86_64-pc-windows-gnu.exe
+          mv truthcoin-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-latest-x86_64-unknown-linux-gnu
+          mv truthcoin-cli-+([0-9]).+([0-9]).+([0-9])-x86_64-unknown-linux-gnu truthcoin-cli-latest-x86_64-unknown-linux-gnu
+          zip L2-S13-Truthcoin-latest-x86_64-unknown-linux-gnu.zip \
+            truthcoin-latest-x86_64-unknown-linux-gnu \
+            truthcoin-cli-latest-x86_64-unknown-linux-gnu
+
+      - name: Upload release assets to releases.drivechain.info
+        uses: appleboy/scp-action@v1
+        with:
+          host: 45.33.96.47
+          username: root
+          password: ${{ secrets.RELEASES_SERVER_PW }}
+          port: 22
+          source: 'L2-S13-Truthcoin-latest-*.zip'
+          target: '/var/www/html/'
