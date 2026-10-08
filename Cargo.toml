@@ -10,7 +10,7 @@ authors = ["Ash Manning <ash@layertwolabs.com>",
 edition = "2024"
 license = "MIT"
 publish = false
-version = "0.19.0"
+version = "0.20.0"
 
 [workspace.dependencies]
 addr = "0.15.6"

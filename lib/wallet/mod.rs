@@ -1782,6 +1782,20 @@ impl Watchable<()> for Wallet {
 mod tests {
     use super::*;
 
+    #[test]
+    fn wallet_opens_a_database_it_created() -> anyhow::Result<()> {
+        let temp_dir = temp_dir::TempDir::with_prefix(format!(
+            "wallet-reopen-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            std::process::id()
+        ))?;
+        drop(Wallet::new(temp_dir.path())?);
+        Wallet::new(temp_dir.path())?;
+        Ok(())
+    }
+
     /// A block that disconnects takes an output off the chain without a
     /// spend, and it takes the utreexo leaf with it. The confirmed row must go
     /// too, so the output moves to the unconfirmed side, where the proof code
