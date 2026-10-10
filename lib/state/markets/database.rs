@@ -7,7 +7,10 @@ use std::collections::{HashMap, HashSet};
 use crate::state::Error;
 use crate::state::decisions::{Decision, DecisionId};
 use crate::state::markets::utxos::UtxoManager;
-use crate::types::{AccumulatorDiff, Address, GetValue, OutPoint, OutPointKey};
+use crate::types::{
+    AccumulatorDiff, Address, GetValue, OutPoint, OutPointKey,
+    state::{MarketUtxo, MarketUtxoChanges, MarketUtxoReason},
+};
 
 use super::market::Market;
 use super::payouts::{
@@ -357,6 +360,7 @@ impl MarketsDatabase {
         &self,
         txn: &mut RwTxn,
         accumulator_diff: &mut AccumulatorDiff,
+        market_utxos: &mut MarketUtxoChanges,
         state: &crate::state::State,
         decisions_db: &crate::state::decisions::Dbs,
         current_height: u32,
@@ -482,6 +486,7 @@ impl MarketsDatabase {
                     state,
                     txn,
                     accumulator_diff,
+                    market_utxos,
                     &payout_summary,
                     current_height,
                 )?;
@@ -973,6 +978,7 @@ impl MarketsDatabase {
         state: &crate::state::State,
         txn: &mut RwTxn,
         accumulator_diff: &mut AccumulatorDiff,
+        market_utxos: &mut MarketUtxoChanges,
         payout_summary: &MarketPayoutSummary,
         block_height: u32,
     ) -> Result<(), Error> {
@@ -996,7 +1002,16 @@ impl MarketsDatabase {
                     )),
                 };
 
-                state.insert_utxo(txn, &outpoint, &output, accumulator_diff)?;
+                state.insert_market_utxo(
+                    txn,
+                    accumulator_diff,
+                    market_utxos,
+                    MarketUtxo {
+                        outpoint,
+                        output,
+                        reason: MarketUtxoReason::SharePayout,
+                    },
+                )?;
             }
 
             self.remove_shares_from_account(
@@ -1026,11 +1041,15 @@ impl MarketsDatabase {
                 )),
             };
 
-            state.insert_utxo(
+            state.insert_market_utxo(
                 txn,
-                &fee_outpoint,
-                &fee_output,
                 accumulator_diff,
+                market_utxos,
+                MarketUtxo {
+                    outpoint: fee_outpoint,
+                    output: fee_output,
+                    reason: MarketUtxoReason::FeePayout,
+                },
             )?;
             sequence += 1;
         }
@@ -1048,11 +1067,15 @@ impl MarketsDatabase {
                     refund.amount_sats,
                 )),
             };
-            state.insert_utxo(
+            state.insert_market_utxo(
                 txn,
-                &refund_outpoint,
-                &refund_output,
                 accumulator_diff,
+                market_utxos,
+                MarketUtxo {
+                    outpoint: refund_outpoint,
+                    output: refund_output,
+                    reason: MarketUtxoReason::CreatorRefund,
+                },
             )?;
         }
 
@@ -1060,7 +1083,13 @@ impl MarketsDatabase {
         if let Some(market_utxo) =
             self.get_market_funds_utxo(txn, &payout_summary.market_id, false)?
         {
-            state.delete_utxo(txn, &market_utxo, accumulator_diff)?;
+            state.delete_market_utxo(
+                txn,
+                accumulator_diff,
+                market_utxos,
+                &market_utxo,
+                MarketUtxoReason::Treasury,
+            )?;
             self.clear_market_funds_utxo(
                 txn,
                 &payout_summary.market_id,
@@ -1072,7 +1101,13 @@ impl MarketsDatabase {
         if let Some(fee_utxo) =
             self.get_market_funds_utxo(txn, &payout_summary.market_id, true)?
         {
-            state.delete_utxo(txn, &fee_utxo, accumulator_diff)?;
+            state.delete_market_utxo(
+                txn,
+                accumulator_diff,
+                market_utxos,
+                &fee_utxo,
+                MarketUtxoReason::AuthorFee,
+            )?;
             self.clear_market_funds_utxo(txn, &payout_summary.market_id, true)?;
         }
 

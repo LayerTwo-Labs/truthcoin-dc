@@ -24,7 +24,7 @@ use crate::{
         WithdrawalBundle, WithdrawalBundleStatus,
         authorization::{self, BatchVerificationContext},
         proto::mainchain::TwoWayPegData,
-        state::{TwoWayPegEvent, WithdrawalBundleInfo},
+        state::{MarketUtxoChanges, TwoWayPegEvent, WithdrawalBundleInfo},
     },
     util::Watchable,
     validation::DecisionValidationInterface,
@@ -128,10 +128,14 @@ pub struct State {
     >,
     skipped_tx_indices_undo:
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Vec<u32>>>,
+    /// Market outputs that no transaction created or spent, keyed by the
+    /// height that applied them
+    market_utxos:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<MarketUtxoChanges>>,
 }
 
 impl State {
-    pub const NUM_DBS: u32 = 20
+    pub const NUM_DBS: u32 = 21
         + reputation::ReputationDbs::NUM_DBS
         + decisions::Dbs::NUM_DBS
         + MarketsDatabase::NUM_DBS
@@ -238,6 +242,8 @@ impl State {
         )?;
         let skipped_tx_indices_undo =
             DatabaseUnique::create(env, &mut rwtxn, "skipped_tx_indices_undo")?;
+        let market_utxos =
+            DatabaseUnique::create(env, &mut rwtxn, "market_utxos")?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
             tip,
@@ -264,6 +270,7 @@ impl State {
             minting_undo,
             reputation_transfer_undo,
             skipped_tx_indices_undo,
+            market_utxos,
         })
     }
 
@@ -336,6 +343,34 @@ impl State {
             .try_get(rotxn, &height)?
             .unwrap_or_default();
         Ok(events)
+    }
+
+    /// Market outputs that the block at this height created and removed
+    /// outside its body
+    pub fn get_market_utxos(
+        &self,
+        rotxn: &RoTxn,
+        height: u32,
+    ) -> Result<MarketUtxoChanges, Error> {
+        let market_utxos = self
+            .market_utxos
+            .try_get(rotxn, &height)?
+            .unwrap_or_default();
+        Ok(market_utxos)
+    }
+
+    /// Body indices of the trades that the block at this height skipped,
+    /// in ascending order
+    pub fn get_skipped_tx_indices(
+        &self,
+        rotxn: &RoTxn,
+        height: u32,
+    ) -> Result<Vec<u32>, Error> {
+        let indices = self
+            .skipped_tx_indices_undo
+            .try_get(rotxn, &height)?
+            .unwrap_or_default();
+        Ok(indices)
     }
 
     pub fn try_get_tip(

@@ -98,7 +98,9 @@ pub mod node {
         decision::DecisionType,
         market::MarketId,
         net::{Peer, PeerAddress, PeerConnectionStatus},
-        state::{TwoWayPegEvent, WithdrawalBundleInfo},
+        state::{
+            MarketUtxo, MarketUtxoReason, TwoWayPegEvent, WithdrawalBundleInfo,
+        },
         transaction::Outputs,
     };
     use typewit::const_marker::Bool;
@@ -378,7 +380,8 @@ pub mod node {
             DecisionContentInfo, DecisionInfo, DecisionState, DecisionSummary,
             DecisionType, Header, InPoint, M6id, MainchainSyncPhase,
             MarketDimension, MarketDimensionKind, MarketId, MarketOutcome,
-            MarketResolution, MarketStatus, MerkleRoot, OutPoint, Output,
+            MarketResolution, MarketStatus, MarketUtxo, MarketUtxoReason,
+            MerkleRoot, OutPoint, Output,
             OutputContent, Outputs, ParticipationStats, PeerConnectionStatus,
             PeriodStats, ScoreChange, SharePosition, Signature, SpentOutput,
             Transaction, TxData, TxIn, Txid, WinningOutcome, WithdrawalBundle,
@@ -427,7 +430,8 @@ pub mod node {
         ) -> RpcResult<Option<truthcoin_dc_types::BlockHash>>;
 
         /// Get the transaction ids, sizes and encodings of a block, with the
-        /// mainchain deposits and withdrawal bundle spends it applied
+        /// mainchain deposits, withdrawal bundle spends and market outputs it
+        /// applied outside its transactions
         #[open_api_method(output_schema(ToSchema))]
         #[method(name = "get_block_index")]
         async fn get_block_index(

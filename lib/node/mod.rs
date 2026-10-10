@@ -35,7 +35,7 @@ use crate::{
         authorization::{BatchVerificationContext, rand_core::CryptoRng},
         net::{Peer, PeerAddress, ResolvedPeerAddress},
         proto::{self, mainchain},
-        state::TwoWayPegEvent,
+        state::{MarketUtxoChanges, TwoWayPegEvent},
     },
     util::Watchable,
 };
@@ -531,6 +531,21 @@ where
         self.try_get_block_hash_at(&rotxn, height)
     }
 
+    /// Height of a block in the active chain
+    fn get_active_height(
+        &self,
+        rotxn: &RoTxn,
+        block_hash: BlockHash,
+    ) -> Result<u32, Error> {
+        let height = self.archive.get_height(rotxn, block_hash)?;
+        // State keys its block records by height, so a block off the active
+        // chain would read the records of another block.
+        if self.try_get_block_hash_at(rotxn, height)? != Some(block_hash) {
+            return Err(Error::NotInActiveChain { block_hash });
+        }
+        Ok(height)
+    }
+
     /// Get the coin movements that a block applied outside its body, in the
     /// order the node applied them
     pub fn get_two_way_peg_events(
@@ -538,13 +553,30 @@ where
         block_hash: BlockHash,
     ) -> Result<Vec<TwoWayPegEvent>, Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
-        let height = self.archive.get_height(&rotxn, block_hash)?;
-        // The events are keyed by height, so a block off the active chain
-        // would read another block's events.
-        if self.try_get_block_hash_at(&rotxn, height)? != Some(block_hash) {
-            return Err(Error::NotInActiveChain { block_hash });
-        }
+        let height = self.get_active_height(&rotxn, block_hash)?;
         Ok(self.state.get_two_way_peg_events(&rotxn, height)?)
+    }
+
+    /// Get the market outputs that a block created and removed outside its
+    /// body
+    pub fn get_market_utxos(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<MarketUtxoChanges, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let height = self.get_active_height(&rotxn, block_hash)?;
+        Ok(self.state.get_market_utxos(&rotxn, height)?)
+    }
+
+    /// Get the body indices of the trades that a block skipped, in ascending
+    /// order
+    pub fn get_skipped_tx_indices(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Vec<u32>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let height = self.get_active_height(&rotxn, block_hash)?;
+        Ok(self.state.get_skipped_tx_indices(&rotxn, height)?)
     }
 
     pub fn try_get_body(
