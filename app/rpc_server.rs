@@ -876,14 +876,21 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         block_hash: truthcoin_dc::types::BlockHash,
     ) -> RpcResult<truthcoin_dc::types::BlockIndex> {
         let body = self.app.node.get_body(block_hash).map_err(custom_err)?;
+        let skipped_tx_indices = self
+            .app
+            .node
+            .get_skipped_tx_indices(block_hash)
+            .map_err(custom_err)?;
         let txs = body
             .transactions
             .iter()
-            .map(|tx| {
+            .enumerate()
+            .map(|(tx_idx, tx)| {
                 Ok(truthcoin_dc::types::BlockIndexTx {
                     txid: tx.txid(),
                     size: tx.canonical_size()?,
                     raw: const_hex::encode(tx.canonical_bytes()?),
+                    skipped: skipped_tx_indices.contains(&(tx_idx as u32)),
                 })
             })
             .collect::<Result<_, std::io::Error>>()
@@ -911,10 +918,17 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                 TwoWayPegEvent::BundleReturn { .. } => (),
             }
         }
+        let market_utxos = self
+            .app
+            .node
+            .get_market_utxos(block_hash)
+            .map_err(custom_err)?;
         Ok(truthcoin_dc::types::BlockIndex {
             txs,
             deposits,
             bundle_spends,
+            market_creates: market_utxos.creates,
+            market_deletes: market_utxos.deletes,
         })
     }
 
