@@ -13,6 +13,7 @@ use crate::{
     types::{
         AccumulatorDiff, Address, Body, FilledTransaction, GetValue as _,
         MerkleRoot, OutPoint, OutPointKey, OutputContent, Transaction, TxData,
+        state::{MarketUtxo, MarketUtxoChanges, MarketUtxoReason},
     },
 };
 
@@ -156,6 +157,7 @@ impl StateUpdate {
         state: &State,
         rwtxn: &mut RwTxn,
         accumulator_diff: &mut AccumulatorDiff,
+        market_utxos: &mut MarketUtxoChanges,
         height: u32,
     ) -> Result<Option<crate::state::undo::ConsolidationUndoData>, Error> {
         for creation in &self.market_creations {
@@ -298,6 +300,7 @@ impl StateUpdate {
             state,
             rwtxn,
             accumulator_diff,
+            market_utxos,
             height,
             &self.pending_sell_payouts,
             &self.pending_buy_settlements,
@@ -371,10 +374,12 @@ impl StateUpdate {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn consolidate_market_utxos(
         state: &State,
         rwtxn: &mut RwTxn,
         accumulator_diff: &mut AccumulatorDiff,
+        market_utxos: &mut MarketUtxoChanges,
         height: u32,
         pending_sell_payouts: &[PendingSellPayout],
         pending_buy_settlements: &[PendingBuySettlement],
@@ -488,7 +493,13 @@ impl StateUpdate {
                 && (treasury_total > 0 || !market_sell_payouts.is_empty())
             {
                 for outpoint in &treasury_utxos_to_consume {
-                    state.delete_utxo(rwtxn, outpoint, accumulator_diff)?;
+                    state.delete_market_utxo(
+                        rwtxn,
+                        accumulator_diff,
+                        market_utxos,
+                        outpoint,
+                        MarketUtxoReason::Treasury,
+                    )?;
                 }
                 state
                     .markets()
@@ -506,11 +517,15 @@ impl StateUpdate {
                             bitcoin::Amount::from_sat(payout.payout_sats),
                         ),
                     };
-                    state.insert_utxo(
+                    state.insert_market_utxo(
                         rwtxn,
-                        &payout_outpoint,
-                        &payout_output,
                         accumulator_diff,
+                        market_utxos,
+                        MarketUtxo {
+                            outpoint: payout_outpoint,
+                            output: payout_output,
+                            reason: MarketUtxoReason::SellPayout,
+                        },
                     )?;
                     sell_payout_utxos.push(payout_outpoint);
                 }
@@ -544,11 +559,15 @@ impl StateUpdate {
                                 bitcoin::Amount::from_sat(change),
                             ),
                         };
-                        state.insert_utxo(
+                        state.insert_market_utxo(
                             rwtxn,
-                            &change_outpoint,
-                            &change_output,
                             accumulator_diff,
+                            market_utxos,
+                            MarketUtxo {
+                                outpoint: change_outpoint,
+                                output: change_output,
+                                reason: MarketUtxoReason::BuyChange,
+                            },
                         )?;
                         buy_change_utxos.push(change_outpoint);
                     }
@@ -584,11 +603,15 @@ impl StateUpdate {
                             is_fee: false,
                         },
                     };
-                    state.insert_utxo(
+                    state.insert_market_utxo(
                         rwtxn,
-                        &new_outpoint,
-                        &new_output,
                         accumulator_diff,
+                        market_utxos,
+                        MarketUtxo {
+                            outpoint: new_outpoint,
+                            output: new_output,
+                            reason: MarketUtxoReason::Treasury,
+                        },
                     )?;
                     state.markets().set_market_funds_utxo(
                         rwtxn,
@@ -606,7 +629,13 @@ impl StateUpdate {
 
             if has_fee_work && fee_total > 0 {
                 for outpoint in &fee_utxos_to_consume {
-                    state.delete_utxo(rwtxn, outpoint, accumulator_diff)?;
+                    state.delete_market_utxo(
+                        rwtxn,
+                        accumulator_diff,
+                        market_utxos,
+                        outpoint,
+                        MarketUtxoReason::AuthorFee,
+                    )?;
                 }
                 state
                     .markets()
@@ -627,11 +656,15 @@ impl StateUpdate {
                         is_fee: true,
                     },
                 };
-                state.insert_utxo(
+                state.insert_market_utxo(
                     rwtxn,
-                    &new_outpoint,
-                    &new_output,
                     accumulator_diff,
+                    market_utxos,
+                    MarketUtxo {
+                        outpoint: new_outpoint,
+                        output: new_output,
+                        reason: MarketUtxoReason::AuthorFee,
+                    },
                 )?;
                 state.markets().set_market_funds_utxo(
                     rwtxn,
@@ -666,11 +699,15 @@ impl StateUpdate {
                         *change_sats,
                     )),
                 };
-                state.insert_utxo(
+                state.insert_market_utxo(
                     rwtxn,
-                    &change_outpoint,
-                    &change_output,
                     accumulator_diff,
+                    market_utxos,
+                    MarketUtxo {
+                        outpoint: change_outpoint,
+                        output: change_output,
+                        reason: MarketUtxoReason::SellInputChange,
+                    },
                 )?;
                 sell_input_change_utxos.push(change_outpoint);
             }
@@ -917,10 +954,12 @@ pub(in crate::state) fn connect_end(
         state_update,
         skipped_tx_indices,
     } = txs;
+    let mut market_utxos = MarketUtxoChanges::default();
     if let Some(consolidation_undo) = state_update.apply_all_changes(
         state,
         rwtxn,
         accumulator_diff,
+        &mut market_utxos,
         height,
     )? {
         state
@@ -1001,6 +1040,7 @@ pub(in crate::state) fn connect_end(
             state.markets().transition_and_payout_resolved_markets(
                 rwtxn,
                 accumulator_diff,
+                &mut market_utxos,
                 state,
                 state.decisions(),
                 height,
@@ -1026,6 +1066,9 @@ pub(in crate::state) fn connect_end(
             };
             state.settlement_undo.put(rwtxn, &height, &undo_data)?;
         }
+    }
+    if !market_utxos.is_empty() {
+        state.market_utxos.put(rwtxn, &height, &market_utxos)?;
     }
     if !skipped_tx_indices.is_empty() {
         let mut indices: Vec<u32> =
@@ -1079,6 +1122,7 @@ pub(in crate::state) fn disconnect_begin(
         )?;
         state.consolidation_undo.delete(rwtxn, &height)?;
     }
+    state.market_utxos.delete(rwtxn, &height)?;
     let skipped_tx_indices = state
         .skipped_tx_indices_undo
         .try_get(rwtxn, &height)?
@@ -2605,6 +2649,150 @@ mod tests {
             .total_cost_sats
     }
 
+    fn utxo_set(
+        state: &State,
+        rotxn: &RoTxn,
+    ) -> anyhow::Result<BTreeMap<OutPoint, Output>> {
+        use fallible_iterator::FallibleIterator as _;
+        let utxos = state
+            .utxos
+            .iter(rotxn)?
+            .map(|(key, output)| Ok((OutPoint::from(key), output)))
+            .collect()?;
+        Ok(utxos)
+    }
+
+    /// The recorded creates and deletes must be exactly the change in the
+    /// UTXO set, so an indexer that applies them reaches the node's set
+    fn ensure_changes_match(
+        before: &BTreeMap<OutPoint, Output>,
+        after: &BTreeMap<OutPoint, Output>,
+        changes: &MarketUtxoChanges,
+    ) -> anyhow::Result<()> {
+        let mut replayed = before.clone();
+        for utxo in &changes.creates {
+            anyhow::ensure!(
+                replayed
+                    .insert(utxo.outpoint, utxo.output.clone())
+                    .is_none(),
+                "{:?} was in the UTXO set before its create",
+                utxo.outpoint
+            );
+        }
+        for utxo in &changes.deletes {
+            anyhow::ensure!(
+                replayed.remove(&utxo.outpoint).as_ref() == Some(&utxo.output),
+                "{:?} was not in the UTXO set with its output before its \
+                 delete",
+                utxo.outpoint
+            );
+        }
+        anyhow::ensure!(
+            &replayed == after,
+            "the recorded changes do not reach the UTXO set of the node"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn consolidation_records_each_utxo_write() -> anyhow::Result<()> {
+        use crate::state::markets::{
+            generate_market_author_fee_address,
+            generate_market_treasury_address,
+        };
+
+        const HEIGHT: u32 = 1;
+
+        let fixture = trading_fixture();
+        let state = &fixture.state;
+        let market_id = fixture.market.id;
+        let seller = Address([1; 20]);
+        let buyer = Address([2; 20]);
+        let mut rwtxn = fixture.env.write_txn()?;
+        for is_fee in [false, true] {
+            let outpoint = OutPoint::MarketFunds {
+                market_id: market_id.0,
+                block_height: 0,
+                is_fee,
+            };
+            let address = if is_fee {
+                generate_market_author_fee_address(&market_id)
+            } else {
+                generate_market_treasury_address(&market_id)
+            };
+            let output = Output {
+                address,
+                content: OutputContent::MarketFunds {
+                    market_id: market_id.0,
+                    amount: bitcoin::Amount::from_sat(10_000),
+                    is_fee,
+                },
+            };
+            state.insert_utxo(
+                &mut rwtxn,
+                &outpoint,
+                &output,
+                &mut AccumulatorDiff::default(),
+            )?;
+            state.markets().set_market_funds_utxo(
+                &mut rwtxn, &market_id, is_fee, &outpoint,
+            )?;
+        }
+        let before = utxo_set(state, &rwtxn)?;
+
+        let mut changes = MarketUtxoChanges::default();
+        StateUpdate::consolidate_market_utxos(
+            state,
+            &mut rwtxn,
+            &mut AccumulatorDiff::default(),
+            &mut changes,
+            HEIGHT,
+            &[PendingSellPayout {
+                market_id,
+                seller_address: seller,
+                payout_sats: 3_000,
+                fee_sats: 30,
+                outcome_index: 0,
+                transaction_id: [3; 32],
+            }],
+            &[PendingBuySettlement {
+                market_id,
+                trader_address: buyer,
+                input_value_sats: 50_000,
+                lmsr_cost_sats: 2_000,
+                market_fee_sats: 20,
+                transaction_id: [4; 32],
+                is_amplify: false,
+            }],
+            &[(seller, 500, [3; 32])],
+        )?;
+        let after = utxo_set(state, &rwtxn)?;
+        ensure_changes_match(&before, &after, &changes)?;
+
+        let reasons = |utxos: &[MarketUtxo]| {
+            utxos.iter().map(|utxo| utxo.reason).collect::<Vec<_>>()
+        };
+        anyhow::ensure!(
+            reasons(&changes.creates)
+                == [
+                    MarketUtxoReason::SellPayout,
+                    MarketUtxoReason::BuyChange,
+                    MarketUtxoReason::Treasury,
+                    MarketUtxoReason::AuthorFee,
+                    MarketUtxoReason::SellInputChange,
+                ],
+            "creates: {:?}",
+            reasons(&changes.creates)
+        );
+        anyhow::ensure!(
+            reasons(&changes.deletes)
+                == [MarketUtxoReason::Treasury, MarketUtxoReason::AuthorFee],
+            "deletes: {:?}",
+            reasons(&changes.deletes)
+        );
+        Ok(())
+    }
+
     #[test]
     fn trade_simulation_prices_at_same_block_amplified_beta() {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
@@ -3024,15 +3212,27 @@ mod tests {
             SettlementUndoData,
         )> {
             let mut diff = AccumulatorDiff::default();
+            let mut changes = MarketUtxoChanges::default();
+            let before = utxo_set(&state, rwtxn)?;
             let (_, entries) =
                 state.markets().transition_and_payout_resolved_markets(
                     rwtxn,
                     &mut diff,
+                    &mut changes,
                     &state,
                     state.decisions(),
                     HEIGHT,
                 )?;
             anyhow::ensure!(entries.len() == 2, "both markets must settle");
+            ensure_changes_match(&before, &utxo_set(&state, rwtxn)?, &changes)?;
+            anyhow::ensure!(
+                changes.deletes.len() == 2
+                    && changes.deletes.iter().all(|utxo| {
+                        utxo.reason == MarketUtxoReason::Treasury
+                    }),
+                "settlement must record both treasury deletes: {:?}",
+                changes.deletes
+            );
             let mut accumulator = Accumulator::default();
             accumulator.apply_diff(treasury_leaves.clone())?;
             accumulator.apply_diff(diff)?;

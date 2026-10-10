@@ -5,7 +5,10 @@ use sneed::RwTxn;
 
 use crate::{
     state::{Error, State},
-    types::{AccumulatorDiff, OutPoint, OutPointKey, Output, PointedOutputRef},
+    types::{
+        AccumulatorDiff, OutPoint, OutPointKey, Output, PointedOutputRef,
+        state::{MarketUtxo, MarketUtxoChanges, MarketUtxoReason},
+    },
 };
 
 /// Writes to the UTXO set. Each write records its Utreexo leaf in the
@@ -95,5 +98,52 @@ impl UtxoManager for State {
         drop(iter);
         self.utxos.clear(rwtxn)?;
         Ok(())
+    }
+}
+
+impl State {
+    /// Insert an output that no transaction creates, and record it for the
+    /// block index
+    pub(in crate::state) fn insert_market_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
+        market_utxos: &mut MarketUtxoChanges,
+        utxo: MarketUtxo,
+    ) -> Result<(), Error> {
+        self.insert_utxo(
+            rwtxn,
+            &utxo.outpoint,
+            &utxo.output,
+            accumulator_diff,
+        )?;
+        market_utxos.creates.push(utxo);
+        Ok(())
+    }
+
+    /// Delete an output that no transaction spends, and record it for the
+    /// block index. Returns false if the UTXO set does not hold it.
+    pub(in crate::state) fn delete_market_utxo(
+        &self,
+        rwtxn: &mut RwTxn,
+        accumulator_diff: &mut AccumulatorDiff,
+        market_utxos: &mut MarketUtxoChanges,
+        outpoint: &OutPoint,
+        reason: MarketUtxoReason,
+    ) -> Result<bool, Error> {
+        let Some(output) =
+            self.utxos.try_get(rwtxn, &OutPointKey::from(outpoint))?
+        else {
+            return Ok(false);
+        };
+        if !self.delete_utxo(rwtxn, outpoint, accumulator_diff)? {
+            return Ok(false);
+        }
+        market_utxos.deletes.push(MarketUtxo {
+            outpoint: *outpoint,
+            output,
+            reason,
+        });
+        Ok(true)
     }
 }
