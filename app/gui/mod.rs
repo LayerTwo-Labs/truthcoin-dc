@@ -1,4 +1,4 @@
-use std::{pin::Pin, task::Poll};
+use std::{pin::Pin, sync::Arc, task::Poll};
 
 use eframe::egui::{self, Color32, RichText};
 use futures::Stream;
@@ -255,6 +255,7 @@ impl EguiApp {
         cc: &eframe::CreationContext<'_>,
         logs_capture: LineBuffer,
         rpc_addr: url::Url,
+        rpc_auth_token: Arc<str>,
         network: Network,
     ) -> Self {
         // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
@@ -281,7 +282,8 @@ impl EguiApp {
         let activity = Activity::new(app.as_ref());
         let bottom_panel = BottomPanel::new(app.clone());
         let coins = Coins::new(app.as_ref());
-        let console_logs = ConsoleLogs::new(logs_capture, rpc_addr);
+        let console_logs =
+            ConsoleLogs::new(logs_capture, rpc_addr, rpc_auth_token);
         let create = Create::default();
         let markets = Markets::new(app.as_ref());
         let parent_chain = ParentChain::new(app.as_ref());

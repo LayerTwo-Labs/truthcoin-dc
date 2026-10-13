@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
+    path::Path,
+    sync::Arc,
 };
 
 use bitcoin::Amount;
@@ -49,7 +51,10 @@ use truthcoin_dc_app_rpc_api::{
     typewit::const_marker::Bool,
 };
 
-use crate::app::App;
+use crate::{
+    app::App,
+    rpc_auth::{BearerAuthLayer, GuardLayer},
+};
 
 fn custom_err_msg(err_msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-1, err_msg.into(), Option::<()>::None)
@@ -3279,10 +3284,22 @@ fn loopback_host_filter(addr: SocketAddr) -> anyhow::Result<HostFilterLayer> {
     ])?)
 }
 
+/// Every wallet and node-private method, so a new one is guarded with no
+/// list to update.
+fn guarded_methods(app: &App) -> anyhow::Result<HashSet<&'static str>> {
+    let rpc_server_impl = RpcServerImpl::<true> { app: app.clone() };
+    let mut rpc_module =
+        rpc_api::node::PrivateRpcServer::into_rpc(rpc_server_impl.clone());
+    rpc_module.merge(rpc_api::wallet::RpcServer::into_rpc(rpc_server_impl))?;
+    Ok(rpc_module.method_names().collect())
+}
+
 pub async fn run_server(
     app: App,
     private_rpc_addr: SocketAddr,
     rpc_addr: SocketAddr,
+    rpc_auth_token: Arc<str>,
+    rpc_cookie_path: &Path,
 ) -> anyhow::Result<ServerAddesses> {
     const REQUEST_ID_HEADER: &str = "x-request-id";
 
@@ -3331,9 +3348,15 @@ pub async fn run_server(
     let http_middleware = |addr| -> anyhow::Result<_> {
         Ok(tower::ServiceBuilder::new()
             .layer(tracer())
-            .layer(loopback_host_filter(addr)?))
+            .layer(loopback_host_filter(addr)?)
+            .layer(BearerAuthLayer::new(rpc_auth_token.clone())))
     };
-    let rpc_middleware = || RpcServiceBuilder::new().rpc_logger(1024);
+    let guard_layer = GuardLayer::new(guarded_methods(&app)?, rpc_cookie_path);
+    let rpc_middleware = || {
+        RpcServiceBuilder::new()
+            .rpc_logger(1024)
+            .layer(guard_layer.clone())
+    };
 
     let server = Server::builder()
         .set_http_middleware(http_middleware(rpc_addr)?)
