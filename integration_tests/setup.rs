@@ -54,6 +54,10 @@ pub enum BmmError {
 pub enum SetupError {
     #[error("Failed to create truthcoin dir")]
     CreateTruthcoinDir(#[source] std::io::Error),
+    #[error("Invalid RPC auth header")]
+    InvalidAuthHeader(#[from] http::header::InvalidHeaderValue),
+    #[error("Failed to read truthcoin RPC cookie")]
+    ReadCookie(#[source] std::io::Error),
     #[error(transparent)]
     ReservePort(#[from] reserve_port::Error),
     #[error(transparent)]
@@ -161,6 +165,7 @@ impl Sidechain for PostSetup {
         };
         std::fs::create_dir(&truthcoin_dc_dir)
             .map_err(Self::SetupError::CreateTruthcoinDir)?;
+        let cookie_path = truthcoin_dc_dir.join(".cookie");
         let truthcoin_dc_app = TruthcoinApp {
             path: init.truthcoin_dc_app,
             data_dir: truthcoin_dc_dir,
@@ -188,7 +193,15 @@ impl Sidechain for PostSetup {
             );
         tracing::debug!("Started truthcoin");
         sleep(Duration::from_secs(1)).await;
+        let cookie = std::fs::read_to_string(&cookie_path)
+            .map_err(Self::SetupError::ReadCookie)?;
+        let authorization =
+            http::HeaderValue::from_str(&format!("Bearer {}", cookie.trim()))?;
         let rpc_client = jsonrpsee::http_client::HttpClient::builder()
+            .set_headers(http::HeaderMap::from_iter([(
+                http::header::AUTHORIZATION,
+                authorization,
+            )]))
             .build(format!("http://127.0.0.1:{}", reserved_ports.rpc.port()))?;
         tracing::debug!("Generating mnemonic seed phrase");
         let mnemonic = rpc_client.generate_mnemonic().await?;
