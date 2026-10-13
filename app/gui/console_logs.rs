@@ -30,15 +30,21 @@ pub struct ConsoleLogs {
     line_buffer: LineBuffer,
     command_input: String,
     rpc_addr: url::Url,
+    rpc_auth_token: Arc<str>,
     running_command: Arc<AtomicBool>,
 }
 
 impl ConsoleLogs {
-    pub fn new(line_buffer: LineBuffer, rpc_addr: url::Url) -> Self {
+    pub fn new(
+        line_buffer: LineBuffer,
+        rpc_addr: url::Url,
+        rpc_auth_token: Arc<str>,
+    ) -> Self {
         Self {
             line_buffer,
             command_input: String::new(),
             rpc_addr,
+            rpc_auth_token,
             running_command: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -68,6 +74,8 @@ impl ConsoleLogs {
             }
         };
         let cli = truthcoin_dc_app_cli_lib::Cli {
+            rpc_auth_token: Some(self.rpc_auth_token.to_string()),
+            rpc_cookie_file: None,
             rpc_url: self.rpc_addr.clone(),
             timeout: None,
             command,
