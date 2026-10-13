@@ -6,11 +6,10 @@ use std::{
 use bitcoin::Amount;
 use jsonrpsee::{
     core::{RpcResult, async_trait, middleware::RpcServiceBuilder},
-    server::Server,
+    server::{Server, middleware::http::HostFilterLayer},
     types::ErrorObject,
 };
 use tower_http::{
-    cors::CorsLayer,
     request_id::{
         MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
     },
@@ -3281,6 +3280,19 @@ pub struct ServerAddesses {
     pub _private_rpc_addr: SocketAddr,
 }
 
+/// Refuses a request on a loopback address whose `Host` names another
+/// site, so a web page cannot reach the RPC through DNS rebinding.
+fn loopback_host_filter(addr: SocketAddr) -> anyhow::Result<HostFilterLayer> {
+    if !addr.ip().is_loopback() {
+        return Ok(HostFilterLayer::disable());
+    }
+    Ok(HostFilterLayer::new([
+        "localhost:*",
+        "127.0.0.1:*",
+        "[::1]:*",
+    ])?)
+}
+
 pub async fn run_server(
     app: App,
     private_rpc_addr: SocketAddr,
@@ -3330,15 +3342,15 @@ pub async fn run_server(
             .into_inner()
     };
 
-    let http_middleware = || {
-        tower::ServiceBuilder::new()
+    let http_middleware = |addr| -> anyhow::Result<_> {
+        Ok(tower::ServiceBuilder::new()
             .layer(tracer())
-            .layer(CorsLayer::permissive())
+            .layer(loopback_host_filter(addr)?))
     };
     let rpc_middleware = || RpcServiceBuilder::new().rpc_logger(1024);
 
     let server = Server::builder()
-        .set_http_middleware(http_middleware())
+        .set_http_middleware(http_middleware(rpc_addr)?)
         .set_rpc_middleware(rpc_middleware())
         .build(rpc_addr)
         .await?;
@@ -3346,7 +3358,7 @@ pub async fn run_server(
 
     let (_task_handle, server_addrs) = if private_rpc_addr != rpc_addr {
         let private_rpc_server = Server::builder()
-            .set_http_middleware(http_middleware())
+            .set_http_middleware(http_middleware(private_rpc_addr)?)
             .set_rpc_middleware(rpc_middleware())
             .build(private_rpc_addr)
             .await?;
@@ -3424,8 +3436,14 @@ pub async fn run_server(
 
 #[cfg(test)]
 mod tests {
-    use super::{check_buy_limit, market_dimension_data, market_outcomes};
-    use std::collections::HashMap;
+    use super::{
+        check_buy_limit, loopback_host_filter, market_dimension_data,
+        market_outcomes,
+    };
+    use std::{collections::HashMap, net::SocketAddr};
+
+    use jsonrpsee::{RpcModule, server::Server};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use truthcoin_dc::math::trading::BuyCost;
     use truthcoin_dc::state::{
@@ -3560,5 +3578,54 @@ mod tests {
                     || outcome.label.contains("Estimate")
             );
         }
+    }
+
+    async fn post_status_line(
+        addr: SocketAddr,
+        host: &str,
+    ) -> anyhow::Result<String> {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await?;
+        Ok(response.lines().next().unwrap_or_default().to_owned())
+    }
+
+    /// A page that rebinds its domain to 127.0.0.1 sends its own name in
+    /// `Host`.
+    #[tokio::test]
+    async fn loopback_rpc_refuses_a_foreign_host() -> anyhow::Result<()> {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let server = Server::builder()
+            .set_http_middleware(
+                tower::ServiceBuilder::new().layer(loopback_host_filter(addr)?),
+            )
+            .build(addr)
+            .await?;
+        let addr = server.local_addr()?;
+        let mut module = RpcModule::new(());
+        module.register_method("ping", |_, _, _| "pong")?;
+        let handle = server.start(module);
+
+        let port = addr.port();
+        assert!(
+            post_status_line(addr, &format!("evil.example:{port}"))
+                .await?
+                .starts_with("HTTP/1.1 403")
+        );
+        for host in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+            assert!(
+                post_status_line(addr, &host)
+                    .await?
+                    .starts_with("HTTP/1.1 200")
+            );
+        }
+        handle.stop()?;
+        Ok(())
     }
 }
