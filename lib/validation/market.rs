@@ -53,8 +53,11 @@ impl MarketValidator {
         let mut total_listing_fee: u64 = 0;
 
         for payload in view.new_claims {
+            // Pass the state, not `state.decisions()`: the decisions db has no
+            // clock (no height or timestamps), so the claim would be checked
+            // against period 0, capping new claims at period 19 for good.
             let fee = DecisionValidator::validate_claim_payload(
-                state.decisions(),
+                state,
                 rotxn,
                 payload,
                 market_maker_address,
@@ -890,6 +893,90 @@ mod tests {
                 &state,
                 &rotxn,
                 &maker_owned,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    /// A CreateMarket tx that claims one new binary decision and uses it as
+    /// its only dimension.
+    fn create_market_with_new_claim_tx(
+        maker: Address,
+        decision_id: DecisionId,
+    ) -> FilledTransaction {
+        use crate::types::ClaimDecisionPayload;
+
+        let specs = vec![DimensionSpec::Single(decision_id)];
+        let market_id = compute_market_id("title", "", &maker, &specs);
+        let mut tx = create_market_tx(
+            maker,
+            specs,
+            generate_market_treasury_address(&market_id),
+        );
+        if let Some(TransactionData::CreateMarket { new_claims, .. }) =
+            &mut tx.transaction.data
+        {
+            new_claims.push(ClaimDecisionPayload {
+                decision_type: DecisionType::Binary,
+                decisions: vec![DecisionClaimEntry {
+                    decision_id_bytes: decision_id.as_bytes(),
+                    header: "decision".to_string(),
+                    description: String::new(),
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                }],
+            });
+        }
+        tx
+    }
+
+    /// New claims in a CreateMarket tx must be checked against the current
+    /// period (from the mainchain timestamp), not against period 0.
+    #[test]
+    fn market_creation_new_claim_window_follows_current_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None).unwrap();
+
+        // Time-based periods of one day; the tip is in period 10.
+        let genesis_ts = 1_700_000_000;
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .put_timestamps_for_test(
+                &mut rwtxn,
+                genesis_ts,
+                genesis_ts + 9 * 86_400 + 60,
+            )
+            .unwrap();
+        rwtxn.commit().unwrap();
+        let rotxn = env.read_txn().unwrap();
+
+        let maker = Address([9; 20]);
+        // Period 25 is inside the window (10..=29) but past 19.
+        let in_window = create_market_with_new_claim_tx(
+            maker,
+            DecisionId::new(false, 25, 0).unwrap(),
+        );
+        MarketValidator::validate_market_creation(
+            &state, &rotxn, &in_window, None,
+        )
+        .unwrap();
+
+        let past_window = create_market_with_new_claim_tx(
+            maker,
+            DecisionId::new(false, 30, 0).unwrap(),
+        );
+        assert!(
+            MarketValidator::validate_market_creation(
+                &state,
+                &rotxn,
+                &past_window,
                 None
             )
             .is_err()
