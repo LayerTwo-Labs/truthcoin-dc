@@ -191,6 +191,7 @@ where
             mempool.clone(),
             net.clone(),
             peer_info_rx,
+            &mut *rng,
             state.clone(),
         );
         let task_handles = TaskHandles {
