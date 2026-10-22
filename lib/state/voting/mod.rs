@@ -228,6 +228,9 @@ impl VotingSystem {
         let mut vote_matrix = SparseVoteMatrix::new(voters, decisions);
 
         for (vote_key, vote_entry) in &all_votes {
+            if !reputations.contains_key(&vote_key.voter_address) {
+                continue;
+            }
             if let Some(vote_value) = vote_entry.to_float_opt() {
                 vote_matrix
                     .set_vote(
@@ -953,5 +956,169 @@ mod conservation_tests {
             (sum - 1.0).abs() < 1e-15,
             "drift accumulated: sum = {sum:.20}"
         );
+    }
+
+    #[test]
+    fn period_close_accepts_a_full_reputation_transfer() -> anyhow::Result<()> {
+        use crate::{
+            state::{
+                State,
+                decisions::{
+                    Decision, DecisionId, DecisionState, DecisionType,
+                },
+                markets::block,
+            },
+            types::{
+                AccumulatorDiff, Body, Coinbase, FilledTransaction, OutPoint,
+                Output, OutputContent, PointedOutputRef, Transaction,
+                TransactionData, Txid,
+            },
+            validation::VoteValidator,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }?;
+        let state = State::new(&env, Some(10))?;
+        let mut rwtxn = env.write_txn()?;
+        let sender = addr(1);
+        let receiver = addr(2);
+        state
+            .reputation()
+            .set_reputation(&mut rwtxn, &sender, 0.4)?;
+        state
+            .reputation()
+            .set_reputation(&mut rwtxn, &receiver, 0.6)?;
+        state.genesis_timestamp.put(&mut rwtxn, &(), &1000)?;
+        state.decisions().mint_genesis(&mut rwtxn, 1000, 0, 1000)?;
+        let decision_id = DecisionId::new(true, 1, 0)?;
+        let decision = Decision::new(
+            sender.0,
+            DecisionType::Binary,
+            "Test decision".to_owned(),
+            String::new(),
+            None,
+            None,
+            vec![],
+        )?;
+        state.decisions().claim_decision(
+            &mut rwtxn,
+            decision_id,
+            decision,
+            Txid([0; 32]),
+            Some(1),
+        )?;
+        let votes =
+            [(sender, 0.0), (receiver, 1.0)].map(|(voter, vote_value)| {
+                FilledTransaction {
+                    transaction: Transaction {
+                        data: Some(TransactionData::SubmitVote {
+                            voter,
+                            decision_id_bytes: decision_id.as_bytes(),
+                            vote_value,
+                            voting_period: decision_id.voting_period(),
+                        }),
+                        ..Default::default()
+                    },
+                    spent_utxos: vec![],
+                    actor_address: Some(voter),
+                }
+            });
+        let input = Output {
+            address: sender,
+            content: OutputContent::Value(bitcoin::Amount::from_sat(1000)),
+        };
+        let outpoint = OutPoint::Regular {
+            txid: Txid([3; 32]),
+            vout: 0,
+        };
+        let input_hash = crate::types::hash(&PointedOutputRef {
+            outpoint,
+            output: &input,
+        });
+        let transfer = FilledTransaction {
+            transaction: Transaction {
+                inputs: vec![(outpoint, input_hash)].into(),
+                outputs: vec![input.clone()].into(),
+                data: Some(TransactionData::TransferReputation {
+                    sender,
+                    dest: receiver,
+                    amount: 0.4,
+                }),
+                ..Default::default()
+            },
+            spent_utxos: vec![input],
+            actor_address: None,
+        };
+        for height in [10, 11, 20] {
+            let timestamp = 1000 + u64::from(height);
+            state.mainchain_timestamp.put(&mut rwtxn, &(), &timestamp)?;
+            let context = block::connect_begin(
+                &state,
+                &mut rwtxn,
+                &Body::new(vec![], Coinbase::default()),
+                height,
+                timestamp,
+            )?;
+            let transactions = match height {
+                10 => {
+                    for vote in &votes {
+                        VoteValidator::validate_vote_submission(
+                            &state,
+                            &rwtxn,
+                            vote,
+                            Some(height),
+                        )?;
+                    }
+                    votes.as_slice()
+                }
+                11 => {
+                    VoteValidator::validate_reputation_transfer(
+                        &state,
+                        &rwtxn,
+                        &transfer,
+                        Some(height),
+                    )?;
+                    std::slice::from_ref(&transfer)
+                }
+                _ => &[],
+            };
+            let changes = block::connect_txs(
+                &state,
+                &mut rwtxn,
+                &context,
+                transactions,
+                bitcoin::Amount::ZERO,
+            )?;
+            block::connect_end(
+                &state,
+                &mut rwtxn,
+                &mut AccumulatorDiff::default(),
+                context,
+                changes,
+            )?;
+        }
+        assert_eq!(state.reputation().get_reputation(&rwtxn, &sender)?, 0.0);
+        assert_eq!(state.reputation().get_reputation(&rwtxn, &receiver)?, 1.0);
+        assert_eq!(
+            state
+                .decisions()
+                .get_decision_current_state(&rwtxn, decision_id)?,
+            DecisionState::Resolved,
+        );
+        let period_id = VotingPeriodId::new(decision_id.voting_period());
+        let outcomes =
+            state.voting().resolve_period_decisions(&rwtxn, period_id)?;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].outcome_value, 1.0);
+        assert_eq!(
+            state
+                .voting()
+                .get_votes_for_period(&rwtxn, period_id)?
+                .len(),
+            2
+        );
+        Ok(())
     }
 }
