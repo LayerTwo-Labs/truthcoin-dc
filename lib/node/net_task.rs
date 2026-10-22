@@ -1594,6 +1594,150 @@ mod test {
         Ok((temp_dir, node))
     }
 
+    fn check_reputation_selection(
+        start_reputation: f64,
+        amounts: &[f64],
+        expected_count: usize,
+    ) -> anyhow::Result<()> {
+        use crate::types::{
+            Address, Body, Coinbase, Header, TransactionData,
+            authorization::{SigningKey, authorize, get_address},
+        };
+        use bitcoin::hashes::Hash as _;
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let key = SigningKey::new(&mut rand::rng());
+            let sender = get_address(&(&key).into());
+            let receiver = Address([3; 20]);
+            let mut accumulator = Accumulator::default();
+            let mut diff = AccumulatorDiff::default();
+            let mut inputs = Vec::new();
+            let mut rwtxn = node.env.write_txn()?;
+            node.state.reputation().set_reputation(
+                &mut rwtxn,
+                &sender,
+                start_reputation,
+            )?;
+            for index in 0..amounts.len() {
+                let pointed = PointedOutput {
+                    outpoint: OutPoint::Regular {
+                        txid: [index as u8; 32].into(),
+                        vout: 0,
+                    },
+                    output: Output {
+                        address: sender,
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(1_000),
+                        ),
+                    },
+                };
+                node.state.utxos.put(
+                    &mut rwtxn,
+                    &OutPointKey::from(&pointed.outpoint),
+                    &pointed.output,
+                )?;
+                diff.insert((&pointed).into());
+                inputs.push((pointed.outpoint, hash(&pointed)));
+            }
+            accumulator.apply_diff(diff)?;
+            node.state.utreexo_accumulator.put(
+                &mut rwtxn,
+                &(),
+                &accumulator,
+            )?;
+            rwtxn.commit()?;
+
+            for (input, &amount) in inputs.into_iter().zip(amounts) {
+                let tx = Transaction {
+                    inputs: vec![input].into(),
+                    outputs: vec![Output {
+                        address: sender,
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(900),
+                        ),
+                    }]
+                    .into(),
+                    data: Some(TransactionData::TransferReputation {
+                        sender,
+                        dest: receiver,
+                        amount,
+                    }),
+                    ..Default::default()
+                };
+                let tx = authorize(rand::rng(), &[(sender, &key)], tx)?;
+                node.submit_transaction(tx)?;
+            }
+
+            let (selected, fee) = node.get_transactions(100)?;
+            let selected_count = selected.len();
+            let transferred: f64 = selected
+                .iter()
+                .map(|tx| tx.transaction.transfer_reputation().unwrap().amount)
+                .sum();
+            let coinbase = Coinbase::default();
+            let merkle_root = Body::compute_merkle_root(&coinbase, &selected)?;
+            let mut header = Header {
+                merkle_root,
+                prev_side_hash: None,
+                prev_main_hash: bitcoin::BlockHash::all_zeros(),
+                roots: Vec::new(),
+            };
+            Body::modify_memforest(
+                header.compute_coinbase_txid(),
+                &[],
+                &selected,
+                &mut accumulator.0,
+            )?;
+            header.roots = accumulator.get_roots();
+            let body = Body::new(
+                selected.into_iter().map(Into::into).collect(),
+                coinbase,
+            );
+            let mut rwtxn = node.env.write_txn()?;
+            node.state.apply_block(
+                &mut rwtxn,
+                &node.batch_verification_ctxt,
+                &header,
+                &body,
+                &node.archive,
+                1_700_000_000,
+            )?;
+            assert_eq!(selected_count, expected_count);
+            assert_eq!(fee.to_sat(), 100 * expected_count as u64);
+            assert_eq!(
+                node.state.reputation().get_reputation(&rwtxn, &sender)?,
+                start_reputation - transferred
+            );
+            assert_eq!(
+                node.state.reputation().get_reputation(&rwtxn, &receiver)?,
+                transferred
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn block_selection_keeps_reputation_balance() -> anyhow::Result<()> {
+        check_reputation_selection(1.0, &[0.75, 0.75], 1)
+    }
+
+    #[test]
+    fn block_selection_keeps_funded_reputation_transfers() -> anyhow::Result<()>
+    {
+        check_reputation_selection(1.0, &[0.25, 0.25], 2)
+    }
+
+    #[test]
+    fn block_selection_matches_decimal_reputation() -> anyhow::Result<()> {
+        check_reputation_selection(0.3, &[0.1, 0.2], 1)
+    }
+
     #[test]
     fn peer_transaction_conflicts_do_not_stop_net_task() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Runtime::new()?;

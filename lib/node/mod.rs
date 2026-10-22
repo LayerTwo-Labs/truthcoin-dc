@@ -622,6 +622,7 @@ where
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
         let mut trades = TradeSimulation::default();
+        let mut reputation = HashMap::new();
         // Outputs the transactions already taken for this block make.
         let mut block_outputs = HashMap::<OutPoint, Output>::new();
         for transaction in transactions {
@@ -678,6 +679,31 @@ where
                     );
                     continue;
                 }
+            }
+            if let Some(transfer) =
+                filled_transaction.transaction.transfer_reputation()
+            {
+                let sender_rep = match reputation.get(&transfer.sender) {
+                    Some(&value) => value,
+                    None => self
+                        .state
+                        .reputation()
+                        .get_reputation(&rwtxn, &transfer.sender)?,
+                };
+                if sender_rep < transfer.amount {
+                    continue;
+                }
+                let receiver_rep = match reputation.get(&transfer.dest) {
+                    Some(&value) => value,
+                    None => self
+                        .state
+                        .reputation()
+                        .get_reputation(&rwtxn, &transfer.dest)?,
+                };
+                reputation
+                    .insert(transfer.sender, sender_rep - transfer.amount);
+                reputation
+                    .insert(transfer.dest, receiver_rep + transfer.amount);
             }
             block_outputs.extend(
                 filled_transaction
