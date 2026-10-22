@@ -761,6 +761,11 @@ pub fn disconnect_tip(
     )?;
     match (header.prev_side_hash, height) {
         (None, 0) => {
+            if let Some(output) = body.coinbase.outputs.iter().next() {
+                state
+                    .reputation()
+                    .delete_reputation(rwtxn, &output.address)?;
+            }
             state.tip.delete(rwtxn, &()).map_err(DbError::from)?;
             state.height.delete(rwtxn, &()).map_err(DbError::from)?;
         }
@@ -802,6 +807,80 @@ mod test {
         state::test::{fresh_state, value_output},
         types::FilledTransaction,
     };
+
+    #[test]
+    fn genesis_reorg_replaces_reputation_credit() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::types::{
+            AccumulatorDiff, Address, Body, Header, OutPoint, PointedOutput,
+            authorization::BatchVerificationContext,
+        };
+
+        let (_temp_dir, env, state) =
+            fresh_state("genesis_reorg_replaces_reputation_credit")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let batch = BatchVerificationContext::new(&mut rand::rng());
+        let first_address = Address([1; 20]);
+        let next_address = Address([2; 20]);
+        let mut rwtxn = env.write_txn()?;
+
+        for address in [first_address, next_address] {
+            let output = value_output(address, 0);
+            let body = Body::new(
+                Vec::new(),
+                Coinbase {
+                    outputs: vec![output.clone()].into(),
+                    ..Default::default()
+                },
+            );
+            let mut header = Header {
+                merkle_root: Body::compute_merkle_root::<FilledTransaction>(
+                    &body.coinbase,
+                    &[],
+                )?,
+                prev_side_hash: None,
+                prev_main_hash: bitcoin::BlockHash::all_zeros(),
+                roots: Vec::new(),
+            };
+            let mut accumulator = state.get_accumulator(&rwtxn)?;
+            let mut diff = AccumulatorDiff::default();
+            diff.insert(
+                (&PointedOutput {
+                    outpoint: OutPoint::Coinbase {
+                        txid: header.compute_coinbase_txid(),
+                        vout: 0,
+                    },
+                    output,
+                })
+                    .into(),
+            );
+            accumulator.apply_diff(diff)?;
+            header.roots = accumulator.get_roots();
+            state.apply_block(
+                &mut rwtxn,
+                &batch,
+                &header,
+                &body,
+                &archive,
+                1_700_000_000,
+            )?;
+            assert_eq!(
+                state.reputation().get_reputation(&rwtxn, &address)?,
+                1.0
+            );
+            if address == first_address {
+                state.disconnect_tip(&mut rwtxn, &header, &body)?;
+            }
+        }
+
+        assert_eq!(
+            state.reputation().get_reputation(&rwtxn, &first_address)?,
+            0.0
+        );
+        assert_eq!(state.reputation().count_holders(&rwtxn)?, 1);
+        Ok(())
+    }
 
     #[test]
     fn validation_rejects_outpoint_utxo_hash_mismatch() -> anyhow::Result<()> {

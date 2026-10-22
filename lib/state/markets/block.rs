@@ -3039,7 +3039,29 @@ mod tests {
             Ok((accumulator.get_roots(), SettlementUndoData { entries }))
         };
 
+        let initial_outputs = state.get_utxos(&rwtxn)?;
+        let total_value = |outputs: &HashMap<OutPoint, Output>| -> u64 {
+            outputs
+                .values()
+                .map(|output| output.get_value().to_sat())
+                .sum()
+        };
+        let initial_value = total_value(&initial_outputs);
         let (roots, undo) = settle(&mut rwtxn)?;
+        let settled_outputs = state.get_utxos(&rwtxn)?;
+        assert_eq!(total_value(&settled_outputs), initial_value);
+
+        let (repeated_payouts, repeated_undo) =
+            state.markets().transition_and_payout_resolved_markets(
+                &mut rwtxn,
+                &mut AccumulatorDiff::default(),
+                &state,
+                state.decisions(),
+                HEIGHT + 1,
+            )?;
+        assert!(repeated_payouts.is_empty());
+        assert!(repeated_undo.is_empty());
+        assert_eq!(state.get_utxos(&rwtxn)?, settled_outputs);
         revert_settlement(
             &state,
             &mut rwtxn,
@@ -3047,7 +3069,9 @@ mod tests {
             &undo,
             HEIGHT,
         )?;
+        assert_eq!(state.get_utxos(&rwtxn)?, initial_outputs);
         let (replayed_roots, _) = settle(&mut rwtxn)?;
+        assert_eq!(state.get_utxos(&rwtxn)?, settled_outputs);
         anyhow::ensure!(
             replayed_roots == roots,
             "the replay reached other roots: {replayed_roots:?} != {roots:?}"
