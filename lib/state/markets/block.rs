@@ -1755,7 +1755,7 @@ fn revert_trade_market_state(
                 ),
             })?;
         market
-            .revert_trading_volume(outcome, sell_proceeds.gross_proceeds_sats)
+            .revert_trading_volume(outcome, sell_proceeds.net_proceeds_sats)
             .map_err(|e| Error::InvalidTransaction {
                 reason: format!(
                     "Volume revert failed during sell trade revert: \
@@ -2790,6 +2790,100 @@ mod tests {
             "deletes: {:?}",
             reasons(&changes.deletes)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sell_rollback_restores_market_volume() -> anyhow::Result<()> {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+        use crate::state::markets::generate_market_treasury_address;
+        use crate::types::{Output, Txid};
+
+        let TradingFixture {
+            env,
+            state,
+            archive,
+            mut market,
+            tip,
+            ..
+        } = trading_fixture();
+        market.total_volume_sats = 20_000;
+        market.outcome_volumes_sats = vec![0, 20_000];
+        let mut rwtxn = env.write_txn()?;
+        state.markets().update_market(&mut rwtxn, &market)?;
+        state.markets().add_shares_to_account(
+            &mut rwtxn,
+            &Address::ALL_ZEROS,
+            market.id,
+            1,
+            20_000,
+            0,
+        )?;
+        let treasury = OutPoint::Regular {
+            txid: Txid([8; 32]),
+            vout: 0,
+        };
+        let mut diff = AccumulatorDiff::default();
+        state.insert_utxo(
+            &mut rwtxn,
+            &treasury,
+            &Output {
+                address: generate_market_treasury_address(&market.id),
+                content: OutputContent::MarketFunds {
+                    market_id: market.id.0,
+                    amount: bitcoin::Amount::from_sat(40_000),
+                    is_fee: false,
+                },
+            },
+            &mut diff,
+        )?;
+        state
+            .markets()
+            .set_market_funds_utxo(&mut rwtxn, &market.id, false, &treasury)?;
+        let initial_utxos = state.get_utxos(&rwtxn)?;
+        let trade = filled_tx(
+            TxData::Trade {
+                market_id: market.id,
+                outcome_index: 1,
+                shares: -2_000,
+                trader: Address::ALL_ZEROS,
+                limit_sats: 0,
+                tx_pow_nonce: None,
+                prev_block_hash: tip,
+            },
+            TRADE_MINER_FEE_SATS,
+        );
+        crate::validation::MarketValidator::validate_trade(
+            &state, &archive, &rwtxn, &trade, None,
+        )?;
+        let mut update = StateUpdate::new();
+        assert!(matches!(
+            apply_trade(&state, &rwtxn, &trade, &mut update)?,
+            TradeApplyResult::Applied
+        ));
+        let net = update.pending_sell_payouts[0].payout_sats;
+        assert!(net > 0);
+        let undo = update
+            .apply_all_changes(
+                &state,
+                &mut rwtxn,
+                &mut diff,
+                &mut MarketUtxoChanges::default(),
+                1,
+            )?
+            .unwrap();
+        let after = state.markets().get_market(&rwtxn, &market.id)?.unwrap();
+        assert_eq!(after.total_volume_sats, market.total_volume_sats + net);
+        revert_consolidation(&state, &mut rwtxn, &mut diff, &undo)?;
+        let delta =
+            revert_trade_market_state(&state, &mut rwtxn, &mut diff, &trade)?;
+        disconnect_end(&state, &mut rwtxn, 1, &HashSet::new(), vec![delta])?;
+        let restored = state.markets().get_market(&rwtxn, &market.id)?.unwrap();
+        assert_eq!(restored.total_volume_sats, market.total_volume_sats);
+        assert_eq!(restored.outcome_volumes_sats, market.outcome_volumes_sats);
+        assert_eq!(restored.shares, market.shares);
+        state.markets().verify_share_invariant(&rwtxn, &market.id)?;
+        assert_eq!(state.get_utxos(&rwtxn)?, initial_utxos);
         Ok(())
     }
 
