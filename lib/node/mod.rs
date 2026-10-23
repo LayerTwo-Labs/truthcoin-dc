@@ -619,6 +619,10 @@ where
             .take(number)
             .collect();
         let mut fee = bitcoin::Amount::ZERO;
+        let next_height =
+            self.state.try_get_height(&rwtxn)?.map_or(0, |h| h + 1);
+        let sigops_limit = State::body_sigops_limit(next_height);
+        let mut sigops = 0;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
         let mut trades = TradeSimulation::default();
@@ -626,6 +630,11 @@ where
         // Outputs the transactions already taken for this block make.
         let mut block_outputs = HashMap::<OutPoint, Output>::new();
         for transaction in transactions {
+            let transaction_sigops = transaction.authorizations.len()
+                + usize::from(transaction.actor_proof.is_some());
+            if sigops + transaction_sigops > sigops_limit {
+                continue;
+            }
             let inputs: HashSet<_> =
                 transaction.transaction.inputs.iter().copied().collect();
             if !spent_utxos.is_disjoint(&inputs) {
@@ -725,6 +734,7 @@ where
                     .cloned(),
             );
             returned_transactions.push(filled_transaction);
+            sigops += transaction_sigops;
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok((returned_transactions, fee))

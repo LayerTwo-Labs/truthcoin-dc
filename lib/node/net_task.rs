@@ -1739,6 +1739,109 @@ mod test {
     }
 
     #[test]
+    fn block_selection_counts_actor_proofs() -> anyhow::Result<()> {
+        use crate::types::{
+            AuthorizedTransaction,
+            authorization::{self, Authorization, SigningKey},
+        };
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let mut rng = rand::rng();
+            let key = SigningKey::new(&mut rng);
+            let address = authorization::get_address(&(&key).into());
+            let mut rwtxn = node.env.write_txn()?;
+            let mut diff = AccumulatorDiff::default();
+            let mut transactions = Vec::new();
+            for index in 0_u32..1_000 {
+                let mut inputs = Vec::new();
+                for vout in 0..42 {
+                    let pointed = PointedOutput {
+                        outpoint: OutPoint::Regular {
+                            txid: hash(&index).into(),
+                            vout,
+                        },
+                        output: Output {
+                            address,
+                            content: OutputContent::Value(
+                                bitcoin::Amount::from_sat(1_000),
+                            ),
+                        },
+                    };
+                    node.state.utxos.put(
+                        &mut rwtxn,
+                        &OutPointKey::from(&pointed.outpoint),
+                        &pointed.output,
+                    )?;
+                    diff.insert((&pointed).into());
+                    inputs.push((pointed.outpoint, hash(&pointed)));
+                }
+                transactions.push(Transaction {
+                    inputs: inputs.into(),
+                    outputs: vec![Output {
+                        address,
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(41_000),
+                        ),
+                    }]
+                    .into(),
+                    ..Default::default()
+                });
+            }
+            let mut accumulator = Accumulator::default();
+            accumulator.apply_diff(diff)?;
+            node.state.utreexo_accumulator.put(
+                &mut rwtxn,
+                &(),
+                &accumulator,
+            )?;
+            for mut transaction in transactions {
+                let targets: Vec<_> = transaction
+                    .inputs
+                    .iter()
+                    .map(|(_, hash)| hash.into())
+                    .collect();
+                transaction.proof = accumulator.prove(&targets)?;
+                let authorization = Authorization {
+                    verifying_key: (&key).into(),
+                    signature: authorization::sign_tx(
+                        &mut rng,
+                        &key,
+                        &transaction,
+                    )?,
+                };
+                let transaction = AuthorizedTransaction {
+                    transaction,
+                    authorizations: vec![authorization.clone(); 42],
+                    actor_proof: Some(Box::new(authorization)),
+                };
+                node.mempool.put(&mut rwtxn, &transaction)?;
+            }
+            rwtxn.commit()?;
+
+            let (selected, fee) = node.get_transactions(1_000)?;
+            assert_eq!(selected.len(), state::State::body_sigops_limit(0) / 43);
+            assert_eq!(fee.to_sat(), selected.len() as u64 * 1_000);
+            let sigops: usize = selected
+                .iter()
+                .map(|tx| {
+                    tx.authorizations.len()
+                        + usize::from(tx.actor_proof.is_some())
+                })
+                .sum();
+            assert!(sigops <= state::State::body_sigops_limit(0));
+            assert!(sigops + 43 > state::State::body_sigops_limit(0));
+            assert_eq!(node.get_all_transactions()?.len(), 1_000);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn peer_transaction_conflicts_do_not_stop_net_task() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
