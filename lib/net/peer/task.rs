@@ -58,20 +58,16 @@ impl ConnectionTask {
         peer_tip_info: &TipInfo,
         peer_state_id: PeerStateId,
     ) -> Result<Option<bool>, blocking_task::TaskError> {
-        // If the peer's mainchain tip is not an ancestor of ours, then ignore
-        // the peer tip.
-        {
+        let peer_tip_main_height = {
             let rotxn = ctxt.env.read_txn()?;
-            if ctxt
-                .archive
-                .try_get_main_header_info(
+            let Some(peer_tip_main_header_info) =
+                ctxt.archive.try_get_main_header_info(
                     &rotxn,
                     &peer_tip_info.tip.main_block_hash,
                 )?
-                .is_none()
-            {
+            else {
                 return Ok(None);
-            }
+            };
             let side_tips_tip = ctxt
                 .archive
                 .side_tips()
@@ -89,7 +85,10 @@ impl ConnectionTask {
             )? {
                 return Ok(None);
             }
-        }
+            peer_tip_main_header_info.height
+        };
+        let headers_height =
+            peer_tip_info.block_height.min(peer_tip_main_height);
         // Check if the peer tip is better, requesting headers if necessary
         let Some(tip_info) = tip_info else {
             // No tip.
@@ -103,7 +102,7 @@ impl ConnectionTask {
                 let request = message::GetHeadersRequest {
                     start: HashSet::new(),
                     end: peer_tip_info.tip.block_hash,
-                    height: Some(peer_tip_info.block_height),
+                    height: Some(headers_height),
                     peer_state_id: Some(peer_state_id),
                 };
                 let _: bool = request_queue.send_request(request.into())?;
@@ -134,7 +133,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -175,7 +174,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -210,7 +209,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -264,7 +263,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -290,7 +289,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -350,7 +349,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
