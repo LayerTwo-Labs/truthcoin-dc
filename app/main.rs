@@ -11,6 +11,7 @@ mod app;
 mod cli;
 mod gui;
 mod line_buffer;
+mod rpc_auth;
 mod rpc_server;
 mod util;
 
@@ -184,6 +185,7 @@ fn run_egui_app(
     config: EguiAppConfig,
     line_buffer: LineBuffer,
     app: Result<crate::app::App, crate::app::Error>,
+    rpc_auth_token: Arc<str>,
 ) -> Result<(), eframe::Error> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -201,6 +203,7 @@ fn run_egui_app(
                 cc,
                 line_buffer,
                 rpc_addr,
+                rpc_auth_token,
                 config.network,
             )))
         }),
@@ -221,6 +224,10 @@ fn main() -> anyhow::Result<()> {
 
     let (app_tx, app_rx) = oneshot::channel::<anyhow::Error>();
 
+    let rpc_cookie_path = config.datadir.join(rpc_auth::COOKIE_FILE_NAME);
+    let rpc_auth_token: Arc<str> =
+        rpc_auth::load_or_create_cookie(&rpc_cookie_path)?.into();
+
     let app_config = app::Config {
         add_peers: config.add_peers,
         datadir: config.datadir,
@@ -238,12 +245,16 @@ fn main() -> anyhow::Result<()> {
         // spawn rpc server
         app.runtime.spawn({
             let app = app.clone();
+            let rpc_auth_token = rpc_auth_token.clone();
+            let rpc_cookie_path = rpc_cookie_path.clone();
             async move {
                 tracing::info!("starting RPC server at `{}`", config.rpc_addr);
                 if let Err(err) = rpc_server::run_server(
                     app,
                     config.private_rpc_addr,
                     config.rpc_addr,
+                    rpc_auth_token,
+                    &rpc_cookie_path,
                 )
                 .await
                 {
@@ -269,7 +280,7 @@ fn main() -> anyhow::Result<()> {
         };
         let _rt_guard = rt.enter();
         // For GUI mode we want the GUI to start, even if the app fails to start.
-        return run_egui_app(egui_app_config, line_buffer, app)
+        return run_egui_app(egui_app_config, line_buffer, app, rpc_auth_token)
             .map_err(|e| anyhow::anyhow!("failed to run egui app: {e:#}"));
     }
 
