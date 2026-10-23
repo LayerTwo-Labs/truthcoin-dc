@@ -83,6 +83,9 @@ ignore = [
     # quick-xml 0.30 (transitive via eframe -> accesskit_unix -> zbus_xml); fixed in 0.41, needs eframe bump
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.30 pinned by zbus_xml under eframe 0.31, no upgrade without eframe bump" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.30 pinned by zbus_xml under eframe 0.31, no upgrade without eframe bump" },
+    { id = "RUSTSEC-2026-0370", reason = "eframe 0.31 accessibility uses zvariant 4; removal depends on its migration to zbus 6" },
+    { id = "RUSTSEC-2026-0371", reason = "eframe 0.31 accessibility uses zbus_names 3; removal depends on its migration to zbus 6" },
+    { id = "RUSTSEC-2026-0372", reason = "eframe 0.31 accessibility uses zvariant_derive 4; removal depends on its migration to zbus 6" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
@@ -122,13 +125,12 @@ exceptions = [
     # Each entry is the crate and version constraint, and its specific allow
     # list
     { allow = ["CDLA-Permissive-2.0"], name = "webpki-root-certs", version = "0.26.11" },
-    { allow = ["CDLA-Permissive-2.0"], name = "webpki-root-certs", version = "1.0.5" },
-    { allow = ["CDLA-Permissive-2.0"], name = "webpki-roots", version = "1.0.5" },
+    { allow = ["CDLA-Permissive-2.0"], name = "webpki-root-certs", version = "1.0.10" },
+    { allow = ["CDLA-Permissive-2.0"], name = "webpki-roots", version = "1.0.10" },
     { allow = ["LicenseRef-UFL-1.0", "OFL-1.1", "Ubuntu-font-1.0"], name = "epaint_default_fonts", version = "0.31.0" },
     { allow = ["MPL-2.0"], name = "imbl", version = "7.0.2" },
     { allow = ["MPL-2.0"], name = "imbl-sized-chunks", version = "0.2.0" },
     { allow = ["MPL-2.0"], name = "option-ext", version = "0.2.0" },
-    { allow = ["MPL-2.0"], name = "webpki-roots", version = "0.25.4" },
     { allow = ["Zlib"], crate = "foldhash" },
     { allow = ["Zlib"], name = "slotmap", version = "1.0.7" },
     { allow = ["Zlib"], name = "slotmap", version = "1.1.1" },
