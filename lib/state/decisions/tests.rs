@@ -331,3 +331,39 @@ fn test_decision_id_standard_bit_encoding() {
     assert_eq!(std_id.period_index(), nonstd_id.period_index());
     assert_eq!(std_id.decision_index(), nonstd_id.decision_index());
 }
+
+#[test]
+fn category_claim_accepts_option_limit() {
+    let decision = Decision::new(
+        [0; 20],
+        DecisionType::Category {
+            options: vec![String::new(); usize::from(u16::MAX)],
+        },
+        String::new(),
+        String::new(),
+        None,
+        None,
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(decision.inconclusive_index(), Some(u16::MAX));
+}
+
+#[test]
+fn category_claim_rejects_excess_options() {
+    let result = Decision::new(
+        [0; 20],
+        DecisionType::Category {
+            options: vec![String::new(); usize::from(u16::MAX) + 1],
+        },
+        String::new(),
+        String::new(),
+        None,
+        None,
+        vec![],
+    );
+    assert!(matches!(
+        result,
+        Err(crate::state::Error::InvalidDecisionId { .. })
+    ));
+}

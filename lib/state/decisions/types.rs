@@ -95,6 +95,13 @@ impl Decision {
                             .to_string(),
                     });
                 }
+                if options.len() > usize::from(u16::MAX) {
+                    return Err(Error::InvalidDecisionId {
+                        reason:
+                            "Category decisions permit at most 65535 options"
+                                .to_string(),
+                    });
+                }
             }
         }
 
