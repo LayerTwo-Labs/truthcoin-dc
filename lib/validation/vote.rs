@@ -541,6 +541,44 @@ mod tests {
     }
 
     #[test]
+    fn categorical_vote_preserves_limit_indices() {
+        use crate::state::decisions::{Decision, DecisionType};
+
+        let decision = Decision::new(
+            [0; 20],
+            DecisionType::Category {
+                options: vec![String::new(); usize::from(u16::MAX)],
+            },
+            String::new(),
+            String::new(),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        for index in [u16::MAX - 1, u16::MAX] {
+            let value = f64::from(index);
+            assert!(
+                VoteValidator::validate_vote_value(&decision, value).is_ok()
+            );
+            assert_eq!(
+                VoteValidator::convert_vote_value_with_decision(
+                    value,
+                    Some(&decision),
+                ),
+                VoteValue::Categorical(index),
+            );
+        }
+        assert!(
+            VoteValidator::validate_vote_value(
+                &decision,
+                f64::from(u16::MAX) + 1.0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn categorical_vote_rejects_out_of_range() {
         use crate::state::decisions::{Decision, DecisionType};
 
