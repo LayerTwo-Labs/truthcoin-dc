@@ -33,7 +33,7 @@ pub fn prevalidate(
         return Err(Error::InvalidHeader(err));
     };
     let next_height = state.try_get_height(rotxn)?.map_or(0, |h| h + 1);
-    if body.authorizations.len() > State::body_sigops_limit(next_height) {
+    if sigops(body) > State::body_sigops_limit(next_height) {
         return Err(Error::TooManySigops);
     }
     let body_size =
@@ -351,7 +351,7 @@ pub fn validate(
         return Err(Error::InvalidHeader(err));
     };
     let height = state.try_get_height(rotxn)?.map_or(0, |height| height + 1);
-    if body.authorizations.len() > State::body_sigops_limit(height) {
+    if sigops(body) > State::body_sigops_limit(height) {
         return Err(Error::TooManySigops);
     }
     let body_size =
@@ -789,6 +789,10 @@ pub fn disconnect_tip(
     Ok(())
 }
 
+fn sigops(body: &Body) -> usize {
+    body.authorizations.len() + body.actor_proofs.iter().flatten().count()
+}
+
 /// Address that the actor proof of a transaction proves, if any
 fn actor_address(body: &Body, tx_idx: usize) -> Option<crate::types::Address> {
     body.actor_proofs
@@ -807,6 +811,89 @@ mod test {
         state::test::{fresh_state, value_output},
         types::FilledTransaction,
     };
+
+    #[test]
+    fn block_actor_proofs_obey_signature_limit() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::{
+            state::{Error, State},
+            types::{
+                Authorization, AuthorizedTransaction, Body, Header, OutPoint,
+                Transaction,
+                authorization::{self, BatchVerificationContext, SigningKey},
+            },
+        };
+
+        let (_temp_dir, env, state) =
+            fresh_state("block_actor_proofs_obey_signature_limit")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let mut rng = rand::rng();
+        let batch = BatchVerificationContext::new(&mut rng);
+        let key = SigningKey::new(&mut rng);
+        let transaction = Transaction::default();
+        let actor_proof = Authorization {
+            verifying_key: (&key).into(),
+            signature: authorization::sign_tx(&mut rng, &key, &transaction)?,
+        };
+        let authorized = AuthorizedTransaction {
+            transaction: transaction.clone(),
+            authorizations: Vec::new(),
+            actor_proof: Some(Box::new(actor_proof)),
+        };
+        let filled = FilledTransaction {
+            transaction,
+            spent_utxos: Vec::new(),
+            actor_address: None,
+        };
+        let rotxn = env.read_txn()?;
+        let body = Body::new(vec![authorized.clone()], Coinbase::default());
+        let header = Header {
+            merkle_root: Body::compute_merkle_root(&body.coinbase, &[filled])?,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: state.get_accumulator(&rotxn)?.get_roots(),
+        };
+        state.validate_block(&rotxn, &batch, &header, &body, &archive)?;
+        state.prevalidate_block(&rotxn, &batch, &header, &body, &archive)?;
+
+        let missing_outpoint = OutPoint::Regular {
+            txid: authorized.transaction.txid(),
+            vout: 0,
+        };
+        let limit = State::body_sigops_limit(0);
+        for count in [limit, limit + 1] {
+            let mut body =
+                Body::new(vec![authorized.clone(); count], Coinbase::default());
+            body.transactions[0].inputs =
+                vec![(missing_outpoint, [0; 32])].into();
+            assert!(borsh::object_length(&body)? <= State::body_size_limit(0));
+            let validation =
+                state.validate_block(&rotxn, &batch, &header, &body, &archive);
+            let prevalidation = state
+                .prevalidate_block(&rotxn, &batch, &header, &body, &archive);
+            if count == limit {
+                assert!(
+                    matches!(
+                        validation,
+                        Err(Error::NoUtxo(error)) if error.outpoint == missing_outpoint
+                    ),
+                    "the exact signature limit must reach the input check"
+                );
+                assert!(
+                    matches!(
+                        prevalidation,
+                        Err(Error::NoUtxo(error)) if error.outpoint == missing_outpoint
+                    ),
+                    "the exact signature limit must reach the input check"
+                );
+            } else {
+                assert!(matches!(validation, Err(Error::TooManySigops)));
+                assert!(matches!(prevalidation, Err(Error::TooManySigops)));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn genesis_reorg_replaces_reputation_credit() -> anyhow::Result<()> {
