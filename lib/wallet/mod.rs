@@ -603,7 +603,7 @@ impl Wallet {
             {
                 continue;
             }
-            if total > value {
+            if total > bitcoin::Amount::ZERO && total >= value {
                 break;
             }
             total = total
@@ -2014,6 +2014,64 @@ mod tests {
 
     fn value_of(output: &Output) -> u64 {
         output.get_value().to_sat()
+    }
+
+    #[test]
+    fn coin_selection_stops_at_the_requested_value() -> anyhow::Result<()> {
+        for (values, value, total, count, takes_unconfirmed) in [
+            (vec![1_000], 1_000, 1_000, 1, false),
+            (vec![1_000], 1_001, 3_000, 2, true),
+            (vec![0, 1_000], 0, 1_000, 2, false),
+        ] {
+            let temp_dir = temp_dir::TempDir::new()?;
+            let wallet = Wallet::new(temp_dir.path())?;
+            wallet.set_seed(&[4; 64])?;
+            let address = wallet.get_new_address()?;
+            let utxos = values
+                .into_iter()
+                .enumerate()
+                .map(|(index, sats)| {
+                    let outpoint = OutPoint::Regular {
+                        txid: [0; 32].into(),
+                        vout: index as u32,
+                    };
+                    let output = Output {
+                        address,
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(sats),
+                        ),
+                    };
+                    (outpoint, output)
+                })
+                .collect();
+            wallet.put_utxos(&utxos)?;
+            let unconfirmed = OutPoint::Regular {
+                txid: [1; 32].into(),
+                vout: 0,
+            };
+            wallet.set_mempool_view(
+                &HashMap::from([(
+                    unconfirmed,
+                    Output {
+                        address,
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(2_000),
+                        ),
+                    },
+                )]),
+                &HashSet::new(),
+            )?;
+
+            let selected =
+                wallet.select_coins(bitcoin::Amount::from_sat(value), true)?;
+            assert_eq!(selected.total.to_sat(), total);
+            assert_eq!(selected.coins.len(), count);
+            assert_eq!(
+                selected.unconfirmed.contains(&unconfirmed),
+                takes_unconfirmed,
+            );
+        }
+        Ok(())
     }
 
     #[test]
