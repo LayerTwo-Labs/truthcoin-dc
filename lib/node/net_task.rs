@@ -1924,6 +1924,152 @@ mod test {
     }
 
     #[test]
+    fn block_selection_skips_conflicting_votes() -> anyhow::Result<()> {
+        use crate::{
+            state::decisions::{Decision, DecisionId, DecisionType},
+            types::{
+                Authorization, AuthorizedTransaction, BallotItem, TxData,
+                authorization::{self, SigningKey},
+            },
+        };
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            for ballots in
+                [[false, false], [false, true], [true, false], [true, true]]
+            {
+                let (_temp_dir, node) = temp_node(&runtime)?;
+                node.task_handles.net.task.abort();
+                while !node.task_handles.net.task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                let mut rng = rand::rng();
+                let key = SigningKey::new(&mut rng);
+                let voter = authorization::get_address(&(&key).into());
+                let decisions = [
+                    DecisionId::new(false, 1, 0)?,
+                    DecisionId::new(false, 1, 1)?,
+                ];
+                let mut rwtxn = node.env.write_txn()?;
+                node.state
+                    .reputation()
+                    .set_reputation(&mut rwtxn, &voter, 1.0)?;
+                for decision_id in decisions {
+                    let decision = Decision::new(
+                        voter.0,
+                        DecisionType::Binary,
+                        String::new(),
+                        String::new(),
+                        None,
+                        None,
+                        vec![],
+                    )?;
+                    node.state.decisions().claim_decision(
+                        &mut rwtxn,
+                        decision_id,
+                        decision,
+                        [1; 32].into(),
+                        Some(0),
+                    )?;
+                    node.state.decisions().transition_decision_to_voting(
+                        &mut rwtxn,
+                        decision_id,
+                        1,
+                    )?;
+                }
+                let mut diff = AccumulatorDiff::default();
+                let mut transactions = Vec::new();
+                for (index, ballot) in
+                    ballots.into_iter().chain([true]).enumerate()
+                {
+                    let pointed = PointedOutput {
+                        outpoint: OutPoint::Regular {
+                            txid: hash(&index).into(),
+                            vout: 0,
+                        },
+                        output: Output {
+                            address: voter,
+                            content: OutputContent::Value(
+                                bitcoin::Amount::from_sat(1_000),
+                            ),
+                        },
+                    };
+                    node.state.utxos.put(
+                        &mut rwtxn,
+                        &OutPointKey::from(&pointed.outpoint),
+                        &pointed.output,
+                    )?;
+                    diff.insert((&pointed).into());
+                    let decision_id_bytes =
+                        decisions[usize::from(index == 2)].as_bytes();
+                    let data = if ballot {
+                        TxData::SubmitBallot {
+                            voter,
+                            voting_period: 2,
+                            votes: vec![BallotItem {
+                                decision_id_bytes,
+                                vote_value: 1.0,
+                            }],
+                        }
+                    } else {
+                        TxData::SubmitVote {
+                            voter,
+                            voting_period: 2,
+                            decision_id_bytes,
+                            vote_value: 0.0,
+                        }
+                    };
+                    transactions.push(Transaction {
+                        inputs: vec![(pointed.outpoint, hash(&pointed))].into(),
+                        data: Some(data),
+                        ..Default::default()
+                    });
+                }
+                let mut accumulator = Accumulator::default();
+                accumulator.apply_diff(diff)?;
+                node.state.utreexo_accumulator.put(
+                    &mut rwtxn,
+                    &(),
+                    &accumulator,
+                )?;
+                rwtxn.commit()?;
+                for transaction in transactions {
+                    let authorization = Authorization {
+                        verifying_key: (&key).into(),
+                        signature: authorization::sign_tx(
+                            &mut rng,
+                            &key,
+                            &transaction,
+                        )?,
+                    };
+                    node.submit_transaction(AuthorizedTransaction {
+                        transaction,
+                        authorizations: vec![authorization],
+                        actor_proof: None,
+                    })?;
+                }
+                let (selected, fee) = node.get_transactions(100)?;
+                assert_eq!(selected.len(), 2, "ballots {ballots:?}");
+                assert_eq!(fee.to_sat(), 2_000);
+                let keys: HashSet<_> = selected
+                    .iter()
+                    .flat_map(|tx| {
+                        crate::validation::vote::vote_keys(
+                            &tx.transaction.transaction,
+                        )
+                    })
+                    .collect();
+                assert_eq!(keys.len(), 2);
+                for decision in decisions {
+                    assert!(keys.contains(&(2, voter, decision.as_bytes())));
+                }
+                assert_eq!(node.get_all_transactions()?.len(), 3);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
     fn block_selection_counts_actor_proofs() -> anyhow::Result<()> {
         use crate::types::{
             AuthorizedTransaction,

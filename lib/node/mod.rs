@@ -658,6 +658,7 @@ where
         let mut sigops = 0;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
+        let mut selected_votes = HashSet::new();
         let mut trades = TradeSimulation::default();
         let mut reputation = HashMap::new();
         // Outputs the transactions already taken for this block make.
@@ -666,6 +667,11 @@ where
             let transaction_sigops = transaction.authorizations.len()
                 + usize::from(transaction.actor_proof.is_some());
             if sigops + transaction_sigops > sigops_limit {
+                continue;
+            }
+            if crate::validation::vote::vote_keys(&transaction.transaction)
+                .any(|key| selected_votes.contains(&key))
+            {
                 continue;
             }
             let inputs: HashSet<_> =
@@ -766,6 +772,9 @@ where
                     .iter()
                     .cloned(),
             );
+            selected_votes.extend(crate::validation::vote::vote_keys(
+                &filled_transaction.transaction.transaction,
+            ));
             returned_transactions.push(filled_transaction);
             sigops += transaction_sigops;
         }
