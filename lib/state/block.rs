@@ -124,6 +124,7 @@ pub fn prevalidate(
     }
     let () =
         crate::validation::check_duplicate_decision_claims(&body.transactions)?;
+    crate::validation::vote::check_duplicate_votes(&body.transactions)?;
     let computed_merkle_root = Body::compute_merkle_root(
         &body.coinbase,
         filled_transactions.as_slice(),
@@ -480,6 +481,7 @@ pub fn validate(
     }
     let () =
         crate::validation::check_duplicate_decision_claims(&body.transactions)?;
+    crate::validation::vote::check_duplicate_votes(&body.transactions)?;
     if coinbase_value > total_fees {
         return Err(Error::NotEnoughFees);
     }
@@ -1350,6 +1352,124 @@ mod test {
                 .is_err(),
             "prevalidate must reject the same body",
         );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_signed_votes_in_block_are_rejected() -> anyhow::Result<()> {
+        use crate::{
+            state::decisions::{Decision, DecisionId, DecisionType},
+            types::{
+                Authorization, AuthorizedTransaction, Body, Header,
+                Transaction, TxData,
+                authorization::{self, BatchVerificationContext, SigningKey},
+            },
+        };
+        use bitcoin::hashes::Hash as _;
+        let (_dir, env, state) = fresh_state("duplicate_votes")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let mut rng = rand::rng();
+        let key = SigningKey::new(&mut rng);
+        let voter = authorization::get_address(&(&key).into());
+        let decision_id = DecisionId::new(false, 1, 0)?;
+        let decision = Decision::new(
+            [0; 20],
+            DecisionType::Binary,
+            String::new(),
+            String::new(),
+            None,
+            None,
+            vec![],
+        )?;
+        let mut txn = env.write_txn()?;
+        let timestamp =
+            1000 + u64::from(state.decisions().get_config().quantity);
+        state.genesis_timestamp.put(&mut txn, &(), &1000)?;
+        state.mainchain_timestamp.put(&mut txn, &(), &timestamp)?;
+        state.height.put(&mut txn, &(), &10)?;
+        state.reputation().set_reputation(&mut txn, &voter, 1.0)?;
+        state
+            .decisions()
+            .mint_genesis(&mut txn, timestamp, 10, 1000)?;
+        state.decisions().claim_decision(
+            &mut txn,
+            decision_id,
+            decision,
+            crate::types::Txid([1; 32]),
+            Some(0),
+        )?;
+        state.decisions().transition_decision_to_voting(
+            &mut txn,
+            decision_id,
+            1,
+        )?;
+        for ballots in
+            [[false, false], [false, true], [true, false], [true, true]]
+        {
+            let mut txs = vec![];
+            let mut filled = vec![];
+            for (value, ballot) in [0.0, 1.0].into_iter().zip(ballots) {
+                let transaction = Transaction {
+                    data: Some(if ballot {
+                        TxData::SubmitBallot {
+                            voter,
+                            voting_period: 2,
+                            votes: vec![crate::types::BallotItem {
+                                decision_id_bytes: decision_id.as_bytes(),
+                                vote_value: value,
+                            }],
+                        }
+                    } else {
+                        TxData::SubmitVote {
+                            voter,
+                            decision_id_bytes: decision_id.as_bytes(),
+                            vote_value: value,
+                            voting_period: 2,
+                        }
+                    }),
+                    ..Default::default()
+                };
+                let proof = Authorization {
+                    verifying_key: (&key).into(),
+                    signature: authorization::sign_tx(
+                        &mut rng,
+                        &key,
+                        &transaction,
+                    )?,
+                };
+                filled.push(FilledTransaction {
+                    transaction: transaction.clone(),
+                    spent_utxos: vec![],
+                    actor_address: Some(voter),
+                });
+                txs.push(AuthorizedTransaction {
+                    transaction,
+                    authorizations: vec![],
+                    actor_proof: Some(Box::new(proof)),
+                });
+            }
+            let body = Body::new(txs, Coinbase::default());
+            let header = Header {
+                merkle_root: Body::compute_merkle_root(
+                    &body.coinbase,
+                    &filled,
+                )?,
+                prev_side_hash: None,
+                prev_main_hash: bitcoin::BlockHash::all_zeros(),
+                roots: state.get_accumulator(&txn)?.get_roots(),
+            };
+            let batch = BatchVerificationContext::new(&mut rng);
+            let validation =
+                state.validate_block(&txn, &batch, &header, &body, &archive);
+            let prevalidation =
+                state.prevalidate_block(&txn, &batch, &header, &body, &archive);
+            assert!(
+                matches!(validation, Err(crate::state::Error::InvalidTransaction { reason }) if reason == "Duplicate vote in block")
+            );
+            assert!(
+                matches!(prevalidation, Err(crate::state::Error::InvalidTransaction { reason }) if reason == "Duplicate vote in block")
+            );
+        }
         Ok(())
     }
 }
