@@ -734,12 +734,20 @@ where
                 &block_outputs,
                 transaction,
             )?;
-            match trades.apply(
+            let trade_result = match trades.apply(
                 &self.state,
                 &self.archive,
                 &rwtxn,
                 &filled_transaction.transaction,
-            )? {
+            ) {
+                Ok(result) => result,
+                // Invalid candidates leave pending trade state unchanged.
+                Err(state::Error::InvalidTransaction { reason }) => {
+                    TradeApplyResult::Skipped { reason }
+                }
+                Err(err) => return Err(err.into()),
+            };
+            match trade_result {
                 TradeApplyResult::Applied => (),
                 TradeApplyResult::Skipped { reason } => {
                     tracing::debug!(
@@ -1260,7 +1268,11 @@ where
         };
 
         let mut new_shares = current_shares.clone();
-        new_shares[outcome_index as usize] += shares_to_buy;
+        new_shares[outcome_index as usize] = new_shares[outcome_index as usize]
+            .checked_add(shares_to_buy)
+            .ok_or_else(|| state::Error::InvalidTransaction {
+                reason: "Mempool share count overflow".to_string(),
+            })?;
 
         let beta = self.derive_market_beta(&market)?;
         trading::validate_lmsr_parameters(beta, &new_shares).map_err(|e| {

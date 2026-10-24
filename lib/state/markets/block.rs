@@ -1888,7 +1888,11 @@ fn apply_trade(
         running_market_state(&trade.market_id, &market, state_update);
 
     let mut new_shares = effective_shares.clone();
-    new_shares[outcome_index] += trade.shares;
+    new_shares[outcome_index] = new_shares[outcome_index]
+        .checked_add(trade.shares)
+        .ok_or_else(|| Error::InvalidTransaction {
+            reason: "Market share count overflow".to_string(),
+        })?;
 
     if new_shares[outcome_index] < 0 {
         return Err(Error::InvalidTransaction {
@@ -2789,6 +2793,80 @@ mod tests {
                 == [MarketUtxoReason::Treasury, MarketUtxoReason::AuthorFee],
             "deletes: {:?}",
             reasons(&changes.deletes)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trade_rejects_share_overflow() -> anyhow::Result<()> {
+        let TradingFixture {
+            env,
+            state,
+            archive,
+            market,
+            tip,
+            ..
+        } = trading_fixture();
+        let trade = filled_tx(
+            TxData::Trade {
+                market_id: market.id,
+                outcome_index: 1,
+                shares: i64::MAX,
+                trader: Address::ALL_ZEROS,
+                limit_sats: 1_000,
+                tx_pow_nonce: None,
+                prev_block_hash: tip,
+            },
+            1_000,
+        );
+        let rotxn = env.read_txn()?;
+        crate::validation::MarketValidator::validate_trade(
+            &state, &archive, &rotxn, &trade, None,
+        )?;
+        assert!(
+            TradeSimulation::default()
+                .apply(&state, &archive, &rotxn, &trade)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trade_rejects_cost_overflow() -> anyhow::Result<()> {
+        let TradingFixture {
+            env,
+            state,
+            archive,
+            mut market,
+            tip,
+            ..
+        } = trading_fixture();
+        market.trading_fee = 1.0;
+        market.liquidity_base_sats = 1;
+        market.shares.fill(0);
+        let mut rwtxn = env.write_txn()?;
+        state.markets().update_market(&mut rwtxn, &market)?;
+        rwtxn.commit()?;
+        let trade = filled_tx(
+            TxData::Trade {
+                market_id: market.id,
+                outcome_index: 0,
+                shares: i64::MAX,
+                trader: Address::ALL_ZEROS,
+                limit_sats: 1_000,
+                tx_pow_nonce: None,
+                prev_block_hash: tip,
+            },
+            1_000,
+        );
+        let rotxn = env.read_txn()?;
+        crate::validation::MarketValidator::validate_trade(
+            &state, &archive, &rotxn, &trade, None,
+        )?;
+        assert!(
+            TradeSimulation::default()
+                .apply(&state, &archive, &rotxn, &trade)
+                .is_err()
         );
         Ok(())
     }

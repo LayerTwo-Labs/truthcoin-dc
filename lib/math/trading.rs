@@ -84,7 +84,9 @@ pub fn calculate_buy_cost(
     let calculated_fee_sats = to_sats(fee_f64, Rounding::Nearest)?;
     let trading_fee_sats = calculated_fee_sats.max(MIN_TRADING_FEE_SATS);
 
-    let total_cost_sats = base_cost_sats + trading_fee_sats;
+    let total_cost_sats = base_cost_sats
+        .checked_add(trading_fee_sats)
+        .ok_or(SatoshiError::Overflow(base_cost_f64 + fee_f64))?;
 
     Ok(BuyCost {
         base_cost_sats,
