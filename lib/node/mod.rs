@@ -29,9 +29,10 @@ use crate::{
     },
     types::{
         Accumulator, Address, AmountUnderflowError, Authorized,
-        AuthorizedTransaction, BlockHash, BmmResult, Body, FilledTransaction,
-        Header, InPoint, MainchainSyncProgress, Network, OutPoint, OutPointKey,
-        Output, SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
+        AuthorizedTransaction, BlockHash, BmmResult, Body, Coinbase,
+        FilledTransaction, Header, InPoint, MainchainSyncProgress, Network,
+        OutPoint, OutPointKey, Output, OutputContent, SpentOutput, Tip,
+        Transaction, TxIn, Txid, WithdrawalBundle,
         authorization::{BatchVerificationContext, rand_core::CryptoRng},
         net::{Peer, PeerAddress, ResolvedPeerAddress},
         proto::{self, mainchain},
@@ -619,12 +620,48 @@ where
             .take(number)
             .collect();
         let mut fee = bitcoin::Amount::ZERO;
+        let next_height =
+            self.state.try_get_height(&rwtxn)?.map_or(0, |h| h + 1);
+        let sigops_limit = State::body_sigops_limit(next_height);
+        let mut sigops = 0;
+        let size_limit = State::body_size_limit(next_height);
+        // The block template uses at most one value output and no memo.
+        let mut body_size = borsh::object_length(&Body::new(
+            Vec::new(),
+            Coinbase {
+                memo: Vec::new(),
+                outputs: vec![Output {
+                    address: Address::ALL_ZEROS,
+                    content: OutputContent::Value(bitcoin::Amount::ZERO),
+                }]
+                .into(),
+            },
+        ))
+        .map_err(state::Error::BorshSerialize)?;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
+        let mut selected_votes = HashSet::new();
         let mut trades = TradeSimulation::default();
         // Outputs the transactions already taken for this block make.
         let mut block_outputs = HashMap::<OutPoint, Output>::new();
         for transaction in transactions {
+            let transaction_sigops = transaction.authorizations.len()
+                + usize::from(transaction.actor_proof.is_some());
+            if sigops + transaction_sigops > sigops_limit {
+                continue;
+            }
+            // The body has one authorization vector for all transactions.
+            let transaction_size = borsh::object_length(&transaction)
+                .map_err(state::Error::BorshSerialize)?
+                - std::mem::size_of::<u32>();
+            if body_size + transaction_size > size_limit {
+                continue;
+            }
+            if crate::validation::vote::vote_keys(&transaction.transaction)
+                .any(|key| selected_votes.contains(&key))
+            {
+                continue;
+            }
             let inputs: HashSet<_> =
                 transaction.transaction.inputs.iter().copied().collect();
             if !spent_utxos.is_disjoint(&inputs) {
@@ -663,12 +700,20 @@ where
                 &block_outputs,
                 transaction,
             )?;
-            match trades.apply(
+            let trade_result = match trades.apply(
                 &self.state,
                 &self.archive,
                 &rwtxn,
                 &filled_transaction.transaction,
-            )? {
+            ) {
+                Ok(result) => result,
+                // Invalid candidates leave pending trade state unchanged.
+                Err(state::Error::InvalidTransaction { reason }) => {
+                    TradeApplyResult::Skipped { reason }
+                }
+                Err(err) => return Err(err.into()),
+            };
+            match trade_result {
                 TradeApplyResult::Applied => (),
                 TradeApplyResult::Skipped { reason } => {
                     tracing::debug!(
@@ -698,7 +743,12 @@ where
                     .iter()
                     .cloned(),
             );
+            selected_votes.extend(crate::validation::vote::vote_keys(
+                &filled_transaction.transaction.transaction,
+            ));
             returned_transactions.push(filled_transaction);
+            sigops += transaction_sigops;
+            body_size += transaction_size;
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok((returned_transactions, fee))
@@ -1159,7 +1209,11 @@ where
         };
 
         let mut new_shares = current_shares.clone();
-        new_shares[outcome_index as usize] += shares_to_buy;
+        new_shares[outcome_index as usize] = new_shares[outcome_index as usize]
+            .checked_add(shares_to_buy)
+            .ok_or_else(|| state::Error::InvalidTransaction {
+                reason: "Mempool share count overflow".to_string(),
+            })?;
 
         let beta = self.derive_market_beta(&market)?;
         trading::validate_lmsr_parameters(beta, &new_shares).map_err(|e| {

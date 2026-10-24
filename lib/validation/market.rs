@@ -109,6 +109,7 @@ impl MarketValidator {
         }
 
         let mut seen_decisions = HashSet::new();
+        let mut outcome_counts = Vec::with_capacity(dimension_specs.len());
         for spec in dimension_specs {
             let decision_id = match spec {
                 DimensionSpec::Single(id) | DimensionSpec::Categorical(id) => {
@@ -125,9 +126,11 @@ impl MarketValidator {
             }
 
             if let Some(ty) = pending_types.get(decision_id) {
+                let mut outcome_count = 2;
                 if let DimensionSpec::Categorical(_) = spec {
                     match ty {
                         DecisionType::Category { options } => {
+                            outcome_count = options.len();
                             if options.len() < 2 {
                                 return Err(Error::InvalidTransaction {
                                     reason: "Categorical dimensions \
@@ -147,6 +150,7 @@ impl MarketValidator {
                         }
                     }
                 }
+                outcome_counts.push(outcome_count);
                 continue;
             }
 
@@ -166,6 +170,7 @@ impl MarketValidator {
                     ),
                 })?;
 
+            let mut outcome_count = 2;
             if let DimensionSpec::Categorical(_) = spec {
                 if !decision.is_categorical() {
                     return Err(Error::InvalidTransaction {
@@ -175,6 +180,7 @@ impl MarketValidator {
                     });
                 }
                 let option_count = decision.option_count().unwrap_or(0);
+                outcome_count = option_count;
                 if option_count < 2 {
                     return Err(Error::InvalidTransaction {
                         reason:
@@ -183,7 +189,16 @@ impl MarketValidator {
                     });
                 }
             }
+            outcome_counts.push(outcome_count);
         }
+
+        let outcome_count =
+            crate::math::markets::outcome_space_size(&outcome_counts)
+                .filter(|count| *count <= crate::math::lmsr::MAX_OUTCOMES)
+                .ok_or_else(|| Error::InvalidTransaction {
+                    reason: "Market outcome count exceeds the limit"
+                        .to_string(),
+                })?;
 
         if let Some(fee) = view.trading_fee
             && (!(0.0..=1.0).contains(&fee))
@@ -258,18 +273,21 @@ impl MarketValidator {
             });
         }
 
-        if total_listing_fee > 0 {
-            let tx_fee = crate::validation::tx_fee(tx)?;
-            if tx_fee.to_sat() < total_listing_fee {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Insufficient listing fee for new claims: tx fee \
-                         is {} sats but listing fees require {} sats",
-                        tx_fee.to_sat(),
-                        total_listing_fee
-                    ),
-                });
-            }
+        let storage_fee =
+            crate::math::markets::market_storage_fee(outcome_count);
+        let total_fee =
+            total_listing_fee.checked_add(storage_fee).ok_or_else(|| {
+                Error::InvalidTransaction {
+                    reason: "Market fee overflow".to_string(),
+                }
+            })?;
+        let tx_fee = crate::validation::tx_fee(tx)?.to_sat();
+        if tx_fee < total_fee {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Market fee is {tx_fee} sats but must be at least {total_fee} sats"
+                ),
+            });
         }
 
         Ok(())
@@ -893,6 +911,126 @@ mod tests {
                 None
             )
             .is_err()
+        );
+    }
+    fn check_market_fee(decision_type: DecisionType, new_claim: bool) {
+        use crate::types::{ClaimDecisionPayload, DecisionClaimEntry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
+        options.map_size(16 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
+        let state = State::new(&env, None).unwrap();
+        let maker = Address([7; 20]);
+        let decision_id = DecisionId::new(true, 1, 0).unwrap();
+        let labels = match &decision_type {
+            DecisionType::Category { options } => Some(options.clone()),
+            _ => None,
+        };
+        let spec = if labels.is_some() {
+            DimensionSpec::Categorical(decision_id)
+        } else {
+            DimensionSpec::Single(decision_id)
+        };
+        let outcome_count = labels.as_ref().map_or(2, Vec::len);
+        let mut rwtxn = env.write_txn().unwrap();
+        state.decisions().mint_genesis(&mut rwtxn, 0, 0, 0).unwrap();
+        let claim_fee = if new_claim {
+            state
+                .decisions()
+                .fee_for_decision_id(&rwtxn, decision_id)
+                .unwrap()
+        } else {
+            state
+                .decisions()
+                .claim_decision(
+                    &mut rwtxn,
+                    decision_id,
+                    Decision::new(
+                        maker.0,
+                        decision_type.clone(),
+                        "decision".into(),
+                        String::new(),
+                        None,
+                        None,
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    Txid::default(),
+                    Some(0),
+                )
+                .unwrap();
+            0
+        };
+        rwtxn.commit().unwrap();
+        let specs = vec![spec];
+        let treasury = generate_market_treasury_address(&compute_market_id(
+            "title", "", &maker, &specs,
+        ));
+        let mut tx = create_market_tx(maker, specs, treasury);
+        if new_claim {
+            let Some(TransactionData::CreateMarket { new_claims, .. }) =
+                &mut tx.transaction.data
+            else {
+                unreachable!()
+            };
+            new_claims.push(ClaimDecisionPayload {
+                decision_type,
+                decisions: vec![DecisionClaimEntry {
+                    decision_id_bytes: decision_id.as_bytes(),
+                    header: "decision".into(),
+                    description: String::new(),
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: labels,
+                    tags: None,
+                }],
+            });
+        }
+        let storage_fee =
+            crate::math::markets::market_storage_fee(outcome_count);
+        let fee = storage_fee + claim_fee;
+        let rotxn = env.read_txn().unwrap();
+        for paid in [fee, fee - 1, claim_fee] {
+            tx.spent_utxos[0].content =
+                OutputContent::Value(bitcoin::Amount::from_sat(10_000 + paid));
+            let result = MarketValidator::validate_market_creation(
+                &state,
+                &rotxn,
+                &tx,
+                Some(0),
+            );
+            assert_eq!(result.is_ok(), paid == fee, "paid {paid}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn market_storage_fee_exact_and_below() {
+        check_market_fee(DecisionType::Binary, false);
+    }
+
+    #[test]
+    fn market_category_storage_fee_uses_option_count() {
+        check_market_fee(
+            DecisionType::Category {
+                options: vec!["a".into(), "b".into(), "c".into()],
+            },
+            false,
+        );
+    }
+
+    #[test]
+    fn market_fee_includes_new_claim_fee() {
+        check_market_fee(DecisionType::Binary, true);
+    }
+
+    #[test]
+    fn market_new_category_fee_uses_option_count() {
+        check_market_fee(
+            DecisionType::Category {
+                options: vec!["a".into(), "b".into(), "c".into()],
+            },
+            true,
         );
     }
 }

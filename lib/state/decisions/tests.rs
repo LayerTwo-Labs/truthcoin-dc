@@ -331,3 +331,129 @@ fn test_decision_id_standard_bit_encoding() {
     assert_eq!(std_id.period_index(), nonstd_id.period_index());
     assert_eq!(std_id.decision_index(), nonstd_id.decision_index());
 }
+
+#[test]
+fn category_claim_accepts_option_limit() {
+    let decision = Decision::new(
+        [0; 20],
+        DecisionType::Category {
+            options: vec![String::new(); usize::from(u16::MAX)],
+        },
+        String::new(),
+        String::new(),
+        None,
+        None,
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(decision.inconclusive_index(), Some(u16::MAX));
+}
+
+#[test]
+fn category_claim_rejects_excess_options() {
+    let result = Decision::new(
+        [0; 20],
+        DecisionType::Category {
+            options: vec![String::new(); usize::from(u16::MAX) + 1],
+        },
+        String::new(),
+        String::new(),
+        None,
+        None,
+        vec![],
+    );
+    assert!(matches!(
+        result,
+        Err(crate::state::Error::InvalidDecisionId { .. })
+    ));
+}
+
+fn check_claim_rollback(direct: bool) -> anyhow::Result<()> {
+    use crate::state::test::fresh_state;
+
+    let (_clean_dir, clean_env, clean_state) =
+        fresh_state("claim_rollback_clean")?;
+    let (_reorg_dir, reorg_env, reorg_state) =
+        fresh_state("claim_rollback_reorg")?;
+    let mut clean_txn = clean_env.write_txn()?;
+    let mut reorg_txn = reorg_env.write_txn()?;
+    let clean = clean_state.decisions();
+    let reorg = reorg_state.decisions();
+    clean.mint_genesis(&mut clean_txn, 1000, 0, 1000)?;
+    reorg.mint_genesis(&mut reorg_txn, 1000, 0, 1000)?;
+
+    let claim_id = DecisionId::new(true, 20, 0)?;
+    let decision = make_binary_decision();
+    reorg.snapshot_period_pricing(&mut reorg_txn, 1)?;
+    reorg.validate_decision_claim(
+        &reorg_txn,
+        claim_id,
+        &decision,
+        1000,
+        Some(1),
+        1000,
+    )?;
+    reorg.claim_decision(
+        &mut reorg_txn,
+        claim_id,
+        decision.clone(),
+        crate::types::Txid([1; 32]),
+        Some(1),
+    )?;
+    reorg.process_block_pricing(&mut reorg_txn, 1, 1000, 1000)?;
+    if direct {
+        reorg.revert_decision_claim(&mut reorg_txn, claim_id)?;
+    }
+    reorg.rollback_decision_states_to_height(&mut reorg_txn, 0)?;
+    reorg.delete_periods_above(&mut reorg_txn, 20)?;
+    reorg.restore_period_pricing_undo(&mut reorg_txn, 1)?;
+
+    clean.process_block_pricing(&mut clean_txn, 1, 1000, 1000)?;
+    reorg.process_block_pricing(&mut reorg_txn, 1, 1000, 1000)?;
+    let next_claim = DecisionId::new(true, 19, 10)?;
+    let clean_accepts = clean
+        .validate_decision_claim(
+            &clean_txn,
+            next_claim,
+            &decision,
+            1000,
+            Some(1),
+            1000,
+        )
+        .is_ok();
+    let reorg_accepts = reorg
+        .validate_decision_claim(
+            &reorg_txn,
+            next_claim,
+            &decision,
+            1000,
+            Some(1),
+            1000,
+        )
+        .is_ok();
+    assert!(!clean_accepts);
+    assert_eq!(clean_accepts, reorg_accepts);
+    for period in 1..=20 {
+        assert_eq!(
+            clean.get_period_pricing(&clean_txn, period)?,
+            reorg.get_period_pricing(&reorg_txn, period)?,
+            "Period {period}"
+        );
+    }
+    assert_eq!(
+        clean.get_highest_minted_period(&clean_txn)?,
+        reorg.get_highest_minted_period(&reorg_txn)?
+    );
+    assert!(reorg.get_decision_entry(&reorg_txn, claim_id)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn claim_reorg_preserves_period_and_prices() -> anyhow::Result<()> {
+    check_claim_rollback(true)
+}
+
+#[test]
+fn state_rollback_preserves_period_and_prices() -> anyhow::Result<()> {
+    check_claim_rollback(false)
+}
