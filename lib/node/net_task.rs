@@ -1885,6 +1885,113 @@ mod test {
     }
 
     #[test]
+    fn block_selection_obeys_body_size_limit() -> anyhow::Result<()> {
+        use crate::types::{
+            AuthorizedTransaction, Body, Coinbase,
+            authorization::{self, Authorization, SigningKey},
+        };
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let mut rng = rand::rng();
+            let key = SigningKey::new(&mut rng);
+            let address = authorization::get_address(&(&key).into());
+            let mut rwtxn = node.env.write_txn()?;
+            let mut diff = AccumulatorDiff::default();
+            let mut transactions = Vec::new();
+            for index in 0_u32..100 {
+                let pointed = PointedOutput {
+                    outpoint: OutPoint::Regular {
+                        txid: hash(&index).into(),
+                        vout: 0,
+                    },
+                    output: Output {
+                        address,
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(1_000),
+                        ),
+                    },
+                };
+                node.state.utxos.put(
+                    &mut rwtxn,
+                    &OutPointKey::from(&pointed.outpoint),
+                    &pointed.output,
+                )?;
+                diff.insert((&pointed).into());
+                transactions.push(Transaction {
+                    inputs: vec![(pointed.outpoint, hash(&pointed))].into(),
+                    outputs: vec![
+                        Output {
+                            address,
+                            content: OutputContent::Value(
+                                bitcoin::Amount::ZERO
+                            ),
+                        };
+                        3_000
+                    ]
+                    .into(),
+                    ..Default::default()
+                });
+            }
+            let mut accumulator = Accumulator::default();
+            accumulator.apply_diff(diff)?;
+            node.state.utreexo_accumulator.put(
+                &mut rwtxn,
+                &(),
+                &accumulator,
+            )?;
+            rwtxn.commit()?;
+            for (index, transaction) in transactions.into_iter().enumerate() {
+                let authorization = Authorization {
+                    verifying_key: (&key).into(),
+                    signature: authorization::sign_tx(
+                        &mut rng,
+                        &key,
+                        &transaction,
+                    )?,
+                };
+                let transaction = AuthorizedTransaction {
+                    transaction,
+                    actor_proof: (index % 2 == 0)
+                        .then(|| Box::new(authorization.clone())),
+                    authorizations: vec![authorization],
+                };
+                assert!(bincode::serialized_size(&transaction)? < 100 * 1024);
+                node.submit_transaction(transaction)?;
+            }
+            let all =
+                Body::new(node.get_all_transactions()?, Coinbase::default());
+            let limit = state::State::body_size_limit(0);
+            assert_eq!(all.transactions.len(), 100);
+            assert!(borsh::object_length(&all)? > limit);
+
+            let (selected, fee) = node.get_transactions(1_000)?;
+            assert!(!selected.is_empty());
+            let body = Body::new(
+                selected.into_iter().map(Into::into).collect(),
+                Coinbase {
+                    memo: Vec::new(),
+                    outputs: vec![Output {
+                        address,
+                        content: OutputContent::Value(fee),
+                    }]
+                    .into(),
+                },
+            );
+            let size = borsh::object_length(&body)?;
+            assert!(size <= limit, "Body size {size} exceeds limit {limit}");
+            assert!(body.transactions.len() < 100);
+            assert_eq!(node.get_all_transactions()?.len(), 100);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn block_selection_counts_actor_proofs() -> anyhow::Result<()> {
         use crate::types::{
             AuthorizedTransaction,
