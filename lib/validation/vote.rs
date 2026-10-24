@@ -2,6 +2,51 @@ use crate::state::Error;
 use crate::types::FilledTransaction;
 use sneed::RoTxn;
 
+pub(crate) fn vote_keys(
+    transaction: &crate::types::Transaction,
+) -> impl Iterator<Item = (u32, crate::types::Address, [u8; 3])> + '_ {
+    use crate::types::TxData;
+
+    let single = match &transaction.data {
+        Some(TxData::SubmitVote {
+            voter,
+            decision_id_bytes,
+            voting_period,
+            ..
+        }) => Some((*voting_period, *voter, *decision_id_bytes)),
+        _ => None,
+    };
+    let ballot = match &transaction.data {
+        Some(TxData::SubmitBallot {
+            voter,
+            votes,
+            voting_period,
+        }) => Some((*voting_period, *voter, votes.as_slice())),
+        _ => None,
+    };
+    single.into_iter().chain(ballot.into_iter().flat_map(
+        |(period, voter, votes)| {
+            votes
+                .iter()
+                .map(move |vote| (period, voter, vote.decision_id_bytes))
+        },
+    ))
+}
+
+pub(crate) fn check_duplicate_votes(
+    transactions: &[crate::types::Transaction],
+) -> Result<(), Error> {
+    let mut seen = std::collections::HashSet::new();
+    for key in transactions.iter().flat_map(vote_keys) {
+        if !seen.insert(key) {
+            return Err(Error::InvalidTransaction {
+                reason: "Duplicate vote in block".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub struct VoteValidator;
 
 impl VoteValidator {
@@ -773,5 +818,67 @@ mod tests {
             &ballot(period + 1),
             None,
         ));
+    }
+    #[test]
+    fn distinct_block_vote_keys_are_accepted() {
+        use crate::types::{Address, BallotItem, Transaction, TxData};
+
+        let voter = Address([1; 20]);
+        let first = [1, 0, 0];
+        let second = [1, 0, 1];
+        let transactions = vec![
+            Transaction {
+                data: Some(TxData::SubmitVote {
+                    voter,
+                    decision_id_bytes: first,
+                    vote_value: 0.0,
+                    voting_period: 2,
+                }),
+                ..Default::default()
+            },
+            Transaction {
+                data: Some(TxData::SubmitBallot {
+                    voter,
+                    voting_period: 2,
+                    votes: vec![BallotItem {
+                        decision_id_bytes: second,
+                        vote_value: 1.0,
+                    }],
+                }),
+                ..Default::default()
+            },
+            Transaction {
+                data: Some(TxData::SubmitVote {
+                    voter: Address([2; 20]),
+                    decision_id_bytes: first,
+                    vote_value: 1.0,
+                    voting_period: 2,
+                }),
+                ..Default::default()
+            },
+            Transaction::default(),
+        ];
+        super::check_duplicate_votes(&transactions).unwrap();
+    }
+
+    #[test]
+    fn repeated_ballot_item_is_rejected() {
+        use crate::types::{Address, BallotItem, Transaction, TxData};
+
+        let transaction = Transaction {
+            data: Some(TxData::SubmitBallot {
+                voter: Address([1; 20]),
+                voting_period: 2,
+                votes: vec![
+                    BallotItem {
+                        decision_id_bytes: [1, 0, 0],
+                        vote_value: 0.0
+                    };
+                    2
+                ],
+            }),
+            ..Default::default()
+        };
+        assert!(super::check_duplicate_votes(&[transaction]).is_err());
     }
 }
