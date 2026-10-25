@@ -20,14 +20,14 @@ use truthcoin_dc_types::{
 struct JsonParser<T>(PhantomData<T>);
 
 impl<T> JsonParser<T> {
-    fn parse(
-        s: &str,
-    ) -> Result<T, serde_path_to_error::Error<serde_json::Error>>
+    fn parse(s: &str) -> anyhow::Result<T>
     where
         T: serde::de::DeserializeOwned,
     {
         let mut deserializer = serde_json::Deserializer::from_str(s);
-        serde_path_to_error::deserialize(&mut deserializer)
+        let value = serde_path_to_error::deserialize(&mut deserializer)?;
+        deserializer.end()?;
+        Ok(value)
     }
 }
 
@@ -1410,19 +1410,58 @@ mod tests {
     #[test]
     fn parse_create_transfer_many() {
         let address = Address([1u8; 20]);
-        let cli = Cli::parse_from([
+        for suffix in ["", " \t\r\n"] {
+            let cli = Cli::parse_from([
+                "truthcoin-cli",
+                "create-transfer-many",
+                &format!("{{\"{address}\": 1000}}{suffix}"),
+                "--fee-sats",
+                "500",
+            ]);
+            let Command::CreateTransferMany { dests, fee_sats } = cli.command
+            else {
+                panic!("the command is not create-transfer-many");
+            };
+            assert_eq!(dests.0, BTreeMap::from([(address, 1000)]));
+            assert_eq!(fee_sats, 500);
+        }
+    }
+
+    #[test]
+    fn refuse_a_second_transfer_map() {
+        let address = Address([1u8; 20]);
+        let other_address = Address([2u8; 20]);
+        let result = Cli::try_parse_from([
             "truthcoin-cli",
             "create-transfer-many",
-            &format!("{{\"{address}\": 1000}}"),
+            &format!("{{\"{address}\": 1000}} {{\"{other_address}\": 2000}}"),
             "--fee-sats",
             "500",
         ]);
-        let Command::CreateTransferMany { dests, fee_sats } = cli.command
-        else {
-            panic!("expected create-transfer-many");
-        };
-        assert_eq!(dests.0, BTreeMap::from([(address, 1000)]));
-        assert_eq!(fee_sats, 500);
+        assert!(result.is_err(), "the CLI accepted a second map: {result:?}");
+    }
+
+    #[test]
+    fn refuse_text_after_a_transfer_map() {
+        let address = Address([1u8; 20]);
+        let result = Cli::try_parse_from([
+            "truthcoin-cli",
+            "create-transfer-many",
+            &format!("{{\"{address}\": 1000}} invalid"),
+            "--fee-sats",
+            "500",
+        ]);
+        assert!(result.is_err(), "the CLI accepted extra text: {result:?}");
+    }
+
+    #[test]
+    fn the_transfer_error_has_the_address_path() {
+        let address = Address([1u8; 20]);
+        let error = JsonParser::<TransferDests>::parse(&format!(
+            "{{\"{address}\": \"invalid\"}}"
+        ))
+        .unwrap_err();
+        assert!(error.to_string().starts_with(&format!("{address}:")));
     }
 
     // Without `MapPreventDuplicates`, serde keeps the last value for a
