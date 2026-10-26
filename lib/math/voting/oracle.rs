@@ -181,7 +181,15 @@ fn weighted_prin_comp(
     for (i, row) in centered.row_iter().enumerate() {
         weighted_centered.set_row(i, &(row * weights[i]));
     }
-    let wcvm = (centered.transpose() * weighted_centered) / total_weight;
+    // A fixed-order loop: nalgebra sends large products to matrixmultiply,
+    // whose CPU-selected kernels round differently.
+    let n_cols = centered.ncols();
+    let wcvm = DMatrix::from_fn(n_cols, n_cols, |a, b| {
+        (0..n_rows)
+            .map(|i| centered[(i, a)] * weighted_centered[(i, b)])
+            .sum::<f64>()
+            / total_weight
+    });
 
     let svd = SVD::new(wcvm.clone(), true, false);
 

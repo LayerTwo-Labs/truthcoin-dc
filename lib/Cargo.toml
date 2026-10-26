@@ -34,7 +34,7 @@ hickory-resolver = { workspace = true, features = ["system-config", "tokio"] }
 jsonrpsee = { workspace = true }
 libes = { workspace = true }
 libm = { workspace = true }
-nalgebra = { workspace = true }
+nalgebra = { workspace = true, features = ["libm-force"] }
 ndarray = { workspace = true }
 nonempty = { workspace = true, features = ["serialize"] }
 parking_lot = { workspace = true }
