@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, hash_map},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use fallible_iterator::FallibleIterator;
@@ -215,6 +215,24 @@ fn ensure_seed_peers(
     Ok(())
 }
 
+fn remove_ended_bans(
+    banned_peers: &DatabaseUnique<
+        SerdeBincode<IpAddr>,
+        SerdeBincode<SystemTime>,
+    >,
+    rwtxn: &mut RwTxn,
+) -> Result<(), DbError> {
+    let now = SystemTime::now();
+    let ended: Vec<IpAddr> = banned_peers
+        .iter(rwtxn)?
+        .filter_map(|(ip, ban_end)| Ok((ban_end <= now).then_some(ip)))
+        .collect()?;
+    for ip in ended {
+        banned_peers.delete(rwtxn, &ip)?;
+    }
+    Ok(())
+}
+
 const fn seed_peer_addrs(
     network: Network,
 ) -> &'static [PeerAddress<&'static str>] {
@@ -310,11 +328,16 @@ pub struct Net {
     peer_info_tx:
         mpsc::UnboundedSender<(SocketAddr, Option<PeerConnectionInfo>)>,
     known_peers: DatabaseUnique<SerdeBincode<PeerAddress>, Unit>,
+    /// Banned peer IPs, with the time that each ban ends
+    banned_peers:
+        DatabaseUnique<SerdeBincode<IpAddr>, SerdeBincode<SystemTime>>,
     _version: DatabaseUnique<UnitKey, SerdeBincode<Version>>,
 }
 
 impl Net {
-    pub const NUM_DBS: u32 = 2;
+    pub const NUM_DBS: u32 = 3;
+
+    pub const BAN_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
     fn add_active_peer(
         &self,
@@ -354,6 +377,30 @@ impl Net {
             drop(peer_connection);
             tracing::info!(%addr, "remove active peer: disconnected");
         }
+    }
+
+    /// Ban the peer's IP for [`Self::BAN_DURATION`], and disconnect it.
+    pub fn ban_peer(
+        &self,
+        rwtxn: &mut RwTxn,
+        addr: SocketAddr,
+    ) -> Result<(), Error> {
+        let ban_end = SystemTime::now() + Self::BAN_DURATION;
+        self.banned_peers
+            .put(rwtxn, &addr.ip().to_canonical(), &ban_end)
+            .map_err(DbError::from)?;
+        tracing::warn!(%addr, "banned peer");
+        let () = self.remove_active_peer(addr);
+        Ok(())
+    }
+
+    pub fn is_banned(
+        &self,
+        rotxn: &RoTxn,
+        ip: IpAddr,
+    ) -> Result<bool, sneed::db::error::TryGet> {
+        let ban_end = self.banned_peers.try_get(rotxn, &ip.to_canonical())?;
+        Ok(ban_end.is_some_and(|ban_end| SystemTime::now() < ban_end))
     }
 
     /// Apply the provided function to the peer connection handle,
@@ -408,6 +455,7 @@ impl Net {
                 }
             }
         }
+        let rotxn = env.read_txn()?;
         let (addr, connecting) = loop {
             let addr = SocketAddr::new(
                 resolved_addr.first_ip_addr(),
@@ -417,6 +465,14 @@ impl Net {
             // remote address". This one names the address.
             if addr.ip().is_unspecified() {
                 return Err(error::ConnectPeer::UnspecfiedPeerIP(addr.ip()));
+            }
+            if self.is_banned(&rotxn, addr.ip())? {
+                let (_, Some(next_addr)) = resolved_addr.pop_first_ip_addr()
+                else {
+                    return Err(error::ConnectPeer::Banned(addr.ip()));
+                };
+                resolved_addr = next_addr;
+                continue;
             }
             let server_name = match resolved_addr.host() {
                 url::Host::Domain(domain) => domain.as_str(),
@@ -435,6 +491,7 @@ impl Net {
                 Err(err) => return Err(err.into()),
             }
         };
+        drop(rotxn);
         let connection_ctxt = PeerConnectionCtxt {
             env,
             archive: self.archive.clone(),
@@ -583,6 +640,14 @@ impl Net {
         for peer in add_peers {
             known_peers.put(&mut rwtxn, &peer, &())?;
         }
+        let banned_peers =
+            match DatabaseUnique::open(env, &rwtxn, "banned_peers")? {
+                Some(banned_peers) => banned_peers,
+                None => {
+                    DatabaseUnique::create(env, &mut rwtxn, "banned_peers")?
+                }
+            };
+        let () = remove_ended_bans(&banned_peers, &mut rwtxn)?;
         let version = DatabaseUnique::create(env, &mut rwtxn, "net_version")?;
         match version.try_get(&rwtxn, &())? {
             Some(db_version)
@@ -623,6 +688,7 @@ impl Net {
             active_peers,
             peer_info_tx,
             known_peers: known_peers.clone(),
+            banned_peers,
             _version: version,
         };
         let known_peers = {
@@ -666,6 +732,17 @@ impl Net {
             Some(conn) => {
                 let remote_address = conn.remote_address();
                 tracing::trace!("accepting connection from {remote_address}",);
+                let banned = {
+                    let rotxn = env.read_txn()?;
+                    self.is_banned(&rotxn, remote_address.ip())?
+                };
+                if banned {
+                    tracing::info!(
+                        %remote_address, "incoming connection: refused banned peer",
+                    );
+                    conn.refuse();
+                    return Ok(None);
+                }
 
                 let raw_conn = conn.await.map_err(|error| {
                     error::AcceptConnection::Connection {
@@ -1069,6 +1146,127 @@ mod test {
         let peers = net.get_active_peers();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].address, addr);
+        Ok(())
+    }
+
+    fn restart_net(env: &sneed::Env<heed::WithoutTls>) -> anyhow::Result<Net> {
+        let (net, _info_rx, _known_peers) = Net::new(
+            &tokio::runtime::Handle::current(),
+            env,
+            Archive::new(env)?,
+            BatchVerificationContext::new(&mut rand::rng()),
+            None,
+            Network::Regtest,
+            MemPool::new(env)?,
+            State::new(env, None)?,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            HashSet::new(),
+            HashSet::new(),
+        )?;
+        Ok(net)
+    }
+
+    fn ban(
+        env: &sneed::Env<heed::WithoutTls>,
+        net: &Net,
+        addr: SocketAddr,
+    ) -> anyhow::Result<()> {
+        let mut rwtxn = env.write_txn()?;
+        net.ban_peer(&mut rwtxn, addr)?;
+        rwtxn.commit()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_banned_ip_is_refused_on_accept() -> anyhow::Result<()> {
+        let (_temp_dir, env, net, _info_rx) = temp_net("peer-ban-accept")?;
+        let (remote, _) = make_server_endpoint(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            HashSet::new(),
+        )?;
+        ban(&env, &net, remote.local_addr()?)?;
+        let connecting =
+            remote.connect(net.server.local_addr()?, "localhost")?;
+
+        let accepted = tokio::time::timeout(
+            Duration::from_secs(5),
+            net.accept_incoming(env),
+        )
+        .await??;
+
+        assert_eq!(accepted, None);
+        assert!(net.get_active_peers().is_empty());
+        assert!(connecting.await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_ban_survives_a_restart() -> anyhow::Result<()> {
+        let (_temp_dir, env, net, _info_rx) = temp_net("peer-ban-restart")?;
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4009));
+        ban(&env, &net, addr)?;
+        drop(net);
+
+        let net = restart_net(&env)?;
+
+        let rotxn = env.read_txn()?;
+        assert!(net.is_banned(&rotxn, addr.ip())?);
+        drop(rotxn);
+        let error = net.connect_peer(env, addr.into()).unwrap_err();
+        assert!(matches!(
+            error,
+            super::error::ConnectPeer::Banned(ip) if ip == addr.ip()
+        ));
+        assert!(net.get_active_peers().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_peer_skips_a_banned_ip() -> anyhow::Result<()> {
+        let (_temp_dir, env, net, _info_rx) = temp_net("peer-ban-skip")?;
+        let (remote, _) = make_server_endpoint(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            HashSet::new(),
+        )?;
+        let addr = remote.local_addr()?;
+        let banned_ip = Ipv4Addr::new(127, 0, 0, 2);
+        ban(&env, &net, (banned_ip, addr.port()).into())?;
+        let resolved = ResolvedPeerAddress::Domain {
+            domain: "localhost".to_owned(),
+            port: addr.port(),
+            addrs: nonempty::NonEmpty {
+                head: banned_ip.into(),
+                tail: vec![Ipv4Addr::LOCALHOST.into()],
+            },
+        };
+
+        net.connect_peer(env, resolved)?;
+
+        let peers = net.get_active_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].address, addr);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_ended_ban_is_removed_on_restart() -> anyhow::Result<()> {
+        let (_temp_dir, env, net, _info_rx) = temp_net("peer-ban-end")?;
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let ended = std::time::SystemTime::now() - Duration::from_secs(1);
+        {
+            let mut rwtxn = env.write_txn()?;
+            net.banned_peers.put(&mut rwtxn, &ip, &ended)?;
+            rwtxn.commit()?;
+        }
+        let rotxn = env.read_txn()?;
+        assert!(!net.is_banned(&rotxn, ip)?);
+        drop(rotxn);
+        drop(net);
+
+        let net = restart_net(&env)?;
+
+        let rotxn = env.read_txn()?;
+        assert_eq!(net.banned_peers.len(&rotxn)?, 0);
         Ok(())
     }
 
