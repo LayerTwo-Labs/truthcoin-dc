@@ -15,12 +15,12 @@ pub const MAGIC_BYTES_LEN: usize = 4;
 
 pub type MagicBytes = [u8; MAGIC_BYTES_LEN];
 
-// First 4 bytes are the US-TTY (LSB Left) Baudot–Murray code for "THNDR".
+// First 25 bits are the US-TTY Baudot–Murray code for "TRUTH".
 // The least significant bits of the 4th byte encode the network
 // identifier.
 pub const fn magic_bytes(network: Network) -> MagicBytes {
     const PREFIX: [u8; 4] =
-        [0b1000_0101, 0b0001_1000, 0b1001_0101, 0b0000_0000];
+        [0b1000_0010, 0b1000_1111, 0b0000_1010, 0b0000_0000];
     const fn network_identifier(network: Network) -> u8 {
         match network {
             Network::Regtest => 0b0000_0000,
@@ -306,6 +306,38 @@ impl ResponseMessage {
             write!(f, "[{first:?}, .., {last:?}]")
         } else {
             std::fmt::Debug::fmt(headers, f)
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{MagicBytes, magic_bytes};
+    use crate::types::Network;
+
+    const NETWORKS: [Network; 4] = [
+        Network::Betanet,
+        Network::Forknet,
+        Network::Regtest,
+        Network::Signet,
+    ];
+
+    fn thunder_magic_bytes(network: Network) -> MagicBytes {
+        let id = match network {
+            Network::Regtest => 0b0000_0000,
+            Network::Signet => 0b0000_0001,
+            Network::Forknet => 0b0000_0010,
+            Network::Betanet => 0b0000_0100,
+        };
+        [0b1000_0101, 0b0001_1000, 0b1001_0101, id]
+    }
+
+    #[test]
+    fn magic_bytes_differ_from_thunder_on_every_network() {
+        for ours in NETWORKS {
+            for theirs in NETWORKS {
+                assert_ne!(magic_bytes(ours), thunder_magic_bytes(theirs));
+            }
         }
     }
 }
