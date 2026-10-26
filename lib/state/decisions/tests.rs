@@ -290,9 +290,9 @@ fn test_decision_id_nonstandard_roundtrip() {
 
 #[test]
 fn test_decision_id_max_period() {
-    let id = DecisionId::new(true, 127, 0).unwrap();
-    assert_eq!(id.period_index(), 127);
-    assert!(DecisionId::new(true, 128, 0).is_err());
+    let id = DecisionId::new(true, 32767, 0).unwrap();
+    assert_eq!(id.period_index(), 32767);
+    assert!(DecisionId::new(true, 32768, 0).is_err());
 }
 
 #[test]
@@ -304,9 +304,9 @@ fn test_decision_id_max_index() {
 
 #[test]
 fn test_decision_id_boundary_values() {
-    let id = DecisionId::new(false, 127, 65535).unwrap();
+    let id = DecisionId::new(false, 32767, 65535).unwrap();
     assert!(!id.is_standard());
-    assert_eq!(id.period_index(), 127);
+    assert_eq!(id.period_index(), 32767);
     assert_eq!(id.decision_index(), 65535);
 }
 
@@ -456,4 +456,106 @@ fn claim_reorg_preserves_period_and_prices() -> anyhow::Result<()> {
 #[test]
 fn state_rollback_preserves_period_and_prices() -> anyhow::Result<()> {
     check_claim_rollback(false)
+}
+
+fn decision_id_key_bytes(id: &DecisionId) -> Vec<u8> {
+    use heed::BytesEncode;
+    heed::types::SerdeBincode::<DecisionId>::bytes_encode(id)
+        .unwrap()
+        .into_owned()
+}
+
+#[test]
+fn test_decision_id_period_above_127_roundtrips() {
+    for (is_standard, period, index) in
+        [(true, 128, 0), (true, 200, 7), (false, 32767, 65535)]
+    {
+        let id = DecisionId::new(is_standard, period, index).unwrap();
+        assert_eq!(id.is_standard(), is_standard);
+        assert_eq!(id.period_index(), period);
+        assert_eq!(id.decision_index(), index);
+
+        assert_eq!(DecisionId::from_bytes(id.as_bytes()).unwrap(), id);
+        assert_eq!(DecisionId::from_hex(&id.to_hex()).unwrap(), id);
+
+        let bincode_bytes = bincode::serialize(&id).unwrap();
+        assert_eq!(bincode_bytes, id.as_bytes());
+        assert_eq!(
+            bincode::deserialize::<DecisionId>(&bincode_bytes).unwrap(),
+            id
+        );
+
+        assert_eq!(borsh::to_vec(&id).unwrap(), id.as_bytes());
+
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<DecisionId>(&json).unwrap(), id);
+
+        assert_eq!(decision_id_key_bytes(&id), id.as_bytes());
+    }
+}
+
+#[test]
+fn test_decision_id_key_order_follows_period() {
+    for is_standard in [false, true] {
+        let ids: Vec<DecisionId> = [(1, 65535), (127, 0), (128, 0), (300, 5)]
+            .into_iter()
+            .map(|(period, index)| {
+                DecisionId::new(is_standard, period, index).unwrap()
+            })
+            .collect();
+        for pair in ids.windows(2) {
+            assert!(pair[0] < pair[1]);
+            assert!(
+                decision_id_key_bytes(&pair[0])
+                    < decision_id_key_bytes(&pair[1])
+            );
+        }
+    }
+}
+
+#[test]
+fn test_claim_decision_in_period_above_127() {
+    use super::{Dbs, DecisionConfig};
+    use crate::types::{Hash, Txid};
+    use std::num::NonZeroU32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
+    options.map_size(16 * 1024 * 1024).max_dbs(Dbs::NUM_DBS);
+    let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
+    let mut rwtxn = env.write_txn().unwrap();
+    let dbs = Dbs::new_with_config(
+        &env,
+        &mut rwtxn,
+        DecisionConfig::testing(NonZeroU32::new(1).unwrap()),
+    )
+    .unwrap();
+
+    let height = 199;
+    dbs.mint_genesis(&mut rwtxn, 0, height, 0).unwrap();
+    let period = dbs.get_current_period(0, Some(height), 0).unwrap();
+    assert_eq!(period, 200);
+
+    let available = dbs
+        .get_available_decisions_in_period(&rwtxn, period, 0, Some(height), 0)
+        .unwrap();
+    let decision_id = available[0];
+    assert_eq!(decision_id.period_index(), period);
+
+    dbs.claim_decision(
+        &mut rwtxn,
+        decision_id,
+        make_binary_decision(),
+        Txid(Hash::from([3; 32])),
+        Some(height),
+    )
+    .unwrap();
+
+    let entry = dbs
+        .get_decision_entry(&rwtxn, decision_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.decision_id, decision_id);
+    assert!(entry.decision.is_some());
+    assert_eq!(dbs.claimed_count_in_period(&rwtxn, period).unwrap(), 1);
 }

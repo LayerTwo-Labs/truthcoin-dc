@@ -67,7 +67,7 @@ pub struct MemPool {
         DatabaseUnique<SerdeBincode<Address>, SerdeBincode<HashSet<Txid>>>,
     /// Pending decision claims: decision id bytes to the claiming txid
     pending_decision_claims:
-        DatabaseUnique<SerdeBincode<[u8; 3]>, SerdeBincode<Txid>>,
+        DatabaseUnique<SerdeBincode<[u8; 4]>, SerdeBincode<Txid>>,
     trade_insertion_order:
         DatabaseUnique<SerdeBincode<u64>, SerdeBincode<Txid>>,
     trade_order_counter: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
@@ -203,7 +203,7 @@ impl MemPool {
     }
 
     /// Extract decision IDs being claimed by this transaction
-    fn get_claimed_decision_ids(transaction: &Transaction) -> Vec<[u8; 3]> {
+    fn get_claimed_decision_ids(transaction: &Transaction) -> Vec<[u8; 4]> {
         use crate::types::TransactionData;
 
         let mut decision_ids = Vec::new();
@@ -238,7 +238,7 @@ impl MemPool {
         &self,
         rwtxn: &mut RwTxn,
         txid: Txid,
-        decision_ids: &[[u8; 3]],
+        decision_ids: &[[u8; 4]],
     ) -> Result<(), Error> {
         // First check for conflicts
         for decision_id in decision_ids {
@@ -824,7 +824,7 @@ impl MemPool {
     pub fn pending_decision_claim_ids(
         &self,
         rotxn: &RoTxn,
-    ) -> Result<BTreeSet<[u8; 3]>, Error> {
+    ) -> Result<BTreeSet<[u8; 4]>, Error> {
         self.pending_decision_claims
             .iter(rotxn)
             .map_err(DbError::from)?
@@ -897,7 +897,7 @@ mod tests {
         }
     }
 
-    fn claim_entry(decision_id: [u8; 3]) -> DecisionClaimEntry {
+    fn claim_entry(decision_id: [u8; 4]) -> DecisionClaimEntry {
         DecisionClaimEntry {
             decision_id_bytes: decision_id,
             header: "h".to_string(),
@@ -911,7 +911,7 @@ mod tests {
 
     fn claim_tx(
         input_seed: u8,
-        decision_ids: &[[u8; 3]],
+        decision_ids: &[[u8; 4]],
     ) -> AuthorizedTransaction {
         let entries: Vec<DecisionClaimEntry> =
             decision_ids.iter().copied().map(claim_entry).collect();
@@ -951,7 +951,7 @@ mod tests {
     fn evict_basic_conflict() {
         let (env, _dir) = make_env();
         let mempool = MemPool::new(&env).unwrap();
-        let did: [u8; 3] = [0x42, 0, 0];
+        let did: [u8; 4] = [0x42, 0, 0, 0];
 
         let tx_a = claim_tx(1, &[did]);
         let tx_b = claim_tx(2, &[did]);
@@ -1002,7 +1002,7 @@ mod tests {
     fn evict_noop_when_in_block_tx_equals_pending_claim() {
         let (env, _dir) = make_env();
         let mempool = MemPool::new(&env).unwrap();
-        let did: [u8; 3] = [1, 2, 3];
+        let did: [u8; 4] = [1, 2, 3, 4];
 
         let tx_a = claim_tx(7, &[did]);
         let txid_a = tx_a.transaction.txid();
@@ -1036,7 +1036,7 @@ mod tests {
     fn evict_noop_when_tx_is_not_claim_decision() {
         let (env, _dir) = make_env();
         let mempool = MemPool::new(&env).unwrap();
-        let did: [u8; 3] = [9, 9, 9];
+        let did: [u8; 4] = [9, 9, 9, 9];
 
         let zombie = claim_tx(3, &[did]);
         let txid_zombie = zombie.transaction.txid();
@@ -1068,9 +1068,9 @@ mod tests {
     fn evict_multi_decision_partial_overlap_clears_all_zombie_rows() {
         let (env, _dir) = make_env();
         let mempool = MemPool::new(&env).unwrap();
-        let x: [u8; 3] = [1, 1, 1];
-        let y: [u8; 3] = [2, 2, 2];
-        let z: [u8; 3] = [3, 3, 3];
+        let x: [u8; 4] = [1, 1, 1, 1];
+        let y: [u8; 4] = [2, 2, 2, 2];
+        let z: [u8; 4] = [3, 3, 3, 3];
 
         let zombie = claim_tx(5, &[x, z]);
         let txid_zombie = zombie.transaction.txid();

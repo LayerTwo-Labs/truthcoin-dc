@@ -459,13 +459,13 @@ grpcurl -plaintext -d '{\"blocks\": 1, \"ack_all_proposals\": true}' 127.0.0.1:5
 
 # Or look it up after the fact
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 decision-list --period 0 --status claimed
-# Returns: decision_id = "800000"
+# Returns: decision_id = "80000000"
 
 # Create market
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "Will BTC hit $100K?" `
 --description "Resolves Yes if Bitcoin reaches $100,000 USD" `
---dimensions "[800000]" --beta 7.0 --fee-sats 1000
+--dimensions "[80000000]" --beta 7.0 --fee-sats 1000
 
 # Outcomes: Yes, No (2 outcomes)
 ```
@@ -481,13 +481,13 @@ Predict a numeric value within a defined range.
 --header "BTC price on Dec 31, 2025 (in thousands USD)" `
 --min 0 --max 500 --tx-fee-sats 1000
 
-# Mine and read the assigned decision_id from the response (e.g. "800001")
+# Mine and read the assigned decision_id from the response (e.g. "80000001")
 
 # Create market
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "BTC Year-End Price Prediction" `
 --description "What will BTC price be on Dec 31, 2025? (in $1000s)" `
---dimensions "[800001]" --beta 7.0 --fee-sats 1000
+--dimensions "[80000001]" --beta 7.0 --fee-sats 1000
 
 # Outcomes: Under, Over (2 outcomes based on scalar midpoint)
 ```
@@ -506,13 +506,13 @@ Combine independent Yes/No decisions. All combinations are tradeable.
 --period-index 0 --decision-type binary `
 --header "Will SOL hit $500?" --tx-fee-sats 1000
 
-# Mine and read the assigned decision_ids (e.g. "800002" and "800003")
+# Mine and read the assigned decision_ids (e.g. "80000002" and "80000003")
 
 # Create parlay market
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "Crypto Price Parlay" `
 --description "Combined predictions on ETH and SOL prices" `
---dimensions "[800002,800003]" --beta 7.0 --fee-sats 1000
+--dimensions "[80000002,80000003]" --beta 7.0 --fee-sats 1000
 
 # Outcomes (4 total):
 #   0: ETH-Yes + SOL-Yes
@@ -535,13 +535,13 @@ references that single decision_id inside `[[...]]`.
 --option-labels "Candidate A,Candidate B,Candidate C" `
 --tx-fee-sats 1000
 
-# Mine and read the assigned decision_id from the response (e.g. "800004")
+# Mine and read the assigned decision_id from the response (e.g. "80000004")
 
 # Create categorical market
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "2028 Presidential Election Winner" `
 --description "Which candidate will win the 2028 US Presidential Election?" `
---dimensions "[[800004]]" `
+--dimensions "[[80000004]]" `
 --beta 7.0 --fee-sats 1000
 
 # Outcomes (3 mutually exclusive):
@@ -561,7 +561,7 @@ Add a "catch-all" residual outcome for options not explicitly labeled.
 --header "Who will win the 2028 US Presidential Election?" `
 --option-labels "Candidate A,Candidate B,Candidate C" `
 --tx-fee-sats 1000
-# Assigned decision_id, e.g. "800004"
+# Assigned decision_id, e.g. "80000004"
 
 .\mine_blocks.ps1 1
 
@@ -569,7 +569,7 @@ Add a "catch-all" residual outcome for options not explicitly labeled.
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "2028 Presidential Election Winner" `
 --description "Which candidate will win the 2028 US Presidential Election?" `
---dimensions "[[800004]]" `
+--dimensions "[[80000004]]" `
 --residual-names "Other" `
 --beta 7.0 --fee-sats 1000
 
@@ -586,7 +586,7 @@ Combine an independent binary decision with a categorical decision.
 
 ```powershell
 # Binary decision: "Will there be a recession?"
-# Assigned decision_id from claim response: e.g. "800007"
+# Assigned decision_id from claim response: e.g. "80000007"
 
 # Claim a categorical decision for sector leadership
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 decision-claim `
@@ -594,7 +594,7 @@ Combine an independent binary decision with a categorical decision.
 --header "Which sector will lead?" `
 --option-labels "Tech,Finance,Energy" `
 --tx-fee-sats 1000
-# Assigned decision_id: e.g. "800008"
+# Assigned decision_id: e.g. "80000008"
 
 .\mine_blocks.ps1 1
 
@@ -602,7 +602,7 @@ Combine an independent binary decision with a categorical decision.
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "Economy & Sector Performance" `
 --description "Recession prediction combined with leading sector" `
---dimensions "[800007,[800008]]" `
+--dimensions "[80000007,[80000008]]" `
 --beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 3 = 6 total):
@@ -620,12 +620,12 @@ Three or more independent binary decisions.
 
 ```powershell
 # Decisions for: "Team A wins?", "Team B wins?", "Team C wins?"
-# Decision IDs: "00000b", "00000c", "00000d"
+# Decision IDs: "0000000b", "0000000c", "0000000d"
 
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "Weekend Sports Parlay" `
 --description "Independent game outcomes" `
---dimensions "[00000b,00000c,00000d]" --beta 5.0 --fee-sats 1000
+--dimensions "[0000000b,0000000c,0000000d]" --beta 5.0 --fee-sats 1000
 
 # Outcomes (2^3 = 8 total combinations)
 ```
@@ -640,14 +640,14 @@ Combine two separate categorical decisions.
 --period-index 0 --decision-type category `
 --header "Conference winner" --option-labels "East,West" `
 --tx-fee-sats 1000
-# Assigned decision_id from response, e.g. "80000e"
+# Assigned decision_id from response, e.g. "8000000e"
 
 # Claim Category 2: MVP winner (Player A, Player B, Player C)
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 decision-claim `
 --period-index 0 --decision-type category `
 --header "Season MVP" --option-labels "Player A,Player B,Player C" `
 --tx-fee-sats 1000
-# Assigned decision_id, e.g. "800010"
+# Assigned decision_id, e.g. "80000010"
 
 .\mine_blocks.ps1 1
 
@@ -655,7 +655,7 @@ Combine two separate categorical decisions.
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "NBA Season Predictions" `
 --description "Conference champion and MVP predictions" `
---dimensions "[[80000e],[800010]]" `
+--dimensions "[[8000000e],[80000010]]" `
 --beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 3 = 6 total):
@@ -673,15 +673,15 @@ Combine a numeric prediction with a Yes/No decision.
 
 ```powershell
 # Scalar {decision}: "What will BTC dominance % be?" (min=30, max=80)
-# Decision ID: "000013"
+# Decision ID: "00000013"
 
 # Binary {decision}: "Will ETH flip BTC in market cap?"
-# Decision ID: "000014"
+# Decision ID: "00000014"
 
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "BTC Dominance & Flippening" `
 --description "BTC dominance level and ETH flippening prediction" `
---dimensions "[000013,000014]" --beta 7.0 --fee-sats 1000
+--dimensions "[00000013,00000014]" --beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 2 = 4 total):
 #   0: BTC dominance Under + Flippening Yes
@@ -696,15 +696,15 @@ Combine two numeric predictions.
 
 ```powershell
 # Scalar {decision} 1: "Fed funds rate end of year" (min=0, max=10)
-# Decision ID: "000015"
+# Decision ID: "00000015"
 
 # Scalar {decision} 2: "Inflation rate %" (min=0, max=15)
-# Decision ID: "000016"
+# Decision ID: "00000016"
 
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "Fed Rate vs Inflation" `
 --description "Interest rate and inflation predictions" `
---dimensions "[000015,000016]" --beta 7.0 --fee-sats 1000
+--dimensions "[00000015,00000016]" --beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 2 = 4 total):
 #   0: Rate Under + Inflation Under
@@ -719,7 +719,7 @@ Combine a numeric prediction with mutually exclusive options.
 
 ```powershell
 # Scalar {decision}: "S&P 500 year-end value" (min=3000, max=6000)
-# Decision ID: "000017"
+# Decision ID: "00000017"
 
 # Claim category {decision}s for sector leadership
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 decision-claim `
@@ -727,14 +727,14 @@ Combine a numeric prediction with mutually exclusive options.
 --header "Which sector will lead?" `
 --option-labels "Tech,Finance,Healthcare" `
 --tx-fee-sats 1000
-# Assigned decision_id, e.g. "800018"
+# Assigned decision_id, e.g. "80000018"
 
 .\mine_blocks.ps1 1
 
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "Market Performance & Sector Leader" `
 --description "S&P 500 level combined with leading sector" `
---dimensions "[800017,[800018]]" `
+--dimensions "[80000017,[80000018]]" `
 --beta 7.0 --fee-sats 1000
 
 # Outcomes (2 x 3 = 6 total):
@@ -752,10 +752,10 @@ Three different decision types combined.
 
 ```powershell
 # Scalar {decision}: "BTC year-end price ($K)" (min=20, max=200)
-# Decision ID: "00001b"
+# Decision ID: "0000001b"
 
 # Binary {decision}: "Will there be a spot BTC ETF approval?"
-# Decision ID: "00001c"
+# Decision ID: "0000001c"
 
 # Claim category {decision}s for market regime
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 decision-claim `
@@ -763,14 +763,14 @@ Three different decision types combined.
 --header "Market regime" `
 --option-labels "Bull,Bear,Sideways" `
 --tx-fee-sats 1000
-# Assigned decision_id, e.g. "80001d"
+# Assigned decision_id, e.g. "8000001d"
 
 .\mine_blocks.ps1 1
 
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "Crypto Market Comprehensive" `
 --description "BTC price, ETF approval, and market regime" `
---dimensions "[80001b,80001c,[80001d]]" `
+--dimensions "[8000001b,8000001c,[8000001d]]" `
 --beta 10.0 --fee-sats 1000
 
 # Outcomes (2 x 2 x 3 = 12 total):
@@ -783,17 +783,17 @@ Three or more scalars with a binary decision.
 
 ```powershell
 # Scalar {decision}s for economic indicators:
-# "GDP growth %" (min=-5, max=10) - Decision ID: "000020"
-# "Unemployment %" (min=0, max=15) - Decision ID: "000021"
-# "CPI inflation %" (min=-2, max=15) - Decision ID: "000022"
+# "GDP growth %" (min=-5, max=10) - Decision ID: "00000020"
+# "Unemployment %" (min=0, max=15) - Decision ID: "00000021"
+# "CPI inflation %" (min=-2, max=15) - Decision ID: "00000022"
 
 # Binary {decision}: "Will there be a recession?"
-# Decision ID: "000023"
+# Decision ID: "00000023"
 
 .\target\debug\truthcoin_dc_app_cli.exe --rpc-port 18332 market-create `
 --title "Economic Indicators Bundle" `
 --description "GDP, unemployment, inflation, and recession prediction" `
---dimensions "[000020,000021,000022,000023]" --beta 10.0 --fee-sats 1000
+--dimensions "[00000020,00000021,00000022,00000023]" --beta 10.0 --fee-sats 1000
 
 # Outcomes (2^4 = 16 total combinations)
 ```

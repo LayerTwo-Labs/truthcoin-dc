@@ -4,7 +4,7 @@ use sneed::RoTxn;
 
 pub(crate) fn vote_keys(
     transaction: &crate::types::Transaction,
-) -> impl Iterator<Item = (u32, crate::types::Address, [u8; 3])> + '_ {
+) -> impl Iterator<Item = (u32, crate::types::Address, [u8; 4])> + '_ {
     use crate::types::TxData;
 
     let single = match &transaction.data {
@@ -824,8 +824,8 @@ mod tests {
         use crate::types::{Address, BallotItem, Transaction, TxData};
 
         let voter = Address([1; 20]);
-        let first = [1, 0, 0];
-        let second = [1, 0, 1];
+        let first = [1, 0, 0, 0];
+        let second = [1, 0, 0, 1];
         let transactions = vec![
             Transaction {
                 data: Some(TxData::SubmitVote {
@@ -871,7 +871,7 @@ mod tests {
                 voting_period: 2,
                 votes: vec![
                     BallotItem {
-                        decision_id_bytes: [1, 0, 0],
+                        decision_id_bytes: [1, 0, 0, 0],
                         vote_value: 0.0
                     };
                     2

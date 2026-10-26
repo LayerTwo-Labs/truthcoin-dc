@@ -1342,10 +1342,10 @@ impl Wallet {
     /// Implements Bitcoin Hivemind Section 3.1 - Market Creation
     ///
     /// Dimension notation examples:
-    /// - Single binary: `[004008]`
-    /// - Multiple independent: `[004008,004009]`
-    /// - Categorical: `[[004008,004009,00400a]]`
-    /// - Mixed: `[004008,[004009,00400a]]`
+    /// - Single binary: `[00004008]`
+    /// - Multiple independent: `[00004008,00004009]`
+    /// - Categorical: `[[00004008,00004009,0000400a]]`
+    /// - Mixed: `[00004008,[00004009,0000400a]]`
     pub fn create_market(
         &self,
         spend_zero_conf_change: bool,

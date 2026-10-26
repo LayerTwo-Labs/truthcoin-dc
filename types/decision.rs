@@ -16,13 +16,13 @@ use crate::error::InvalidDecisionId;
     Serialize,
     BorshSerialize,
 )]
-pub struct DecisionId([u8; 3]);
+pub struct DecisionId([u8; 4]);
 
-const MAX_PERIOD_INDEX: u32 = (1 << 7) - 1; // 127
+const MAX_PERIOD_INDEX: u32 = (1 << 15) - 1; // 32767
 const MAX_DECISION_INDEX: u32 = (1 << 16) - 1; // 65535
-const STANDARD_BIT: u32 = 23;
+const STANDARD_BIT: u32 = 31;
 const PERIOD_SHIFT: u32 = 16;
-const PERIOD_MASK: u32 = 0x7F; // 7 bits
+const PERIOD_MASK: u32 = MAX_PERIOD_INDEX; // 15 bits
 const DECISION_MASK: u32 = MAX_DECISION_INDEX; // 16 bits
 
 fn validate_decision_bounds(
@@ -50,9 +50,7 @@ fn validate_decision_bounds(
 impl DecisionId {
     #[inline(always)]
     const fn as_u32(self) -> u32 {
-        ((self.0[0] as u32) << 16)
-            | ((self.0[1] as u32) << 8)
-            | (self.0[2] as u32)
+        u32::from_be_bytes(self.0)
     }
 
     pub fn new(
@@ -64,12 +62,7 @@ impl DecisionId {
         let standard_bit = if is_standard { 1u32 } else { 0u32 };
         let combined =
             (standard_bit << STANDARD_BIT) | (period << PERIOD_SHIFT) | index;
-        let bytes = [
-            (combined >> 16) as u8,
-            (combined >> 8) as u8,
-            combined as u8,
-        ];
-        Ok(DecisionId(bytes))
+        Ok(DecisionId(combined.to_be_bytes()))
     }
 
     #[inline(always)]
@@ -87,26 +80,26 @@ impl DecisionId {
         self.as_u32() & DECISION_MASK
     }
 
-    pub fn as_bytes(self) -> [u8; 3] {
+    pub fn as_bytes(self) -> [u8; 4] {
         self.0
     }
 
-    pub fn from_bytes(bytes: [u8; 3]) -> Result<Self, InvalidDecisionId> {
+    pub fn from_bytes(bytes: [u8; 4]) -> Result<Self, InvalidDecisionId> {
         let id = DecisionId(bytes);
         validate_decision_bounds(id.period_index(), id.decision_index())?;
         Ok(id)
     }
 
     pub fn from_hex(hex_str: &str) -> Result<Self, InvalidDecisionId> {
-        if hex_str.len() != 6 {
+        if hex_str.len() != 8 {
             return Err(InvalidDecisionId {
-                reason: "Decision ID hex must be exactly 6 characters \
-                     (3 bytes)"
+                reason: "Decision ID hex must be exactly 8 characters \
+                     (4 bytes)"
                     .to_string(),
             });
         }
 
-        let mut bytes = [0u8; 3];
+        let mut bytes = [0u8; 4];
         for (i, chunk) in
             hex_str.as_bytes().as_chunks::<2>().0.iter().enumerate()
         {
