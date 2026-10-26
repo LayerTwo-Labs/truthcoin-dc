@@ -2,12 +2,13 @@
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{Arc, atomic::AtomicBool},
 };
 
 use fallible_iterator::FallibleIterator;
 use futures::{StreamExt as _, channel::mpsc};
+use hashlink::LinkedHashMap;
 use quinn::SendStream;
 use sneed::EnvError;
 use truthcoin_dc_types::Block;
@@ -30,6 +31,8 @@ use crate::{
     },
     util::{ErrorChain, join_set},
 };
+
+const MAX_PEER_STATES: usize = 256;
 
 pub(in crate::net::peer) struct ConnectionTask {
     pub connection: Connection,
@@ -55,20 +58,16 @@ impl ConnectionTask {
         peer_tip_info: &TipInfo,
         peer_state_id: PeerStateId,
     ) -> Result<Option<bool>, blocking_task::TaskError> {
-        // If the peer's mainchain tip is not an ancestor of ours, then ignore
-        // the peer tip.
-        {
+        let peer_tip_main_height = {
             let rotxn = ctxt.env.read_txn()?;
-            if ctxt
-                .archive
-                .try_get_main_header_info(
+            let Some(peer_tip_main_header_info) =
+                ctxt.archive.try_get_main_header_info(
                     &rotxn,
                     &peer_tip_info.tip.main_block_hash,
                 )?
-                .is_none()
-            {
+            else {
                 return Ok(None);
-            }
+            };
             let side_tips_tip = ctxt
                 .archive
                 .side_tips()
@@ -86,7 +85,10 @@ impl ConnectionTask {
             )? {
                 return Ok(None);
             }
-        }
+            peer_tip_main_header_info.height
+        };
+        let headers_height =
+            peer_tip_info.block_height.min(peer_tip_main_height);
         // Check if the peer tip is better, requesting headers if necessary
         let Some(tip_info) = tip_info else {
             // No tip.
@@ -100,7 +102,7 @@ impl ConnectionTask {
                 let request = message::GetHeadersRequest {
                     start: HashSet::new(),
                     end: peer_tip_info.tip.block_hash,
-                    height: Some(peer_tip_info.block_height),
+                    height: Some(headers_height),
                     peer_state_id: Some(peer_state_id),
                 };
                 let _: bool = request_queue.send_request(request.into())?;
@@ -131,7 +133,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -172,7 +174,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -207,7 +209,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -261,7 +263,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -287,7 +289,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -347,7 +349,7 @@ impl ConnectionTask {
                     let request = message::GetHeadersRequest {
                         start,
                         end: peer_tip_info.tip.block_hash,
-                        height: Some(peer_tip_info.block_height),
+                        height: Some(headers_height),
                         peer_state_id: Some(peer_state_id),
                     };
                     let _: bool = request_queue.send_request(request.into())?;
@@ -726,21 +728,32 @@ impl ConnectionTask {
         }
     }
 
+    fn insert_peer_state(
+        peer_states: &mut LinkedHashMap<PeerStateId, PeerState>,
+        peer_state: PeerState,
+    ) -> PeerStateId {
+        let peer_state_id = (&peer_state).into();
+        peer_states.insert(peer_state_id, peer_state);
+        while peer_states.len() > MAX_PEER_STATES {
+            let _evicted = peer_states.pop_front();
+        }
+        peer_state_id
+    }
+
     async fn handle_peer_request(
         ctxt: &Arc<ConnectionContext>,
         info_tx: &mpsc::UnboundedSender<Info>,
         mailbox_sender: &mailbox::Sender,
         peer_state: &mut Option<PeerStateId>,
-        // Map associating peer state hashes to peer state
-        peer_states: &mut HashMap<PeerStateId, PeerState>,
+        peer_states: &mut LinkedHashMap<PeerStateId, PeerState>,
         response_tx: SendStream,
         request_msg: RequestMessage,
     ) -> Result<(), Error> {
         match request_msg {
             RequestMessage::Heartbeat(heartbeat) => {
                 let new_peer_state = heartbeat.0;
-                let new_peer_state_id = (&new_peer_state).into();
-                peer_states.insert(new_peer_state_id, new_peer_state);
+                let new_peer_state_id =
+                    Self::insert_peer_state(peer_states, new_peer_state);
                 if *peer_state != Some(new_peer_state_id) {
                     let ctxt = Arc::clone(ctxt);
                     let info_tx = info_tx.clone();
@@ -800,7 +813,7 @@ impl ConnectionTask {
         request_queue: &request_queue::Sender,
         blocking_task_queue_tx: &mpsc::UnboundedSender<BlockingTaskFn>,
         // known peer states
-        peer_states: &HashMap<PeerStateId, PeerState>,
+        peer_states: &LinkedHashMap<PeerStateId, PeerState>,
         msg: InternalMessage,
     ) -> Result<(), Error> {
         match msg {
@@ -814,7 +827,7 @@ impl ConnectionTask {
                 }
                 let Some(peer_state) = peer_states.get(&peer_state_id).copied()
                 else {
-                    return Err(Error::MissingPeerState(peer_state_id));
+                    return Ok(());
                 };
                 let ctxt = Arc::clone(ctxt);
                 let info_tx = info_tx.clone();
@@ -847,7 +860,7 @@ impl ConnectionTask {
             | InternalMessage::BodiesAvailable(peer_state_id) => {
                 let Some(peer_state) = peer_states.get(&peer_state_id).copied()
                 else {
-                    return Err(Error::MissingPeerState(peer_state_id));
+                    return Ok(());
                 };
                 let ctxt = Arc::clone(ctxt);
                 let info_tx = info_tx.clone();
@@ -871,8 +884,7 @@ impl ConnectionTask {
         let ctxt = Arc::new(self.ctxt);
         // current peer state
         let mut peer_state = Option::<PeerStateId>::None;
-        // known peer states
-        let mut peer_states = HashMap::<PeerStateId, PeerState>::new();
+        let mut peer_states = LinkedHashMap::<PeerStateId, PeerState>::new();
         let mut mailbox_stream = self
             .mailbox_rx
             .into_stream(self.connection, &self.received_msg_successfully);
@@ -964,6 +976,123 @@ impl ConnectionTask {
                     };
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hashlink::LinkedHashMap;
+
+    use super::{ConnectionTask, MAX_PEER_STATES};
+    use crate::{
+        net::peer::{PeerState, PeerStateId},
+        types::Version,
+    };
+
+    fn peer_state(patch: u64) -> PeerState {
+        PeerState {
+            tip_info: None,
+            version: Version {
+                major: 0,
+                minor: 0,
+                patch,
+            },
+        }
+    }
+
+    #[test]
+    fn peer_state_cache_is_bounded() {
+        let mut peer_states = LinkedHashMap::<PeerStateId, PeerState>::new();
+        let peer_state_ids: Vec<PeerStateId> = (0..2 * MAX_PEER_STATES)
+            .map(|patch| {
+                ConnectionTask::insert_peer_state(
+                    &mut peer_states,
+                    peer_state(patch as u64),
+                )
+            })
+            .collect();
+        assert_eq!(peer_states.len(), MAX_PEER_STATES);
+        for (idx, peer_state_id) in peer_state_ids.iter().enumerate() {
+            assert_eq!(
+                peer_states.contains_key(peer_state_id),
+                idx >= peer_state_ids.len() - MAX_PEER_STATES,
+                "Wrong cache entry for peer state {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_messages_for_removed_peer_states_do_not_stop_the_connection()
+    -> anyhow::Result<()> {
+        use std::{net::Ipv4Addr, sync::Arc};
+
+        use futures::channel::mpsc;
+
+        use crate::{
+            archive::Archive,
+            mempool::MemPool,
+            net::peer::{
+                ConnectionContext,
+                mailbox::{BlockingTaskFn, InternalMessage},
+                message, request_queue,
+            },
+            state::State,
+            types::{
+                Network, authorization::BatchVerificationContext,
+                net::ResolvedPeerAddress,
+            },
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
+        opts.map_size(16 * 1024 * 1024)
+            .max_dbs(Archive::NUM_DBS + MemPool::NUM_DBS + State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, temp_dir.path()) }?;
+        let ctxt = Arc::new(ConnectionContext {
+            archive: Archive::new(&env)?,
+            batch_verification_ctxt: BatchVerificationContext::new(
+                &mut rand::rng(),
+            ),
+            magic_bytes: message::magic_bytes(Network::Regtest),
+            resolved_address: ResolvedPeerAddress::Static(
+                (Ipv4Addr::LOCALHOST, 4000).into(),
+            ),
+            mempool: MemPool::new(&env)?,
+            state: State::new(&env, None)?,
+            env,
+        });
+        let mut peer_states = LinkedHashMap::new();
+        let removed_id =
+            ConnectionTask::insert_peer_state(&mut peer_states, peer_state(0));
+        for patch in 1..=MAX_PEER_STATES {
+            ConnectionTask::insert_peer_state(
+                &mut peer_states,
+                peer_state(patch as u64),
+            );
+        }
+        assert!(!peer_states.contains_key(&removed_id));
+        let (info_tx, _info_rx) = mpsc::unbounded();
+        let (request_tx, _request_rx) = request_queue::new();
+        let (task_tx, _task_rx) = mpsc::unbounded::<BlockingTaskFn>();
+        for msg in [
+            InternalMessage::BmmVerification {
+                res: Ok(()),
+                peer_state_id: removed_id,
+            },
+            InternalMessage::MainchainAncestors(removed_id),
+            InternalMessage::Headers(removed_id),
+            InternalMessage::BodiesAvailable(removed_id),
+        ] {
+            ConnectionTask::handle_internal_message(
+                &ctxt,
+                &info_tx,
+                &request_tx,
+                &task_tx,
+                &peer_states,
+                msg,
+            )?;
         }
         Ok(())
     }
