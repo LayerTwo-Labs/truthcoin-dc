@@ -590,6 +590,7 @@ impl NetTask {
                         block_hash,
                         descendant_tip: Some(descendant_tip),
                         ancestor,
+                        height: _,
                         peer_state_id: Some(peer_state_id),
                     },
                 ),
@@ -810,6 +811,7 @@ impl NetTask {
                     block_hash: req_block_hash,
                     descendant_tip: Some(_),
                     ancestor: _,
+                    height: _,
                     peer_state_id: Some(_),
                 }),
                 PeerResponse::NoBlock {

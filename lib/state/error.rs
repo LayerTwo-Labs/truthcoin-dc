@@ -138,6 +138,8 @@ pub enum Error {
     #[error("body too large")]
     BodyTooLarge,
     #[error(transparent)]
+    BincodeSerialize(bincode::Error),
+    #[error(transparent)]
     BorshSerialize(borsh::io::Error),
     #[error(transparent)]
     ConnectWithdrawalBundleSubmitted(#[from] ConnectWithdrawalBundleSubmitted),

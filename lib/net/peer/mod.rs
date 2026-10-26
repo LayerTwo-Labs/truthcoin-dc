@@ -159,7 +159,7 @@ impl Connection {
         // Minimum sustained throughput, in bytes per second, that a peer
         // streaming a response body is expected to achieve.
         // Used to scale the response read timeout to `read_response_limit`, so
-        // a large (up to 10MB) block response is given proportionally more
+        // a large block response is given proportionally more
         // time. Deliberately conservative so a slow or congested link is not
         // aborted; a peer that stops making progress entirely still hits the
         // timeout.
@@ -297,8 +297,8 @@ impl Connection {
         send.finish()?;
         // Bound the wait for a response so an unresponsive peer that holds the
         // bi-stream open cannot pin the outbound request channel indefinitely.
-        // The timeout scales with the maximum response size, so a large (up to
-        // 10MB) block response on a slow or congested link is not aborted.
+        // The timeout scales with the maximum response size, so a large block
+        // response on a slow or congested link is not aborted.
         let response = match tokio::time::timeout(
             Self::response_read_timeout(read_response_limit),
             Self::receive_response(self.magic_bytes, recv, read_response_limit),
@@ -592,7 +592,7 @@ mod test {
         types::BlockHash,
     };
 
-    /// A large (up to 10MB) block response must be granted substantially more
+    /// A large block response must be granted substantially more
     /// time than the heartbeat timeout, so that a slow but steadily-progressing
     /// response over a congested link is not spuriously aborted (which would
     /// stall IBD).
@@ -602,13 +602,14 @@ mod test {
             block_hash: BlockHash([0u8; 32]),
             descendant_tip: None,
             ancestor: None,
+            height: Some(0),
             peer_state_id: None,
         };
         let timeout =
             Connection::response_read_timeout(get_block.read_response_limit());
         assert!(
             timeout > Connection::HEARTBEAT_TIMEOUT_INTERVAL,
-            "10MB block response timeout {timeout:?} must exceed the heartbeat \
+            "Block response timeout {timeout:?} must exceed the heartbeat \
              timeout {:?}",
             Connection::HEARTBEAT_TIMEOUT_INTERVAL,
         );
