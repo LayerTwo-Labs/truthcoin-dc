@@ -106,11 +106,6 @@ impl From<ConnectSidechainTip> for ConnectMainchainTip {
 }
 
 #[derive(Debug, Error)]
-#[error("missing sidechain tip ({0})")]
-#[repr(transparent)]
-pub struct MissingSidechainTip(pub(crate) crate::types::BlockHash);
-
-#[derive(Debug, Error)]
 pub enum DisconnectMainchainTip {
     #[error(transparent)]
     DbDelete(Box<db::Delete>),
@@ -124,8 +119,6 @@ pub enum DisconnectMainchainTip {
     InvalidMainchainParent { expected: bitcoin::BlockHash },
     #[error("invalid mainchain parent height, expected ({tip_height} - 1)")]
     InvalidMainchainParentHeight { tip_height: u32 },
-    #[error(transparent)]
-    MissingSidechainTip(#[from] MissingSidechainTip),
     #[error("no mainchain tip to disconnect")]
     NoMainchainTip,
 }
