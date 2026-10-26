@@ -578,7 +578,7 @@ impl ConnectionTask {
         // Request missing bodies, or notify that a new tip is ready
         let (common_ancestor, missing_bodies): (
             Option<BlockHash>,
-            Vec<BlockHash>,
+            Vec<(BlockHash, u32)>,
         ) = {
             let rotxn = ctxt.env.read_txn()?;
             let common_ancestor = if let Some(tip_info) = tip_info {
@@ -604,6 +604,10 @@ impl ConnectionTask {
                     start_height,
                 )
                 .take(MAX_BLOCK_REQUESTS)
+                .map(|block_hash| {
+                    let height = ctxt.archive.get_height(&rotxn, block_hash)?;
+                    Ok((block_hash, height))
+                })
                 .collect()?;
             (common_ancestor, missing_bodies)
         };
@@ -614,16 +618,19 @@ impl ConnectionTask {
                 .map_err(|_| blocking_task::TaskError::SendInfo)?;
         } else {
             // Request missing bodies
-            missing_bodies.into_iter().try_for_each(|block_hash| {
-                let request = message::GetBlockRequest {
-                    block_hash,
-                    descendant_tip: Some(peer_tip_info.tip),
-                    peer_state_id: Some(peer_state.into()),
-                    ancestor: common_ancestor,
-                };
-                let _: bool = request_queue.send_request(request.into())?;
-                Ok::<_, blocking_task::TaskError>(())
-            })?;
+            missing_bodies.into_iter().try_for_each(
+                |(block_hash, height)| {
+                    let request = message::GetBlockRequest {
+                        block_hash,
+                        descendant_tip: Some(peer_tip_info.tip),
+                        height: Some(height),
+                        peer_state_id: Some(peer_state.into()),
+                        ancestor: common_ancestor,
+                    };
+                    let _: bool = request_queue.send_request(request.into())?;
+                    Ok::<_, blocking_task::TaskError>(())
+                },
+            )?;
         }
         Ok(())
     }
@@ -778,6 +785,7 @@ impl ConnectionTask {
                     block_hash,
                     descendant_tip: _,
                     ancestor: _,
+                    height: _,
                     peer_state_id: _,
                 },
             )) => Self::handle_get_block(ctxt, response_tx, block_hash).await,

@@ -36,9 +36,8 @@ pub fn prevalidate(
     if body.authorizations.len() > State::body_sigops_limit(next_height) {
         return Err(Error::TooManySigops);
     }
-    let body_size =
-        borsh::object_length(&body).map_err(Error::BorshSerialize)?;
-    if body_size > State::body_size_limit(next_height) {
+    let body_size = State::body_size(body)?;
+    if body_size > State::body_size_limit(next_height) as u64 {
         return Err(Error::BodyTooLarge);
     }
 
@@ -354,9 +353,8 @@ pub fn validate(
     if body.authorizations.len() > State::body_sigops_limit(height) {
         return Err(Error::TooManySigops);
     }
-    let body_size =
-        borsh::object_length(&body).map_err(Error::BorshSerialize)?;
-    if body_size > State::body_size_limit(height) {
+    let body_size = State::body_size(body)?;
+    if body_size > State::body_size_limit(height) as u64 {
         return Err(Error::BodyTooLarge);
     }
     let mut accumulator = state
@@ -1262,6 +1260,65 @@ mod test {
                 .prevalidate_block(&rotxn, &ctxt, &header, &body, &archive)
                 .is_err(),
             "prevalidate must reject the same body",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn body_size_counts_utreexo_proofs() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::{
+            state::{Error, State},
+            types::{
+                AuthorizedTransaction, Body, Header, Transaction,
+                UtreexoNodeHash, UtreexoProof,
+                authorization::BatchVerificationContext,
+            },
+        };
+
+        let (_temp_dir, env, state) =
+            fresh_state("body_size_counts_utreexo_proofs")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let batch = BatchVerificationContext::new(&mut rand::rng());
+        let hash_count = State::body_size_limit(0)
+            / std::mem::size_of::<UtreexoNodeHash>()
+            + 1;
+        let transaction = Transaction {
+            inputs: Vec::new().into(),
+            proof: UtreexoProof::new(
+                Vec::new(),
+                vec![UtreexoNodeHash::Some([1; 32]); hash_count],
+            ),
+            outputs: Vec::new().into(),
+            data: None,
+        };
+        let body = Body::new(
+            vec![AuthorizedTransaction {
+                transaction,
+                authorizations: Vec::new(),
+                actor_proof: None,
+            }],
+            Coinbase::default(),
+        );
+        anyhow::ensure!(
+            borsh::object_length(&body)? < State::body_size_limit(0)
+        );
+        let header = Header {
+            merkle_root: Body::compute_merkle_root::<FilledTransaction>(
+                &body.coinbase,
+                &[],
+            )?,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        let rotxn = env.read_txn()?;
+        let result =
+            state.validate_block(&rotxn, &batch, &header, &body, &archive);
+        anyhow::ensure!(
+            matches!(result, Err(Error::BodyTooLarge)),
+            "expected BodyTooLarge, got {result:?}",
         );
         Ok(())
     }

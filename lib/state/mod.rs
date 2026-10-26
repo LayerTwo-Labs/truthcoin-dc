@@ -722,7 +722,12 @@ impl State {
         }
     }
 
-    // in bytes
+    /// Size in bytes of a body as P2P sends it, with the Utreexo proofs.
+    pub fn body_size(body: &Body) -> Result<u64, Error> {
+        bincode::serialized_size(body).map_err(Error::BincodeSerialize)
+    }
+
+    /// Largest valid [`Self::body_size`] at a block height
     pub fn body_size_limit(height: u32) -> usize {
         // 8MB starting body size limit.
         const START: usize = 8 * 1024 * 1024;
