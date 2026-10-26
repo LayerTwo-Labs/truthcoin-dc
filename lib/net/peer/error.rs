@@ -643,6 +643,18 @@ impl Error {
         false
     }
 
+    /// True when the peer broke a rule that bans it.
+    pub fn is_ban(&self) -> bool {
+        let mut error: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(err) = error {
+            if err.is::<crate::net::peer::BanReason>() {
+                return true;
+            }
+            error = err.source();
+        }
+        false
+    }
+
     /// True when the peer answered with another network's magic bytes. Such a
     /// peer runs a different chain, so it never becomes useful.
     pub fn is_bad_magic(&self) -> bool {
@@ -767,6 +779,22 @@ mod test {
             connection::Receive::Timeout,
         ));
         assert!(!err.is_bad_magic());
+    }
+
+    #[test]
+    fn a_ban_reason_survives_the_blocking_task_path() {
+        let ban_reason = crate::net::peer::BanReason::BmmVerificationFailed(
+            crate::types::Tip {
+                block_hash: crate::types::BlockHash([0; 32]),
+                main_block_hash:
+                    <bitcoin::BlockHash as bitcoin::hashes::Hash>::all_zeros(),
+            },
+        );
+        let err = Error::Mailbox(mailbox::Error::BlockingTask(
+            super::blocking_task::TaskError::PeerBan(ban_reason).into(),
+        ));
+        assert!(err.is_ban());
+        assert!(!Error::Mailbox(mailbox::Error::HeartbeatTimeout).is_ban());
     }
 
     #[test]

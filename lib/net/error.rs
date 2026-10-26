@@ -35,6 +35,8 @@ pub use parse_peer_address::Error as ParsePeerAddress;
 #[transitive(
     from(db::Error, sneed::Error),
     from(db::Put, db::Error),
+    from(db::TryGet, db::Error),
+    from(env::ReadTxn, env::Error),
     from(env::WriteTxn, env::Error),
     from(env::Error, sneed::Error),
     from(rwtxn::Error, sneed::Error)
@@ -91,8 +93,14 @@ pub use configure_client::Error as ConfigureClient;
 pub enum ConnectPeer {
     #[error(transparent)]
     AlreadyConnected(#[from] AlreadyConnected),
+    #[error("peer ip address is banned (cannot connect to '{0}')")]
+    Banned(IpAddr),
     #[error("failed to commit db write txn")]
     DbCommit(#[source] Box<rwtxn::Commit>),
+    #[error("failed to create db read txn")]
+    DbReadTxn(#[source] Box<env::ReadTxn>),
+    #[error("database error")]
+    DbTryGet(#[source] Box<db::TryGet>),
     #[error("database error")]
     DbPut(#[source] Box<db::Put>),
     #[error("failed to create db write txn")]
@@ -108,6 +116,18 @@ pub enum ConnectPeer {
 impl From<db::Put> for ConnectPeer {
     fn from(err: db::Put) -> Self {
         Self::DbPut(Box::new(err))
+    }
+}
+
+impl From<env::ReadTxn> for ConnectPeer {
+    fn from(err: env::ReadTxn) -> Self {
+        Self::DbReadTxn(Box::new(err))
+    }
+}
+
+impl From<db::TryGet> for ConnectPeer {
+    fn from(err: db::TryGet) -> Self {
+        Self::DbTryGet(Box::new(err))
     }
 }
 

@@ -1277,6 +1277,17 @@ impl NetTask {
                                     },
                                 );
                             let () = self.ctxt.net.remove_active_peer(addr);
+                            if err.is_ban() {
+                                let mut rwtxn = self
+                                    .ctxt
+                                    .env
+                                    .write_txn()
+                                    .map_err(EnvError::from)?;
+                                let () =
+                                    self.ctxt.net.ban_peer(&mut rwtxn, addr)?;
+                                rwtxn.commit().map_err(RwTxnError::from)?;
+                                continue;
+                            }
                             // A peer on another network never becomes useful,
                             // so it must not survive into the next start.
                             if err.is_bad_magic() {
