@@ -1529,4 +1529,67 @@ mod test {
         );
         Ok(())
     }
+
+    #[test]
+    fn a_block_rejects_outputs_without_inputs() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::{
+            state::Error,
+            types::{
+                Address, AuthorizedTransaction, Body, Header, Transaction,
+                authorization::BatchVerificationContext,
+            },
+        };
+
+        let (_temp_dir, env, state) =
+            fresh_state("a_block_rejects_outputs_without_inputs")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let transaction = Transaction {
+            outputs: vec![value_output(Address([1; 20]), 0)].into(),
+            ..Transaction::default()
+        };
+        let filled = FilledTransaction {
+            transaction: transaction.clone(),
+            spent_utxos: Vec::new(),
+            actor_address: None,
+        };
+        let body = Body::new(
+            vec![AuthorizedTransaction {
+                transaction,
+                authorizations: Vec::new(),
+                actor_proof: None,
+            }],
+            Coinbase::default(),
+        );
+        let rotxn = env.read_txn()?;
+        let mut header = Header {
+            merkle_root: Body::compute_merkle_root(
+                &body.coinbase,
+                std::slice::from_ref(&filled),
+            )?,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        let mut accumulator = state.get_accumulator(&rotxn)?;
+        Body::modify_memforest(
+            header.compute_coinbase_txid(),
+            &[],
+            &[filled],
+            &mut accumulator.0,
+        )?;
+        header.roots = accumulator.get_roots();
+        let ctxt = BatchVerificationContext::new(&mut rand::rng());
+        let validation =
+            state.validate_block(&rotxn, &ctxt, &header, &body, &archive);
+        assert!(
+            matches!(validation, Err(Error::OutputsWithoutInputs)),
+            "{validation:?}"
+        );
+        let prevalidation =
+            state.prevalidate_block(&rotxn, &ctxt, &header, &body, &archive);
+        assert!(matches!(prevalidation, Err(Error::OutputsWithoutInputs)));
+        Ok(())
+    }
 }
