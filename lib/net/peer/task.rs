@@ -885,6 +885,7 @@ impl ConnectionTask {
         // current peer state
         let mut peer_state = Option::<PeerStateId>::None;
         let mut peer_states = LinkedHashMap::<PeerStateId, PeerState>::new();
+        let inbound_budget = request_queue::InboundBudget::new();
         let mut mailbox_stream = self
             .mailbox_rx
             .into_stream(self.connection, &self.received_msg_successfully);
@@ -949,6 +950,9 @@ impl ConnectionTask {
                     self.mailbox_tx.request_tx.send_heartbeat(heartbeat_msg)?;
                 }
                 MailboxItem::PeerRequest((request, response_tx)) => {
+                    if let RequestMessage::Request(request) = &request {
+                        let () = inbound_budget.spend(request)?;
+                    }
                     let () = Self::handle_peer_request(
                         &ctxt,
                         &self.info_tx,

@@ -586,6 +586,8 @@ pub enum Error {
     Mailbox(#[from] mailbox::Error),
     #[error("missing peer state for id {0}")]
     MissingPeerState(PeerStateId),
+    #[error("peer should be banned; {0}")]
+    PeerBan(#[from] crate::net::peer::BanReason),
     #[error(transparent)]
     ReceiveResponse(#[from] connection::ReceiveResponse),
     #[error("Failed to push blocking task")]
@@ -614,6 +616,7 @@ impl Recoverable for Error {
             | Self::SendBlockingTask
             | Self::SendInfo
             | Self::State(_) => true,
+            Self::PeerBan(_) => false,
             Self::Connection(err) => err.may_reconnect(),
             Self::Mailbox(err) => err.may_reconnect(),
             Self::ReceiveResponse(err) => err.may_reconnect(),
@@ -664,6 +667,7 @@ impl Error {
             | Self::DbEnv(_)
             | Self::MemPool(_)
             | Self::MissingPeerState(_)
+            | Self::PeerBan(_)
             | Self::SendBlockingTask
             | Self::SendHeartbeat(_)
             | Self::SendInfo

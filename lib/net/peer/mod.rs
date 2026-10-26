@@ -54,6 +54,8 @@ pub enum BanReason {
         tip.main_block_hash
     )]
     IncorrectTotalWork { tip: Tip, total_work: Work },
+    #[error("Peer sent requests faster than the inbound request budget")]
+    RequestBudgetExceeded,
 }
 
 fn borsh_serialize_work<W>(work: &Work, writer: &mut W) -> borsh::io::Result<()>

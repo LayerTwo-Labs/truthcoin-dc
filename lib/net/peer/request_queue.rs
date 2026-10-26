@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 
 use crate::{
     net::peer::{
-        Connection, PeerResponseItem,
+        BanReason, Connection, PeerResponseItem,
         channel_pool::{self, ChannelPool},
         error,
         message::{Heartbeat, Request},
@@ -18,6 +18,29 @@ use crate::{
 
 const REQUEST_QUOTA: Quota =
     Quota::per_second(NonZeroU32::new(50_000).unwrap());
+
+/// A peer that obeys [`REQUEST_QUOTA`] stays inside this budget, with every
+/// request channel in flight.
+const INBOUND_REQUEST_QUOTA: Quota =
+    Quota::per_second(NonZeroU32::new(100_000).unwrap())
+        .allow_burst(NonZeroU32::new(200_000).unwrap());
+
+/// Rate limiter for the requests that a peer sends to this node
+#[repr(transparent)]
+pub(in crate::net::peer) struct InboundBudget(DefaultDirectRateLimiter);
+
+impl InboundBudget {
+    pub fn new() -> Self {
+        Self(DefaultDirectRateLimiter::direct(INBOUND_REQUEST_QUOTA))
+    }
+
+    pub fn spend(&self, request: &Request) -> Result<(), BanReason> {
+        match self.0.check_n(request_cost(request)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(BanReason::RequestBudgetExceeded),
+        }
+    }
+}
 
 /// The rate limiter token cost for a request
 const fn request_cost(req: &Request) -> NonZeroU32 {
@@ -182,4 +205,121 @@ pub fn new() -> (Sender, ErrorRx) {
         rate_limiter: Arc::new(rate_limiter),
     };
     (sender, error_rx)
+}
+
+#[cfg(test)]
+mod test {
+    use std::{collections::HashSet, net::Ipv4Addr, time::Duration};
+
+    use futures::{StreamExt as _, future};
+
+    use super::{INBOUND_REQUEST_QUOTA, InboundBudget, request_cost};
+    use crate::{
+        archive::Archive,
+        mempool::MemPool,
+        net::{
+            Net, make_server_endpoint,
+            peer::{
+                BanReason, Connection, ConnectionContext, Info, handle,
+                message::{self, GetHeadersRequest, Request},
+            },
+        },
+        state::State,
+        types::{BlockHash, Network, authorization::BatchVerificationContext},
+    };
+
+    fn get_headers() -> Request {
+        GetHeadersRequest {
+            start: HashSet::new(),
+            end: BlockHash([0xab; 32]),
+            height: Some(0),
+            peer_state_id: None,
+        }
+        .into()
+    }
+
+    #[test]
+    fn the_budget_refuses_a_request_over_the_burst() {
+        let budget = InboundBudget::new();
+        let request = get_headers();
+        let burst = INBOUND_REQUEST_QUOTA.burst_size().get()
+            / request_cost(&request).get();
+        for _ in 0..burst {
+            assert!(budget.spend(&request).is_ok());
+        }
+        assert!(matches!(
+            budget.spend(&request),
+            Err(BanReason::RequestBudgetExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_peer_over_budget_is_dropped() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
+        opts.map_size(16 * 1024 * 1024).max_dbs(
+            Archive::NUM_DBS + MemPool::NUM_DBS + State::NUM_DBS + Net::NUM_DBS,
+        );
+        let env = unsafe { sneed::Env::open(&opts, temp_dir.path()) }?;
+        let magic_bytes = message::magic_bytes(Network::Regtest);
+        let (server, _) = make_server_endpoint(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            HashSet::new(),
+        )?;
+        let (client, _) = make_server_endpoint(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            HashSet::new(),
+        )?;
+        let connecting = client.connect(server.local_addr()?, "localhost")?;
+        let incoming = server
+            .accept()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the server endpoint closed"))?;
+        let (client_connection, server_connection) = tokio::join!(
+            Connection::from_connecting(connecting, magic_bytes),
+            incoming,
+        );
+        let client_connection = client_connection?;
+        let server_connection =
+            Connection::new(server_connection?, magic_bytes);
+        let ctxt = ConnectionContext {
+            archive: Archive::new(&env)?,
+            batch_verification_ctxt: BatchVerificationContext::new(
+                &mut rand::rng(),
+            ),
+            magic_bytes,
+            resolved_address: server_connection.addr().into(),
+            mempool: MemPool::new(&env)?,
+            state: State::new(&env, None)?,
+            env,
+        };
+        let (_handle, info_rx) = handle(ctxt, server_connection);
+
+        let request = get_headers();
+        let burst = INBOUND_REQUEST_QUOTA.burst_size().get()
+            / request_cost(&request).get();
+        let requests =
+            (0..2 * burst).map(|_| client_connection.send_request(&request));
+        let _responses = tokio::time::timeout(
+            Duration::from_secs(10),
+            future::join_all(requests),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("requests timed out"))?;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            info_rx
+                .filter_map(async |info| match info {
+                    Info::Error { err, .. } => Some(err),
+                    _ => None,
+                })
+                .boxed()
+                .next(),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the connection task sent no error"))?;
+        assert!(error.is_ban(), "{error:#}");
+        Ok(())
+    }
 }
