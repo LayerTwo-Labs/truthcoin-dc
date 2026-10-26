@@ -623,7 +623,7 @@ impl App {
                     }],
                 };
                 Coinbase {
-                    memo: Vec::new(),
+                    memo: self.node.oracle_memo(prev_side_hash)?,
                     outputs: outputs.into(),
                 }
             };
@@ -680,7 +680,10 @@ impl App {
             });
             (bribe, header, body, tx_fees)
         } else {
-            let coinbase = Default::default();
+            let coinbase = Coinbase {
+                memo: self.node.oracle_memo(prev_side_hash)?,
+                ..Default::default()
+            };
             let txs: [FilledTransaction; 0] = [];
             let merkle_root =
                 types::Body::compute_merkle_root(&coinbase, &txs)?;

@@ -12,7 +12,15 @@ fn is_step_aligned(delta: f64, step: f64) -> bool {
 }
 
 #[derive(
-    Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd,
+    Clone,
+    Debug,
+    Deserialize,
+    Serialize,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    borsh::BorshSerialize,
 )]
 pub struct Decision {
     pub market_maker_pubkey_hash: [u8; 20],
@@ -386,7 +394,15 @@ impl DecisionStateHistory {
 }
 
 #[derive(
-    Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd,
+    Clone,
+    Debug,
+    Deserialize,
+    Serialize,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    borsh::BorshSerialize,
 )]
 pub struct DecisionEntry {
     pub decision_id: DecisionId,
