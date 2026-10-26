@@ -624,6 +624,13 @@ impl State {
         archive: &crate::archive::Archive,
         override_height: Option<u32>,
     ) -> Result<bitcoin::Amount, Error> {
+        // Each copy of a transaction with no inputs has the same txid, so its
+        // outputs get the same outpoints.
+        if transaction.transaction.inputs.is_empty()
+            && !transaction.transaction.outputs.is_empty()
+        {
+            return Err(Error::OutputsWithoutInputs);
+        }
         let () = Self::validate_utxo_hashes(transaction)?;
         let mut value_in = bitcoin::Amount::ZERO;
         let mut value_out = bitcoin::Amount::ZERO;
