@@ -1739,6 +1739,204 @@ mod test {
     }
 
     #[test]
+    fn block_selection_drops_transactions_that_conflict_at_connect()
+    -> anyhow::Result<()> {
+        use crate::{
+            state::{
+                decisions::{Decision, DecisionId, DecisionType},
+                markets::{
+                    DimensionSpec, compute_market_id,
+                    generate_market_treasury_address,
+                },
+            },
+            types::{
+                Address, Body, Coinbase, Header, TransactionData,
+                authorization::{SigningKey, authorize, get_address},
+            },
+        };
+        use bitcoin::hashes::Hash as _;
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let key = SigningKey::new(&mut rand::rng());
+            let creator = get_address(&(&key).into());
+            let decision_id = DecisionId::new(false, 0, 0)?;
+            let dimension_specs = vec![DimensionSpec::Single(decision_id)];
+            let market_id =
+                compute_market_id("title", "", &creator, &dimension_specs);
+            let mut accumulator = Accumulator::default();
+            let mut diff = AccumulatorDiff::default();
+            let mut inputs = Vec::new();
+            let mut rwtxn = node.env.write_txn()?;
+            node.state.decisions().claim_decision(
+                &mut rwtxn,
+                decision_id,
+                Decision::new(
+                    creator.0,
+                    DecisionType::Binary,
+                    "header".to_owned(),
+                    String::new(),
+                    None,
+                    None,
+                    Vec::new(),
+                )?,
+                [9; 32].into(),
+                Some(0),
+            )?;
+            for index in 0..2u8 {
+                let pointed = PointedOutput {
+                    outpoint: OutPoint::Regular {
+                        txid: [index; 32].into(),
+                        vout: 0,
+                    },
+                    output: Output {
+                        address: creator,
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(10_000),
+                        ),
+                    },
+                };
+                node.state.utxos.put(
+                    &mut rwtxn,
+                    &OutPointKey::from(&pointed.outpoint),
+                    &pointed.output,
+                )?;
+                diff.insert((&pointed).into());
+                inputs.push((pointed.outpoint, hash(&pointed)));
+            }
+            accumulator.apply_diff(diff)?;
+            node.state.utreexo_accumulator.put(
+                &mut rwtxn,
+                &(),
+                &accumulator,
+            )?;
+            rwtxn.commit()?;
+
+            let mut market_txs = Vec::new();
+            for input in inputs {
+                let tx = Transaction {
+                    inputs: vec![input].into(),
+                    outputs: vec![
+                        Output {
+                            address: generate_market_treasury_address(
+                                &market_id,
+                            ),
+                            content: OutputContent::MarketFunds {
+                                market_id: market_id.0,
+                                amount: bitcoin::Amount::from_sat(5_000),
+                                is_fee: false,
+                            },
+                        },
+                        Output {
+                            address: creator,
+                            content: OutputContent::Value(
+                                bitcoin::Amount::from_sat(4_000),
+                            ),
+                        },
+                    ]
+                    .into(),
+                    data: Some(TransactionData::CreateMarket {
+                        title: "title".to_owned(),
+                        description: String::new(),
+                        dimension_specs: dimension_specs.clone(),
+                        new_claims: Vec::new(),
+                        trading_fee: None,
+                        tx_pow_hash_selector: None,
+                        tx_pow_ordering: None,
+                        tx_pow_difficulty: None,
+                    }),
+                    ..Default::default()
+                };
+                let tx = authorize(rand::rng(), &[(creator, &key)], tx)?;
+                market_txs.push(tx.transaction.clone());
+                node.submit_transaction(tx)?;
+            }
+            // Each market creation has a child that spends its change.
+            let mut child_txids = Vec::new();
+            for market_tx in &market_txs {
+                let change = OutPoint::Regular {
+                    txid: market_tx.txid(),
+                    vout: 1,
+                };
+                let child = Transaction {
+                    inputs: vec![(
+                        change,
+                        hash(&PointedOutput {
+                            outpoint: change,
+                            output: market_tx.outputs.as_slice()[1].clone(),
+                        }),
+                    )]
+                    .into(),
+                    outputs: vec![Output {
+                        address: Address([4; 20]),
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(3_000),
+                        ),
+                    }]
+                    .into(),
+                    ..Default::default()
+                };
+                let child = authorize(rand::rng(), &[(creator, &key)], child)?;
+                child_txids.push(child.transaction.txid());
+                node.submit_transaction(child)?;
+            }
+
+            let (selected, fee) = node.get_transactions(100)?;
+            let selected_txids: Vec<_> =
+                selected.iter().map(|tx| tx.transaction.txid()).collect();
+            let kept = market_txs
+                .iter()
+                .position(|tx| selected_txids.contains(&tx.txid()))
+                .expect("one market creation stays in the block");
+            assert_eq!(
+                selected_txids,
+                vec![market_txs[kept].txid(), child_txids[kept]]
+            );
+            assert_eq!(fee.to_sat(), 2_000);
+            let coinbase = Coinbase::default();
+            let merkle_root = Body::compute_merkle_root(&coinbase, &selected)?;
+            let mut header = Header {
+                merkle_root,
+                prev_side_hash: None,
+                prev_main_hash: bitcoin::BlockHash::all_zeros(),
+                roots: Vec::new(),
+            };
+            Body::modify_memforest(
+                header.compute_coinbase_txid(),
+                &[],
+                &selected,
+                &mut accumulator.0,
+            )?;
+            header.roots = accumulator.get_roots();
+            let body = Body::new(
+                selected.into_iter().map(Into::into).collect(),
+                coinbase,
+            );
+            let mut rwtxn = node.env.write_txn()?;
+            node.state.apply_block(
+                &mut rwtxn,
+                &node.batch_verification_ctxt,
+                &header,
+                &body,
+                &node.archive,
+                1_700_000_000,
+            )?;
+            assert!(
+                node.state
+                    .markets()
+                    .get_market(&rwtxn, &market_id)?
+                    .is_some()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn peer_transaction_conflicts_do_not_stop_net_task() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {

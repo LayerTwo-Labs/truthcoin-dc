@@ -28,10 +28,11 @@ use crate::{
         },
     },
     types::{
-        Accumulator, Address, AmountUnderflowError, Authorized,
-        AuthorizedTransaction, BlockHash, BmmResult, Body, FilledTransaction,
-        Header, InPoint, MainchainSyncProgress, Network, OutPoint, OutPointKey,
-        Output, SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
+        Accumulator, Address, AmountOverflowError, Authorized,
+        AuthorizedTransaction, BlockHash, BmmResult, Body, Coinbase,
+        FilledTransaction, Header, InPoint, MainchainSyncProgress, Network,
+        OutPoint, OutPointKey, Output, OutputContent, SpentOutput, Tip,
+        Transaction, TxIn, Txid, WithdrawalBundle,
         authorization::{BatchVerificationContext, rand_core::CryptoRng},
         net::{Peer, PeerAddress, ResolvedPeerAddress},
         proto::{self, mainchain},
@@ -46,6 +47,21 @@ mod mainchain_task;
 use mainchain_task::MainchainTaskHandle;
 mod net_task;
 use net_task::NetTaskHandle;
+
+/// Sum of the miner fees of the transactions
+fn template_fee(
+    transactions: &[Authorized<FilledTransaction>],
+) -> Result<bitcoin::Amount, state::Error> {
+    let mut fee = bitcoin::Amount::ZERO;
+    for transaction in transactions {
+        fee = fee
+            .checked_add(crate::validation::miner_fee(
+                &transaction.transaction,
+            )?)
+            .ok_or(AmountOverflowError)?;
+    }
+    Ok(fee)
+}
 
 pub type FilledTransactionWithPosition =
     (Authorized<FilledTransaction>, Option<TxIn>);
@@ -618,7 +634,6 @@ where
             .chain(trade_txs)
             .take(number)
             .collect();
-        let mut fee = bitcoin::Amount::ZERO;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
         let mut trades = TradeSimulation::default();
@@ -711,11 +726,6 @@ where
                     .transaction
                     .outputs_by_outpoint(),
             );
-            fee = fee
-                .checked_add(crate::validation::miner_fee(
-                    &filled_transaction.transaction,
-                )?)
-                .ok_or(AmountUnderflowError)?;
             spent_utxos.extend(
                 filled_transaction
                     .transaction
@@ -727,7 +737,138 @@ where
             returned_transactions.push(filled_transaction);
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
+        let returned_transactions =
+            self.drop_unconnectable_transactions(returned_transactions)?;
+        let fee = template_fee(&returned_transactions)?;
         Ok((returned_transactions, fee))
+    }
+
+    /// Remove each transaction that block connect rejects after the
+    /// transactions before it. Also remove each transaction that spends an
+    /// output of a removed transaction.
+    fn drop_unconnectable_transactions(
+        &self,
+        mut transactions: Vec<Authorized<FilledTransaction>>,
+    ) -> Result<Vec<Authorized<FilledTransaction>>, Error> {
+        // The first `connects` transactions connect as one block.
+        let mut connects = 0;
+        let mut empty_connects = false;
+        loop {
+            let Err(err) = self.connect_template(&transactions)? else {
+                return Ok(transactions);
+            };
+            if !empty_connects {
+                if let Err(err) = self.connect_template(&[])? {
+                    return Err(err.into());
+                }
+                empty_connects = true;
+            }
+            let mut rejects = transactions.len();
+            let mut reject_err = err;
+            while rejects - connects > 1 {
+                let middle = connects + (rejects - connects) / 2;
+                match self.connect_template(&transactions[..middle])? {
+                    Ok(()) => connects = middle,
+                    Err(err) => {
+                        rejects = middle;
+                        reject_err = err;
+                    }
+                }
+            }
+            let dropped = transactions.remove(connects);
+            tracing::debug!(
+                txid = %dropped.transaction.txid(),
+                err = %reject_err,
+                "Drop transaction that does not connect in this block"
+            );
+            let mut dropped_txids = HashSet::from([dropped.transaction.txid()]);
+            transactions.retain(|transaction| {
+                let spends_dropped =
+                    transaction.transaction.transaction.inputs.iter().any(
+                        |(outpoint, _)| {
+                            matches!(outpoint, OutPoint::Regular { txid, .. }
+                                if dropped_txids.contains(txid))
+                        },
+                    );
+                if spends_dropped {
+                    dropped_txids.insert(transaction.transaction.txid());
+                }
+                !spends_dropped
+            });
+        }
+    }
+
+    /// Connect the transactions as the next block in a write txn, then abort
+    /// the txn. The inner error is the reason that block connect rejects the
+    /// transactions.
+    fn connect_template(
+        &self,
+        transactions: &[Authorized<FilledTransaction>],
+    ) -> Result<Result<(), state::Error>, Error> {
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        let res = self.connect_template_in(&mut rwtxn, transactions);
+        rwtxn.abort();
+        match res {
+            Ok(()) => Ok(Ok(())),
+            Err(
+                err @ (state::Error::Db(_)
+                | state::Error::Archive(_)
+                | state::Error::BorshSerialize(_)
+                | state::Error::IncompatibleVersion { .. }),
+            ) => Err(err.into()),
+            Err(err) => Ok(Err(err)),
+        }
+    }
+
+    fn connect_template_in(
+        &self,
+        rwtxn: &mut RwTxn,
+        transactions: &[Authorized<FilledTransaction>],
+    ) -> Result<(), state::Error> {
+        use bitcoin::hashes::Hash as _;
+
+        let fee = template_fee(transactions)?;
+        let coinbase = Coinbase {
+            memo: Vec::new(),
+            outputs: if fee == bitcoin::Amount::ZERO {
+                Vec::new()
+            } else {
+                vec![Output {
+                    address: Address::ALL_ZEROS,
+                    content: OutputContent::Value(fee),
+                }]
+            }
+            .into(),
+        };
+        let mut header = Header {
+            merkle_root: Body::compute_merkle_root(&coinbase, transactions)?,
+            prev_side_hash: self.state.try_get_tip(rwtxn)?,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        let mut accumulator = self.state.get_accumulator(rwtxn)?;
+        let () = Body::modify_memforest(
+            header.compute_coinbase_txid(),
+            coinbase.outputs.as_slice(),
+            transactions,
+            &mut accumulator.0,
+        )?;
+        header.roots = accumulator.get_roots();
+        let body = Body::new(
+            transactions.iter().cloned().map(Into::into).collect(),
+            coinbase,
+        );
+        // Before the first block, no mainchain timestamp exists yet.
+        let mainchain_timestamp =
+            self.state.try_get_mainchain_timestamp(rwtxn)?.unwrap_or(0);
+        self.state.apply_block(
+            rwtxn,
+            &self.batch_verification_ctxt,
+            &header,
+            &body,
+            &self.archive,
+            mainchain_timestamp,
+        )
     }
 
     /// Get a transaction if it exists in the active chain or mempool.
