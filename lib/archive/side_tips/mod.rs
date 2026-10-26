@@ -336,19 +336,14 @@ impl SideTips {
                 },
             );
         };
-        if let Some(side_block_hash) = bmm_commitment {
-            let Some(side_tip_info) =
+        // The BMM commitment can name a sidechain block that never connected
+        if let Some(side_block_hash) = bmm_commitment
+            && let Some(side_tip_info) =
                 self.sidechain_tips.try_get(rwtxn, &side_block_hash)?
-            else {
-                let err = error::MissingSidechainTip(side_block_hash);
-                return Err(err.into());
-            };
-            if side_tip_info.main_block_hash == mainchain_tip_info.block_hash
-                && !self.ordered_sidechain_tips.delete(rwtxn, &side_tip_info)?
-            {
-                let err = error::MissingSidechainTip(side_block_hash);
-                return Err(err.into());
-            }
+            && side_tip_info.main_block_hash == mainchain_tip_info.block_hash
+        {
+            self.ordered_sidechain_tips.delete(rwtxn, &side_tip_info)?;
+            self.sidechain_tips.delete(rwtxn, &side_block_hash)?;
         }
         let new_mainchain_tip = MainchainTip {
             cumulative_work: cumulative_work - mainchain_tip_info.work,

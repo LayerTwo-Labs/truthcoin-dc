@@ -1790,4 +1790,86 @@ pub(crate) mod test {
             .connect_mainchain_tip(&mut rwtxn, child, None)?;
         Ok(())
     }
+
+    /// A sidechain block leaves every side tip index when its BMM block
+    /// leaves the mainchain, so a later BMM of the same block connects it
+    /// again.
+    #[test]
+    fn mainchain_reorg_disconnects_bmm_side_tip() -> anyhow::Result<()> {
+        use crate::{
+            archive::side_tips::{BmmCommitment, SidechainHeaderData},
+            types::BlockHash,
+        };
+
+        let (_temp_dir, env) = temp_env("mainchain-reorg-bmm-side-tip")?;
+        let archive = Archive::new(&env)?;
+        let side_tips = archive.side_tips();
+        let mut rwtxn = env.write_txn()?;
+        let genesis = main_header_info(0);
+        let main_block = main_header_info(1);
+        let mut other_main_block = main_block;
+        other_main_block.block_hash =
+            bitcoin::BlockHash::from_byte_array([0xee; 32]);
+        let side_block = BlockHash([1; 32]);
+        let bmm = || BmmCommitment {
+            sidechain_block_hash: side_block,
+            sidechain_header_data: SidechainHeaderData {
+                prev_side_hash: None,
+                prev_main_hash: genesis.block_hash,
+            },
+        };
+        let best_side_tip = |rwtxn: &sneed::RwTxn| {
+            side_tips.best_side_tip(rwtxn).map(|tip| {
+                tip.map(|tip| (tip.block_hash, tip.info.main_block_hash))
+            })
+        };
+        side_tips.connect_mainchain_tip(&mut rwtxn, genesis, None)?;
+
+        side_tips.connect_mainchain_tip(&mut rwtxn, main_block, Some(bmm()))?;
+        side_tips.disconnect_mainchain_tip(
+            &mut rwtxn,
+            Some(genesis),
+            Some(side_block),
+        )?;
+        assert!(
+            !side_tips
+                .sidechain_tips()
+                .contains_key(&rwtxn, &side_block)?
+        );
+        assert_eq!(best_side_tip(&rwtxn)?, None);
+
+        side_tips.connect_mainchain_tip(
+            &mut rwtxn,
+            other_main_block,
+            Some(bmm()),
+        )?;
+        assert_eq!(
+            best_side_tip(&rwtxn)?,
+            Some((side_block, other_main_block.block_hash))
+        );
+        side_tips.disconnect_mainchain_tip(
+            &mut rwtxn,
+            Some(genesis),
+            Some(side_block),
+        )?;
+        assert_eq!(best_side_tip(&rwtxn)?, None);
+
+        side_tips.connect_mainchain_tip(&mut rwtxn, main_block, Some(bmm()))?;
+        side_tips.disconnect_mainchain_tip(
+            &mut rwtxn,
+            Some(genesis),
+            Some(side_block),
+        )?;
+        assert_eq!(best_side_tip(&rwtxn)?, None);
+
+        // The BMM block commits to a sidechain block that never connected.
+        side_tips.connect_mainchain_tip(&mut rwtxn, main_block, None)?;
+        side_tips.disconnect_mainchain_tip(
+            &mut rwtxn,
+            Some(genesis),
+            Some(side_block),
+        )?;
+        assert_eq!(best_side_tip(&rwtxn)?, None);
+        Ok(())
+    }
 }
