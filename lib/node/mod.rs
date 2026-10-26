@@ -1104,7 +1104,7 @@ where
 
     pub fn get_pending_decision_claim_ids(
         &self,
-    ) -> Result<std::collections::BTreeSet<[u8; 3]>, Error> {
+    ) -> Result<std::collections::BTreeSet<[u8; 4]>, Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         Ok(self.mempool.pending_decision_claim_ids(&rotxn)?)
     }

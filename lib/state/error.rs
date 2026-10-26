@@ -254,7 +254,7 @@ pub enum Error {
         reason: String,
     },
     #[error("duplicate decision claim in block: {0:?}")]
-    DuplicateDecisionClaim([u8; 3]),
+    DuplicateDecisionClaim([u8; 4]),
     #[error("Database consistency error: {0}")]
     DatabaseError(String),
     #[error(

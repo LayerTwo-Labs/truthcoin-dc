@@ -70,8 +70,8 @@ pub enum InPoint {
     ToSchema,
 )]
 pub struct BallotItem {
-    /// 3 byte decision ID
-    pub decision_id_bytes: [u8; 3],
+    /// 4 byte decision ID
+    pub decision_id_bytes: [u8; 4],
     /// The vote value (0.0-1.0 for binary, scaled range for scaled decisions)
     pub vote_value: f64,
 }
@@ -80,7 +80,7 @@ pub struct BallotItem {
     BorshSerialize, Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema,
 )]
 pub struct DecisionClaimEntry {
-    pub decision_id_bytes: [u8; 3],
+    pub decision_id_bytes: [u8; 4],
     pub header: String,
     pub description: String,
     pub option_0_label: Option<String>,
@@ -135,7 +135,7 @@ pub enum TransactionData {
     /// Submit a vote for a decision
     SubmitVote {
         voter: Address,
-        decision_id_bytes: [u8; 3],
+        decision_id_bytes: [u8; 4],
         vote_value: f64,
         voting_period: u32,
     },
@@ -241,7 +241,7 @@ impl Trade {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SubmitVote {
     pub voter: Address,
-    pub decision_id_bytes: [u8; 3],
+    pub decision_id_bytes: [u8; 4],
     pub vote_value: f64,
     pub voting_period: u32,
 }
@@ -667,7 +667,7 @@ mod test {
         let payload = ClaimDecisionPayload {
             decision_type: DecisionType::Binary,
             decisions: vec![DecisionClaimEntry {
-                decision_id_bytes: [0x01, 0x02, 0x03],
+                decision_id_bytes: [0x01, 0x02, 0x03, 0x04],
                 header: "h".to_string(),
                 description: "d".to_string(),
                 option_0_label: None,

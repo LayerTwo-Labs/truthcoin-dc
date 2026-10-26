@@ -112,11 +112,11 @@ fn parse_single_decision(
     let decision_bytes = const_hex::decode(decision_str)
         .map_err(|_| MarketError::InvalidDimensions)?;
 
-    if decision_bytes.len() != 3 {
+    if decision_bytes.len() != 4 {
         return Err(MarketError::InvalidDimensions);
     }
 
-    let decision_id_array: [u8; 3] = decision_bytes
+    let decision_id_array: [u8; 4] = decision_bytes
         .try_into()
         .map_err(|_| MarketError::InvalidDimensions)?;
     DecisionId::from_bytes(decision_id_array)

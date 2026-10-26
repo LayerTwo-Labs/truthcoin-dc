@@ -263,7 +263,7 @@ mod tests {
         assert!(super::validate_fees(coinbase, &[], &HashSet::new()).is_err());
     }
 
-    fn claim_tx(ids: &[[u8; 3]]) -> Transaction {
+    fn claim_tx(ids: &[[u8; 4]]) -> Transaction {
         use crate::state::decisions::DecisionType;
         let decisions = ids
             .iter()
@@ -315,13 +315,13 @@ mod tests {
 
     #[test]
     fn duplicate_decision_claim_across_txs_rejected() {
-        let txs = vec![claim_tx(&[[1, 2, 3]]), claim_tx(&[[1, 2, 3]])];
+        let txs = vec![claim_tx(&[[1, 2, 3, 4]]), claim_tx(&[[1, 2, 3, 4]])];
         assert!(super::check_duplicate_decision_claims(&txs).is_err());
     }
 
     #[test]
     fn distinct_decision_claims_ok() {
-        let txs = vec![claim_tx(&[[1, 2, 3]]), claim_tx(&[[4, 5, 6]])];
+        let txs = vec![claim_tx(&[[1, 2, 3, 4]]), claim_tx(&[[5, 6, 7, 8]])];
         assert!(super::check_duplicate_decision_claims(&txs).is_ok());
     }
 }

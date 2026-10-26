@@ -4,21 +4,21 @@ use ndarray::Array;
 
 #[test]
 fn test_dimension_parsing() {
-    let single_str = "[010101]";
+    let single_str = "[00010101]";
     let result = parse_dimensions(single_str);
     assert!(result.is_ok());
     let dimensions = result.unwrap();
     assert_eq!(dimensions.len(), 1);
     assert!(matches!(dimensions[0], DimensionSpec::Single(_)));
 
-    let categorical_str = "[[010101]]";
+    let categorical_str = "[[00010101]]";
     let result = parse_dimensions(categorical_str);
     assert!(result.is_ok());
     let dimensions = result.unwrap();
     assert_eq!(dimensions.len(), 1);
     assert!(matches!(dimensions[0], DimensionSpec::Categorical(_)));
 
-    let mixed_str = "[010101,[010102],010104]";
+    let mixed_str = "[00010101,[00010102],00010104]";
     let result = parse_dimensions(mixed_str);
     assert!(result.is_ok());
     let dimensions = result.unwrap();
@@ -27,7 +27,7 @@ fn test_dimension_parsing() {
     assert!(matches!(dimensions[1], DimensionSpec::Categorical(_)));
     assert!(matches!(dimensions[2], DimensionSpec::Single(_)));
 
-    let invalid_str = "010101,010102";
+    let invalid_str = "00010101,00010102";
     let result = parse_dimensions(invalid_str);
     assert!(result.is_err());
 }
