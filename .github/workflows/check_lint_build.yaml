@@ -281,6 +281,20 @@ jobs:
       - name: Test
         run: cargo test --tests
 
+      # Consensus math must give the same bits on each release target.
+      - name: Test golden values on the release target
+        run: |
+          sudo apt install wine
+          cargo test --target '${{ matrix.name }}' -p truthcoin_dc --lib golden_tests
+        if: ${{ matrix.name == 'x86_64-pc-windows-gnu' }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER: wine
+
+      - name: Test golden values on the release target
+        run: cargo test --target '${{ matrix.name }}' -p truthcoin_dc --lib golden_tests
+        if: ${{ matrix.name == 'x86_64-apple-darwin' }}
+
       - name: Build
         run: cargo build --release --target ${{ matrix.name }}
         env:
