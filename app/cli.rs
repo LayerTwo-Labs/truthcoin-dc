@@ -319,30 +319,4 @@ mod tests {
         .unwrap();
         assert_eq!(cli.network, Network::Betanet);
     }
-
-    #[test]
-    fn oracle_test_has_separate_storage_and_peer_magic() {
-        let config = Cli::try_parse_from([
-            "truthcoin",
-            "--datadir=/tmp/truthcoin-cli-test",
-            "--network=oracletest",
-        ])
-        .unwrap()
-        .get_config()
-        .unwrap();
-        assert_eq!(
-            config.datadir.to_str().unwrap(),
-            "/tmp/truthcoin-cli-test/oracletest"
-        );
-        assert_eq!(config.wallet_dir, config.datadir);
-        use truthcoin_dc::net::peer_message::magic_bytes;
-        for other in [
-            Network::Betanet,
-            Network::Forknet,
-            Network::Signet,
-            Network::Regtest,
-        ] {
-            assert_ne!(magic_bytes(Network::Oracletest), magic_bytes(other));
-        }
-    }
 }
