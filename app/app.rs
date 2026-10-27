@@ -332,7 +332,9 @@ impl App {
             }
             // Some proxies expose only the CUSF services. Call the validator
             // directly instead; the optional services count as missing.
-            Err(health_err) => {
+            Err(health_err)
+                if health_err.code() == tonic::Code::Unimplemented =>
+            {
                 tracing::warn!(
                     "Mainchain health service unavailable ({health_err}), calling {validator_service_name} directly"
                 );
@@ -349,6 +351,7 @@ impl App {
                     wallet: false,
                 });
             }
+            Err(health_err) => return Err(health_err),
         }
 
         tracing::info!("Verified existence of {}", validator_service_name);
