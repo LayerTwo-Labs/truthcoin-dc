@@ -28,10 +28,11 @@ use crate::{
         },
     },
     types::{
-        Accumulator, Address, AmountUnderflowError, Authorized,
-        AuthorizedTransaction, BlockHash, BmmResult, Body, FilledTransaction,
-        Header, InPoint, MainchainSyncProgress, Network, OutPoint, OutPointKey,
-        Output, SpentOutput, Tip, Transaction, TxIn, Txid, WithdrawalBundle,
+        Accumulator, Address, AmountOverflowError, Authorized,
+        AuthorizedTransaction, BlockHash, BmmResult, Body, Coinbase,
+        FilledTransaction, Header, InPoint, MainchainSyncProgress, Network,
+        OutPoint, OutPointKey, Output, OutputContent, SpentOutput, Tip,
+        Transaction, TxIn, Txid, WithdrawalBundle,
         authorization::{BatchVerificationContext, rand_core::CryptoRng},
         net::{Peer, PeerAddress, ResolvedPeerAddress},
         proto::{self, mainchain},
@@ -46,6 +47,21 @@ mod mainchain_task;
 use mainchain_task::MainchainTaskHandle;
 mod net_task;
 use net_task::NetTaskHandle;
+
+/// Sum of the miner fees of the transactions
+fn template_fee(
+    transactions: &[Authorized<FilledTransaction>],
+) -> Result<bitcoin::Amount, state::Error> {
+    let mut fee = bitcoin::Amount::ZERO;
+    for transaction in transactions {
+        fee = fee
+            .checked_add(crate::validation::miner_fee(
+                &transaction.transaction,
+            )?)
+            .ok_or(AmountOverflowError)?;
+    }
+    Ok(fee)
+}
 
 pub type FilledTransactionWithPosition =
     (Authorized<FilledTransaction>, Option<TxIn>);
@@ -651,14 +667,47 @@ where
             .chain(trade_txs)
             .take(number)
             .collect();
-        let mut fee = bitcoin::Amount::ZERO;
+        let next_height =
+            self.state.try_get_height(&rwtxn)?.map_or(0, |h| h + 1);
+        let sigops_limit = State::body_sigops_limit(next_height);
+        let mut sigops = 0;
+        let size_limit = State::body_size_limit(next_height) as u64;
+        // The block template uses at most one value output and no memo.
+        let mut body_size = State::body_size(&Body::new(
+            Vec::new(),
+            Coinbase {
+                memo: Vec::new(),
+                outputs: vec![Output {
+                    address: Address::ALL_ZEROS,
+                    content: OutputContent::Value(bitcoin::Amount::ZERO),
+                }]
+                .into(),
+            },
+        ))?;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
+        let mut selected_votes = HashSet::new();
         let mut trades = TradeSimulation::default();
         let mut reputation = HashMap::new();
         // Outputs the transactions already taken for this block make.
         let mut block_outputs = HashMap::<OutPoint, Output>::new();
         for transaction in transactions {
+            let transaction_sigops = transaction.authorizations.len()
+                + usize::from(transaction.actor_proof.is_some());
+            if sigops + transaction_sigops > sigops_limit {
+                continue;
+            }
+            // The body has one authorization vector for all transactions.
+            let transaction_size =
+                State::body_size_of_transaction(&transaction)?;
+            if body_size + transaction_size > size_limit {
+                continue;
+            }
+            if crate::validation::vote::vote_keys(&transaction.transaction)
+                .any(|key| selected_votes.contains(&key))
+            {
+                continue;
+            }
             let inputs: HashSet<_> =
                 transaction.transaction.inputs.iter().copied().collect();
             if !spent_utxos.is_disjoint(&inputs) {
@@ -697,12 +746,20 @@ where
                 &block_outputs,
                 transaction,
             )?;
-            match trades.apply(
+            let trade_result = match trades.apply(
                 &self.state,
                 &self.archive,
                 &rwtxn,
                 &filled_transaction.transaction,
-            )? {
+            ) {
+                Ok(result) => result,
+                // Invalid candidates leave pending trade state unchanged.
+                Err(state::Error::InvalidTransaction { reason }) => {
+                    TradeApplyResult::Skipped { reason }
+                }
+                Err(err) => return Err(err.into()),
+            };
+            match trade_result {
                 TradeApplyResult::Applied => (),
                 TradeApplyResult::Skipped { reason } => {
                     tracing::debug!(
@@ -744,11 +801,6 @@ where
                     .transaction
                     .outputs_by_outpoint(),
             );
-            fee = fee
-                .checked_add(crate::validation::miner_fee(
-                    &filled_transaction.transaction,
-                )?)
-                .ok_or(AmountUnderflowError)?;
             spent_utxos.extend(
                 filled_transaction
                     .transaction
@@ -757,10 +809,146 @@ where
                     .iter()
                     .cloned(),
             );
+            selected_votes.extend(crate::validation::vote::vote_keys(
+                &filled_transaction.transaction.transaction,
+            ));
             returned_transactions.push(filled_transaction);
+            sigops += transaction_sigops;
+            body_size += transaction_size;
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
+        let returned_transactions =
+            self.drop_unconnectable_transactions(returned_transactions)?;
+        let fee = template_fee(&returned_transactions)?;
         Ok((returned_transactions, fee))
+    }
+
+    /// Remove each transaction that block connect rejects after the
+    /// transactions before it. Also remove each transaction that spends an
+    /// output of a removed transaction.
+    fn drop_unconnectable_transactions(
+        &self,
+        mut transactions: Vec<Authorized<FilledTransaction>>,
+    ) -> Result<Vec<Authorized<FilledTransaction>>, Error> {
+        // The first `connects` transactions connect as one block.
+        let mut connects = 0;
+        let mut empty_connects = false;
+        loop {
+            let Err(err) = self.connect_template(&transactions)? else {
+                return Ok(transactions);
+            };
+            if !empty_connects {
+                if let Err(err) = self.connect_template(&[])? {
+                    return Err(err.into());
+                }
+                empty_connects = true;
+            }
+            let mut rejects = transactions.len();
+            let mut reject_err = err;
+            while rejects - connects > 1 {
+                let middle = connects + (rejects - connects) / 2;
+                match self.connect_template(&transactions[..middle])? {
+                    Ok(()) => connects = middle,
+                    Err(err) => {
+                        rejects = middle;
+                        reject_err = err;
+                    }
+                }
+            }
+            let dropped = transactions.remove(connects);
+            tracing::debug!(
+                txid = %dropped.transaction.txid(),
+                err = %reject_err,
+                "Drop transaction that does not connect in this block"
+            );
+            let mut dropped_txids = HashSet::from([dropped.transaction.txid()]);
+            transactions.retain(|transaction| {
+                let spends_dropped =
+                    transaction.transaction.transaction.inputs.iter().any(
+                        |(outpoint, _)| {
+                            matches!(outpoint, OutPoint::Regular { txid, .. }
+                                if dropped_txids.contains(txid))
+                        },
+                    );
+                if spends_dropped {
+                    dropped_txids.insert(transaction.transaction.txid());
+                }
+                !spends_dropped
+            });
+        }
+    }
+
+    /// Connect the transactions as the next block in a write txn, then abort
+    /// the txn. The inner error is the reason that block connect rejects the
+    /// transactions.
+    fn connect_template(
+        &self,
+        transactions: &[Authorized<FilledTransaction>],
+    ) -> Result<Result<(), state::Error>, Error> {
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        let res = self.connect_template_in(&mut rwtxn, transactions);
+        rwtxn.abort();
+        match res {
+            Ok(()) => Ok(Ok(())),
+            Err(
+                err @ (state::Error::Db(_)
+                | state::Error::Archive(_)
+                | state::Error::BorshSerialize(_)
+                | state::Error::IncompatibleVersion { .. }),
+            ) => Err(err.into()),
+            Err(err) => Ok(Err(err)),
+        }
+    }
+
+    fn connect_template_in(
+        &self,
+        rwtxn: &mut RwTxn,
+        transactions: &[Authorized<FilledTransaction>],
+    ) -> Result<(), state::Error> {
+        use bitcoin::hashes::Hash as _;
+
+        let fee = template_fee(transactions)?;
+        let coinbase = Coinbase {
+            memo: Vec::new(),
+            outputs: if fee == bitcoin::Amount::ZERO {
+                Vec::new()
+            } else {
+                vec![Output {
+                    address: Address::ALL_ZEROS,
+                    content: OutputContent::Value(fee),
+                }]
+            }
+            .into(),
+        };
+        let mut header = Header {
+            merkle_root: Body::compute_merkle_root(&coinbase, transactions)?,
+            prev_side_hash: self.state.try_get_tip(rwtxn)?,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        let mut accumulator = self.state.get_accumulator(rwtxn)?;
+        let () = Body::modify_memforest(
+            header.compute_coinbase_txid(),
+            coinbase.outputs.as_slice(),
+            transactions,
+            &mut accumulator.0,
+        )?;
+        header.roots = accumulator.get_roots();
+        let body = Body::new(
+            transactions.iter().cloned().map(Into::into).collect(),
+            coinbase,
+        );
+        // Before the first block, no mainchain timestamp exists yet.
+        let mainchain_timestamp =
+            self.state.try_get_mainchain_timestamp(rwtxn)?.unwrap_or(0);
+        self.state.apply_block(
+            rwtxn,
+            &self.batch_verification_ctxt,
+            &header,
+            &body,
+            &self.archive,
+            mainchain_timestamp,
+        )
     }
 
     /// Get a transaction if it exists in the active chain or mempool.
@@ -1137,7 +1325,7 @@ where
 
     pub fn get_pending_decision_claim_ids(
         &self,
-    ) -> Result<std::collections::BTreeSet<[u8; 3]>, Error> {
+    ) -> Result<std::collections::BTreeSet<[u8; 4]>, Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         Ok(self.mempool.pending_decision_claim_ids(&rotxn)?)
     }
@@ -1218,7 +1406,11 @@ where
         };
 
         let mut new_shares = current_shares.clone();
-        new_shares[outcome_index as usize] += shares_to_buy;
+        new_shares[outcome_index as usize] = new_shares[outcome_index as usize]
+            .checked_add(shares_to_buy)
+            .ok_or_else(|| state::Error::InvalidTransaction {
+                reason: "Mempool share count overflow".to_string(),
+            })?;
 
         let beta = self.derive_market_beta(&market)?;
         trading::validate_lmsr_parameters(beta, &new_shares).map_err(|e| {

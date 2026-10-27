@@ -963,15 +963,11 @@ impl Dbs {
         if let Some(decision_to_remove) = target_decision {
             period_decisions.remove(&decision_to_remove);
 
-            if period_decisions.is_empty() {
-                self.period_decisions.delete(rwtxn, &period_index)?;
-            } else {
-                self.period_decisions.put(
-                    rwtxn,
-                    &period_index,
-                    &period_decisions,
-                )?;
-            }
+            self.period_decisions.put(
+                rwtxn,
+                &period_index,
+                &period_decisions,
+            )?;
         } else {
             tracing::debug!(
                 "Attempted to revert decision {:?} that wasn't found",
@@ -1078,15 +1074,11 @@ impl Dbs {
                 self.period_decisions.try_get(rwtxn, &period_index)?
             {
                 period_decisions.retain(|s| s.decision_id != decision_id);
-                if period_decisions.is_empty() {
-                    self.period_decisions.delete(rwtxn, &period_index)?;
-                } else {
-                    self.period_decisions.put(
-                        rwtxn,
-                        &period_index,
-                        &period_decisions,
-                    )?;
-                }
+                self.period_decisions.put(
+                    rwtxn,
+                    &period_index,
+                    &period_decisions,
+                )?;
             }
         }
 

@@ -359,10 +359,13 @@ fn connect_withdrawal_bundle_confirmed(
                     spend_utxos: utxos,
                 };
             } else {
-                return Err(Error::UnknownWithdrawalBundleConfirmed {
-                    event_block_hash: *event_block_hash,
-                    m6id,
-                });
+                // The sidechain cannot know which outputs an unknown bundle
+                // spends, so it records the payout and spends no outputs.
+                tracing::warn!(
+                    %event_block_hash,
+                    %m6id,
+                    "Unknown withdrawal bundle confirmed, no UTXOs spent"
+                );
             }
         }
         WithdrawalBundleInfo::Known(bundle) => {
@@ -1170,6 +1173,7 @@ mod test {
         hashes::Hash as _,
         secp256k1::{Secp256k1, SecretKey},
     };
+    use fallible_iterator::FallibleIterator as _;
     use hashlink::LinkedHashMap;
 
     use crate::{
@@ -1489,6 +1493,117 @@ mod test {
         let mut rwtxn = env.write_txn()?;
         let () = disconnect(&state, &mut rwtxn, &two_way_peg_data)?;
         anyhow::ensure!(state.get_two_way_peg_events(&rwtxn, 0)?.is_empty());
+        Ok(())
+    }
+
+    fn two_way_peg_state_bytes(
+        state: &State,
+        rotxn: &sneed::RoTxn,
+    ) -> anyhow::Result<Vec<u8>> {
+        let utxos: Vec<(OutPoint, Output)> = state
+            .utxos
+            .iter(rotxn)?
+            .map(|(key, output)| Ok((key.into(), output)))
+            .collect()?;
+        let stxos: Vec<(OutPoint, crate::types::SpentOutput)> = state
+            .stxos
+            .iter(rotxn)?
+            .map(|(key, spent)| Ok((key.into(), spent)))
+            .collect()?;
+        let withdrawal_bundles: Vec<_> =
+            state.withdrawal_bundles.iter(rotxn)?.collect()?;
+        let withdrawal_bundle_event_blocks: Vec<_> = state
+            .withdrawal_bundle_event_blocks
+            .iter(rotxn)?
+            .collect()?;
+        let deposit_blocks: Vec<_> =
+            state.deposit_blocks.iter(rotxn)?.collect()?;
+        let two_way_peg_events: Vec<_> =
+            state.two_way_peg_events.iter(rotxn)?.collect()?;
+        let bytes = bincode::serialize(&(
+            utxos,
+            stxos,
+            withdrawal_bundles,
+            withdrawal_bundle_event_blocks,
+            deposit_blocks,
+            two_way_peg_events,
+            state.pending_withdrawal_bundle.try_get(rotxn, &())?,
+            state.latest_failed_withdrawal_bundle.try_get(rotxn, &())?,
+            state.utreexo_accumulator.try_get(rotxn, &())?,
+        ))?;
+        Ok(bytes)
+    }
+
+    #[test]
+    fn unknown_bundle_confirmed_above_genesis_round_trips() -> anyhow::Result<()>
+    {
+        let (_temp_dir, env, state) =
+            fresh_state("unknown_bundle_confirmed_above_genesis_round_trips")?;
+        let block_height = 5;
+        let m6id = M6id(bitcoin::Txid::from_byte_array([5; 32]));
+        let outpoint = OutPoint::Regular {
+            txid: Txid::from([1; 32]),
+            vout: 0,
+        };
+        let output = value_output(Address::ALL_ZEROS, 1000);
+        let key = OutPointKey::from(&outpoint);
+        let event_block_hash = bitcoin::BlockHash::from_byte_array([9; 32]);
+        let mut block_info = LinkedHashMap::new();
+        block_info.insert(
+            event_block_hash,
+            BlockInfo {
+                bmm_commitment: None,
+                events: vec![BlockEvent::WithdrawalBundle(
+                    WithdrawalBundleEvent {
+                        m6id,
+                        status: WithdrawalBundleEventStatus::Confirmed,
+                    },
+                )],
+            },
+        );
+        let two_way_peg_data = TwoWayPegData { block_info };
+
+        let mut rwtxn = env.write_txn()?;
+        state.height.put(&mut rwtxn, &(), &block_height)?;
+        state.utxos.put(&mut rwtxn, &key, &output)?;
+        let mut accumulator = crate::types::Accumulator::default();
+        let mut accumulator_diff = AccumulatorDiff::default();
+        accumulator_diff.insert(
+            crate::types::hash(&crate::types::PointedOutputRef {
+                outpoint,
+                output: &output,
+            })
+            .into(),
+        );
+        let () = accumulator.apply_diff(accumulator_diff)?;
+        state
+            .utreexo_accumulator
+            .put(&mut rwtxn, &(), &accumulator)?;
+        state.withdrawal_bundles.put(
+            &mut rwtxn,
+            &m6id,
+            &(
+                WithdrawalBundleInfo::Unknown,
+                RollBack::new(
+                    WithdrawalBundleStatus::Submitted,
+                    block_height - 1,
+                ),
+            ),
+        )?;
+        let before = two_way_peg_state_bytes(&state, &rwtxn)?;
+
+        let () = connect(&state, &mut rwtxn, &two_way_peg_data)?;
+        anyhow::ensure!(state.utxos.try_get(&rwtxn, &key)?.is_some());
+        let (bundle, bundle_status) =
+            state.withdrawal_bundles.get(&rwtxn, &m6id)?;
+        anyhow::ensure!(matches!(bundle, WithdrawalBundleInfo::Unknown));
+        anyhow::ensure!(
+            bundle_status.latest().value == WithdrawalBundleStatus::Confirmed
+        );
+
+        let () = disconnect(&state, &mut rwtxn, &two_way_peg_data)?;
+        let after = two_way_peg_state_bytes(&state, &rwtxn)?;
+        anyhow::ensure!(before == after);
         Ok(())
     }
 

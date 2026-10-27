@@ -290,9 +290,9 @@ fn test_decision_id_nonstandard_roundtrip() {
 
 #[test]
 fn test_decision_id_max_period() {
-    let id = DecisionId::new(true, 127, 0).unwrap();
-    assert_eq!(id.period_index(), 127);
-    assert!(DecisionId::new(true, 128, 0).is_err());
+    let id = DecisionId::new(true, 32767, 0).unwrap();
+    assert_eq!(id.period_index(), 32767);
+    assert!(DecisionId::new(true, 32768, 0).is_err());
 }
 
 #[test]
@@ -304,9 +304,9 @@ fn test_decision_id_max_index() {
 
 #[test]
 fn test_decision_id_boundary_values() {
-    let id = DecisionId::new(false, 127, 65535).unwrap();
+    let id = DecisionId::new(false, 32767, 65535).unwrap();
     assert!(!id.is_standard());
-    assert_eq!(id.period_index(), 127);
+    assert_eq!(id.period_index(), 32767);
     assert_eq!(id.decision_index(), 65535);
 }
 
@@ -330,4 +330,232 @@ fn test_decision_id_standard_bit_encoding() {
     assert!(!nonstd_id.is_standard());
     assert_eq!(std_id.period_index(), nonstd_id.period_index());
     assert_eq!(std_id.decision_index(), nonstd_id.decision_index());
+}
+
+#[test]
+fn category_claim_accepts_option_limit() {
+    let decision = Decision::new(
+        [0; 20],
+        DecisionType::Category {
+            options: vec![String::new(); usize::from(u16::MAX)],
+        },
+        String::new(),
+        String::new(),
+        None,
+        None,
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(decision.inconclusive_index(), Some(u16::MAX));
+}
+
+#[test]
+fn category_claim_rejects_excess_options() {
+    let result = Decision::new(
+        [0; 20],
+        DecisionType::Category {
+            options: vec![String::new(); usize::from(u16::MAX) + 1],
+        },
+        String::new(),
+        String::new(),
+        None,
+        None,
+        vec![],
+    );
+    assert!(matches!(
+        result,
+        Err(crate::state::Error::InvalidDecisionId { .. })
+    ));
+}
+
+fn check_claim_rollback(direct: bool) -> anyhow::Result<()> {
+    use crate::state::test::fresh_state;
+
+    let (_clean_dir, clean_env, clean_state) =
+        fresh_state("claim_rollback_clean")?;
+    let (_reorg_dir, reorg_env, reorg_state) =
+        fresh_state("claim_rollback_reorg")?;
+    let mut clean_txn = clean_env.write_txn()?;
+    let mut reorg_txn = reorg_env.write_txn()?;
+    let clean = clean_state.decisions();
+    let reorg = reorg_state.decisions();
+    clean.mint_genesis(&mut clean_txn, 1000, 0, 1000)?;
+    reorg.mint_genesis(&mut reorg_txn, 1000, 0, 1000)?;
+
+    let claim_id = DecisionId::new(true, 20, 0)?;
+    let decision = make_binary_decision();
+    reorg.snapshot_period_pricing(&mut reorg_txn, 1)?;
+    reorg.validate_decision_claim(
+        &reorg_txn,
+        claim_id,
+        &decision,
+        1000,
+        Some(1),
+        1000,
+    )?;
+    reorg.claim_decision(
+        &mut reorg_txn,
+        claim_id,
+        decision.clone(),
+        crate::types::Txid([1; 32]),
+        Some(1),
+    )?;
+    reorg.process_block_pricing(&mut reorg_txn, 1, 1000, 1000)?;
+    if direct {
+        reorg.revert_decision_claim(&mut reorg_txn, claim_id)?;
+    }
+    reorg.rollback_decision_states_to_height(&mut reorg_txn, 0)?;
+    reorg.delete_periods_above(&mut reorg_txn, 20)?;
+    reorg.restore_period_pricing_undo(&mut reorg_txn, 1)?;
+
+    clean.process_block_pricing(&mut clean_txn, 1, 1000, 1000)?;
+    reorg.process_block_pricing(&mut reorg_txn, 1, 1000, 1000)?;
+    let next_claim = DecisionId::new(true, 19, 10)?;
+    let clean_accepts = clean
+        .validate_decision_claim(
+            &clean_txn,
+            next_claim,
+            &decision,
+            1000,
+            Some(1),
+            1000,
+        )
+        .is_ok();
+    let reorg_accepts = reorg
+        .validate_decision_claim(
+            &reorg_txn,
+            next_claim,
+            &decision,
+            1000,
+            Some(1),
+            1000,
+        )
+        .is_ok();
+    assert!(!clean_accepts);
+    assert_eq!(clean_accepts, reorg_accepts);
+    for period in 1..=20 {
+        assert_eq!(
+            clean.get_period_pricing(&clean_txn, period)?,
+            reorg.get_period_pricing(&reorg_txn, period)?,
+            "Period {period}"
+        );
+    }
+    assert_eq!(
+        clean.get_highest_minted_period(&clean_txn)?,
+        reorg.get_highest_minted_period(&reorg_txn)?
+    );
+    assert!(reorg.get_decision_entry(&reorg_txn, claim_id)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn claim_reorg_preserves_period_and_prices() -> anyhow::Result<()> {
+    check_claim_rollback(true)
+}
+
+#[test]
+fn state_rollback_preserves_period_and_prices() -> anyhow::Result<()> {
+    check_claim_rollback(false)
+}
+
+fn decision_id_key_bytes(id: &DecisionId) -> Vec<u8> {
+    use heed::BytesEncode;
+    heed::types::SerdeBincode::<DecisionId>::bytes_encode(id)
+        .unwrap()
+        .into_owned()
+}
+
+#[test]
+fn test_decision_id_period_above_127_roundtrips() {
+    for (is_standard, period, index) in
+        [(true, 128, 0), (true, 200, 7), (false, 32767, 65535)]
+    {
+        let id = DecisionId::new(is_standard, period, index).unwrap();
+        assert_eq!(id.is_standard(), is_standard);
+        assert_eq!(id.period_index(), period);
+        assert_eq!(id.decision_index(), index);
+
+        assert_eq!(DecisionId::from_bytes(id.as_bytes()).unwrap(), id);
+        assert_eq!(DecisionId::from_hex(&id.to_hex()).unwrap(), id);
+
+        let bincode_bytes = bincode::serialize(&id).unwrap();
+        assert_eq!(bincode_bytes, id.as_bytes());
+        assert_eq!(
+            bincode::deserialize::<DecisionId>(&bincode_bytes).unwrap(),
+            id
+        );
+
+        assert_eq!(borsh::to_vec(&id).unwrap(), id.as_bytes());
+
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<DecisionId>(&json).unwrap(), id);
+
+        assert_eq!(decision_id_key_bytes(&id), id.as_bytes());
+    }
+}
+
+#[test]
+fn test_decision_id_key_order_follows_period() {
+    for is_standard in [false, true] {
+        let ids: Vec<DecisionId> = [(1, 65535), (127, 0), (128, 0), (300, 5)]
+            .into_iter()
+            .map(|(period, index)| {
+                DecisionId::new(is_standard, period, index).unwrap()
+            })
+            .collect();
+        for pair in ids.windows(2) {
+            assert!(pair[0] < pair[1]);
+            assert!(
+                decision_id_key_bytes(&pair[0])
+                    < decision_id_key_bytes(&pair[1])
+            );
+        }
+    }
+}
+
+#[test]
+fn test_claim_decision_in_period_above_127() {
+    use super::{Dbs, DecisionConfig};
+    use crate::types::{Hash, Txid};
+    use std::num::NonZeroU32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
+    options.map_size(16 * 1024 * 1024).max_dbs(Dbs::NUM_DBS);
+    let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
+    let mut rwtxn = env.write_txn().unwrap();
+    let dbs = Dbs::new_with_config(
+        &env,
+        &mut rwtxn,
+        DecisionConfig::testing(NonZeroU32::new(1).unwrap()),
+    )
+    .unwrap();
+
+    let height = 199;
+    dbs.mint_genesis(&mut rwtxn, 0, height, 0).unwrap();
+    let period = dbs.get_current_period(0, Some(height), 0).unwrap();
+    assert_eq!(period, 200);
+
+    let available = dbs
+        .get_available_decisions_in_period(&rwtxn, period, 0, Some(height), 0)
+        .unwrap();
+    let decision_id = available[0];
+    assert_eq!(decision_id.period_index(), period);
+
+    dbs.claim_decision(
+        &mut rwtxn,
+        decision_id,
+        make_binary_decision(),
+        Txid(Hash::from([3; 32])),
+        Some(height),
+    )
+    .unwrap();
+
+    let entry = dbs
+        .get_decision_entry(&rwtxn, decision_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.decision_id, decision_id);
+    assert!(entry.decision.is_some());
+    assert_eq!(dbs.claimed_count_in_period(&rwtxn, period).unwrap(), 1);
 }

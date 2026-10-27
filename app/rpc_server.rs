@@ -217,7 +217,7 @@ pub(crate) fn allocate_decision_slots(
     use truthcoin_dc::math::decisions as math_decisions;
     use truthcoin_dc::types::DecisionClaimEntry;
 
-    let pending_claim_ids: BTreeSet<[u8; 3]> =
+    let pending_claim_ids: BTreeSet<[u8; 4]> =
         node.get_pending_decision_claim_ids().map_err(custom_err)?;
 
     let mut per_period_picked: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();

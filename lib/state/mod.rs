@@ -659,6 +659,13 @@ impl State {
         archive: &crate::archive::Archive,
         override_height: Option<u32>,
     ) -> Result<bitcoin::Amount, Error> {
+        // Each copy of a transaction with no inputs has the same txid, so its
+        // outputs get the same outpoints.
+        if transaction.transaction.inputs.is_empty()
+            && !transaction.transaction.outputs.is_empty()
+        {
+            return Err(Error::OutputsWithoutInputs);
+        }
         let () = Self::validate_utxo_hashes(transaction)?;
         let mut value_in = bitcoin::Amount::ZERO;
         let mut value_out = bitcoin::Amount::ZERO;
@@ -757,7 +764,22 @@ impl State {
         }
     }
 
-    // in bytes
+    /// Size in bytes of a body as P2P sends it, with the Utreexo proofs.
+    pub fn body_size(body: &Body) -> Result<u64, Error> {
+        bincode::serialized_size(body).map_err(Error::BincodeSerialize)
+    }
+
+    /// Bytes that one transaction adds to [`Self::body_size`]
+    pub fn body_size_of_transaction(
+        transaction: &AuthorizedTransaction,
+    ) -> Result<u64, Error> {
+        // The body holds one authorization vector for all transactions.
+        let size = bincode::serialized_size(transaction)
+            .map_err(Error::BincodeSerialize)?;
+        Ok(size - std::mem::size_of::<u64>() as u64)
+    }
+
+    /// Largest valid [`Self::body_size`] at a block height
     pub fn body_size_limit(height: u32) -> usize {
         // 8MB starting body size limit.
         const START: usize = 8 * 1024 * 1024;
@@ -1215,6 +1237,56 @@ mod test {
             address: addr,
             content: OutputContent::Value(bitcoin::Amount::from_sat(sats)),
         }
+    }
+
+    #[test]
+    fn body_size_is_the_sum_of_its_transactions() -> anyhow::Result<()> {
+        use crate::types::{
+            Authorization, AuthorizedTransaction, Body, Coinbase, Transaction,
+            UtreexoNodeHash, UtreexoProof,
+            authorization::{self, SigningKey},
+        };
+
+        let mut rng = rand::rng();
+        let key = SigningKey::new(&mut rng);
+        let transaction = Transaction {
+            proof: UtreexoProof::new(
+                vec![1, 2],
+                vec![UtreexoNodeHash::Some([1; 32]); 3],
+            ),
+            outputs: vec![value_output(Address([1; 20]), 1)].into(),
+            ..Transaction::default()
+        };
+        let authorization = Authorization {
+            verifying_key: (&key).into(),
+            signature: authorization::sign_tx(&mut rng, &key, &transaction)?,
+        };
+        let transactions = vec![
+            AuthorizedTransaction {
+                transaction: transaction.clone(),
+                authorizations: vec![authorization.clone(); 2],
+                actor_proof: None,
+            },
+            AuthorizedTransaction {
+                transaction,
+                authorizations: Vec::new(),
+                actor_proof: Some(Box::new(authorization)),
+            },
+        ];
+        let coinbase = Coinbase {
+            memo: vec![7; 5],
+            outputs: vec![value_output(Address::ALL_ZEROS, 0)].into(),
+        };
+        let mut expected =
+            State::body_size(&Body::new(Vec::new(), coinbase.clone()))?;
+        for transaction in &transactions {
+            expected += State::body_size_of_transaction(transaction)?;
+        }
+        assert_eq!(
+            State::body_size(&Body::new(transactions, coinbase))?,
+            expected
+        );
+        Ok(())
     }
 
     #[test]

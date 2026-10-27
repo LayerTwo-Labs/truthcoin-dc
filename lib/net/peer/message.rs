@@ -8,6 +8,7 @@ use truthcoin_dc_types::Block;
 
 use crate::{
     net::peer::{PeerState, PeerStateId},
+    state::State,
     types::{AuthorizedTransaction, BlockHash, Header, Network, Tip, Txid},
 };
 
@@ -52,6 +53,11 @@ pub struct GetBlockRequest {
     #[borsh(skip)]
     #[serde(skip)]
     pub ancestor: Option<BlockHash>,
+    /// Height of the requested block.
+    /// Only relevant for the requester, so serialization is skipped
+    #[borsh(skip)]
+    #[serde(skip)]
+    pub height: Option<u32>,
     /// Only relevant for the requester, so serialization is skipped
     #[borsh(skip)]
     #[serde(skip)]
@@ -59,10 +65,18 @@ pub struct GetBlockRequest {
 }
 
 impl GetBlockRequest {
+    /// Upper bound of the bytes in a block response other than the body
+    const BLOCK_RESPONSE_OVERHEAD: usize = 4096;
+
     /// Limit bytes to read in a response to a request
-    pub const fn read_response_limit(&self) -> NonZeroUsize {
-        // 10MB limit for blocks
-        NonZeroUsize::new(10 * 1024 * 1024).unwrap()
+    pub fn read_response_limit(&self) -> NonZeroUsize {
+        let height = self.height.expect(
+            "GetBlock height should always be Some in an outbound request",
+        );
+        NonZeroUsize::new(
+            State::body_size_limit(height) + Self::BLOCK_RESPONSE_OVERHEAD,
+        )
+        .unwrap()
     }
 }
 
@@ -130,7 +144,7 @@ pub enum Request {
 
 impl Request {
     /// Limit bytes to read in a response to a request
-    pub const fn read_response_limit(&self) -> NonZeroUsize {
+    pub fn read_response_limit(&self) -> NonZeroUsize {
         // TODO: Add constant for discriminant
         match self {
             Self::GetBlock(request) => request.read_response_limit(),
@@ -312,8 +326,17 @@ impl ResponseMessage {
 
 #[cfg(test)]
 mod test {
-    use super::{MagicBytes, magic_bytes};
-    use crate::types::Network;
+    use bitcoin::hashes::Hash as _;
+    use truthcoin_dc_types::{Block, Coinbase};
+
+    use super::{GetBlockRequest, MagicBytes, ResponseMessage, magic_bytes};
+    use crate::{
+        state::State,
+        types::{
+            BlockHash, Body, FilledTransaction, Header, Network,
+            UtreexoNodeHash,
+        },
+    };
 
     const NETWORKS: [Network; 4] = [
         Network::Betanet,
@@ -339,5 +362,42 @@ mod test {
                 assert_ne!(magic_bytes(ours), thunder_magic_bytes(theirs));
             }
         }
+    }
+
+    const BLOCKS_PER_MONTH: u32 = 6 * 24 * 30;
+
+    #[test]
+    fn largest_block_message_fits_read_cap() -> anyhow::Result<()> {
+        let body = Body::new(Vec::new(), Coinbase::default());
+        let header = Header {
+            merkle_root: Body::compute_merkle_root::<FilledTransaction>(
+                &body.coinbase,
+                &[],
+            )?,
+            prev_side_hash: Some(BlockHash([1; 32])),
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: vec![UtreexoNodeHash::Some([1; 32]); u64::BITS as usize],
+        };
+        let body_size = State::body_size(&body)?;
+        let response = ResponseMessage::Block(Box::new(Block { header, body }));
+        let overhead = bincode::serialized_size(&response)? - body_size;
+        for month in 0..=121 {
+            let height = month * BLOCKS_PER_MONTH;
+            let request = GetBlockRequest {
+                block_hash: BlockHash([0; 32]),
+                descendant_tip: None,
+                ancestor: None,
+                height: Some(height),
+                peer_state_id: None,
+            };
+            let largest = overhead + State::body_size_limit(height) as u64;
+            let read_cap = request.read_response_limit().get() as u64;
+            anyhow::ensure!(
+                largest <= read_cap,
+                "month {month}: block message of {largest} B exceeds the \
+                 read cap of {read_cap} B",
+            );
+        }
+        Ok(())
     }
 }

@@ -138,6 +138,8 @@ pub enum Error {
     #[error("body too large")]
     BodyTooLarge,
     #[error(transparent)]
+    BincodeSerialize(bincode::Error),
+    #[error(transparent)]
     BorshSerialize(borsh::io::Error),
     #[error(transparent)]
     ConnectWithdrawalBundleSubmitted(#[from] ConnectWithdrawalBundleSubmitted),
@@ -172,6 +174,8 @@ pub enum Error {
     NotEnoughValueIn,
     #[error(transparent)]
     NoUtxo(#[from] NoUtxo),
+    #[error("a transaction with no inputs cannot have outputs")]
+    OutputsWithoutInputs,
     #[error("withdrawal output {outpoint} cannot be spent by a transaction")]
     SpendWithdrawalOutput { outpoint: OutPoint },
     #[error("Withdrawal bundle event block doesn't exist")]
@@ -213,13 +217,6 @@ pub enum Error {
     #[error("Unknown withdrawal bundle: {m6id}")]
     UnknownWithdrawalBundle { m6id: M6id },
     #[error(
-        "Unknown withdrawal bundle confirmed in {event_block_hash}: {m6id}"
-    )]
-    UnknownWithdrawalBundleConfirmed {
-        event_block_hash: bitcoin::BlockHash,
-        m6id: M6id,
-    },
-    #[error(
         "Unknown confirmed withdrawal bundle reconfirmed in {event_block_hash}: {m6id}"
     )]
     UnknownWithdrawalBundleReconfirmed {
@@ -254,7 +251,7 @@ pub enum Error {
         reason: String,
     },
     #[error("duplicate decision claim in block: {0:?}")]
-    DuplicateDecisionClaim([u8; 3]),
+    DuplicateDecisionClaim([u8; 4]),
     #[error("Database consistency error: {0}")]
     DatabaseError(String),
     #[error(

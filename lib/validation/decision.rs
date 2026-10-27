@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn parse_valid_hex_decision_id() {
-        let hex = "010001";
+        let hex = "00010001";
         let result = DecisionValidator::parse_decision_id_from_hex(hex);
         assert!(result.is_ok());
     }
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn parse_invalid_hex_decision_id() {
         assert!(
-            DecisionValidator::parse_decision_id_from_hex("zzzzzz").is_err()
+            DecisionValidator::parse_decision_id_from_hex("zzzzzzzz").is_err()
         );
     }
 
