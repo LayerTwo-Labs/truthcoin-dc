@@ -671,9 +671,9 @@ where
             self.state.try_get_height(&rwtxn)?.map_or(0, |h| h + 1);
         let sigops_limit = State::body_sigops_limit(next_height);
         let mut sigops = 0;
-        let size_limit = State::body_size_limit(next_height);
+        let size_limit = State::body_size_limit(next_height) as u64;
         // The block template uses at most one value output and no memo.
-        let mut body_size = borsh::object_length(&Body::new(
+        let mut body_size = State::body_size(&Body::new(
             Vec::new(),
             Coinbase {
                 memo: Vec::new(),
@@ -683,8 +683,7 @@ where
                 }]
                 .into(),
             },
-        ))
-        .map_err(state::Error::BorshSerialize)?;
+        ))?;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
         let mut selected_votes = HashSet::new();
@@ -699,9 +698,8 @@ where
                 continue;
             }
             // The body has one authorization vector for all transactions.
-            let transaction_size = borsh::object_length(&transaction)
-                .map_err(state::Error::BorshSerialize)?
-                - std::mem::size_of::<u32>();
+            let transaction_size =
+                State::body_size_of_transaction(&transaction)?;
             if body_size + transaction_size > size_limit {
                 continue;
             }
