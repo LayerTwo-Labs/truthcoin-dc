@@ -103,6 +103,9 @@ pub struct BlockIndexTx {
     pub size: u64,
     /// Borsh encoding, as hex
     pub raw: String,
+    /// True for a trade that failed its price limit: the block keeps it in
+    /// the body, but it spends no input and creates no output
+    pub skipped: bool,
 }
 
 /// One output a mainchain deposit created
@@ -129,6 +132,13 @@ pub struct BlockIndex {
     pub deposits: Vec<BlockIndexDeposit>,
     /// Outputs that a withdrawal bundle removed
     pub bundle_spends: Vec<BlockIndexSpend>,
+    /// Outputs that market trades and settlement created outside any
+    /// transaction
+    pub market_creates: Vec<state::MarketUtxo>,
+    /// Outputs that market trades and settlement removed outside any
+    /// transaction. Apply them after `market_creates`, because settlement can
+    /// remove a treasury that the same block created.
+    pub market_deletes: Vec<state::MarketUtxo>,
 }
 
 /// Step of the startup sync with the mainchain
