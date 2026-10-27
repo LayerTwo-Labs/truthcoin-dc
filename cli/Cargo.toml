@@ -9,8 +9,9 @@ version.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 bitcoin = { workspace = true, features = ["serde"] }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 const-hex = { workspace = true }
+dirs = { workspace = true }
 http = { workspace = true }
 jsonrpsee = { workspace = true, features = ["http-client"] }
 serde = { workspace = true }
