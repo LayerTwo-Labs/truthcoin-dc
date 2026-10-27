@@ -2794,6 +2794,43 @@ mod tests {
     }
 
     #[test]
+    fn oracle_slippage_skip_does_not_change_committed_prices() {
+        let TradingFixture {
+            env,
+            mut state,
+            market,
+            tip,
+            ..
+        } = trading_fixture();
+        state.oracle_test = true;
+        let txn = env.read_txn().unwrap();
+        let before = state.oracle_snapshot(&txn).unwrap().commitment.memo();
+        let trade = filled_tx(
+            TxData::Trade {
+                market_id: market.id,
+                outcome_index: 0,
+                shares: 1_000,
+                trader: Address::ALL_ZEROS,
+                limit_sats: 0,
+                tx_pow_nonce: None,
+                prev_block_hash: tip,
+            },
+            100_000,
+        );
+        let mut update = StateUpdate::new();
+        assert!(matches!(
+            apply_trade(&state, &txn, &trade, &mut update).unwrap(),
+            TradeApplyResult::Skipped { .. }
+        ));
+        assert!(update.market_updates.is_empty());
+        assert!(update.share_account_changes.is_empty());
+        assert_eq!(
+            state.oracle_snapshot(&txn).unwrap().commitment.memo(),
+            before
+        );
+    }
+
+    #[test]
     fn trade_simulation_prices_at_same_block_amplified_beta() {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
 

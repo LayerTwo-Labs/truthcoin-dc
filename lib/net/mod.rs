@@ -240,6 +240,7 @@ const fn seed_peer_addrs(
         Network::Betanet => BETANET_SEED_PEER_ADDRS,
         Network::Forknet => FORKNET_SEED_PEER_ADDRS,
         Network::Regtest => &[],
+        Network::Oracletest => &[],
         Network::Signet => SIGNET_SEED_PEER_ADDRS,
     }
 }

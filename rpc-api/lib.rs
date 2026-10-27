@@ -389,6 +389,8 @@ pub mod node {
             schema::BitcoinBlockHash, schema::BitcoinOutPoint,
             schema::BitcoinTransaction, schema::SocketAddr,
             schema::UtreexoNodeHash, schema::UtreexoProof,
+            truthcoin_dc_types::oracle::Commitment,
+            truthcoin_dc_types::oracle::MarketPrice,
         ],
     )]
     #[rpc(
@@ -417,6 +419,17 @@ pub mod node {
             ))]
             main_block_hash: bitcoin::BlockHash,
         ) -> RpcResult<bool>;
+
+        /// Current executed-market proof, committed by the NEXT oracletest block.
+        /// The response alone is not authenticated and None is not an absence proof.
+        #[open_api_method(output_schema(
+            PartialSchema = "schema::Optional<truthcoin_dc_types::oracle::PriceProof>"
+        ))]
+        #[method(name = "get_oracle_price_proof")]
+        async fn get_oracle_price_proof(
+            &self,
+            market_id: truthcoin_dc_types::market::MarketId,
+        ) -> RpcResult<Option<truthcoin_dc_types::oracle::PriceProof>>;
 
         /// Get the block hash at the specified height in the active chain,
         /// if it exists

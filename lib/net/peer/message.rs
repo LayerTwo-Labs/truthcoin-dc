@@ -28,6 +28,7 @@ pub const fn magic_bytes(network: Network) -> MagicBytes {
             Network::Forknet => 0b0000_0010,
             // Network::Alphanet => 0b0000_0011,
             Network::Betanet => 0b0000_0100,
+            Network::Oracletest => 0b0000_0101,
         }
     }
     let mut res = PREFIX;

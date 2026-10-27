@@ -33,6 +33,7 @@ pub fn prevalidate(
         return Err(Error::InvalidHeader(err));
     };
     let next_height = state.try_get_height(rotxn)?.map_or(0, |h| h + 1);
+    state.check_oracle_memo(rotxn, &body.coinbase.memo)?;
     if body.authorizations.len() > State::body_sigops_limit(next_height) {
         return Err(Error::TooManySigops);
     }
@@ -225,6 +226,7 @@ pub fn connect_prevalidated(
         };
         return Err(err);
     }
+    state.check_oracle_memo(rwtxn, &body.coinbase.memo)?;
     let market_ctxt = markets::block::connect_begin(
         state,
         rwtxn,
@@ -309,6 +311,7 @@ pub fn connect_prevalidated(
     )?;
 
     // Update tip/height
+    state.check_oracle_state(rwtxn)?;
     let block_hash = header.hash();
     state
         .tip
@@ -351,6 +354,7 @@ pub fn validate(
         return Err(Error::InvalidHeader(err));
     };
     let height = state.try_get_height(rotxn)?.map_or(0, |height| height + 1);
+    state.check_oracle_memo(rotxn, &body.coinbase.memo)?;
     if body.authorizations.len() > State::body_sigops_limit(height) {
         return Err(Error::TooManySigops);
     }
@@ -521,6 +525,7 @@ pub fn connect(
         return Err(Error::InvalidHeader(err));
     }
     let height = state.try_get_height(rwtxn)?.map_or(0, |height| height + 1);
+    state.check_oracle_memo(rwtxn, &body.coinbase.memo)?;
     let market_ctxt = markets::block::connect_begin(
         state,
         rwtxn,
@@ -620,6 +625,7 @@ pub fn connect(
     )?;
     let merkle_root =
         Body::compute_merkle_root(&body.coinbase, filled_txs.as_slice())?;
+    state.check_oracle_state(rwtxn)?;
     if merkle_root != header.merkle_root {
         let err = Error::InvalidBody {
             expected: header.merkle_root,

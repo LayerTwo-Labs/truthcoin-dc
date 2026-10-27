@@ -114,6 +114,16 @@ where
             server_names,
             decision_config_testing,
         } = config;
+        if network == Network::Oracletest
+            && magic_bytes_override.is_some_and(|magic| {
+                magic != crate::net::peer_message::magic_bytes(network)
+            })
+        {
+            return Err(state::Error::Oracle(
+                "oracletest requires its own peer magic",
+            )
+            .into());
+        }
         let env_path = datadir.join("data.mdb");
         // let _ = std::fs::remove_dir_all(&env_path);
         std::fs::create_dir_all(&env_path)?;
@@ -159,7 +169,11 @@ where
             unsafe { Env::open(&env_open_opts, &env_path) }
                 .map_err(EnvError::from)?
         };
-        let state = State::new(&env, decision_config_testing)?;
+        let state = State::new_with_oracle_test(
+            &env,
+            decision_config_testing,
+            network == Network::Oracletest,
+        )?;
         let archive = Archive::new(&env)?;
         let mempool = MemPool::new(&env)?;
         let (mainchain_task_handle, mainchain_task_event_rx) =
@@ -1343,6 +1357,22 @@ where
         market: &crate::state::Market,
     ) -> Result<f64, Error> {
         self.derive_market_beta(market)
+    }
+
+    pub fn oracle_memo(
+        &self,
+        expected_tip: Option<BlockHash>,
+    ) -> Result<Vec<u8>, Error> {
+        let txn = self.env.read_txn()?;
+        Ok(self.state.oracle_memo(&txn, expected_tip)?)
+    }
+
+    pub fn oracle_price_proof(
+        &self,
+        market_id: MarketId,
+    ) -> Result<Option<crate::types::oracle::PriceProof>, Error> {
+        let txn = self.env.read_txn()?;
+        Ok(self.state.oracle_snapshot(&txn)?.proof(market_id))
     }
 
     pub fn get_all_decision_periods(&self) -> Result<Vec<(u32, u64)>, Error> {

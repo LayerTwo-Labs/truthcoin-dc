@@ -34,6 +34,7 @@ mod block;
 pub mod decisions;
 mod error;
 pub mod markets;
+pub mod oracle;
 pub mod reputation;
 mod rollback;
 mod two_way_peg_data;
@@ -67,6 +68,7 @@ pub struct PrevalidatedBlock {
 
 #[derive(Clone)]
 pub struct State {
+    oracle_test: bool,
     /// Current tip
     tip: DatabaseUnique<UnitKey, SerdeBincode<BlockHash>>,
     /// Current height
@@ -145,11 +147,32 @@ impl State {
         env: &sneed::Env<Tls>,
         decision_config_testing: Option<u32>,
     ) -> Result<Self, Error> {
+        Self::new_with_oracle_test(env, decision_config_testing, false)
+    }
+
+    pub fn new_with_oracle_test<Tls>(
+        env: &sneed::Env<Tls>,
+        decision_config_testing: Option<u32>,
+        oracle_test: bool,
+    ) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
         let tip = DatabaseUnique::create(env, &mut rwtxn, "tip")
             .map_err(EnvError::from)?;
         let height = DatabaseUnique::create(env, &mut rwtxn, "height")
             .map_err(EnvError::from)?;
+        let profile: DatabaseUnique<UnitKey, SerdeBincode<bool>> =
+            DatabaseUnique::create(env, &mut rwtxn, "oracle_test_profile")?;
+        let stored_profile = profile.try_get(&rwtxn, &())?;
+        if stored_profile.is_some_and(|stored| stored != oracle_test)
+            || (stored_profile.is_none()
+                && oracle_test
+                && tip.try_get(&rwtxn, &())?.is_some())
+        {
+            return Err(Error::Oracle(
+                "data directory belongs to another consensus profile",
+            ));
+        }
+        profile.put(&mut rwtxn, &(), &oracle_test)?;
         let utxos = DatabaseUnique::create(env, &mut rwtxn, "utxos")
             .map_err(EnvError::from)?;
         let stxos = DatabaseUnique::create(env, &mut rwtxn, "stxos")
@@ -246,6 +269,7 @@ impl State {
             DatabaseUnique::create(env, &mut rwtxn, "market_utxos")?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
+            oracle_test,
             tip,
             height,
             utxos,

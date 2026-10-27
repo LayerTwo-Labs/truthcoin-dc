@@ -854,6 +854,13 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         self.app.node.try_get_tip().map_err(custom_err)
     }
 
+    async fn get_oracle_price_proof(
+        &self,
+        market_id: truthcoin_dc::types::market::MarketId,
+    ) -> RpcResult<Option<truthcoin_dc::types::oracle::PriceProof>> {
+        self.app.node.oracle_price_proof(market_id).map_err(custom_err)
+    }
+
     async fn get_best_mainchain_block_hash(
         &self,
     ) -> RpcResult<Option<bitcoin::BlockHash>> {

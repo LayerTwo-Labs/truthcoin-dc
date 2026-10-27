@@ -127,6 +127,8 @@ pub enum InvalidHeader {
 #[transitive(from(rwtxn::Commit, rwtxn::Error))]
 #[transitive(from(rwtxn::Error, sneed::Error))]
 pub enum Error {
+    #[error("oracle commitment: {0}")]
+    Oracle(&'static str),
     #[error("failed to verify authorization")]
     Authorization,
     #[error(transparent)]

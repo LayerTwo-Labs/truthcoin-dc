@@ -34,6 +34,7 @@ pub mod keys;
 pub use keys::{EncryptionPubKey, VerifyingKey};
 pub mod market;
 pub mod net;
+pub mod oracle;
 pub mod schema;
 pub mod state;
 pub mod transaction;
@@ -647,6 +648,8 @@ pub enum Network {
     Forknet,
     Regtest,
     Signet,
+    /// Isolated fresh chain with executed-market oracle commitments.
+    Oracletest,
 }
 
 /// Semver-compatible version
