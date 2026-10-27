@@ -85,6 +85,9 @@ ignore = [
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.30 pinned by zbus_xml under eframe 0.31, no upgrade without eframe bump" },
     { id = "RUSTSEC-2026-0370", reason = "eframe 0.31 accessibility uses zvariant 4; removal depends on its migration to zbus 6" },
     { id = "RUSTSEC-2026-0371", reason = "eframe 0.31 accessibility uses zbus_names 3; removal depends on its migration to zbus 6" },
+    { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 comes only from connectrpc 0.9 in the enforcer test crates; release builds do not use it" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd 0.13 comes only from connectrpc 0.9 in the enforcer test crates; release builds do not use it" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd 0.13 comes only from connectrpc 0.9 in the enforcer test crates; release builds do not use it" },
     { id = "RUSTSEC-2026-0372", reason = "eframe 0.31 accessibility uses zvariant_derive 4; removal depends on its migration to zbus 6" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
