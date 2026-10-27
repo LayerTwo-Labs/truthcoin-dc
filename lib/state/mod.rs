@@ -306,6 +306,18 @@ impl State {
         Ok(timestamp)
     }
 
+    #[cfg(test)]
+    pub(crate) fn put_timestamps_for_test(
+        &self,
+        rwtxn: &mut RwTxn,
+        genesis_ts: u64,
+        mainchain_ts: u64,
+    ) -> Result<(), Error> {
+        self.genesis_timestamp.put(rwtxn, &(), &genesis_ts)?;
+        self.mainchain_timestamp.put(rwtxn, &(), &mainchain_ts)?;
+        Ok(())
+    }
+
     pub fn get_mempool_shares(
         &self,
         rotxn: &RoTxn,
