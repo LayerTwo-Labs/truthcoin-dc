@@ -16,6 +16,7 @@ use crate::{
     block_template_address::block_template_address_trial,
     ibd::{ibd_trial, reorg_across_deposit_trial},
     list_mempool::list_mempool_trial,
+    mainchain_tls::mainchain_tls_trial,
     receive_address::receive_address_trial,
     roundtrip::roundtrip_trial,
     setup::{Init, PostSetup},
@@ -164,11 +165,7 @@ fn deposit_withdraw_roundtrip_trial(
             };
             deposit_withdraw_roundtrip(
                 post_setup,
-                Init {
-                    truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
-                    data_dir_suffix: None,
-                    extra_args: Vec::new(),
-                },
+                Init::new(bin_paths.truthcoin()?.clone()),
                 res_tx,
             )
             .await
@@ -191,6 +188,11 @@ pub fn tests(
             failure_collector.clone(),
         ),
         deposit_withdraw_roundtrip_trial(
+            bin_paths.clone(),
+            file_registry.clone(),
+            failure_collector.clone(),
+        ),
+        mainchain_tls_trial(
             bin_paths.clone(),
             file_registry.clone(),
             failure_collector.clone(),

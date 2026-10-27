@@ -649,24 +649,22 @@ impl Net {
             };
         let () = remove_ended_bans(&banned_peers, &mut rwtxn)?;
         let version = DatabaseUnique::create(env, &mut rwtxn, "net_version")?;
-        match version.try_get(&rwtxn, &())? {
-            Some(db_version)
-                if db_version
-                    < Version {
-                        major: 0,
-                        minor: 17,
-                        patch: 6,
-                    } =>
-            {
-                // types for `known_peers` db changed in v0.17.6
-                return Err(Error::IncompatibleVersion {
-                    version: db_version,
-                    db_path: env.path().to_path_buf(),
-                });
-            }
-            Some(_) => (),
-            None => version.put(&mut rwtxn, &(), &*VERSION)?,
+        if let Some(db_version) = version.try_get(&rwtxn, &())?
+            && (db_version
+                < (Version {
+                    major: 0,
+                    minor: 17,
+                    patch: 6,
+                })
+                || db_version > *VERSION)
+        {
+            // types for `known_peers` db changed in v0.17.6
+            return Err(Error::IncompatibleVersion {
+                version: db_version,
+                db_path: env.path().to_path_buf(),
+            });
         }
+        version.put(&mut rwtxn, &(), &*VERSION)?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         let magic_bytes = magic_bytes_override
             .unwrap_or_else(|| peer_message::magic_bytes(network));

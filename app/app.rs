@@ -8,7 +8,7 @@ use std::{
 };
 
 use fallible_iterator::FallibleIterator as _;
-use futures::{StreamExt, TryFutureExt};
+use futures::StreamExt;
 use parking_lot::RwLock;
 use rustreexo::accumulator::proof::Proof;
 use tokio::{spawn, sync::RwLock as TokioRwLock, task::JoinHandle};
@@ -19,14 +19,16 @@ use tonic_health::{
 };
 use truthcoin_dc::{
     miner::{self, Miner},
-    node::{self, Node},
+    node::{self, FatalErrorTx, Node},
     types::{
         self, Address, Coinbase, FilledTransaction, InPoint, OutPoint, Output,
         Transaction,
         proto::mainchain::{
             self,
             generated::{
-                block_producer_service_server, mining_service_server,
+                GetChainTipRequest, block_producer_service_server,
+                mining_service_server,
+                validator_service_client::ValidatorServiceClient,
                 validator_service_server, wallet_service_server,
             },
         },
@@ -42,6 +44,8 @@ pub enum Error {
     CusfMainchain(#[from] truthcoin_dc::types::proto::Error),
     #[error("io error")]
     Io(#[from] std::io::Error),
+    #[error("Invalid mainchain gRPC TLS config")]
+    MainchainTls(#[source] tonic::transport::Error),
     #[error("miner error")]
     Miner(#[from] miner::Error),
     #[error("node error")]
@@ -52,6 +56,11 @@ pub enum Error {
     RequestMainchainAncestorInfos { block_hash: bitcoin::BlockHash },
     #[error(transparent)]
     Utreexo(#[from] truthcoin_dc::types::UtreexoError),
+    #[error("Unable to verify existence of CUSF mainchain service(s) at {url}")]
+    VerifyMainchainServices {
+        url: Box<url::Url>,
+        source: Box<tonic::Status>,
+    },
     #[error("wallet error")]
     Wallet(#[from] wallet::Error),
 }
@@ -62,7 +71,28 @@ impl From<node::Error> for Error {
     }
 }
 
-fn update_wallet(node: &Node, wallet: &Wallet) -> Result<(), Error> {
+/// The error stays until the config changes: a TLS error, or no gRPC service
+/// at the URL path
+fn mainchain_config_error(status: &tonic::Status) -> bool {
+    if status.code() == tonic::Code::Unimplemented {
+        return true;
+    }
+    let mut source = std::error::Error::source(status);
+    while let Some(err) = source {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::InvalidData
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+fn update_wallet(
+    node: &Node<MainchainTransport>,
+    wallet: &Wallet,
+) -> Result<(), Error> {
     tracing::trace!("starting wallet update");
     let addresses = wallet.get_addresses()?;
     let utxos = node.get_utxos_by_addresses(&addresses)?;
@@ -94,7 +124,7 @@ fn update_wallet(node: &Node, wallet: &Wallet) -> Result<(), Error> {
 
 /// Update utxos & wallet
 fn update(
-    node: &Node,
+    node: &Node<MainchainTransport>,
     utxos: &mut HashMap<OutPoint, Output>,
     unconfirmed_utxos: &mut HashMap<OutPoint, Output>,
     wallet: &Wallet,
@@ -130,7 +160,7 @@ fn spendable_utxos(
 /// Outputs of mempool transactions that pay the wallet, and that the wallet
 /// may not spend
 fn unspendable_unconfirmed_utxos(
-    node: &Node,
+    node: &Node<MainchainTransport>,
     wallet: &Wallet,
     spendable: &HashMap<OutPoint, Output>,
 ) -> Result<HashMap<OutPoint, Output>, Error> {
@@ -166,6 +196,8 @@ pub struct Config {
     /// Blocks per voting period, for a test network
     pub decision_config_testing: Option<u32>,
     pub mainchain_grpc_url: url::Url,
+    /// Extra CA certificate (PEM) to trust for an `https` mainchain URL
+    pub mainchain_grpc_ca_cert: Option<PathBuf>,
     pub mnemonic_seed_phrase_path: Option<PathBuf>,
     pub net_addr: SocketAddr,
     pub network: truthcoin_dc::types::Network,
@@ -176,11 +208,15 @@ pub struct Config {
     pub wallet_dir: PathBuf,
 }
 
+/// Connection to the mainchain node
+pub type MainchainTransport =
+    crate::path_prefix::PathPrefix<tonic::transport::Channel>;
+
 #[derive(Clone)]
 pub struct App {
-    pub node: Arc<Node>,
+    pub node: Arc<Node<MainchainTransport>>,
     pub wallet: Wallet,
-    pub miner: Option<Arc<TokioRwLock<Miner>>>,
+    pub miner: Option<Arc<TokioRwLock<Miner<MainchainTransport>>>>,
     pub utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
     /// Outputs of mempool transactions that pay the wallet, and that the
     /// wallet may not spend
@@ -194,7 +230,7 @@ pub struct App {
 
 impl App {
     async fn task(
-        node: Arc<Node>,
+        node: Arc<Node<MainchainTransport>>,
         utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         wallet: Wallet,
@@ -221,29 +257,28 @@ impl App {
     }
 
     fn spawn_task(
-        node: Arc<Node>,
+        node: Arc<Node<MainchainTransport>>,
         utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         unconfirmed_utxos: Arc<RwLock<HashMap<OutPoint, Output>>>,
         wallet: Wallet,
         spend_zero_conf_change: bool,
+        fatal_error_tx: FatalErrorTx,
     ) -> JoinHandle<()> {
-        spawn(
+        spawn(node::supervise(
+            "Wallet",
             Self::task(
                 node,
                 utxos,
                 unconfirmed_utxos,
                 wallet,
                 spend_zero_conf_change,
-            )
-            .unwrap_or_else(|err| {
-                let err = anyhow::Error::from(err);
-                tracing::error!("{err:#}")
-            }),
-        )
+            ),
+            fatal_error_tx,
+        ))
     }
 
     async fn check_status_serving(
-        client: &mut HealthClient<tonic::transport::Channel>,
+        client: &mut HealthClient<MainchainTransport>,
         service_name: &str,
     ) -> Result<bool, tonic::Status> {
         match client
@@ -275,9 +310,9 @@ impl App {
     /// Returns `Ok(_)` iff validator service is available, and error if validator
     /// service is unavailable.
     async fn check_proto_support(
-        transport: tonic::transport::channel::Channel,
+        transport: MainchainTransport,
     ) -> Result<ProtoSupport, tonic::Status> {
-        let mut client = HealthClient::new(transport);
+        let mut client = HealthClient::new(transport.clone());
 
         let block_producer_service_name =
             block_producer_service_server::SERVICE_NAME;
@@ -286,12 +321,34 @@ impl App {
         let wallet_service_name = wallet_service_server::SERVICE_NAME;
 
         // The validator service MUST exist. We therefore error out here directly.
-        if !Self::check_status_serving(&mut client, validator_service_name)
-            .await?
+        match Self::check_status_serving(&mut client, validator_service_name)
+            .await
         {
-            return Err(tonic::Status::aborted(format!(
-                "{validator_service_name} is not supported in mainchain client",
-            )));
+            Ok(true) => (),
+            Ok(false) => {
+                return Err(tonic::Status::aborted(format!(
+                    "{validator_service_name} is not supported in mainchain client",
+                )));
+            }
+            // Some proxies expose only the CUSF services. Call the validator
+            // directly instead; the optional services count as missing.
+            Err(health_err) => {
+                tracing::warn!(
+                    "Mainchain health service unavailable ({health_err}), calling {validator_service_name} directly"
+                );
+                let _tip = ValidatorServiceClient::new(transport)
+                    .get_chain_tip(GetChainTipRequest {})
+                    .await?;
+                tracing::info!(
+                    "Verified existence of {}",
+                    validator_service_name
+                );
+                return Ok(ProtoSupport {
+                    block_producer: false,
+                    miner: false,
+                    wallet: false,
+                });
+            }
         }
 
         tracing::info!("Verified existence of {}", validator_service_name);
@@ -327,16 +384,20 @@ impl App {
     }
 
     /// Ask the mainchain node for its services until it answers. The node may
-    /// start before the mainchain node.
+    /// start before the mainchain node. A config error, such as a TLS error, is
+    /// returned.
     async fn wait_for_proto_support(
-        transport: tonic::transport::channel::Channel,
+        transport: MainchainTransport,
         url: &url::Url,
-    ) -> ProtoSupport {
+    ) -> Result<ProtoSupport, tonic::Status> {
         const RETRY_DELAY: Duration = Duration::from_secs(5);
 
         loop {
             match Self::check_proto_support(transport.clone()).await {
-                Ok(proto_support) => return proto_support,
+                Ok(proto_support) => return Ok(proto_support),
+                Err(status) if mainchain_config_error(&status) => {
+                    return Err(status);
+                }
                 Err(status) => {
                     tracing::warn!(
                         %url, %status, "Waiting for CUSF mainchain service(s)"
@@ -347,7 +408,10 @@ impl App {
         }
     }
 
-    pub fn new(config: Config) -> Result<Self, Error> {
+    pub fn new(
+        config: Config,
+        fatal_error_tx: FatalErrorTx,
+    ) -> Result<Self, Error> {
         let mut rng = rand::rng();
         // Node launches some tokio tasks for p2p networking, that is why we need a tokio runtime
         // here.
@@ -366,12 +430,27 @@ impl App {
             config.mainchain_grpc_url
         );
         let rt_guard = runtime.enter();
-        let transport = tonic::transport::channel::Channel::from_shared(
+        let mut endpoint = tonic::transport::channel::Channel::from_shared(
             format!("{}", config.mainchain_grpc_url),
         )
         .unwrap()
-        .concurrency_limit(256)
-        .connect_lazy();
+        .concurrency_limit(256);
+        if config.mainchain_grpc_url.scheme() == "https" {
+            let mut tls =
+                tonic::transport::ClientTlsConfig::new().with_webpki_roots();
+            if let Some(path) = &config.mainchain_grpc_ca_cert {
+                tls = tls.ca_certificate(
+                    tonic::transport::Certificate::from_pem(std::fs::read(
+                        path,
+                    )?),
+                );
+            }
+            endpoint = endpoint.tls_config(tls).map_err(Error::MainchainTls)?;
+        }
+        let transport = crate::path_prefix::PathPrefix::new(
+            endpoint.connect_lazy(),
+            config.mainchain_grpc_url.path(),
+        );
         let (
             cusf_mainchain,
             cusf_mainchain_miner,
@@ -382,10 +461,15 @@ impl App {
                 block_producer,
                 miner,
                 wallet,
-            } = runtime.block_on(Self::wait_for_proto_support(
-                transport.clone(),
-                &config.mainchain_grpc_url,
-            ));
+            } = runtime
+                .block_on(Self::wait_for_proto_support(
+                    transport.clone(),
+                    &config.mainchain_grpc_url,
+                ))
+                .map_err(|err| Error::VerifyMainchainServices {
+                    url: Box::new(config.mainchain_grpc_url.clone()),
+                    source: Box::new(err),
+                })?;
             let mining_client = if miner {
                 Some(mainchain::MiningClient::new(transport.clone()))
             } else {
@@ -436,6 +520,7 @@ impl App {
             cusf_mainchain_block_producer,
             &mut rng,
             &runtime,
+            fatal_error_tx.clone(),
         )?;
         let node = Arc::new(node);
         let spend_zero_conf_change = config.spend_zero_conf_change;
@@ -454,6 +539,7 @@ impl App {
             unconfirmed_utxos.clone(),
             wallet.clone(),
             spend_zero_conf_change,
+            fatal_error_tx,
         );
         drop(rt_guard);
         Ok(Self {
@@ -873,14 +959,18 @@ mod test {
     use tonic_health::ServingStatus;
     use truthcoin_dc::types::proto::mainchain::generated::validator_service_server;
 
-    use crate::app::App;
+    use crate::{
+        app::{App, MainchainTransport},
+        path_prefix::PathPrefix,
+    };
 
-    fn transport(addr: SocketAddr) -> tonic::transport::channel::Channel {
-        tonic::transport::channel::Channel::from_shared(format!(
+    fn transport(addr: SocketAddr) -> MainchainTransport {
+        let channel = tonic::transport::channel::Channel::from_shared(format!(
             "http://{addr}"
         ))
         .unwrap()
-        .connect_lazy()
+        .connect_lazy();
+        PathPrefix::new(channel, "")
     }
 
     async fn serve_validator_service(addr: SocketAddr) {
@@ -916,9 +1006,49 @@ mod test {
         );
         let () = serve_validator_service(addr).await;
         let proto_support =
-            timeout(Duration::from_secs(30), proto_support).await?;
+            timeout(Duration::from_secs(30), proto_support).await??;
         assert!(!proto_support.miner);
         assert!(!proto_support.wallet);
+        Ok(())
+    }
+
+    /// The host name of the mainchain node may resolve only after it starts
+    #[tokio::test]
+    async fn wait_for_an_unknown_host() -> anyhow::Result<()> {
+        let url: url::Url = "http://mainchain.invalid:50051".parse()?;
+        let channel =
+            tonic::transport::channel::Channel::from_shared(url.to_string())?
+                .connect_lazy();
+        let proto_support = timeout(
+            Duration::from_secs(10),
+            App::wait_for_proto_support(PathPrefix::new(channel, ""), &url),
+        )
+        .await;
+        assert!(proto_support.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn return_a_tls_error() -> anyhow::Result<()> {
+        let reserved =
+            reserve_port::ReservedSocketAddr::reserve_random_socket_addr()?;
+        let addr = reserved.socket_addr();
+        let () = serve_validator_service(addr).await;
+        let url: url::Url =
+            format!("https://localhost:{}", addr.port()).parse()?;
+        let channel =
+            tonic::transport::channel::Channel::from_shared(url.to_string())?
+                .tls_config(
+                    tonic::transport::ClientTlsConfig::new()
+                        .with_webpki_roots(),
+                )?
+                .connect_lazy();
+        let res = timeout(
+            Duration::from_secs(30),
+            App::wait_for_proto_support(PathPrefix::new(channel, ""), &url),
+        )
+        .await?;
+        assert!(res.is_err());
         Ok(())
     }
 }

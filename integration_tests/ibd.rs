@@ -46,9 +46,8 @@ async fn setup(
     };
     let sidechain_sender = PostSetup::setup(
         Init {
-            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("sender".to_owned()),
-            extra_args: Vec::new(),
+            ..Init::new(bin_paths.truthcoin()?.clone())
         },
         &enforcer_post_setup,
         res_tx.clone(),
@@ -57,9 +56,8 @@ async fn setup(
     tracing::info!("Setup truthcoin send node successfully");
     let sidechain_syncer = PostSetup::setup(
         Init {
-            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("syncer".to_owned()),
-            extra_args: Vec::new(),
+            ..Init::new(bin_paths.truthcoin()?.clone())
         },
         &enforcer_post_setup,
         res_tx,

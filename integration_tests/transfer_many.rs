@@ -61,11 +61,7 @@ async fn transfer_many_task(
     let mut enforcer_post_setup =
         setup(&bin_paths.others, res_tx.clone()).await?;
     let mut sidechain = PostSetup::setup(
-        Init {
-            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
-            data_dir_suffix: None,
-            extra_args: Vec::new(),
-        },
+        Init::new(bin_paths.truthcoin()?.clone()),
         &enforcer_post_setup,
         res_tx,
     )

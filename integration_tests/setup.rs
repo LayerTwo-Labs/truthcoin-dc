@@ -40,6 +40,30 @@ pub struct Init {
     /// More arguments for the truthcoin binary, such as
     /// `--spend-zero-conf-change=false`.
     pub extra_args: Vec<String>,
+    /// Reach the enforcer over TLS, instead of plain h2c
+    pub mainchain_tls: Option<MainchainTls>,
+}
+
+impl Init {
+    /// Defaults for everything but the binary. Override fields with struct
+    /// update syntax, so that adding a field doesn't touch every test:
+    /// `Init { data_dir_suffix: Some(..), ..Init::new(truthcoin_dc_app) }`
+    pub fn new(truthcoin_dc_app: PathBuf) -> Self {
+        Self {
+            truthcoin_dc_app,
+            data_dir_suffix: None,
+            extra_args: Vec::new(),
+            mainchain_tls: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct MainchainTls {
+    /// `https` URL of a TLS endpoint in front of the enforcer
+    pub url: String,
+    /// CA certificate to trust for it
+    pub ca_cert: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -170,10 +194,17 @@ impl Sidechain for PostSetup {
             path: init.truthcoin_dc_app,
             data_dir: truthcoin_dc_dir,
             log_level: Some(tracing::Level::TRACE),
-            mainchain_grpc_port: post_setup
-                .reserved_ports
-                .enforcer_serve_grpc
-                .port(),
+            mainchain_grpc_url: match &init.mainchain_tls {
+                Some(tls) => tls.url.clone(),
+                None => format!(
+                    "http://127.0.0.1:{}",
+                    post_setup.reserved_ports.enforcer_serve_grpc.port()
+                ),
+            },
+            mainchain_grpc_ca_cert: init
+                .mainchain_tls
+                .as_ref()
+                .map(|tls| tls.ca_cert.clone()),
             net_port: reserved_ports.net.port(),
             network: Network::Regtest,
             rpc_port: reserved_ports.rpc.port(),

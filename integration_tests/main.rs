@@ -9,6 +9,7 @@ mod block_template_address;
 mod ibd;
 mod integration_test;
 mod list_mempool;
+mod mainchain_tls;
 mod receive_address;
 mod roundtrip;
 mod setup;
