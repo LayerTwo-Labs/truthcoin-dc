@@ -32,6 +32,11 @@ use crate::{
     util::{ErrorChain, join_set},
 };
 
+/// Maximum number of peer states retained per connection.
+/// Peer states are retained so that follow-up internal messages can be
+/// associated with the peer state that prompted them. A peer chooses the
+/// contents of its own heartbeats, so it can produce an unlimited number of
+/// distinct peer states; the cache must therefore be bounded.
 const MAX_PEER_STATES: usize = 256;
 
 pub(in crate::net::peer) struct ConnectionTask {
@@ -48,6 +53,8 @@ pub(in crate::net::peer) struct ConnectionTask {
 
 impl ConnectionTask {
     /// Check if peer tip is better, requesting headers if necessary.
+    /// `peer_tip_main_height` MUST be the mainchain height of
+    /// `peer_tip_info.tip.main_block_hash`.
     /// Returns `Some(true)` if the peer tip is better and headers are available,
     /// `Some(false)` if the peer tip is better and headers were requested,
     /// and `None` if the peer tip is not better.
@@ -78,6 +85,8 @@ impl ConnectionTask {
             let Some(side_tips_tip_info) = side_tips_tip.tip_info else {
                 return Ok(None);
             };
+            // If the peer's mainchain tip is not an ancestor of ours, then ignore
+            // the peer tip.
             if !ctxt.archive.is_main_descendant(
                 &rotxn,
                 peer_tip_info.tip.main_block_hash,
@@ -87,6 +96,11 @@ impl ConnectionTask {
             }
             peer_tip_main_header_info.height
         };
+        // The height attached to a headers request is only used to size the
+        // read budget for the response. The peer-supplied height is untrusted,
+        // so clamp it: a block at height `h` requires `h` distinct mainchain
+        // blocks, so the peer tip's height cannot exceed the mainchain height
+        // of the mainchain block that its BMM commitment lives in.
         let headers_height =
             peer_tip_info.block_height.min(peer_tip_main_height);
         // Check if the peer tip is better, requesting headers if necessary
@@ -549,7 +563,7 @@ impl ConnectionTask {
                     }
                 }
             }
-        }
+        };
         // Check if the peer tip is better, requesting headers if necessary
         match Self::check_peer_tip_and_request_headers(
             ctxt,
@@ -735,11 +749,15 @@ impl ConnectionTask {
         }
     }
 
+    /// Record a peer state, evicting the least recently received states if the
+    /// cache is full. Returns the ID of the recorded peer state.
     fn insert_peer_state(
         peer_states: &mut LinkedHashMap<PeerStateId, PeerState>,
         peer_state: PeerState,
     ) -> PeerStateId {
         let peer_state_id = (&peer_state).into();
+        // Inserts at the back of the linked list, so that evicting from the
+        // front evicts the least recently received peer state
         peer_states.insert(peer_state_id, peer_state);
         while peer_states.len() > MAX_PEER_STATES {
             let _evicted = peer_states.pop_front();
@@ -752,6 +770,7 @@ impl ConnectionTask {
         info_tx: &mpsc::UnboundedSender<Info>,
         mailbox_sender: &mailbox::Sender,
         peer_state: &mut Option<PeerStateId>,
+        // Bounded map associating peer state hashes to peer state
         peer_states: &mut LinkedHashMap<PeerStateId, PeerState>,
         response_tx: SendStream,
         request_msg: RequestMessage,
@@ -835,6 +854,11 @@ impl ConnectionTask {
                 }
                 let Some(peer_state) = peer_states.get(&peer_state_id).copied()
                 else {
+                    // The peer state may have been evicted from the bounded
+                    // cache, so dropping the message is preferable to killing
+                    // the connection
+                    let err = Error::MissingPeerState(peer_state_id);
+                    tracing::warn!("{err}");
                     return Ok(());
                 };
                 let ctxt = Arc::clone(ctxt);
@@ -868,6 +892,11 @@ impl ConnectionTask {
             | InternalMessage::BodiesAvailable(peer_state_id) => {
                 let Some(peer_state) = peer_states.get(&peer_state_id).copied()
                 else {
+                    // The peer state may have been evicted from the bounded
+                    // cache, so dropping the message is preferable to killing
+                    // the connection
+                    let err = Error::MissingPeerState(peer_state_id);
+                    tracing::warn!("{err}");
                     return Ok(());
                 };
                 let ctxt = Arc::clone(ctxt);
@@ -892,6 +921,7 @@ impl ConnectionTask {
         let ctxt = Arc::new(self.ctxt);
         // current peer state
         let mut peer_state = Option::<PeerStateId>::None;
+        // known peer states, bounded to `MAX_PEER_STATES`
         let mut peer_states = LinkedHashMap::<PeerStateId, PeerState>::new();
         let inbound_budget = request_queue::InboundBudget::new();
         let mut mailbox_stream = self
@@ -1014,6 +1044,10 @@ mod tests {
         }
     }
 
+    /// A peer controls the contents of its own heartbeats, so it can send
+    /// arbitrarily many distinct peer states over a single connection. The
+    /// per-connection cache of known peer states must stay bounded, retaining
+    /// the most recently received states.
     #[test]
     fn peer_state_cache_is_bounded() {
         let mut peer_states = LinkedHashMap::<PeerStateId, PeerState>::new();
@@ -1030,7 +1064,7 @@ mod tests {
             assert_eq!(
                 peer_states.contains_key(peer_state_id),
                 idx >= peer_state_ids.len() - MAX_PEER_STATES,
-                "Wrong cache entry for peer state {idx}"
+                "unexpected cache membership for peer state {idx}"
             );
         }
     }

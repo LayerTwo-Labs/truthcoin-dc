@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use error_fatality::{Nested as _, Split};
+use error_fatality::{Fatality as _, Nested as _, Split};
 use fallible_iterator::{FallibleIterator, IteratorExt};
 use futures::{
     StreamExt,
@@ -33,8 +33,10 @@ use crate::{
         peer_message,
     },
     node::{
+        FatalErrorTx,
         error::net_task::{self as error, Error},
         mainchain_task::{self, MainchainTaskHandle},
+        supervise,
     },
     state::{self, State},
     types::{
@@ -305,10 +307,6 @@ pub(in crate::node) fn disconnect_tip_(
     Ok(())
 }
 
-fn is_fatal_reorg_error(err: &Error) -> bool {
-    !matches!(err, Error::State(_))
-}
-
 /// A peer sends a transaction this node refuses. The peer is at fault, so the
 /// net task must stay up. A database error belongs to this node, and it must
 /// stop the task.
@@ -476,7 +474,7 @@ fn reorg_to_tip<ThreadLocalStorage>(
         ) {
             Ok(()) => (),
             Err(err) => {
-                if !is_fatal_reorg_error(&err) {
+                if !err.is_fatal() {
                     // The stored body for this block failed validation (e.g. a peer
                     // supplied a body whose contents do not match the header's merkle
                     // root). Abort the reorg and discard the invalid body from the
@@ -991,14 +989,25 @@ impl NetTask {
                 block_hash: best_side_tip.block_hash,
                 main_block_hash: best_side_tip.info.main_block_hash,
             };
-            let _: bool = reorg_to_tip(
+            match reorg_to_tip(
                 &ctxt.env,
                 &ctxt.archive,
                 &ctxt.net.batch_verification_ctxt,
                 &ctxt.mempool,
                 &ctxt.state,
                 best_side_tip,
-            )?;
+            )
+            .into_nested()?
+            {
+                Ok(completed_reorg) => {
+                    let _: bool = completed_reorg;
+                }
+                Err(err) => tracing::warn!(
+                    ?best_side_tip,
+                    err = format!("{:#}", ErrorChain::new(&err)),
+                    "rejecting invalid best side tip"
+                ),
+            }
         }
         Ok(())
     }
@@ -1272,12 +1281,10 @@ impl NetTask {
                             &self.ctxt.state,
                             new_tip,
                         )
-                    });
+                    })
+                    .into_nested()?;
                     let reorg_applied = match reorg_result {
                         Ok(applied) => applied,
-                        Err(err) if is_fatal_reorg_error(&err) => {
-                            return Err(err);
-                        }
                         // an invalid block must not kill the net task; drop the
                         // peer and keep running
                         Err(err) => {
@@ -1605,6 +1612,7 @@ impl NetTaskHandle {
         peer_info_rx: PeerInfoRx,
         mut rng: R,
         state: State,
+        fatal_error_tx: FatalErrorTx,
     ) -> Self
     where
         R: rand::CryptoRng,
@@ -1632,11 +1640,7 @@ impl NetTaskHandle {
             peer_info_rx,
             rng: ChaCha20Rng::from_rng(&mut rng),
         };
-        let task = runtime.spawn(async {
-            if let Err(err) = task.run().await {
-                tracing::error!("Net task error: {:#}", ErrorChain::new(&err));
-            }
-        });
+        let task = runtime.spawn(supervise("Net", task.run(), fatal_error_tx));
         NetTaskHandle {
             task: Arc::new(task),
             new_tip_ready_tx,
@@ -1738,20 +1742,27 @@ mod test {
     use truthcoin_dc_types::authorization::BatchVerificationContext;
 
     use anyhow::Context;
+    use bitcoin::hashes::Hash as _;
+    use error_fatality::Fatality as _;
     use futures::channel::mpsc;
     use rand::SeedableRng as _;
 
     use crate::{
+        archive::side_tips::BmmCommitment,
         net::{PeerConnectionInfo, make_server_endpoint},
         node::{
             Config, Node,
-            net_task::{Error, NetTask, NetTaskContext, is_fatal_reorg_error},
+            net_task::{Error, NetTask, NetTaskContext},
         },
         state,
         types::{
-            Accumulator, AccumulatorDiff, Network, OutPoint, OutPointKey,
-            Output, OutputContent, PointedOutput, Transaction, hash,
-            net::PeerConnectionStatus, proto::mainchain::ValidatorClient,
+            Accumulator, AccumulatorDiff, Body, Coinbase, Header, MerkleRoot,
+            Network, OutPoint, OutPointKey, Output, OutputContent,
+            PointedOutput, Transaction, hash,
+            net::PeerConnectionStatus,
+            proto::mainchain::{
+                BlockHeaderInfo, Event as MainchainBlockEvent, ValidatorClient,
+            },
         },
         wallet::Wallet,
     };
@@ -1763,6 +1774,7 @@ mod test {
         let channel =
             tonic::transport::Endpoint::from_static("http://127.0.0.1:1")
                 .connect_lazy();
+        let (fatal_error_tx, _fatal_error_rx) = mpsc::unbounded();
         let node = Node::new(
             Config {
                 datadir: temp_dir.path().to_owned(),
@@ -1777,6 +1789,7 @@ mod test {
             None,
             &mut rand::rng(),
             runtime,
+            fatal_error_tx,
         )?;
         Ok((temp_dir, node))
     }
@@ -2722,17 +2735,103 @@ mod test {
         })
     }
 
+    #[test]
+    fn an_invalid_best_side_tip_does_not_stop_the_net_task()
+    -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let temp_dir = temp_dir::TempDir::new()?;
+            let channel =
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1")
+                    .connect_lazy();
+            let (fatal_error_tx, _fatal_error_rx) =
+                futures::channel::mpsc::unbounded();
+            let node = Node::new(
+                Config {
+                    datadir: temp_dir.path().to_owned(),
+                    bind_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+                    magic_bytes_override: None,
+                    network: Network::Regtest,
+                    add_peers: HashSet::new(),
+                    server_names: HashSet::new(),
+                    decision_config_testing: None,
+                },
+                ValidatorClient::new(channel),
+                None,
+                &mut rand::rng(),
+                &runtime,
+                fatal_error_tx,
+            )?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let main_header = BlockHeaderInfo {
+                block_hash: bitcoin::BlockHash::from_byte_array([1; 32]),
+                prev_block_hash: bitcoin::BlockHash::all_zeros(),
+                height: 0,
+                work: bitcoin::Target::MAX.to_work(),
+                timestamp: 0,
+            };
+            let header = Header {
+                merkle_root: MerkleRoot::from([7; 32]),
+                prev_side_hash: None,
+                prev_main_hash: main_header.prev_block_hash,
+                roots: Vec::new(),
+            };
+            let block_hash = header.hash();
+            let body = Body {
+                coinbase: Coinbase::default(),
+                transactions: Vec::new(),
+                authorizations: Vec::new(),
+                actor_proofs: Vec::new(),
+            };
+            let mut rwtxn = node.env.write_txn()?;
+            node.archive.put_header(&mut rwtxn, &header)?;
+            node.archive.put_body(&mut rwtxn, block_hash, &body)?;
+            node.archive.side_tips().connect_mainchain_tip(
+                &mut rwtxn,
+                main_header,
+                Some(BmmCommitment {
+                    sidechain_block_hash: block_hash,
+                    sidechain_header_data: (&header).into(),
+                }),
+            )?;
+            rwtxn.commit()?;
+            let ctxt = NetTaskContext {
+                env: node.env.clone(),
+                archive: node.archive.clone(),
+                mainchain_task: node.task_handles.mainchain.clone(),
+                mempool: node.mempool.clone(),
+                net: node.net.clone(),
+                state: node.state.clone(),
+            };
+            for _ in 0..2 {
+                NetTask::handle_mainchain_block_event(
+                    &ctxt,
+                    MainchainBlockEvent::DisconnectBlock {
+                        block_hash: main_header.block_hash,
+                    },
+                )?;
+            }
+            let rotxn = node.env.read_txn()?;
+            assert!(node.archive.try_get_body(&rotxn, block_hash)?.is_none());
+            assert!(node.state.try_get_tip(&rotxn)?.is_none());
+            Ok(())
+        })
+    }
+
     // a peer's invalid block (value out > value in) must not be fatal
     #[test]
     fn invalid_peer_block_is_not_fatal() {
         let err = Error::State(state::Error::NotEnoughValueIn);
-        assert!(!is_fatal_reorg_error(&err));
+        assert!(!err.is_fatal());
     }
 
     // local infrastructure errors stay fatal
     #[test]
     fn infrastructure_error_is_fatal() {
-        assert!(is_fatal_reorg_error(&Error::PeerInfoRxClosed));
+        assert!(Error::PeerInfoRxClosed.is_fatal());
     }
 
     // a peer that pushes a chain past the ancestor limit, a double spend, or a

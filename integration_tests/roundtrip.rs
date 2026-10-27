@@ -356,9 +356,8 @@ impl TruthcoinNodes {
         let setup_single = |suffix: &str| {
             PostSetup::setup(
                 Init {
-                    truthcoin_dc_app: truthcoin_app.clone(),
                     data_dir_suffix: Some(suffix.to_owned()),
-                    extra_args: Vec::new(),
+                    ..Init::new(truthcoin_app.clone())
                 },
                 enforcer_post_setup,
                 res_tx.clone(),

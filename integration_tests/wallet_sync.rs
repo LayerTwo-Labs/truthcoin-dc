@@ -46,9 +46,8 @@ async fn wallet_sync_task(
     };
     let miner = PostSetup::setup(
         Init {
-            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("miner".to_owned()),
-            extra_args: Vec::new(),
+            ..Init::new(bin_paths.truthcoin()?.clone())
         },
         &enforcer_post_setup,
         res_tx.clone(),
@@ -56,9 +55,8 @@ async fn wallet_sync_task(
     .await?;
     let wallet = PostSetup::setup(
         Init {
-            truthcoin_dc_app: bin_paths.truthcoin()?.clone(),
             data_dir_suffix: Some("wallet".to_owned()),
-            extra_args: Vec::new(),
+            ..Init::new(bin_paths.truthcoin()?.clone())
         },
         &enforcer_post_setup,
         res_tx,

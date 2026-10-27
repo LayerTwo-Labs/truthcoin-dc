@@ -52,7 +52,7 @@ use truthcoin_dc_app_rpc_api::{
 };
 
 use crate::{
-    app::App,
+    app::{App, MainchainTransport},
     rpc_auth::{BearerAuthLayer, GuardLayer},
 };
 
@@ -210,7 +210,7 @@ pub(crate) struct AllocatedSlot {
 /// requested period, considering tier pricing and the mempool's pending
 /// claims. Returns one [`AllocatedSlot`] per request in input order.
 pub(crate) fn allocate_decision_slots(
-    node: &Node,
+    node: &Node<MainchainTransport>,
     requests: &[SlotRequest],
 ) -> RpcResult<Vec<AllocatedSlot>> {
     use std::collections::{BTreeMap, BTreeSet};
@@ -319,7 +319,7 @@ fn parse_market_id(
 
 impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
     #[inline(always)]
-    fn node(&self) -> &Node {
+    fn node(&self) -> &Node<MainchainTransport> {
         &self.app.node
     }
 

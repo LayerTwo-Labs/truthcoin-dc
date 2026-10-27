@@ -38,7 +38,7 @@ use crate::{
         proto::{self, mainchain},
         state::{MarketUtxoChanges, TwoWayPegEvent},
     },
-    util::Watchable,
+    util::{ErrorChain, Watchable},
 };
 
 pub(crate) mod error;
@@ -78,6 +78,71 @@ pub struct Config {
     pub decision_config_testing: Option<u32>,
 }
 
+/// A long-running task that stopped with an error
+#[derive(Debug, thiserror::Error)]
+#[error("{task} task error: {err}")]
+pub struct TaskError {
+    pub task: &'static str,
+    /// Rendered error chain
+    pub err: String,
+}
+
+impl TaskError {
+    pub fn new<E>(task: &'static str, err: &E) -> Self
+    where
+        E: std::error::Error,
+    {
+        Self {
+            task,
+            err: format!("{:#}", crate::util::ErrorChain::new(err)),
+        }
+    }
+}
+
+/// Receives the error of any task that stops. The node makes no progress once
+/// its net or mainchain task has ended, while its RPC server keeps answering,
+/// so the owner of the process should exit on the first one.
+pub type FatalErrorTx = futures::channel::mpsc::UnboundedSender<TaskError>;
+
+/// Wrap a task that must run for the life of the node, reporting on
+/// `fatal_error_tx` however it ends: an error, a panic, or returning at all.
+/// A panic unwinds only the task, and a return leaves nothing running in its
+/// place, so both would otherwise leave the node up with a frozen tip.
+/// Aborting the spawned task, as dropping the node does, reports nothing.
+pub fn supervise<Fut, E>(
+    task: &'static str,
+    fut: Fut,
+    fatal_error_tx: FatalErrorTx,
+) -> impl Future<Output = ()> + Send + 'static
+where
+    Fut: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::error::Error,
+{
+    use futures::FutureExt as _;
+    async move {
+        let err = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(Ok(())) => TaskError {
+                task,
+                err: "exited unexpectedly".to_owned(),
+            },
+            Ok(Err(err)) => TaskError::new(task, &err),
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|msg| (*msg).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string payload".to_owned());
+                TaskError {
+                    task,
+                    err: format!("panicked: {msg}"),
+                }
+            }
+        };
+        tracing::error!("{err}");
+        let _send_err: Result<(), _> = fatal_error_tx.unbounded_send(err);
+    }
+}
+
 /// Handles for spawned tasks / task sets
 #[derive(Clone)]
 struct TaskHandles {
@@ -112,6 +177,7 @@ where
         >,
         rng: &mut R,
         runtime: &tokio::runtime::Runtime,
+        fatal_error_tx: FatalErrorTx,
     ) -> Result<Self, Error>
     where
         mainchain::ValidatorClient<MainchainTransport>: Clone,
@@ -183,6 +249,7 @@ where
                 env.clone(),
                 archive.clone(),
                 cusf_mainchain.clone(),
+                fatal_error_tx.clone(),
             );
         let batch_verification_ctxt = BatchVerificationContext::new(rng);
         let (net, peer_info_rx, dial_known_peers_handle) = Net::new(
@@ -207,8 +274,9 @@ where
             mempool.clone(),
             net.clone(),
             peer_info_rx,
-            &mut *rng,
+            rng,
             state.clone(),
+            fatal_error_tx,
         );
         let task_handles = TaskHandles {
             _dial_known_peers: Arc::new(dial_known_peers_handle),
@@ -1232,14 +1300,30 @@ where
             if let Some(cusf_mainchain_block_producer) =
                 self.cusf_mainchain_block_producer.as_ref()
             {
-                {
+                let broadcast_res = {
                     let mut cusf_mainchain_block_producer_lock =
                         cusf_mainchain_block_producer.lock().await;
-                    let () = cusf_mainchain_block_producer_lock
+                    cusf_mainchain_block_producer_lock
                         .propose_withdrawal_bundle(bundle.tx())
-                        .await?;
+                        .await
+                };
+                // The new tip is already committed at this point, so a broadcast
+                // failure MUST NOT be reported as a rejected block.
+                // The bundle remains pending until the corresponding mainchain
+                // event is connected, so it is re-broadcast on the next block.
+                match broadcast_res {
+                    Ok(()) => {
+                        tracing::trace!(%m6id, "Proposed withdrawal bundle")
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            %m6id,
+                            "Failed to broadcast withdrawal bundle; \
+                            will retry on next block: {:#}",
+                            ErrorChain::new(&err),
+                        )
+                    }
                 }
-                tracing::trace!(%m6id, "Proposed withdrawal bundle");
             } else {
                 // Without the mainchain's block producer service there is
                 // nowhere to send the bundle, and it stays pending for every

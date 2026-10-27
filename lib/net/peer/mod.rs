@@ -583,7 +583,7 @@ pub fn connect(
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use std::{collections::HashSet, num::NonZeroUsize, time::Duration};
 
     use super::Connection;
@@ -615,6 +615,9 @@ mod test {
         );
     }
 
+    /// The height attached to a `GetHeaders` request originates from a peer
+    /// heartbeat, so an absurd height must not be able to inflate the read
+    /// budget (and with it, the response read timeout) without bound.
     #[test]
     fn get_headers_read_response_limit_is_bounded() {
         let get_headers = GetHeadersRequest {
@@ -626,12 +629,12 @@ mod test {
         let limit = get_headers.read_response_limit();
         assert!(
             limit.get() <= 64 * 1024 * 1024,
-            "GetHeaders read limit {limit} exceeds 64 MiB",
+            "GetHeaders read limit {limit} must stay bounded",
         );
         let timeout = Connection::response_read_timeout(limit);
         assert!(
             timeout <= Duration::from_secs(60 * 60),
-            "GetHeaders response read timeout {timeout:?} exceeds one hour",
+            "GetHeaders response read timeout {timeout:?} must stay bounded",
         );
     }
 

@@ -1,8 +1,9 @@
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use clap::Parser as _;
+use futures::StreamExt as _;
 use mimalloc::MiMalloc;
-use tokio::{signal::ctrl_c, sync::oneshot};
+use tokio::signal::ctrl_c;
 use tracing_subscriber::{
     Layer, filter as tracing_filter, fmt::format, layer::SubscriberExt,
 };
@@ -11,6 +12,7 @@ mod app;
 mod cli;
 mod gui;
 mod line_buffer;
+mod path_prefix;
 mod rpc_auth;
 mod rpc_server;
 mod util;
@@ -222,7 +224,10 @@ fn main() -> anyhow::Result<()> {
     )?;
     let () = config.log_all_fields("Loaded config");
 
-    let (app_tx, app_rx) = oneshot::channel::<anyhow::Error>();
+    // Any task that stops leaves the node unable to make progress, so in
+    // headless mode the first error ends the process.
+    let (fatal_error_tx, mut fatal_error_rx) =
+        futures::channel::mpsc::unbounded();
 
     let rpc_cookie_path = config.datadir.join(rpc_auth::COOKIE_FILE_NAME);
     let rpc_auth_token: Arc<str> =
@@ -233,6 +238,7 @@ fn main() -> anyhow::Result<()> {
         datadir: config.datadir,
         decision_config_testing: config.decision_config_testing,
         mainchain_grpc_url: config.mainchain_grpc_url,
+        mainchain_grpc_ca_cert: config.mainchain_grpc_ca_cert,
         mnemonic_seed_phrase_path: config.mnemonic_seed_phrase_path,
         net_addr: config.net_addr,
         network: config.network,
@@ -241,28 +247,37 @@ fn main() -> anyhow::Result<()> {
         spend_zero_conf_change: config.spend_zero_conf_change,
         wallet_dir: config.wallet_dir,
     };
-    let app = app::App::new(app_config).inspect(|app| {
-        // spawn rpc server
-        app.runtime.spawn({
-            let app = app.clone();
-            let rpc_auth_token = rpc_auth_token.clone();
-            let rpc_cookie_path = rpc_cookie_path.clone();
-            async move {
-                tracing::info!("starting RPC server at `{}`", config.rpc_addr);
-                if let Err(err) = rpc_server::run_server(
-                    app,
-                    config.private_rpc_addr,
-                    config.rpc_addr,
-                    rpc_auth_token,
-                    &rpc_cookie_path,
-                )
-                .await
-                {
-                    app_tx.send(err).expect("failed to send error to app");
+    let app =
+        app::App::new(app_config, fatal_error_tx.clone()).inspect(|app| {
+            // spawn rpc server
+            app.runtime.spawn({
+                let app = app.clone();
+                let rpc_auth_token = rpc_auth_token.clone();
+                let rpc_cookie_path = rpc_cookie_path.clone();
+                async move {
+                    tracing::info!(
+                        "starting RPC server at `{}`",
+                        config.rpc_addr
+                    );
+                    if let Err(err) = rpc_server::run_server(
+                        app,
+                        config.private_rpc_addr,
+                        config.rpc_addr,
+                        rpc_auth_token,
+                        &rpc_cookie_path,
+                    )
+                    .await
+                    {
+                        let err = truthcoin_dc::node::TaskError {
+                            task: "RPC server",
+                            err: format!("{err:#}"),
+                        };
+                        let _send_err: Result<(), _> =
+                            fatal_error_tx.unbounded_send(err);
+                    }
                 }
-            }
+            });
         });
-    });
 
     if !config.headless {
         let rt = match &app {
@@ -296,8 +311,8 @@ fn main() -> anyhow::Result<()> {
                 tracing::info!("Shutting down due to process interruption");
                 Ok(())
             }
-            Ok(err) = app_rx => {
-                Err(anyhow::anyhow!("received error from RPC server: {err:#} ({err:?})"))
+            Some(err) = fatal_error_rx.next() => {
+                Err(err.into())
             }
         }
     })

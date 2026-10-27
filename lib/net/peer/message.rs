@@ -99,6 +99,9 @@ pub struct GetHeadersRequest {
 }
 
 impl GetHeadersRequest {
+    /// Hard cap on the bytes to read in a response, regardless of the
+    /// requested height. Bounds memory use (and the response read timeout)
+    /// even if an unreasonably large height is used to size the read budget.
     const MAX_READ_RESPONSE_LIMIT: NonZeroUsize =
         NonZeroUsize::new(64 * 1024 * 1024).unwrap();
 

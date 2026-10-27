@@ -22,7 +22,11 @@ use tokio::{
 
 use crate::{
     archive::{self, Archive},
-    node::error::mainchain_task::{self as error, Error},
+    node::{
+        FatalErrorTx,
+        error::mainchain_task::{self as error, Error},
+        supervise,
+    },
     types::{
         BmmResult, MainchainSyncPhase, MainchainSyncProgress,
         proto::{
@@ -651,7 +655,7 @@ where
 
     /// Run the task, and start it again after it stops. The mainchain node can
     /// stop at any time, and the node must connect to it again.
-    async fn run(mut self) {
+    async fn run(mut self) -> Result<(), Error> {
         const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
         loop {
@@ -690,6 +694,7 @@ impl MainchainTaskHandle {
         env: sneed::Env<heed::WithoutTls>,
         archive: Archive,
         mainchain: ValidatorClient<Transport>,
+        fatal_error_tx: FatalErrorTx,
     ) -> (Self, mpsc::UnboundedReceiver<Event>)
     where
         Transport: proto::Transport + Send + 'static,
@@ -707,7 +712,7 @@ impl MainchainTaskHandle {
             request_rx,
             event_tx,
         };
-        let task = spawn(task.run());
+        let task = spawn(supervise("Mainchain", task.run(), fatal_error_tx));
         let task_handle = MainchainTaskHandle {
             task: Arc::new(task),
             sync_progress,
@@ -1092,6 +1097,7 @@ mod test {
             env,
             archive,
             ValidatorClient::new(transport),
+            futures::channel::mpsc::unbounded().0,
         );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let request = Request::AncestorInfos(bitcoin::BlockHash::all_zeros());
