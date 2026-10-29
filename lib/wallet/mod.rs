@@ -617,6 +617,25 @@ impl Wallet {
         }
     }
 
+    /// Remove each coin that is not mature at the heights in `options`
+    pub fn retain_mature(
+        &self,
+        utxos: &mut HashMap<OutPoint, Output>,
+        options: SpendOptions,
+    ) -> Result<(), Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let mut immature = Vec::new();
+        for outpoint in utxos.keys() {
+            if !self.is_mature(&rotxn, outpoint, options)? {
+                immature.push(*outpoint);
+            }
+        }
+        for outpoint in immature {
+            utxos.remove(&outpoint);
+        }
+        Ok(())
+    }
+
     /// Pick mature coins worth at least `value`. A confirmed coin comes
     /// first, so a chain of unconfirmed transactions only forms when the
     /// confirmed coins fall short. Bitcoin Core orders its coin selection the
@@ -2236,6 +2255,16 @@ mod tests {
         assert_eq!(selected.coins.keys().collect::<Vec<_>>(), [&coinbase]);
         let selected = pick(0, 100 + DEPOSIT_MATURITY)?;
         assert_eq!(selected.coins.keys().collect::<Vec<_>>(), [&deposit]);
+        let mut utxos = wallet.get_utxos()?;
+        wallet.retain_mature(
+            &mut utxos,
+            SpendOptions {
+                spend_height: 10 + COINBASE_MATURITY,
+                main_height: 100 + DEPOSIT_MATURITY - 1,
+                spend_zero_conf_change: false,
+            },
+        )?;
+        assert_eq!(utxos.keys().collect::<Vec<_>>(), [&coinbase]);
         Ok(())
     }
 

@@ -171,27 +171,43 @@ fn update(
 ) -> Result<(), Error> {
     tracing::trace!("Updating wallet");
     let () = update_wallet(node, wallet)?;
-    *utxos = spendable_utxos(wallet, spend_zero_conf_change)?;
+    *utxos =
+        spendable_utxos(wallet, spend_options(node, spend_zero_conf_change)?)?;
     *unconfirmed_utxos = unspendable_unconfirmed_utxos(node, wallet, utxos)?;
     tracing::trace!("Updated wallet");
     Ok(())
 }
 
+/// The options that pick the coins for a new transaction
+fn spend_options(
+    node: &Node<MainchainTransport>,
+    spend_zero_conf_change: bool,
+) -> Result<SpendOptions, Error> {
+    let spend_height = node.try_get_height()?.map_or(0, |height| height + 1);
+    let main_height = node.try_get_mainchain_tip_height()?.unwrap_or(0);
+    Ok(SpendOptions {
+        spend_height,
+        main_height,
+        spend_zero_conf_change,
+    })
+}
+
 /// The coins the wallet may put in a new transaction. It matches what
-/// `Wallet::select_coins` takes under the same option.
+/// `Wallet::select_coins` takes under the same options.
 fn spendable_utxos(
     wallet: &Wallet,
-    spend_zero_conf_change: bool,
+    options: SpendOptions,
 ) -> Result<HashMap<OutPoint, Output>, Error> {
     let mut utxos = wallet.get_utxos()?;
     let spent = wallet.get_mempool_spent_utxos()?;
-    if spend_zero_conf_change {
+    if options.spend_zero_conf_change {
         utxos.extend(wallet.get_unconfirmed_utxos()?);
     }
     // A withdrawal output waits for a bundle, so `select_coins` skips it too.
     utxos.retain(|outpoint, output| {
         !spent.contains(outpoint) && !output.content.is_withdrawal()
     });
+    let () = wallet.retain_mature(&mut utxos, options)?;
     Ok(utxos)
 }
 
@@ -568,7 +584,7 @@ impl App {
         let () = update_wallet(&node, &wallet)?;
         let utxos = Arc::new(RwLock::new(spendable_utxos(
             &wallet,
-            spend_zero_conf_change,
+            spend_options(&node, spend_zero_conf_change)?,
         )?));
         let unconfirmed_utxos = Arc::new(RwLock::new(
             unspendable_unconfirmed_utxos(&node, &wallet, &utxos.read())?,
@@ -615,15 +631,7 @@ impl App {
 
     /// The options that pick the coins for a new transaction
     pub fn spend_options(&self) -> Result<SpendOptions, Error> {
-        let spend_height =
-            self.node.try_get_height()?.map_or(0, |height| height + 1);
-        let main_height =
-            self.node.try_get_mainchain_tip_height()?.unwrap_or(0);
-        Ok(SpendOptions {
-            spend_height,
-            main_height,
-            spend_zero_conf_change: self.spend_zero_conf_change,
-        })
+        spend_options(&self.node, self.spend_zero_conf_change)
     }
 
     /// Regenerate proofs and submit transaction
