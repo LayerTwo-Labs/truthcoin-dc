@@ -1417,7 +1417,10 @@ where
             block_hash,
             main_block_hash,
         };
-        if !self.task_handles.net.new_tip_ready_confirm(new_tip).await? {
+        // The net task can connect the block from its mainchain event first.
+        if !self.task_handles.net.new_tip_ready_confirm(new_tip).await?
+            && self.try_get_tip()? != Some(block_hash)
+        {
             tracing::warn!(%block_hash, "Not ready to reorg");
             return Ok(false);
         };
