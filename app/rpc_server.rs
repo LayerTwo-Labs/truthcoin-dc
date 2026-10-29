@@ -905,6 +905,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
             .get_two_way_peg_events(block_hash)
             .map_err(custom_err)?;
         let mut deposits = Vec::new();
+        let mut bundle_returns = Vec::new();
         let mut bundle_spends = Vec::new();
         for event in events {
             match event {
@@ -919,7 +920,17 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                         outpoint,
                         m6id,
                     }),
-                TwoWayPegEvent::BundleReturn { .. } => (),
+                TwoWayPegEvent::BundleReturn {
+                    outpoint,
+                    output,
+                    m6id,
+                } => {
+                    bundle_returns.push(truthcoin_dc::types::BlockIndexReturn {
+                        outpoint,
+                        output,
+                        m6id,
+                    })
+                }
             }
         }
         let market_utxos = self
@@ -930,6 +941,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         Ok(truthcoin_dc::types::BlockIndex {
             txs,
             deposits,
+            bundle_returns,
             bundle_spends,
             market_creates: market_utxos.creates,
             market_deletes: market_utxos.deletes,

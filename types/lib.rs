@@ -122,15 +122,28 @@ pub struct BlockIndexSpend {
     pub m6id: M6id,
 }
 
+/// One output that a failed or dropped withdrawal bundle made again, with the
+/// bundle
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndexReturn {
+    pub outpoint: transaction::OutPoint,
+    pub output: transaction::Output,
+    pub m6id: M6id,
+}
+
 /// Everything about a block that its body does not carry
 //  Each pair is a named struct: a tuple of ref schemas does not compose.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct BlockIndex {
     /// Transactions in body order
     pub txs: Vec<BlockIndexTx>,
-    /// Outputs that mainchain deposits created
+    /// Outputs that mainchain deposits created. Apply them before `txs`.
     pub deposits: Vec<BlockIndexDeposit>,
-    /// Outputs that a withdrawal bundle removed
+    /// Outputs that a failed or dropped withdrawal bundle made again. Apply
+    /// them before `txs`, because a transaction of the block can spend one.
+    pub bundle_returns: Vec<BlockIndexReturn>,
+    /// Outputs that the withdrawal bundle of this block removed. Apply them
+    /// after `txs`, because the bundle can take an output of the block.
     pub bundle_spends: Vec<BlockIndexSpend>,
     /// Outputs that market trades and settlement created outside any
     /// transaction

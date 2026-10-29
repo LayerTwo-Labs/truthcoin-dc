@@ -88,8 +88,8 @@ pub mod node {
     use serde::{Deserialize, Serialize};
     use truthcoin_dc_types::{
         Address, Authorization, Authorized, Block, BlockHash, BlockIndex,
-        BlockIndexDeposit, BlockIndexSpend, BlockIndexTx, Body,
-        ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
+        BlockIndexDeposit, BlockIndexReturn, BlockIndexSpend, BlockIndexTx,
+        Body, ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
         Header, InPoint, M6id, MainchainSyncPhase, MainchainSyncProgress,
         MerkleRoot, OutPoint, Output, OutputContent, PointedOutput,
         SpentOutput, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
@@ -376,7 +376,7 @@ pub mod node {
         merge_apis[get_block::RpcDoc],
         ref_schemas[
             Address, Authorization, BallotItem, BlockHash, BlockIndexDeposit,
-            BlockIndexSpend, BlockIndexTx, Body, ClaimDecisionPayload, Coinbase,
+            BlockIndexReturn, BlockIndexSpend, BlockIndexTx, Body, ClaimDecisionPayload, Coinbase,
             CoinbaseTxid, ConsensusResults, DecisionClaimEntry,
             DecisionContentInfo, DecisionInfo, DecisionState, DecisionSummary,
             DecisionType, Header, InPoint, M6id, MainchainSyncPhase,
