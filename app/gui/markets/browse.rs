@@ -2455,8 +2455,16 @@ impl Browse {
                         return;
                     }
                 };
+                let options = match app.spend_options() {
+                    Ok(options) => options,
+                    Err(err) => {
+                        self.amplify_panel.tx_error =
+                            Some(format!("Failed to read the chain heights: {err:#}"));
+                        return;
+                    }
+                };
                 match app.wallet.amplify_beta(
-                    app.spend_zero_conf_change,
+                    options,
                     market.id,
                     amount,
                     market.creator_address,
@@ -2533,8 +2541,17 @@ impl Browse {
                 return;
             }
         };
+        let options = match app.spend_options() {
+            Ok(options) => options,
+            Err(err) => {
+                self.trading_panel.tx_error =
+                    Some(format!("Failed to read the chain heights: {err:#}"));
+                self.trading_panel.is_processing = false;
+                return;
+            }
+        };
         match app.wallet.trade(
-            app.spend_zero_conf_change,
+            options,
             market.id,
             actual_idx,
             preview.shares as i64,
@@ -2605,8 +2622,17 @@ impl Browse {
                 return;
             }
         };
+        let options = match app.spend_options() {
+            Ok(options) => options,
+            Err(err) => {
+                self.trading_panel.tx_error =
+                    Some(format!("Failed to read the chain heights: {err:#}"));
+                self.trading_panel.is_processing = false;
+                return;
+            }
+        };
         match app.wallet.trade(
-            app.spend_zero_conf_change,
+            options,
             market.id,
             actual_idx,
             -(preview.shares as i64),

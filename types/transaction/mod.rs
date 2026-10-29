@@ -573,7 +573,7 @@ pub struct Authorized<T> {
     pub actor_proof: Option<Box<Authorization>>,
 }
 
-pub type AuthorizedTransaction = Authorized<Transaction>;
+pub type AuthorizedTransaction<T = Transaction> = Authorized<T>;
 
 impl AuthorizedTransaction {
     /// Return an iterator over all addresses relevant to the transaction

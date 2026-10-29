@@ -166,6 +166,8 @@ impl Body {
     pub fn compute_merkle_root<FilledTx>(
         coinbase: &Coinbase,
         txs: &[FilledTx],
+        authorizations: &[Authorization],
+        actor_proofs: &[Option<Authorization>],
     ) -> Result<MerkleRoot, error::ComputeMerkleRoot>
     where
         FilledTx: Borrow<FilledTransaction>,
@@ -226,10 +228,18 @@ impl Body {
         struct HashComponents {
             coinbase_commitment: CoinbaseMerkleRoot,
             txs_commitment: Hash,
+            authorizations_commitment: Hash,
+            actor_proofs_commitment: Hash,
         }
         let root = hashes::hash_with_scratch_buffer(&HashComponents {
             coinbase_commitment,
             txs_commitment,
+            authorizations_commitment: hashes::hash_with_scratch_buffer(
+                authorizations,
+            ),
+            actor_proofs_commitment: hashes::hash_with_scratch_buffer(
+                actor_proofs,
+            ),
         })
         .into();
         Ok(root)
@@ -342,6 +352,7 @@ mod test {
 
     use crate::{
         address::Address,
+        authorization::{Authorization, Dst, SigningKey, sign},
         block::{Body, Coinbase},
         transaction::{FilledTransaction, Output, OutputContent, Transaction},
     };
@@ -374,7 +385,8 @@ mod test {
         let txs: Vec<_> = (1..=MAX_TXS).map(filled_tx).collect();
         for n_txs in 1..=txs.len() {
             let honest = &txs[..n_txs];
-            let honest_root = Body::compute_merkle_root(&coinbase, honest)?;
+            let honest_root =
+                Body::compute_merkle_root(&coinbase, honest, &[], &[])?;
             for n_repeated in 1..=n_txs {
                 let mutated: Vec<_> = honest
                     .iter()
@@ -382,13 +394,55 @@ mod test {
                     .cloned()
                     .collect();
                 let mutated_root =
-                    Body::compute_merkle_root(&coinbase, &mutated)?;
+                    Body::compute_merkle_root(&coinbase, &mutated, &[], &[])?;
                 anyhow::ensure!(
                     mutated_root != honest_root,
                     "{n_txs} txs with the last {n_repeated} repeated give the same merkle root"
                 );
             }
         }
+        Ok(())
+    }
+
+    fn authorization(msg: &[u8]) -> Authorization {
+        let signing_key = SigningKey::new(&mut rand::rng());
+        Authorization {
+            verifying_key: (&signing_key).into(),
+            signature: sign(rand::rng(), &signing_key, Dst::Transaction, msg),
+        }
+    }
+
+    #[test]
+    fn signatures_change_merkle_root() -> anyhow::Result<()> {
+        let coinbase = Coinbase::default();
+        let txs = [filled_tx(1)];
+        let authorizations = [authorization(b"tx")];
+        let actor_proofs = [Some(authorization(b"actor"))];
+        let root = Body::compute_merkle_root(
+            &coinbase,
+            &txs,
+            &authorizations,
+            &actor_proofs,
+        )?;
+        let other_authorizations = [authorization(b"tx")];
+        anyhow::ensure!(
+            Body::compute_merkle_root(
+                &coinbase,
+                &txs,
+                &other_authorizations,
+                &actor_proofs,
+            )? != root,
+            "the merkle root does not commit to the authorizations"
+        );
+        anyhow::ensure!(
+            Body::compute_merkle_root(
+                &coinbase,
+                &txs,
+                &authorizations,
+                &[None]
+            )? != root,
+            "the merkle root does not commit to the actor proofs"
+        );
         Ok(())
     }
 }

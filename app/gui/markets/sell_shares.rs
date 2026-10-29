@@ -212,8 +212,16 @@ impl SellShares {
                 return;
             }
         };
+        let options = match app.spend_options() {
+            Ok(options) => options,
+            Err(err) => {
+                self.tx_error =
+                    Some(format!("Failed to read the chain heights: {err:#}"));
+                return;
+            }
+        };
         match app.wallet.trade(
-            app.spend_zero_conf_change,
+            options,
             self.market_id,
             actual_idx,
             -preview.shares, // Negative for sell

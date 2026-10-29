@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use sneed::{RoTxn, RwTxn, db::error::Error as DbError};
 
 use crate::{
-    state::{Error, PrevalidatedBlock, State, error, markets},
+    state::{
+        Error, PrevalidatedBlock, State, error, markets, two_way_peg_data,
+    },
     types::{
         AccumulatorDiff, AmountOverflowError, Body, FilledTransaction,
         GetAddress as _, GetValue as _, Header, InPoint, MerkleRoot, OutPoint,
@@ -21,6 +23,7 @@ pub fn prevalidate(
     state: &State,
     rotxn: &RoTxn,
     header: &Header,
+    prev_main_height: u32,
     body: &Body,
     archive: &crate::archive::Archive,
 ) -> Result<PrevalidatedBlock, Error> {
@@ -114,6 +117,7 @@ pub fn prevalidate(
         total_fees = total_fees
             .checked_add(state.validate_filled_transaction(
                 rotxn,
+                prev_main_height,
                 &filled_tx,
                 archive,
                 Some(next_height),
@@ -127,6 +131,8 @@ pub fn prevalidate(
     let computed_merkle_root = Body::compute_merkle_root(
         &body.coinbase,
         filled_transactions.as_slice(),
+        &body.authorizations,
+        &body.actor_proofs,
     )?;
     if computed_merkle_root != header.merkle_root {
         let err = Error::InvalidBody {
@@ -181,11 +187,22 @@ pub fn prevalidate(
             return Err(Error::WrongPubKeyForAddress);
         }
     }
-    if authorization::verify_body(batch_verification_ctxt, body).is_err() {
-        return Err(Error::Authorization);
-    }
+    let () = authorization::verify_body(batch_verification_ctxt, body)?;
+    // Withdrawal bundles are constructed after the block's
+    // transactions, and the header roots commit to the
+    // post-construction accumulator: simulate the construction here.
+    let construction_diff =
+        two_way_peg_data::simulate_withdrawal_bundle_construction(
+            state,
+            rotxn,
+            next_height,
+            &filled_transactions,
+            &body.coinbase,
+            coinbase_txid,
+        )?;
     // Check root consistency without committing to DB
     let () = accumulator.apply_diff(accumulator_diff.clone())?;
+    let () = accumulator.apply_diff(construction_diff)?;
     let roots: Vec<UtreexoNodeHash> = accumulator.get_roots();
     if roots != header.roots {
         return Err(Error::UtreexoRootsMismatch);
@@ -308,16 +325,8 @@ pub fn connect_prevalidated(
         market_txs,
     )?;
 
-    // Update tip/height
-    let block_hash = header.hash();
-    state
-        .tip
-        .put(rwtxn, &(), &block_hash)
-        .map_err(DbError::from)?;
-    state
-        .height
-        .put(rwtxn, &(), &pre.next_height)
-        .map_err(DbError::from)?;
+    // NOTE: the tip, height, and coinbase height are NOT updated here;
+    // that happens after the block's transactions, in `connect_header`.
 
     // Apply accumulator diff
     let mut accumulator = state
@@ -334,11 +343,30 @@ pub fn connect_prevalidated(
     Ok(pre.computed_merkle_root)
 }
 
+/// Connect a block header: update the tip, height, and coinbase
+/// height.
+/// MUST be applied AFTER the block's transactions, and BEFORE
+/// withdrawal bundle construction.
+pub fn connect_header(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    header: &Header,
+) -> Result<(), Error> {
+    let block_hash = header.hash();
+    let height = state.try_get_height(rwtxn)?.map_or(0, |height| height + 1);
+    state.tip.put(rwtxn, &(), &block_hash)?;
+    let coinbase_txid = header.compute_coinbase_txid();
+    state.coinbase_height.put(rwtxn, &coinbase_txid, &height)?;
+    state.height.put(rwtxn, &(), &height)?;
+    Ok(())
+}
+
 pub fn validate(
     batch_verification_context: &BatchVerificationContext,
     state: &State,
     rotxn: &RoTxn,
     header: &Header,
+    prev_main_height: u32,
     body: &Body,
     archive: &crate::archive::Archive,
 ) -> Result<(bitcoin::Amount, MerkleRoot), Error> {
@@ -404,6 +432,8 @@ pub fn validate(
     let merkle_root = Body::compute_merkle_root(
         &body.coinbase,
         filled_transactions.as_slice(),
+        &body.authorizations,
+        &body.actor_proofs,
     )?;
     if merkle_root != header.merkle_root {
         let err = Error::InvalidBody {
@@ -457,6 +487,7 @@ pub fn validate(
         total_fees = total_fees
             .checked_add(state.validate_filled_transaction(
                 rotxn,
+                prev_main_height,
                 filled_transaction,
                 archive,
                 Some(height),
@@ -493,9 +524,7 @@ pub fn validate(
             return Err(Error::WrongPubKeyForAddress);
         }
     }
-    if authorization::verify_body(batch_verification_context, body).is_err() {
-        return Err(Error::Authorization);
-    }
+    let () = authorization::verify_body(batch_verification_context, body)?;
     // Check root consistency without committing to DB
     let () = accumulator.apply_diff(accumulator_diff)?;
     let roots: Vec<UtreexoNodeHash> = accumulator.get_roots();
@@ -618,8 +647,12 @@ pub fn connect(
         market_ctxt,
         market_txs,
     )?;
-    let merkle_root =
-        Body::compute_merkle_root(&body.coinbase, filled_txs.as_slice())?;
+    let merkle_root = Body::compute_merkle_root(
+        &body.coinbase,
+        filled_txs.as_slice(),
+        &body.authorizations,
+        &body.actor_proofs,
+    )?;
     if merkle_root != header.merkle_root {
         let err = Error::InvalidBody {
             expected: header.merkle_root,
@@ -629,13 +662,14 @@ pub fn connect(
     }
     let block_hash = header.hash();
     state.tip.put(rwtxn, &(), &block_hash)?;
+    state.coinbase_height.put(rwtxn, &coinbase_txid, &height)?;
     state.height.put(rwtxn, &(), &height)?;
     let () = accumulator.apply_diff(accumulator_diff)?;
     state.utreexo_accumulator.put(rwtxn, &(), &accumulator)?;
     Ok(merkle_root)
 }
 
-pub fn disconnect_tip(
+pub fn disconnect_tip_body(
     state: &State,
     rwtxn: &mut RwTxn,
     header: &Header,
@@ -726,9 +760,9 @@ pub fn disconnect_tip(
                 })
         },
     )?;
-    // delete coinbase UTXOs, last-to-first
     {
         let coinbase_txid = header.compute_coinbase_txid();
+        // delete coinbase UTXOs, last-to-first
         body.coinbase
             .outputs
             .iter()
@@ -759,13 +793,41 @@ pub fn disconnect_tip(
         &skipped_tx_indices,
         trade_share_deltas,
     )?;
+    if header.prev_side_hash.is_none()
+        && height == 0
+        && let Some(output) = body.coinbase.outputs.iter().next()
+    {
+        state
+            .reputation()
+            .delete_reputation(rwtxn, &output.address)?;
+    }
+    // NOTE: the tip, height, and coinbase height are NOT rolled back
+    // here; that happens after 2WPD is disconnected, in
+    // `disconnect_tip_header`.
+    let () = accumulator.apply_diff(accumulator_diff)?;
+    state
+        .utreexo_accumulator
+        .put(rwtxn, &(), &accumulator)
+        .map_err(DbError::from)?;
+    Ok(())
+}
+
+/// Disconnect the tip block's header: roll back the coinbase height,
+/// tip, and height.
+/// MUST be applied AFTER disconnecting the block's transactions and
+/// 2WPD.
+pub fn disconnect_tip_header(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    header: &Header,
+) -> Result<(), Error> {
+    let coinbase_txid = header.compute_coinbase_txid();
+    state.coinbase_height.delete(rwtxn, &coinbase_txid)?;
+    let height = state
+        .try_get_height(rwtxn)?
+        .expect("Height should not be None");
     match (header.prev_side_hash, height) {
         (None, 0) => {
-            if let Some(output) = body.coinbase.outputs.iter().next() {
-                state
-                    .reputation()
-                    .delete_reputation(rwtxn, &output.address)?;
-            }
             state.tip.delete(rwtxn, &()).map_err(DbError::from)?;
             state.height.delete(rwtxn, &()).map_err(DbError::from)?;
         }
@@ -781,11 +843,6 @@ pub fn disconnect_tip(
                 .map_err(DbError::from)?;
         }
     }
-    let () = accumulator.apply_diff(accumulator_diff)?;
-    state
-        .utreexo_accumulator
-        .put(rwtxn, &(), &accumulator)
-        .map_err(DbError::from)?;
     Ok(())
 }
 
@@ -803,6 +860,7 @@ fn actor_address(body: &Body, tx_idx: usize) -> Option<crate::types::Address> {
 
 #[cfg(test)]
 mod test {
+    use crate::types::transaction::outpoint::DEPOSIT_MATURITY;
     use std::collections::HashMap;
 
     use truthcoin_dc_types::Coinbase;
@@ -849,13 +907,18 @@ mod test {
         let rotxn = env.read_txn()?;
         let body = Body::new(vec![authorized.clone()], Coinbase::default());
         let header = Header {
-            merkle_root: Body::compute_merkle_root(&body.coinbase, &[filled])?,
+            merkle_root: Body::compute_merkle_root(
+                &body.coinbase,
+                &[filled],
+                &body.authorizations,
+                &body.actor_proofs,
+            )?,
             prev_side_hash: None,
             prev_main_hash: bitcoin::BlockHash::all_zeros(),
             roots: state.get_accumulator(&rotxn)?.get_roots(),
         };
-        state.validate_block(&rotxn, &batch, &header, &body, &archive)?;
-        state.prevalidate_block(&rotxn, &batch, &header, &body, &archive)?;
+        state.validate_block(&rotxn, &batch, &header, 0, &body, &archive)?;
+        state.prevalidate_block(&rotxn, &batch, &header, 0, &body, &archive)?;
 
         let missing_outpoint = OutPoint::Regular {
             txid: authorized.transaction.txid(),
@@ -868,10 +931,10 @@ mod test {
             body.transactions[0].inputs =
                 vec![(missing_outpoint, [0; 32])].into();
             assert!(borsh::object_length(&body)? <= State::body_size_limit(0));
-            let validation =
-                state.validate_block(&rotxn, &batch, &header, &body, &archive);
+            let validation = state
+                .validate_block(&rotxn, &batch, &header, 0, &body, &archive);
             let prevalidation = state
-                .prevalidate_block(&rotxn, &batch, &header, &body, &archive);
+                .prevalidate_block(&rotxn, &batch, &header, 0, &body, &archive);
             if count == limit {
                 assert!(
                     matches!(
@@ -925,6 +988,8 @@ mod test {
                 merkle_root: Body::compute_merkle_root::<FilledTransaction>(
                     &body.coinbase,
                     &[],
+                    &body.authorizations,
+                    &body.actor_proofs,
                 )?,
                 prev_side_hash: None,
                 prev_main_hash: bitcoin::BlockHash::all_zeros(),
@@ -948,6 +1013,7 @@ mod test {
                 &mut rwtxn,
                 &batch,
                 &header,
+                0,
                 &body,
                 &archive,
                 1_700_000_000,
@@ -957,7 +1023,13 @@ mod test {
                 1.0
             );
             if address == first_address {
-                state.disconnect_tip(&mut rwtxn, &header, &body)?;
+                state.disconnect_withdrawal_bundle_creation(&mut rwtxn)?;
+                state.disconnect_tip_body(&mut rwtxn, &header, &body)?;
+                state.disconnect_two_way_peg_data(
+                    &mut rwtxn,
+                    &Default::default(),
+                )?;
+                state.disconnect_tip_header(&mut rwtxn, &header)?;
             }
         }
 
@@ -1072,31 +1144,40 @@ mod test {
         // Assemble body.
         let body = Body::new(vec![authorized], Coinbase::default());
 
+        let main_height = 9999;
+
         // Compute the header the validator expects:
         //   merkle_root from the filled tx, roots = post-block accumulator
         //   (B's leaf removed, C's leaf inserted) -- exactly the diff validate
         //   builds from the SUPPLIED utxo_hash.
         let filled = {
             let rotxn = env.read_txn()?;
-            state.fill_transaction(
+            let filled = state.fill_transaction(
                 &rotxn,
                 &HashMap::new(),
                 &body.transactions[0],
-            )?
-        };
-
-        // tx validation REJECTS the outpoint/utxo_hash mismatch.
-        {
-            let rotxn = env.read_txn()?;
+            )?;
+            // tx validation REJECTS the outpoint/utxo_hash mismatch.
             anyhow::ensure!(
                 state
                     .validate_filled_transaction(
-                        &rotxn, &filled, &archive, None
+                        &rotxn,
+                        main_height,
+                        &filled,
+                        &archive,
+                        None
                     )
                     .is_err()
             );
-        }
-        let merkle_root = Body::compute_merkle_root(&body.coinbase, &[filled])?;
+            filled
+        };
+
+        let merkle_root = Body::compute_merkle_root(
+            &body.coinbase,
+            &[filled],
+            &body.authorizations,
+            &body.actor_proofs,
+        )?;
         let mut post_accumulator = seeded_accumulator()?;
         {
             let mut diff = AccumulatorDiff::default();
@@ -1113,7 +1194,7 @@ mod test {
         let header = Header {
             merkle_root,
             prev_side_hash: None,
-            prev_main_hash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
+            prev_main_hash: bitcoin::BlockHash::from_byte_array([0x55u8; 32]),
             roots: post_accumulator.get_roots(),
         };
 
@@ -1126,6 +1207,7 @@ mod test {
                         &rotxn,
                         &batch_verification_ctxt,
                         &header,
+                        main_height,
                         &body,
                         &archive,
                     )
@@ -1193,6 +1275,11 @@ mod test {
                 &mut rwtxn,
                 &OutPointKey::from(&deposit_outpoint),
                 &deposit_output,
+            )?;
+            state.deposit_mainchain_height.put(
+                &mut rwtxn,
+                &bitcoin::Txid::from_byte_array([0xCC; 32]),
+                &0,
             )?;
             state
                 .utreexo_accumulator
@@ -1309,6 +1396,8 @@ mod test {
             merkle_root: Body::compute_merkle_root(
                 &body.coinbase,
                 filled.as_slice(),
+                &body.authorizations,
+                &body.actor_proofs,
             )?,
             prev_side_hash: None,
             prev_main_hash: bitcoin::BlockHash::from_byte_array([0u8; 32]),
@@ -1323,11 +1412,24 @@ mod test {
             chained_block("a_block_carries_a_parent_and_its_child", false)?;
         let archive = crate::archive::Archive::new(&env)?;
         let rotxn = env.read_txn()?;
-        let (fees, _) =
-            state.validate_block(&rotxn, &ctxt, &header, &body, &archive)?;
+        let (fees, _) = state.validate_block(
+            &rotxn,
+            &ctxt,
+            &header,
+            DEPOSIT_MATURITY,
+            &body,
+            &archive,
+        )?;
         anyhow::ensure!(fees == bitcoin::Amount::from_sat(2_000));
         let () = state
-            .prevalidate_block(&rotxn, &ctxt, &header, &body, &archive)
+            .prevalidate_block(
+                &rotxn,
+                &ctxt,
+                &header,
+                DEPOSIT_MATURITY,
+                &body,
+                &archive,
+            )
             .map(|_| ())?;
         Ok(())
     }
@@ -1340,13 +1442,27 @@ mod test {
         let rotxn = env.read_txn()?;
         anyhow::ensure!(
             state
-                .validate_block(&rotxn, &ctxt, &header, &body, &archive)
+                .validate_block(
+                    &rotxn,
+                    &ctxt,
+                    &header,
+                    DEPOSIT_MATURITY,
+                    &body,
+                    &archive
+                )
                 .is_err(),
             "a body that puts a child before its parent must not validate",
         );
         anyhow::ensure!(
             state
-                .prevalidate_block(&rotxn, &ctxt, &header, &body, &archive)
+                .prevalidate_block(
+                    &rotxn,
+                    &ctxt,
+                    &header,
+                    DEPOSIT_MATURITY,
+                    &body,
+                    &archive
+                )
                 .is_err(),
             "prevalidate must reject the same body",
         );
@@ -1451,6 +1567,8 @@ mod test {
                 merkle_root: Body::compute_merkle_root(
                     &body.coinbase,
                     &filled,
+                    &body.authorizations,
+                    &body.actor_proofs,
                 )?,
                 prev_side_hash: None,
                 prev_main_hash: bitcoin::BlockHash::all_zeros(),
@@ -1458,9 +1576,9 @@ mod test {
             };
             let batch = BatchVerificationContext::new(&mut rng);
             let validation =
-                state.validate_block(&txn, &batch, &header, &body, &archive);
-            let prevalidation =
-                state.prevalidate_block(&txn, &batch, &header, &body, &archive);
+                state.validate_block(&txn, &batch, &header, 0, &body, &archive);
+            let prevalidation = state
+                .prevalidate_block(&txn, &batch, &header, 0, &body, &archive);
             assert!(
                 matches!(validation, Err(crate::state::Error::InvalidTransaction { reason }) if reason == "Duplicate vote in block")
             );
@@ -1515,6 +1633,8 @@ mod test {
             merkle_root: Body::compute_merkle_root::<FilledTransaction>(
                 &body.coinbase,
                 &[],
+                &body.authorizations,
+                &body.actor_proofs,
             )?,
             prev_side_hash: None,
             prev_main_hash: bitcoin::BlockHash::all_zeros(),
@@ -1522,7 +1642,7 @@ mod test {
         };
         let rotxn = env.read_txn()?;
         let result =
-            state.validate_block(&rotxn, &batch, &header, &body, &archive);
+            state.validate_block(&rotxn, &batch, &header, 0, &body, &archive);
         anyhow::ensure!(
             matches!(result, Err(Error::BodyTooLarge)),
             "expected BodyTooLarge, got {result:?}",
@@ -1567,6 +1687,8 @@ mod test {
             merkle_root: Body::compute_merkle_root(
                 &body.coinbase,
                 std::slice::from_ref(&filled),
+                &body.authorizations,
+                &body.actor_proofs,
             )?,
             prev_side_hash: None,
             prev_main_hash: bitcoin::BlockHash::all_zeros(),
@@ -1582,13 +1704,13 @@ mod test {
         header.roots = accumulator.get_roots();
         let ctxt = BatchVerificationContext::new(&mut rand::rng());
         let validation =
-            state.validate_block(&rotxn, &ctxt, &header, &body, &archive);
+            state.validate_block(&rotxn, &ctxt, &header, 0, &body, &archive);
         assert!(
             matches!(validation, Err(Error::OutputsWithoutInputs)),
             "{validation:?}"
         );
         let prevalidation =
-            state.prevalidate_block(&rotxn, &ctxt, &header, &body, &archive);
+            state.prevalidate_block(&rotxn, &ctxt, &header, 0, &body, &archive);
         assert!(matches!(prevalidation, Err(Error::OutputsWithoutInputs)));
         Ok(())
     }

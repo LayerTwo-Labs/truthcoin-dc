@@ -327,12 +327,15 @@ impl Ballot {
         let fee = bitcoin::Amount::from_sat(fee_sats);
         let period = self.current_period;
 
-        let tx = match app.wallet.submit_ballot(
-            app.spend_zero_conf_change,
-            items,
-            period,
-            fee,
-        ) {
+        let options = match app.spend_options() {
+            Ok(options) => options,
+            Err(err) => {
+                self.error =
+                    Some(format!("Failed to read the chain heights: {err:#}"));
+                return;
+            }
+        };
+        let tx = match app.wallet.submit_ballot(options, items, period, fee) {
             Ok(tx) => tx,
             Err(err) => {
                 self.error = Some(format!("Failed to build ballot: {err:#}"));

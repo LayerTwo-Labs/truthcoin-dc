@@ -254,9 +254,10 @@ pub mod node {
             use truthcoin_dc_types::{
                 Address, Authorization, Block, BlockHash, Body,
                 ClaimDecisionPayload, Coinbase, CoinbaseTxid,
-                DecisionClaimEntry, Header, MerkleRoot, Output, OutputContent,
-                Transaction, TxData, Txid, authorization::Signature,
-                market::MarketId, transaction::Outputs,
+                DecisionClaimEntry, Header, M6id, MerkleRoot, Output,
+                OutputContent, Transaction, TxData, Txid,
+                authorization::Signature, market::MarketId,
+                transaction::Outputs,
             };
             use typewit::const_marker::Bool;
             use utoipa::ToSchema;
@@ -293,7 +294,7 @@ pub mod node {
             #[open_api(ref_schemas[
                 Address, Authorization, BallotItem, Block, BlockHash,
                 BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, Coinbase,
-                CoinbaseTxid, DecisionClaimEntry, Header, MarketId, MerkleRoot,
+                CoinbaseTxid, DecisionClaimEntry, Header, M6id, MarketId, MerkleRoot,
                 Output, OutputContent, Outputs, Signature, Transaction,
                 TransactionVerbose, TxData, Txid, schema::BitcoinAddr,
                 schema::BitcoinBlockHash, schema::BitcoinOutPoint,
@@ -712,8 +713,8 @@ pub mod wallet {
     use truthcoin_dc_types::{
         Address, Authorization, Authorized, Block, BlockHash, Body,
         ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
-        EncryptionPubKey, Header, MerkleRoot, OutPoint, Output, OutputContent,
-        PointedOutput, Transaction, TxData, Txid, VerifyingKey,
+        EncryptionPubKey, Header, M6id, MerkleRoot, OutPoint, Output,
+        OutputContent, PointedOutput, Transaction, TxData, Txid, VerifyingKey,
         authorization::{Dst, Signature},
         market::MarketId,
         transaction::Outputs,
@@ -746,8 +747,8 @@ pub mod wallet {
     #[open_api(ref_schemas[
         Address, Authorization, BallotItem, Block, BlockHash, Body,
         ClaimDecisionPayload, ClaimedDecisionInfo, Coinbase, CoinbaseTxid,
-        DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, MarketId,
-        MerkleRoot, OutPoint, Output, OutputContent, Outputs, Signature,
+        DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, M6id,
+        MarketId, MerkleRoot, OutPoint, Output, OutputContent, Outputs, Signature,
         Transaction, TxData, Txid, schema::BitcoinAddr,
         schema::BitcoinBlockHash, schema::BitcoinOutPoint,
         schema::UtreexoNodeHash, schema::UtreexoProof,

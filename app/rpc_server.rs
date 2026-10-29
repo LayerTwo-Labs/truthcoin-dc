@@ -2176,7 +2176,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .wallet
             .create_transaction(
                 &accumulator,
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 dest,
                 Amount::from_sat(value_sats),
                 Amount::from_sat(fee_sats),
@@ -2206,7 +2206,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .wallet
             .create_transaction_many(
                 &accumulator,
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 &dests,
                 Amount::from_sat(fee_sats),
             )
@@ -2230,7 +2230,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .wallet
             .create_withdrawal(
                 &accumulator,
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 mainchain_address,
                 Amount::from_sat(amount_sats),
                 Amount::from_sat(mainchain_fee_sats),
@@ -2470,7 +2470,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .transfer_reputation(
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 dest,
                 amount,
                 Amount::from_sat(fee_sats),
@@ -2580,7 +2580,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .claim_decision(
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 DecisionClaimInput {
                     decision_type,
                     decisions: entries,
@@ -2807,7 +2807,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .create_market(
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 CreateMarketInput {
                     title: request.title,
                     description: request.description,
@@ -2919,7 +2919,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .trade(
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 market_id_struct,
                 request.outcome_index,
                 request.shares_amount,
@@ -3046,7 +3046,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .trade(
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 market_id_struct,
                 request.outcome_index,
                 -request.shares_amount, // Negative for sell
@@ -3083,7 +3083,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .amplify_beta(
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 market_id,
                 request.amount_sats,
                 market.creator_address,
@@ -3173,7 +3173,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .submit_ballot(
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 batch_items,
                 period_id,
                 fee,
@@ -3228,7 +3228,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .trade(
-                self.app.spend_zero_conf_change,
+                self.app.spend_options().map_err(custom_err)?,
                 market_id_struct,
                 request.outcome_index,
                 request.shares_amount,

@@ -16,7 +16,7 @@ use truthcoin_dc_types::{
 };
 
 use crate::{
-    archive::Archive,
+    archive::{self, Archive},
     math::trading,
     mempool::{self, MemPool},
     net::{DialKnownPeersHandle, Net},
@@ -382,10 +382,19 @@ where
                 &unconfirmed,
                 &mut transaction.borrow_mut().transaction,
             )?;
+            let main_tip = self
+                .archive
+                .side_tips()
+                .get_mainchain_tip(&rotxn)
+                .map_err(archive::Error::from)?;
+            let main_tip_height = self
+                .archive
+                .get_main_height(&rotxn, main_tip.block_hash())?;
             self.state.validate_transaction(
                 &rotxn,
                 &self.batch_verification_ctxt,
                 &unconfirmed,
+                main_tip_height,
                 transaction.borrow(),
                 &self.archive,
             )?;
@@ -542,6 +551,17 @@ where
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         let tip = self.state.try_get_tip(&rotxn)?;
         Ok(tip)
+    }
+
+    pub fn try_get_mainchain_tip_height(&self) -> Result<Option<u32>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let mainchain_tip = self
+            .archive
+            .side_tips()
+            .get_mainchain_tip(&rotxn)
+            .map_err(archive::Error::from)?;
+        let height = mainchain_tip.tip_info.map(|info| info.height);
+        Ok(height)
     }
 
     pub fn get_tip_accumulator(&self) -> Result<Accumulator, Error> {
@@ -759,6 +779,15 @@ where
         let mut reputation = HashMap::new();
         // Outputs the transactions already taken for this block make.
         let mut block_outputs = HashMap::<OutPoint, Output>::new();
+        let main_tip_height = {
+            let main_tip = self
+                .archive
+                .side_tips()
+                .get_mainchain_tip(&rwtxn)
+                .map_err(archive::Error::from)?;
+            self.archive
+                .get_main_height(&rwtxn, main_tip.block_hash())?
+        };
         for transaction in transactions {
             let transaction_sigops = transaction.authorizations.len()
                 + usize::from(transaction.actor_proof.is_some());
@@ -800,6 +829,7 @@ where
                     &rwtxn,
                     &self.batch_verification_ctxt,
                     &block_outputs,
+                    main_tip_height,
                     &transaction,
                     &self.archive,
                 )
@@ -973,8 +1003,6 @@ where
         rwtxn: &mut RwTxn,
         transactions: &[Authorized<FilledTransaction>],
     ) -> Result<(), state::Error> {
-        use bitcoin::hashes::Hash as _;
-
         let fee = template_fee(transactions)?;
         let coinbase = Coinbase {
             memo: Vec::new(),
@@ -988,24 +1016,75 @@ where
             }
             .into(),
         };
-        let mut header = Header {
-            merkle_root: Body::compute_merkle_root(&coinbase, transactions)?,
-            prev_side_hash: self.state.try_get_tip(rwtxn)?,
-            prev_main_hash: bitcoin::BlockHash::all_zeros(),
-            roots: Vec::new(),
-        };
-        let mut accumulator = self.state.get_accumulator(rwtxn)?;
-        let () = Body::modify_memforest(
-            header.compute_coinbase_txid(),
-            coinbase.outputs.as_slice(),
-            transactions,
-            &mut accumulator.0,
-        )?;
-        header.roots = accumulator.get_roots();
+        let main_tip_hash = self
+            .archive
+            .side_tips()
+            .get_mainchain_tip(rwtxn)?
+            .block_hash();
+        let main_tip_height =
+            self.archive.get_main_height(rwtxn, main_tip_hash)?;
+        // A block connects the 2WPD of its mainchain parent before its
+        // transactions, so the proofs follow the accumulator after the 2WPD.
+        let pre_roots = self.state.get_accumulator(rwtxn)?.get_roots();
+        let two_way_peg_data =
+            self.pending_two_way_peg_data(rwtxn, main_tip_hash)?;
+        let () = self
+            .state
+            .connect_two_way_peg_data(rwtxn, &two_way_peg_data)?;
+        let mut transactions = transactions.to_vec();
+        if self.state.get_accumulator(rwtxn)?.get_roots() != pre_roots {
+            let mut body_outputs = HashMap::new();
+            for tx in &mut transactions {
+                let transaction = &mut tx.transaction.transaction;
+                let () = self.state.regenerate_proof(
+                    rwtxn,
+                    &body_outputs,
+                    transaction,
+                )?;
+                body_outputs.extend(transaction.outputs_by_outpoint());
+            }
+        }
         let body = Body::new(
             transactions.iter().cloned().map(Into::into).collect(),
             coinbase,
         );
+        let mut header = Header {
+            merkle_root: Body::compute_merkle_root(
+                &body.coinbase,
+                &transactions,
+                &body.authorizations,
+                &body.actor_proofs,
+            )?,
+            prev_side_hash: self.state.try_get_tip(rwtxn)?,
+            prev_main_hash: main_tip_hash,
+            roots: Vec::new(),
+        };
+        let coinbase_txid = header.compute_coinbase_txid();
+        let mut accumulator = self.state.get_accumulator(rwtxn)?;
+        let () = Body::modify_memforest(
+            coinbase_txid,
+            body.coinbase.outputs.as_slice(),
+            &transactions,
+            &mut accumulator.0,
+        )?;
+        let filled_transactions: Vec<FilledTransaction> = transactions
+            .iter()
+            .map(|tx| tx.transaction.clone())
+            .collect();
+        let next_height = self
+            .state
+            .try_get_height(rwtxn)?
+            .map_or(0, |height| height + 1);
+        let construction_diff =
+            self.state.simulate_withdrawal_bundle_construction(
+                rwtxn,
+                next_height,
+                &filled_transactions,
+                &body.coinbase,
+                coinbase_txid,
+            )?;
+        let () = accumulator.apply_diff(construction_diff)?;
+        header.roots = accumulator.get_roots();
         // Before the first block, no mainchain timestamp exists yet.
         let mainchain_timestamp =
             self.state.try_get_mainchain_timestamp(rwtxn)?.unwrap_or(0);
@@ -1013,6 +1092,7 @@ where
             rwtxn,
             &self.batch_verification_ctxt,
             &header,
+            main_tip_height,
             &body,
             &self.archive,
             mainchain_timestamp,
@@ -1144,6 +1224,54 @@ where
             .try_get_pending_withdrawal_bundle(&rotxn)?
             .map(|(bundle, _)| bundle);
         Ok(bundle)
+    }
+
+    /// Compute the 2WPD events that a block with the given
+    /// `prev_main_hash` built on the current tip would connect:
+    /// mainchain events in blocks after the tip's `prev_main_hash`, up
+    /// to and including `prev_main_hash`.
+    pub fn get_pending_two_way_peg_data(
+        &self,
+        prev_main_hash: bitcoin::BlockHash,
+    ) -> Result<mainchain::TwoWayPegData, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.pending_two_way_peg_data(&rotxn, prev_main_hash)?)
+    }
+
+    fn pending_two_way_peg_data(
+        &self,
+        rotxn: &RoTxn,
+        prev_main_hash: bitcoin::BlockHash,
+    ) -> Result<mainchain::TwoWayPegData, state::Error> {
+        let tip_prev_main_hash = self
+            .state
+            .try_get_tip(rotxn)?
+            .map(|tip| self.archive.get_header(rotxn, tip))
+            .transpose()?
+            .map(|header| header.prev_main_hash);
+        let block_infos: Vec<_> = self
+            .archive
+            .main_ancestors(rotxn, prev_main_hash)
+            .take_while(|ancestor| Ok(Some(*ancestor) != tip_prev_main_hash))
+            .filter_map(|ancestor| {
+                let block_info =
+                    self.archive.get_main_block_info(rotxn, &ancestor)?;
+                if block_info.events.is_empty() {
+                    Ok(None)
+                } else {
+                    let height =
+                        self.archive.get_main_height(rotxn, ancestor)?;
+                    let block_info = mainchain::two_way_peg_data::BlockInfo {
+                        height,
+                        inner: block_info,
+                    };
+                    Ok(Some((ancestor, block_info)))
+                }
+            })
+            .collect()?;
+        Ok(mainchain::TwoWayPegData {
+            block_info: block_infos.into_iter().rev().collect(),
+        })
     }
 
     pub fn remove_from_mempool(&self, txid: Txid) -> Result<(), Error> {

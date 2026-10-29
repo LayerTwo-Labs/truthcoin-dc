@@ -109,10 +109,16 @@ fn connect_tip_(
     two_way_peg_data: &mainchain::TwoWayPegData,
 ) -> Result<(), Error> {
     let block_hash = header.hash();
+    let prev_main_height =
+        archive.get_main_height(rwtxn, header.prev_main_hash)?;
+    // 2WPD events are connected BEFORE the block's transactions, so
+    // that txs can spend eg. recreated unsuccessful-withdrawal outputs.
+    let () = state.connect_two_way_peg_data(rwtxn, two_way_peg_data)?;
     let prevalidated = state.prevalidate_block(
         rwtxn,
         batch_verification_ctxt,
         header,
+        prev_main_height,
         body,
         archive,
     )?;
@@ -142,7 +148,11 @@ fn connect_tip_(
             mainchain_timestamp,
         )?;
     }
-    let () = state.connect_two_way_peg_data(rwtxn, two_way_peg_data)?;
+    let () = state.connect_header(rwtxn, header)?;
+    // Withdrawal bundles are constructed AFTER the block's
+    // transactions, so that txs in this block can still cancel
+    // withdrawal outputs before they are selected.
+    let () = state.maybe_create_withdrawal_bundle(rwtxn)?;
     let accumulator = state.get_accumulator(rwtxn)?;
     // TODO: are these needed?
     {
@@ -260,6 +270,11 @@ pub(in crate::node) fn disconnect_tip_(
                 if block_info.events.is_empty() {
                     Ok(None)
                 } else {
+                    let height = archive.get_main_height(rwtxn, ancestor)?;
+                    let block_info = mainchain::two_way_peg_data::BlockInfo {
+                        height,
+                        inner: block_info,
+                    };
                     Ok(Some((ancestor, block_info)))
                 }
             })
@@ -268,8 +283,10 @@ pub(in crate::node) fn disconnect_tip_(
             block_info: block_infos.into_iter().rev().collect(),
         }
     };
+    let () = state.disconnect_withdrawal_bundle_creation(rwtxn)?;
+    let () = state.disconnect_tip_body(rwtxn, &tip_header, &tip_body)?;
     let () = state.disconnect_two_way_peg_data(rwtxn, &two_way_peg_data)?;
-    let () = state.disconnect_tip(rwtxn, &tip_header, &tip_body)?;
+    let () = state.disconnect_tip_header(rwtxn, &tip_header)?;
     // TODO: revert accumulator only necessary because rustreexo does not
     // support undo yet
     {
@@ -442,8 +459,13 @@ fn reorg_to_tip<ThreadLocalStorage>(
                 Ok(Some(ancestor) != common_ancestor_prev_main_hash.as_ref())
             })
             .map(|ancestor| {
+                let height = archive.get_main_height(&rwtxn, ancestor)?;
                 let block_info =
                     archive.get_main_block_info(&rwtxn, &ancestor)?;
+                let block_info = mainchain::two_way_peg_data::BlockInfo {
+                    height,
+                    inner: block_info,
+                };
                 Ok((ancestor, block_info))
             })
             .collect()?
@@ -1761,7 +1783,8 @@ mod test {
             PointedOutput, Transaction, hash,
             net::PeerConnectionStatus,
             proto::mainchain::{
-                BlockHeaderInfo, Event as MainchainBlockEvent, ValidatorClient,
+                BlockHeaderInfo, BlockInfo, Event as MainchainBlockEvent,
+                ValidatorClient,
             },
         },
         wallet::Wallet,
@@ -1794,6 +1817,32 @@ mod test {
         Ok((temp_dir, node))
     }
 
+    /// Connect a mainchain tip, so that block selection finds its height
+    fn connect_main_tip(node: &Node) -> anyhow::Result<()> {
+        let header_info = BlockHeaderInfo {
+            block_hash: bitcoin::BlockHash::from_byte_array([0xaa; 32]),
+            prev_block_hash: bitcoin::BlockHash::all_zeros(),
+            height: 0,
+            work: bitcoin::Target::MAX.to_work(),
+            timestamp: 0,
+        };
+        let mut rwtxn = node.env.write_txn()?;
+        node.archive
+            .put_main_header_info(&mut rwtxn, &header_info)?;
+        node.archive.put_main_block_info(
+            &mut rwtxn,
+            header_info.block_hash,
+            &BlockInfo::default(),
+        )?;
+        node.archive.side_tips().connect_mainchain_tip(
+            &mut rwtxn,
+            header_info,
+            None,
+        )?;
+        rwtxn.commit()?;
+        Ok(())
+    }
+
     fn check_reputation_selection(
         start_reputation: f64,
         amounts: &[f64],
@@ -1808,6 +1857,7 @@ mod test {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let (_temp_dir, node) = temp_node(&runtime)?;
+            let () = connect_main_tip(&node)?;
             node.task_handles.net.task.abort();
             while !node.task_handles.net.task.is_finished() {
                 tokio::task::yield_now().await;
@@ -1880,8 +1930,16 @@ mod test {
                 .iter()
                 .map(|tx| tx.transaction.transfer_reputation().unwrap().amount)
                 .sum();
-            let coinbase = Coinbase::default();
-            let merkle_root = Body::compute_merkle_root(&coinbase, &selected)?;
+            let body = Body::new(
+                selected.iter().cloned().map(Into::into).collect(),
+                Coinbase::default(),
+            );
+            let merkle_root = Body::compute_merkle_root(
+                &body.coinbase,
+                &selected,
+                &body.authorizations,
+                &body.actor_proofs,
+            )?;
             let mut header = Header {
                 merkle_root,
                 prev_side_hash: None,
@@ -1895,15 +1953,12 @@ mod test {
                 &mut accumulator.0,
             )?;
             header.roots = accumulator.get_roots();
-            let body = Body::new(
-                selected.into_iter().map(Into::into).collect(),
-                coinbase,
-            );
             let mut rwtxn = node.env.write_txn()?;
             node.state.apply_block(
                 &mut rwtxn,
                 &node.batch_verification_ctxt,
                 &header,
+                0,
                 &body,
                 &node.archive,
                 1_700_000_000,
@@ -1966,6 +2021,7 @@ mod test {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let (_temp_dir, node) = temp_node(&runtime)?;
+            let () = connect_main_tip(&node)?;
             node.task_handles.net.task.abort();
             while !node.task_handles.net.task.is_finished() {
                 tokio::task::yield_now().await;
@@ -1999,6 +2055,8 @@ mod test {
                 merkle_root: Body::compute_merkle_root(
                     &body.coinbase,
                     &Vec::<crate::types::FilledTransaction>::new(),
+                    &body.authorizations,
+                    &body.actor_proofs,
                 )?,
                 prev_side_hash: None,
                 prev_main_hash: bitcoin::BlockHash::all_zeros(),
@@ -2089,6 +2147,7 @@ mod test {
                     &rwtxn,
                     &node.batch_verification_ctxt,
                     &HashMap::new(),
+                    0,
                     &transaction,
                     &node.archive,
                 )?;
@@ -2138,6 +2197,7 @@ mod test {
                 [[false, false], [false, true], [true, false], [true, true]]
             {
                 let (_temp_dir, node) = temp_node(&runtime)?;
+                let () = connect_main_tip(&node)?;
                 node.task_handles.net.task.abort();
                 while !node.task_handles.net.task.is_finished() {
                     tokio::task::yield_now().await;
@@ -2155,6 +2215,8 @@ mod test {
                     merkle_root: Body::compute_merkle_root(
                         &body.coinbase,
                         &Vec::<crate::types::FilledTransaction>::new(),
+                        &body.authorizations,
+                        &body.actor_proofs,
                     )?,
                     prev_side_hash: None,
                     prev_main_hash: bitcoin::BlockHash::all_zeros(),
@@ -2293,6 +2355,7 @@ mod test {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let (_temp_dir, node) = temp_node(&runtime)?;
+            let () = connect_main_tip(&node)?;
             node.task_handles.net.task.abort();
             while !node.task_handles.net.task.is_finished() {
                 tokio::task::yield_now().await;
@@ -2400,6 +2463,7 @@ mod test {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let (_temp_dir, node) = temp_node(&runtime)?;
+            let () = connect_main_tip(&node)?;
             node.task_handles.net.task.abort();
             while !node.task_handles.net.task.is_finished() {
                 tokio::task::yield_now().await;
@@ -2531,7 +2595,7 @@ mod test {
                 inputs.push((pointed.outpoint, hash(&pointed)));
                 utxos.insert(pointed.outpoint, pointed.output);
             }
-            wallet.put_utxos(&utxos)?;
+            wallet.put_utxos(&HashMap::new(), &HashMap::new(), &utxos)?;
             let mut accumulator = Accumulator::default();
             accumulator.apply_diff(diff)?;
             node.state.utreexo_accumulator.put(
@@ -2561,6 +2625,7 @@ mod test {
                     &rwtxn,
                     &BatchVerificationContext::new(&mut rand::rng()),
                     &HashMap::new(),
+                    0,
                     &tx,
                     &node.archive,
                 )?;
@@ -2766,17 +2831,24 @@ mod test {
             while !node.task_handles.net.task.is_finished() {
                 tokio::task::yield_now().await;
             }
-            let main_header = BlockHeaderInfo {
-                block_hash: bitcoin::BlockHash::from_byte_array([1; 32]),
+            let main_parent = BlockHeaderInfo {
+                block_hash: bitcoin::BlockHash::from_byte_array([2; 32]),
                 prev_block_hash: bitcoin::BlockHash::all_zeros(),
                 height: 0,
+                work: bitcoin::Target::MAX.to_work(),
+                timestamp: 0,
+            };
+            let main_header = BlockHeaderInfo {
+                block_hash: bitcoin::BlockHash::from_byte_array([1; 32]),
+                prev_block_hash: main_parent.block_hash,
+                height: main_parent.height + 1,
                 work: bitcoin::Target::MAX.to_work(),
                 timestamp: 0,
             };
             let header = Header {
                 merkle_root: MerkleRoot::from([7; 32]),
                 prev_side_hash: None,
-                prev_main_hash: main_header.prev_block_hash,
+                prev_main_hash: main_parent.block_hash,
                 roots: Vec::new(),
             };
             let block_hash = header.hash();
@@ -2787,8 +2859,32 @@ mod test {
                 actor_proofs: Vec::new(),
             };
             let mut rwtxn = node.env.write_txn()?;
+            // Mainchain headers and block infos, including the BMM
+            // commitment, MUST be stored before the sidechain header,
+            // as required by `Archive::put_header`
+            node.archive
+                .put_main_header_info(&mut rwtxn, &main_parent)?;
+            node.archive.put_main_block_info(
+                &mut rwtxn,
+                main_parent.block_hash,
+                &BlockInfo::default(),
+            )?;
+            node.archive
+                .put_main_header_info(&mut rwtxn, &main_header)?;
+            node.archive.put_main_block_info(
+                &mut rwtxn,
+                main_header.block_hash,
+                &BlockInfo {
+                    bmm_commitment: Some(block_hash),
+                    events: Vec::new(),
+                },
+            )?;
             node.archive.put_header(&mut rwtxn, &header)?;
-            node.archive.put_body(&mut rwtxn, block_hash, &body)?;
+            node.archive.side_tips().connect_mainchain_tip(
+                &mut rwtxn,
+                main_parent,
+                None,
+            )?;
             node.archive.side_tips().connect_mainchain_tip(
                 &mut rwtxn,
                 main_header,
@@ -2797,6 +2893,7 @@ mod test {
                     sidechain_header_data: (&header).into(),
                 }),
             )?;
+            node.archive.put_body(&mut rwtxn, block_hash, &body)?;
             rwtxn.commit()?;
             let ctxt = NetTaskContext {
                 env: node.env.clone(),
@@ -2879,6 +2976,7 @@ mod test {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let (_temp_dir, node) = temp_node(&runtime)?;
+            let () = connect_main_tip(&node)?;
             node.task_handles.net.task.abort();
             while !node.task_handles.net.task.is_finished() {
                 tokio::task::yield_now().await;
@@ -3018,8 +3116,16 @@ mod test {
                 vec![market_txs[kept].txid(), child_txids[kept]]
             );
             assert_eq!(fee.to_sat(), 2_000);
-            let coinbase = Coinbase::default();
-            let merkle_root = Body::compute_merkle_root(&coinbase, &selected)?;
+            let body = Body::new(
+                selected.iter().cloned().map(Into::into).collect(),
+                Coinbase::default(),
+            );
+            let merkle_root = Body::compute_merkle_root(
+                &body.coinbase,
+                &selected,
+                &body.authorizations,
+                &body.actor_proofs,
+            )?;
             let mut header = Header {
                 merkle_root,
                 prev_side_hash: None,
@@ -3033,15 +3139,12 @@ mod test {
                 &mut accumulator.0,
             )?;
             header.roots = accumulator.get_roots();
-            let body = Body::new(
-                selected.into_iter().map(Into::into).collect(),
-                coinbase,
-            );
             let mut rwtxn = node.env.write_txn()?;
             node.state.apply_block(
                 &mut rwtxn,
                 &node.batch_verification_ctxt,
                 &header,
+                0,
                 &body,
                 &node.archive,
                 1_700_000_000,

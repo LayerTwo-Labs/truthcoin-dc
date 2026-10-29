@@ -26,7 +26,8 @@ pub enum TwoWayPegEvent {
     Deposit { outpoint: OutPoint, output: Output },
     /// A withdrawal bundle spent this output
     BundleSpend { outpoint: OutPoint, m6id: M6id },
-    /// A failed withdrawal bundle returned this output to the UTXO set
+    /// A failed or dropped withdrawal bundle made this output again, at an
+    /// unsuccessful withdrawal outpoint
     BundleReturn {
         outpoint: OutPoint,
         output: Output,
