@@ -285,32 +285,26 @@ impl Sidechain for PostSetup {
                     _ => false,
                 }
         };
-        let mut found =
-            self.rpc_client.list_utxos().await?.iter().any(is_expected);
-        // The market roundtrip deposits twice in a row, and the second
-        // deposit can need more than one BMM'd block.
-        const BMM_ATTEMPTS: usize = 3;
-        for _ in 0..BMM_ATTEMPTS {
-            if found {
-                break;
-            }
-            tracing::debug!("Deposit not found, BMM 1 block...");
-            let () = self.bmm_single(post_setup).await?;
-            found = self.rpc_client.list_utxos().await?.iter().any(is_expected);
-        }
-        if !found {
-            return Err(Self::ConfirmDepositError::DepositNotFound { txid });
-        }
-        // The BMM'd block puts the node on the mainchain tip, where the
-        // deposit is mature.
+        // The deposit matures `DEPOSIT_MATURITY` mainchain blocks after its
+        // block. The BMM below mines the last of them, and the node is on
+        // that tip when `bmm_single` returns.
         let () = mine::<Self>(
             post_setup,
             DEPOSIT_MATURITY - 1,
             MiningPolicy::SILENT,
         )
         .await?;
-        let () = self.bmm_single(post_setup).await?;
-        Ok(())
+        // The market roundtrip deposits twice in a row, and the second
+        // deposit can need more than one BMM'd block.
+        const BMM_ATTEMPTS: usize = 3;
+        for _ in 0..BMM_ATTEMPTS {
+            let () = self.bmm_single(post_setup).await?;
+            if self.rpc_client.list_utxos().await?.iter().any(is_expected) {
+                return Ok(());
+            }
+            tracing::debug!("Deposit not found, BMM 1 more block...");
+        }
+        Err(Self::ConfirmDepositError::DepositNotFound { txid })
     }
 
     type CreateWithdrawalError = CreateWithdrawalError;

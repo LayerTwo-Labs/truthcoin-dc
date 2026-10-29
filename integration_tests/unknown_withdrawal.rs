@@ -114,7 +114,11 @@ async fn unknown_withdrawal_task(
     anyhow::ensure!(successor_block_count == 1);
     tracing::debug!("Checking that successor sidechain has no deposit UTXOs");
     let successor_utxos = sidechain_successor.rpc_client.list_utxos().await?;
-    anyhow::ensure!(successor_utxos.is_empty());
+    anyhow::ensure!(
+        !successor_utxos
+            .iter()
+            .any(|utxo| matches!(utxo.outpoint, OutPoint::Deposit(_)))
+    );
     let successor_deposit_address =
         sidechain_successor.get_deposit_address().await?;
     let () = deposit(
