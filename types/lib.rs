@@ -142,8 +142,9 @@ pub struct BlockIndex {
     /// Outputs that a failed or dropped withdrawal bundle made again. Apply
     /// them before `txs`, because a transaction of the block can spend one.
     pub bundle_returns: Vec<BlockIndexReturn>,
-    /// Outputs that the withdrawal bundle of this block removed. Apply them
-    /// after `txs`, because the bundle can take an output of the block.
+    /// Outputs that a withdrawal bundle removed. Apply them after `txs`,
+    /// because the bundle that this block builds can take an output of the
+    /// block.
     pub bundle_spends: Vec<BlockIndexSpend>,
     /// Outputs that market trades and settlement created outside any
     /// transaction

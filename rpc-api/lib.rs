@@ -294,9 +294,10 @@ pub mod node {
             #[open_api(ref_schemas[
                 Address, Authorization, BallotItem, Block, BlockHash,
                 BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, Coinbase,
-                CoinbaseTxid, DecisionClaimEntry, Header, M6id, MarketId, MerkleRoot,
-                Output, OutputContent, Outputs, Signature, Transaction,
-                TransactionVerbose, TxData, Txid, schema::BitcoinAddr,
+                CoinbaseTxid, DecisionClaimEntry, Header, M6id, MarketId,
+                MerkleRoot, Output, OutputContent, Outputs, Signature,
+                Transaction, TransactionVerbose, TxData, Txid,
+                schema::BitcoinAddr,
                 schema::BitcoinBlockHash, schema::BitcoinOutPoint,
                 schema::UtreexoNodeHash, schema::UtreexoProof,
             ])]
@@ -376,8 +377,9 @@ pub mod node {
         merge_apis[get_block::RpcDoc],
         ref_schemas[
             Address, Authorization, BallotItem, BlockHash, BlockIndexDeposit,
-            BlockIndexReturn, BlockIndexSpend, BlockIndexTx, Body, ClaimDecisionPayload, Coinbase,
-            CoinbaseTxid, ConsensusResults, DecisionClaimEntry,
+            BlockIndexReturn, BlockIndexSpend, BlockIndexTx, Body,
+            ClaimDecisionPayload, Coinbase, CoinbaseTxid, ConsensusResults,
+            DecisionClaimEntry,
             DecisionContentInfo, DecisionInfo, DecisionState, DecisionSummary,
             DecisionType, Header, InPoint, M6id, MainchainSyncPhase,
             MarketDimension, MarketDimensionKind, MarketId, MarketOutcome,
@@ -748,8 +750,8 @@ pub mod wallet {
         Address, Authorization, BallotItem, Block, BlockHash, Body,
         ClaimDecisionPayload, ClaimedDecisionInfo, Coinbase, CoinbaseTxid,
         DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, M6id,
-        MarketId, MerkleRoot, OutPoint, Output, OutputContent, Outputs, Signature,
-        Transaction, TxData, Txid, schema::BitcoinAddr,
+        MarketId, MerkleRoot, OutPoint, Output, OutputContent, Outputs,
+        Signature, Transaction, TxData, Txid, schema::BitcoinAddr,
         schema::BitcoinBlockHash, schema::BitcoinOutPoint,
         schema::UtreexoNodeHash, schema::UtreexoProof,
     ])]
