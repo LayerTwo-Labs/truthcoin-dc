@@ -1473,12 +1473,17 @@ where
         self.state.watch()
     }
 
-    /// Get a notification whenever the tip or the mempool changes
+    /// Get a notification whenever the tip, the mainchain tip or the mempool
+    /// changes
     pub fn watch(&self) -> std::pin::Pin<Box<dyn Stream<Item = ()> + Send>> {
-        Box::pin(futures::stream::select(
-            self.state.watch(),
+        let streams: [std::pin::Pin<Box<dyn Stream<Item = ()> + Send>>; 3] = [
+            Box::pin(self.state.watch()),
             self.mempool.watch(),
-        ))
+            Box::pin(tokio_stream::wrappers::WatchStream::new(
+                self.archive.side_tips().watch_mainchain_tip(),
+            )),
+        ];
+        Box::pin(futures::stream::select_all(streams))
     }
 
     pub fn get_height(&self, block_hash: BlockHash) -> Result<u32, Error> {

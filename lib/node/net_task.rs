@@ -1843,6 +1843,21 @@ mod test {
         Ok(())
     }
 
+    #[test]
+    fn a_new_mainchain_tip_wakes_the_watchers() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            use futures::{FutureExt as _, StreamExt as _};
+
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            let mut watch = node.watch();
+            while watch.next().now_or_never().is_some() {}
+            let () = connect_main_tip(&node)?;
+            anyhow::ensure!(watch.next().now_or_never().is_some());
+            Ok(())
+        })
+    }
+
     fn check_reputation_selection(
         start_reputation: f64,
         amounts: &[f64],
