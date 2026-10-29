@@ -29,7 +29,7 @@ fn create_bitcoin_transfer(
     let accumulator = app.node.get_tip_accumulator()?;
     let tx = app.wallet.create_transaction(
         &accumulator,
-        app.spend_zero_conf_change,
+        app.spend_options()?,
         dest,
         amount,
         fee,

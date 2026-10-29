@@ -170,6 +170,11 @@ impl SideTips {
         self.mainchain_tip.get(rotxn, &())
     }
 
+    /// Get a signal that notifies whenever the mainchain tip changes
+    pub fn watch_mainchain_tip(&self) -> tokio::sync::watch::Receiver<()> {
+        self.mainchain_tip.watch().clone()
+    }
+
     pub fn best_side_tip(
         &self,
         rotxn: &RoTxn,

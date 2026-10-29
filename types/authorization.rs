@@ -11,10 +11,12 @@ use utoipa::ToSchema;
 
 use crate::{
     Address, AuthorizedTransaction, Body, GetAddress, Transaction,
-    VerifyingKey, error::Authorization as Error,
+    VerifyingKey, error,
 };
 
 pub use frost_ristretto255::rand_core;
+
+pub type Error = error::Authorization;
 
 pub type SignatureError = frost_ristretto255::Error;
 pub type SigningKey = frost_ristretto255::SigningKey;

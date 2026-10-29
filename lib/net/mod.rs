@@ -167,9 +167,9 @@ pub fn make_server_endpoint(
 pub type PeerInfoRx =
     mpsc::UnboundedReceiver<(SocketAddr, Option<PeerConnectionInfo>)>;
 
-const BETANET_SEED_PEER_ADDRS: &[PeerAddress<&'static str>] = {
+const MAINNET_SEED_PEER_ADDRS: &[PeerAddress<&'static str>] = {
     const ECASH_EU_COM: PeerAddress<&'static str> = PeerAddress {
-        host: url::Host::Domain("seed.beta.ecash.eu.com"),
+        host: url::Host::Domain("seed.ecash.eu.com"),
         port: DEFAULT_PORT,
     };
     &[ECASH_EU_COM]
@@ -237,7 +237,7 @@ const fn seed_peer_addrs(
     network: Network,
 ) -> &'static [PeerAddress<&'static str>] {
     match network {
-        Network::Betanet => BETANET_SEED_PEER_ADDRS,
+        Network::Mainnet => MAINNET_SEED_PEER_ADDRS,
         Network::Forknet => FORKNET_SEED_PEER_ADDRS,
         Network::Regtest => &[],
         Network::Signet => SIGNET_SEED_PEER_ADDRS,
@@ -1273,7 +1273,7 @@ mod test {
     #[test]
     fn seeds_reach_an_existing_database() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("seed-peers")?;
-        let network = Network::Betanet;
+        let network = Network::Mainnet;
         let known_peers = {
             let mut rwtxn = env.write_txn()?;
             let known_peers: DatabaseUnique<SerdeBincode<PeerAddress>, Unit> =

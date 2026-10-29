@@ -20,7 +20,7 @@ use futures::{
 };
 use tokio::time::sleep;
 use tracing::Instrument as _;
-use truthcoin_dc::types::OutPoint;
+use truthcoin_dc::types::transaction::outpoint::{DEPOSIT_MATURITY, OutPoint};
 use truthcoin_dc_app_rpc_api::node::RpcClient as _;
 
 use crate::{
@@ -81,6 +81,9 @@ async fn unknown_withdrawal_task(
     )
     .await?;
     tracing::info!("Deposited to sidechain successfully");
+    let () = sidechain_withdrawer
+        .bmm(&mut enforcer_post_setup, DEPOSIT_MATURITY)
+        .await?;
     let () = withdraw_succeed(
         &mut enforcer_post_setup,
         &mut sidechain_withdrawer,
@@ -111,7 +114,11 @@ async fn unknown_withdrawal_task(
     anyhow::ensure!(successor_block_count == 1);
     tracing::debug!("Checking that successor sidechain has no deposit UTXOs");
     let successor_utxos = sidechain_successor.rpc_client.list_utxos().await?;
-    anyhow::ensure!(successor_utxos.is_empty());
+    anyhow::ensure!(
+        !successor_utxos
+            .iter()
+            .any(|utxo| matches!(utxo.outpoint, OutPoint::Deposit(_)))
+    );
     let successor_deposit_address =
         sidechain_successor.get_deposit_address().await?;
     let () = deposit(

@@ -327,6 +327,10 @@ jobs:
           TRUTHCOIN_APP_FILENAME="truthcoin-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
           TRUTHCOIN_CLI_FILENAME="truthcoin-cli-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}${{ matrix.binary-suffix }}"
           TRUTHCOIN_ZIP_FILENAME="truthcoin-${TRUTHCOIN_APP_VERSION}-${{ matrix.name }}.zip"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$TRUTHCOIN_APP_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $TRUTHCOIN_APP_VERSION"
+            exit 1
+          fi
           echo "TRUTHCOIN_APP_VERSION=$TRUTHCOIN_APP_VERSION" >> "$GITHUB_ENV"
           echo "TRUTHCOIN_APP_FILENAME=$TRUTHCOIN_APP_FILENAME" >> "$GITHUB_ENV"
           echo "TRUTHCOIN_CLI_FILENAME=$TRUTHCOIN_CLI_FILENAME" >> "$GITHUB_ENV"

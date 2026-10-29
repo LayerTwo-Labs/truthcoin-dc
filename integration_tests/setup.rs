@@ -5,6 +5,7 @@ use std::{
 };
 
 use bip300301_enforcer_integration_tests::{
+    mine::{MineError, MiningPolicy, mine},
     setup::{PostSetup as EnforcerPostSetup, Sidechain},
     util::AbortOnDrop,
 };
@@ -13,7 +14,10 @@ use futures::{TryFutureExt as _, channel::mpsc, future};
 use reserve_port::ReservedPort;
 use thiserror::Error;
 use tokio::time::sleep;
-use truthcoin_dc::types::{Network, OutputContent, PointedOutput};
+use truthcoin_dc::types::{
+    Network, OutputContent, PointedOutput,
+    transaction::outpoint::DEPOSIT_MATURITY,
+};
 use truthcoin_dc_app_rpc_api::{node::RpcClient as _, wallet::RpcClient as _};
 
 use crate::util::TruthcoinApp;
@@ -94,6 +98,8 @@ pub enum ConfirmDepositError {
     Bmm(#[from] BmmError),
     #[error("Deposit not found with txid: `{txid}`")]
     DepositNotFound { txid: bitcoin::Txid },
+    #[error(transparent)]
+    Mine(#[from] MineError),
     #[error(transparent)]
     RpcClient(#[from] jsonrpsee::core::ClientError),
 }
@@ -279,20 +285,24 @@ impl Sidechain for PostSetup {
                     _ => false,
                 }
         };
-        let utxos = self.rpc_client.list_utxos().await?;
-        if utxos.iter().any(is_expected) {
-            return Ok(());
-        }
+        // The deposit matures `DEPOSIT_MATURITY` mainchain blocks after its
+        // block. The BMM below mines the last of them, and the node is on
+        // that tip when `bmm_single` returns.
+        let () = mine::<Self>(
+            post_setup,
+            DEPOSIT_MATURITY - 1,
+            MiningPolicy::SILENT,
+        )
+        .await?;
         // The market roundtrip deposits twice in a row, and the second
         // deposit can need more than one BMM'd block.
         const BMM_ATTEMPTS: usize = 3;
         for _ in 0..BMM_ATTEMPTS {
-            tracing::debug!("Deposit not found, BMM 1 block...");
             let () = self.bmm_single(post_setup).await?;
-            let utxos = self.rpc_client.list_utxos().await?;
-            if utxos.iter().any(is_expected) {
+            if self.rpc_client.list_utxos().await?.iter().any(is_expected) {
                 return Ok(());
             }
+            tracing::debug!("Deposit not found, BMM 1 more block...");
         }
         Err(Self::ConfirmDepositError::DepositNotFound { txid })
     }

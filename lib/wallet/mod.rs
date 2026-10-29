@@ -9,7 +9,9 @@ use fallible_iterator::FallibleIterator as _;
 use futures::{Stream, StreamExt};
 use heed::types::{Bytes, SerdeBincode, U8, Unit};
 use libes::EciesError;
-use sneed::{Env, EnvError, RwTxnError, UnitKey, db::error::Error as DbError};
+use sneed::{
+    DbError, Env, EnvError, RwTxnError, UnitKey, db::error as db_error,
+};
 use thiserror::Error;
 use tokio_stream::{StreamMap, wrappers::WatchStream};
 use transitive::Transitive;
@@ -25,8 +27,8 @@ use crate::{
     },
     types::{
         Accumulator, Address, AmountOverflowError, AmountUnderflowError,
-        AuthorizedTransaction, EncryptionPubKey, GetValue, Hash, InPoint,
-        OutPoint, OutPointKey, Output, OutputContent, PointedOutput,
+        AuthorizedTransaction, CoinbaseTxid, EncryptionPubKey, GetValue, Hash,
+        InPoint, OutPoint, OutPointKey, Output, OutputContent, PointedOutput,
         SpentOutput, THIS_SIDECHAIN, Transaction, TxData, UtreexoError,
         UtreexoNodeHash, VERSION, VerifyingKey, Version,
         authorization::{
@@ -35,6 +37,7 @@ use crate::{
         },
         hash,
         keys::Ecies,
+        transaction::outpoint::{COINBASE_MATURITY, DEPOSIT_MATURITY},
         wallet::Balance,
     },
     util::Watchable,
@@ -123,7 +126,10 @@ pub struct VkDoesNotExistError {
 #[derive(Debug, Error, Transitive)]
 #[transitive(
     from(bip32::HardenedDeriveError, bip32::Error),
-    from(bip32::NonHardenedDeriveError, bip32::Error)
+    from(bip32::NonHardenedDeriveError, bip32::Error),
+    from(db_error::Delete, DbError),
+    from(db_error::Get, DbError),
+    from(db_error::Put, DbError)
 )]
 pub enum Error {
     #[error("address {address} does not exist")]
@@ -184,6 +190,17 @@ pub struct WalletEnv;
 type DatabaseUnique<KC, DC> = sneed::DatabaseUnique<KC, DC, WalletEnv>;
 type RoTxn<'a> = sneed::RoTxn<'a, heed::AnyTls, WalletEnv>;
 
+/// The chain heights and the option that decide which coins a wallet may pick
+#[derive(Clone, Copy, Debug)]
+pub struct SpendOptions {
+    /// Height of the sidechain block that will include the transaction
+    pub spend_height: u32,
+    /// Height of the mainchain tip
+    pub main_height: u32,
+    /// Lets the wallet pick its own unconfirmed change
+    pub spend_zero_conf_change: bool,
+}
+
 /// The coins a wallet picked for a transaction.
 pub struct SelectedCoins {
     pub total: bitcoin::Amount,
@@ -203,6 +220,12 @@ pub struct Wallet {
     /// Map each address to it's index
     address_to_index:
         DatabaseUnique<SerdeBincode<Address>, SerdeBincode<[u8; 4]>>,
+    /// Sidechain heights for each coinbase txid
+    coinbase_height:
+        DatabaseUnique<SerdeBincode<CoinbaseTxid>, SerdeBincode<u32>>,
+    /// Mainchain heights for each deposit txid
+    deposit_mainchain_height:
+        DatabaseUnique<SerdeBincode<bitcoin::Txid>, SerdeBincode<u32>>,
     /// Map each address index to an address
     index_to_address:
         DatabaseUnique<SerdeBincode<[u8; 4]>, SerdeBincode<Address>>,
@@ -230,7 +253,7 @@ pub struct Wallet {
 }
 
 impl Wallet {
-    pub const NUM_DBS: u32 = 12;
+    pub const NUM_DBS: u32 = 14;
 
     pub fn new(path: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(path)?;
@@ -278,6 +301,15 @@ impl Wallet {
         let address_to_index =
             DatabaseUnique::create(&env, &mut rwtxn, "address_to_index")
                 .map_err(EnvError::from)?;
+        let coinbase_height =
+            DatabaseUnique::create(&env, &mut rwtxn, "coinbase_height")
+                .map_err(EnvError::from)?;
+        let deposit_mainchain_height = DatabaseUnique::create(
+            &env,
+            &mut rwtxn,
+            "deposit_mainchain_height",
+        )
+        .map_err(EnvError::from)?;
         let index_to_address =
             DatabaseUnique::create(&env, &mut rwtxn, "index_to_address")
                 .map_err(EnvError::from)?;
@@ -310,7 +342,7 @@ impl Wallet {
                 if db_version
                     < Version {
                         major: 0,
-                        minor: 20,
+                        minor: 21,
                         patch: 0,
                     } =>
             {
@@ -329,6 +361,8 @@ impl Wallet {
             env,
             seed: seed_db,
             address_to_index,
+            coinbase_height,
+            deposit_mainchain_height,
             index_to_address,
             utxos,
             stxos,
@@ -418,7 +452,7 @@ impl Wallet {
     pub fn create_withdrawal(
         &self,
         accumulator: &Accumulator,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
         main_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
         value: bitcoin::Amount,
         main_fee: bitcoin::Amount,
@@ -438,7 +472,7 @@ impl Wallet {
                 .ok_or(AmountOverflowError)?
                 .checked_add(main_fee)
                 .ok_or(AmountOverflowError)?,
-            spend_zero_conf_change,
+            options,
         )?;
         let change = selected.total - value - fee - main_fee;
 
@@ -482,14 +516,14 @@ impl Wallet {
     pub fn create_transaction(
         &self,
         accumulator: &Accumulator,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
         address: Address,
         value: bitcoin::Amount,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
         self.create_transaction_many(
             accumulator,
-            spend_zero_conf_change,
+            options,
             &BTreeMap::from([(address, value)]),
             fee,
         )
@@ -499,7 +533,7 @@ impl Wallet {
     pub fn create_transaction_many(
         &self,
         accumulator: &Accumulator,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
         dests: &BTreeMap<Address, bitcoin::Amount>,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
@@ -514,7 +548,7 @@ impl Wallet {
             .ok_or(AmountOverflowError)?;
         let selected = self.select_coins(
             value.checked_add(fee).ok_or(AmountOverflowError)?,
-            spend_zero_conf_change,
+            options,
         )?;
         let change = selected.total - value - fee;
         let inputs: Vec<_> = selected
@@ -551,16 +585,65 @@ impl Wallet {
         })
     }
 
-    /// Pick coins worth at least `value`. A confirmed coin comes first, so a
-    /// chain of unconfirmed transactions only forms when the confirmed coins
-    /// fall short. Bitcoin Core orders its coin selection the same way.
-    ///
-    /// `spend_zero_conf_change` decides whether the wallet's own unconfirmed
-    /// change joins the pick at all.
+    /// Whether the coin at `outpoint` is mature at the heights in `options`
+    fn is_mature(
+        &self,
+        rotxn: &RoTxn,
+        outpoint: &OutPoint,
+        options: SpendOptions,
+    ) -> Result<bool, Error> {
+        match outpoint {
+            OutPoint::Coinbase { txid, vout: _ } => {
+                let coinbase_height = self.coinbase_height.get(rotxn, txid)?;
+                Ok(options
+                    .spend_height
+                    .checked_sub(coinbase_height)
+                    .is_some_and(|height_diff| {
+                        height_diff >= COINBASE_MATURITY
+                    }))
+            }
+            OutPoint::Deposit(bitcoin::OutPoint { txid, vout: _ }) => {
+                let deposit_height =
+                    self.deposit_mainchain_height.get(rotxn, txid)?;
+                Ok(options
+                    .main_height
+                    .checked_sub(deposit_height)
+                    .is_some_and(|height_diff| height_diff >= DEPOSIT_MATURITY))
+            }
+            OutPoint::Regular { .. }
+            | OutPoint::MarketFunds { .. }
+            | OutPoint::Payout { .. }
+            | OutPoint::UnsuccessfulWithdrawal { .. } => Ok(true),
+        }
+    }
+
+    /// Remove each coin that is not mature at the heights in `options`
+    pub fn retain_mature(
+        &self,
+        utxos: &mut HashMap<OutPoint, Output>,
+        options: SpendOptions,
+    ) -> Result<(), Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let mut immature = Vec::new();
+        for outpoint in utxos.keys() {
+            if !self.is_mature(&rotxn, outpoint, options)? {
+                immature.push(*outpoint);
+            }
+        }
+        for outpoint in immature {
+            utxos.remove(&outpoint);
+        }
+        Ok(())
+    }
+
+    /// Pick mature coins worth at least `value`. A confirmed coin comes
+    /// first, so a chain of unconfirmed transactions only forms when the
+    /// confirmed coins fall short. Bitcoin Core orders its coin selection the
+    /// same way.
     pub fn select_coins(
         &self,
         value: bitcoin::Amount,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
     ) -> Result<SelectedCoins, Error> {
         use rayon::prelude::ParallelSliceMut;
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
@@ -578,7 +661,7 @@ impl Wallet {
             .map_err(DbError::from)?;
         utxos.retain(|(outpoint_key, _)| !mempool_spent.contains(outpoint_key));
         utxos.par_sort_unstable_by_key(|(_, output)| output.get_value());
-        let mut unconfirmed_utxos: Vec<_> = if spend_zero_conf_change {
+        let mut unconfirmed_utxos: Vec<_> = if options.spend_zero_conf_change {
             self.unconfirmed_utxos
                 .iter(&rotxn)
                 .map_err(DbError::from)?
@@ -597,8 +680,10 @@ impl Wallet {
         for (index, (outpoint_key, output)) in
             utxos.iter().chain(&unconfirmed_utxos).enumerate()
         {
+            let outpoint: OutPoint = outpoint_key.into();
             if output.content.is_withdrawal()
                 || output.content.is_market_funds()
+                || !self.is_mature(&rotxn, &outpoint, options)?
             {
                 continue;
             }
@@ -608,7 +693,6 @@ impl Wallet {
             total = total
                 .checked_add(output.get_value())
                 .ok_or(AmountOverflowError)?;
-            let outpoint: OutPoint = outpoint_key.into();
             selected.insert(outpoint, output.clone());
             if index >= confirmed_count {
                 unconfirmed.insert(outpoint);
@@ -625,12 +709,26 @@ impl Wallet {
     }
 
     pub fn delete_utxos(&self, outpoints: &[OutPoint]) -> Result<(), Error> {
-        let mut txn = self.env.write_txn().map_err(EnvError::from)?;
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
         for outpoint in outpoints {
             let key = OutPointKey::from(outpoint);
-            self.utxos.delete(&mut txn, &key).map_err(DbError::from)?;
+            if !self.utxos.delete(&mut rwtxn, &key)? {
+                continue;
+            };
+            match outpoint {
+                OutPoint::Coinbase { txid, vout: _ } => {
+                    self.coinbase_height.delete(&mut rwtxn, txid)?;
+                }
+                OutPoint::Deposit(bitcoin::OutPoint { txid, vout: _ }) => {
+                    self.deposit_mainchain_height.delete(&mut rwtxn, txid)?;
+                }
+                OutPoint::Regular { .. }
+                | OutPoint::MarketFunds { .. }
+                | OutPoint::Payout { .. }
+                | OutPoint::UnsuccessfulWithdrawal { .. } => (),
+            }
         }
-        txn.commit().map_err(RwTxnError::from)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(())
     }
 
@@ -668,10 +766,23 @@ impl Wallet {
     /// send fails. Delete such a row here, where the chain's answer is known.
     pub fn sync_confirmed(
         &self,
+        coinbase_heights: &HashMap<CoinbaseTxid, u32>,
+        deposit_main_heights: &HashMap<bitcoin::Txid, u32>,
         utxos: &HashMap<OutPoint, Output>,
         spent: &[(OutPoint, InPoint)],
     ) -> Result<(), Error> {
         let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        for (coinbase_txid, height) in coinbase_heights {
+            self.coinbase_height
+                .put(&mut rwtxn, coinbase_txid, height)?;
+        }
+        for (deposit_txid, height) in deposit_main_heights {
+            self.deposit_mainchain_height.put(
+                &mut rwtxn,
+                deposit_txid,
+                height,
+            )?;
+        }
         for (outpoint, output) in utxos {
             self.utxos
                 .put(&mut rwtxn, &OutPointKey::from(outpoint), output)
@@ -709,16 +820,29 @@ impl Wallet {
 
     pub fn put_utxos(
         &self,
+        coinbase_heights: &HashMap<CoinbaseTxid, u32>,
+        deposit_main_heights: &HashMap<bitcoin::Txid, u32>,
         utxos: &HashMap<OutPoint, Output>,
     ) -> Result<(), Error> {
-        let mut txn = self.env.write_txn().map_err(EnvError::from)?;
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        for (coinbase_txid, height) in coinbase_heights {
+            self.coinbase_height
+                .put(&mut rwtxn, coinbase_txid, height)?;
+        }
+        for (deposit_txid, height) in deposit_main_heights {
+            self.deposit_mainchain_height.put(
+                &mut rwtxn,
+                deposit_txid,
+                height,
+            )?;
+        }
         for (outpoint, output) in utxos {
             let key = OutPointKey::from(outpoint);
             self.utxos
-                .put(&mut txn, &key, output)
+                .put(&mut rwtxn, &key, output)
                 .map_err(DbError::from)?;
         }
-        txn.commit().map_err(RwTxnError::from)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(())
     }
 
@@ -1310,7 +1434,7 @@ impl Wallet {
     /// Returns a new transaction ready to be signed and sent.
     pub fn claim_decision(
         &self,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
         input: DecisionClaimInput,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
@@ -1319,7 +1443,7 @@ impl Wallet {
             decisions,
         } = input;
 
-        let selected = self.select_coins(fee, spend_zero_conf_change)?;
+        let selected = self.select_coins(fee, options)?;
         let change = selected.total - fee;
         let inputs = spend_inputs(selected.coins);
 
@@ -1347,7 +1471,7 @@ impl Wallet {
     /// - Mixed: `[00004008,[00004009,0000400a]]`
     pub fn create_market(
         &self,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
         input: CreateMarketInput,
         fee: bitcoin::Amount,
     ) -> Result<(Transaction, crate::state::markets::MarketId), Error> {
@@ -1435,7 +1559,7 @@ impl Wallet {
             total: total_bitcoin,
             coins: bitcoin_utxos,
             unconfirmed: _,
-        } = self.select_coins(total_cost, spend_zero_conf_change)?;
+        } = self.select_coins(total_cost, options)?;
         let change = total_bitcoin - total_cost;
 
         // Collect inputs first so creator_address matches the first
@@ -1493,7 +1617,7 @@ impl Wallet {
     #[allow(clippy::too_many_arguments)]
     pub fn trade(
         &self,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
         market_id: crate::state::markets::MarketId,
         outcome_index: usize,
         shares: i64,
@@ -1505,16 +1629,13 @@ impl Wallet {
         let is_buy = shares > 0;
 
         let inputs = if is_buy {
-            let selected = self.select_coins(
-                bitcoin::Amount::from_sat(limit_sats),
-                spend_zero_conf_change,
-            )?;
+            let selected = self
+                .select_coins(bitcoin::Amount::from_sat(limit_sats), options)?;
             spend_inputs(selected.coins)
         } else {
             let min_fee =
                 bitcoin::Amount::from_sat(trading::TRADE_MINER_FEE_SATS);
-            let selected =
-                self.select_coins(min_fee, spend_zero_conf_change)?;
+            let selected = self.select_coins(min_fee, options)?;
             spend_inputs(selected.coins)
         };
 
@@ -1555,7 +1676,7 @@ impl Wallet {
     /// authorization can prove author identity.
     pub fn amplify_beta(
         &self,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
         market_id: crate::state::markets::MarketId,
         amount: u64,
         market_author: Address,
@@ -1572,9 +1693,7 @@ impl Wallet {
                 .ok_or(AmountOverflowError)?,
         );
 
-        let bitcoin_utxos = self
-            .select_coins(total_needed, spend_zero_conf_change)?
-            .coins;
+        let bitcoin_utxos = self.select_coins(total_needed, options)?.coins;
 
         let has_author_input = bitcoin_utxos
             .values()
@@ -1597,7 +1716,7 @@ impl Wallet {
 
     pub fn submit_ballot(
         &self,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
         votes: Vec<crate::types::BallotItem>,
         voting_period: u32,
         fee: bitcoin::Amount,
@@ -1609,7 +1728,7 @@ impl Wallet {
             voting_period,
         };
 
-        let selected = self.select_coins(fee, spend_zero_conf_change)?;
+        let selected = self.select_coins(fee, options)?;
         let change_bitcoin = selected.total - fee;
 
         let inputs = spend_inputs(selected.coins);
@@ -1624,7 +1743,7 @@ impl Wallet {
 
     pub fn transfer_reputation(
         &self,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
         dest: Address,
         amount: f64,
         fee: bitcoin::Amount,
@@ -1636,12 +1755,8 @@ impl Wallet {
             amount,
         };
 
-        let (total_bitcoin, bitcoin_utxos) = self
-            .select_bitcoins_from_address(
-                fee,
-                voter_addr,
-                spend_zero_conf_change,
-            )?;
+        let (total_bitcoin, bitcoin_utxos) =
+            self.select_bitcoins_from_address(fee, voter_addr, options)?;
         let change_bitcoin = total_bitcoin - fee;
 
         let inputs = spend_inputs(bitcoin_utxos);
@@ -1665,7 +1780,7 @@ impl Wallet {
         &self,
         value: bitcoin::Amount,
         address: Address,
-        spend_zero_conf_change: bool,
+        options: SpendOptions,
     ) -> Result<(bitcoin::Amount, HashMap<OutPoint, Output>), Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         let mempool_spent: HashSet<OutPointKey> = self
@@ -1680,12 +1795,14 @@ impl Wallet {
         while let Some((outpoint, output)) =
             iter.next().map_err(DbError::from)?
         {
+            let outpoint = OutPoint::from(outpoint);
             if output.address == address
                 && output.content.is_value()
                 && output.get_value() > bitcoin::Amount::ZERO
-                && !mempool_spent.contains(&outpoint)
+                && !mempool_spent.contains(&OutPointKey::from(&outpoint))
+                && self.is_mature(&rotxn, &outpoint, options)?
             {
-                bitcoin_utxos.push((OutPoint::from(outpoint), output));
+                bitcoin_utxos.push((outpoint, output));
             }
         }
 
@@ -1694,7 +1811,7 @@ impl Wallet {
                 std::cmp::Reverse(output.get_value())
             },
         );
-        if spend_zero_conf_change {
+        if options.spend_zero_conf_change {
             let mut unconfirmed_utxos = Vec::new();
             let mut iter =
                 self.unconfirmed_utxos.iter(&rotxn).map_err(DbError::from)?;
@@ -1741,6 +1858,8 @@ impl Watchable<()> for Wallet {
             env: _,
             seed,
             address_to_index,
+            coinbase_height: _,
+            deposit_mainchain_height: _,
             index_to_address,
             utxos,
             stxos,
@@ -1780,6 +1899,14 @@ impl Watchable<()> for Wallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn options(spend_zero_conf_change: bool) -> SpendOptions {
+        SpendOptions {
+            spend_height: 0,
+            main_height: 0,
+            spend_zero_conf_change,
+        }
+    }
 
     #[test]
     fn wallet_opens_a_database_it_created() -> anyhow::Result<()> {
@@ -1824,11 +1951,16 @@ mod tests {
         };
         let held = HashMap::from([(outpoint, output.clone())]);
 
-        wallet.sync_confirmed(&held, &[])?;
+        wallet.sync_confirmed(&HashMap::new(), &HashMap::new(), &held, &[])?;
         anyhow::ensure!(wallet.get_utxos()?.len() == 1);
 
         // The chain drops the output, and no block spends it.
-        wallet.sync_confirmed(&HashMap::new(), &[])?;
+        wallet.sync_confirmed(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        )?;
         anyhow::ensure!(
             wallet.get_utxos()?.is_empty(),
             "the confirmed row must go when the chain drops the output",
@@ -1864,15 +1996,15 @@ mod tests {
         );
         anyhow::ensure!(
             wallet
-                .select_coins(bitcoin::Amount::from_sat(1_000), false)
+                .select_coins(bitcoin::Amount::from_sat(1_000), options(false))
                 .is_err(),
             "coin selection must refuse the unconfirmed coin",
         );
 
         // With the option on the wallet takes it, and marks it unconfirmed so
         // the proof leaves it out.
-        let selected =
-            wallet.select_coins(bitcoin::Amount::from_sat(1_000), true)?;
+        let selected = wallet
+            .select_coins(bitcoin::Amount::from_sat(1_000), options(true))?;
         anyhow::ensure!(
             selected.unconfirmed.contains(&outpoint),
             "the wallet takes the coin and marks it unconfirmed",
@@ -1915,7 +2047,11 @@ mod tests {
             address: wallet.get_receive_address()?,
             content: OutputContent::Value(bitcoin::Amount::from_sat(1000)),
         };
-        wallet.put_utxos(&HashMap::from([(outpoint, output)]))?;
+        wallet.put_utxos(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::from([(outpoint, output)]),
+        )?;
         let second = wallet.get_receive_address()?;
         assert_ne!(second, first);
         assert_eq!(wallet.get_receive_address()?, second);
@@ -2005,7 +2141,7 @@ mod tests {
             diff.insert((&pointed).into());
             utxos.insert(outpoint, output);
         }
-        wallet.put_utxos(&utxos)?;
+        wallet.put_utxos(&HashMap::new(), &HashMap::new(), &utxos)?;
         let mut accumulator = Accumulator::default();
         accumulator.apply_diff(diff)?;
         Ok((test_dir, wallet, accumulator))
@@ -2043,7 +2179,7 @@ mod tests {
                     (outpoint, output)
                 })
                 .collect();
-            wallet.put_utxos(&utxos)?;
+            wallet.put_utxos(&HashMap::new(), &HashMap::new(), &utxos)?;
             let unconfirmed = OutPoint::Regular {
                 txid: [1; 32].into(),
                 vout: 0,
@@ -2061,8 +2197,10 @@ mod tests {
                 &HashSet::new(),
             )?;
 
-            let selected =
-                wallet.select_coins(bitcoin::Amount::from_sat(value), true)?;
+            let selected = wallet.select_coins(
+                bitcoin::Amount::from_sat(value),
+                options(true),
+            )?;
             assert_eq!(selected.total.to_sat(), total);
             assert_eq!(selected.coins.len(), count);
             assert_eq!(
@@ -2070,6 +2208,63 @@ mod tests {
                 takes_unconfirmed,
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn coin_selection_waits_for_maturity() -> anyhow::Result<()> {
+        let temp_dir = temp_dir::TempDir::new()?;
+        let wallet = Wallet::new(temp_dir.path())?;
+        wallet.set_seed(&[5; 64])?;
+        let address = wallet.get_new_address()?;
+        let output = Output {
+            address,
+            content: OutputContent::Value(bitcoin::Amount::from_sat(1_000)),
+        };
+        let deposit_txid =
+            <bitcoin::Txid as bitcoin::hashes::Hash>::from_byte_array([6; 32]);
+        let coinbase_txid = CoinbaseTxid::from([7; 32]);
+        let deposit = OutPoint::Deposit(bitcoin::OutPoint {
+            txid: deposit_txid,
+            vout: 0,
+        });
+        let coinbase = OutPoint::Coinbase {
+            txid: coinbase_txid,
+            vout: 0,
+        };
+        wallet.put_utxos(
+            &HashMap::from([(coinbase_txid, 10)]),
+            &HashMap::from([(deposit_txid, 100)]),
+            &HashMap::from([(deposit, output.clone()), (coinbase, output)]),
+        )?;
+        let pick = |spend_height, main_height| {
+            wallet.select_coins(
+                bitcoin::Amount::from_sat(1),
+                SpendOptions {
+                    spend_height,
+                    main_height,
+                    spend_zero_conf_change: false,
+                },
+            )
+        };
+        assert!(matches!(
+            pick(10 + COINBASE_MATURITY - 1, 100 + DEPOSIT_MATURITY - 1),
+            Err(Error::NotEnoughFunds)
+        ));
+        let selected = pick(10 + COINBASE_MATURITY, 0)?;
+        assert_eq!(selected.coins.keys().collect::<Vec<_>>(), [&coinbase]);
+        let selected = pick(0, 100 + DEPOSIT_MATURITY)?;
+        assert_eq!(selected.coins.keys().collect::<Vec<_>>(), [&deposit]);
+        let mut utxos = wallet.get_utxos()?;
+        wallet.retain_mature(
+            &mut utxos,
+            SpendOptions {
+                spend_height: 10 + COINBASE_MATURITY,
+                main_height: 100 + DEPOSIT_MATURITY - 1,
+                spend_zero_conf_change: false,
+            },
+        )?;
+        assert_eq!(utxos.keys().collect::<Vec<_>>(), [&coinbase]);
         Ok(())
     }
 
@@ -2084,8 +2279,12 @@ mod tests {
             (Address([3u8; 20]), bitcoin::Amount::from_sat(3000)),
         ]);
         let fee = bitcoin::Amount::from_sat(500);
-        let tx =
-            wallet.create_transaction_many(&accumulator, true, &dests, fee)?;
+        let tx = wallet.create_transaction_many(
+            &accumulator,
+            options(true),
+            &dests,
+            fee,
+        )?;
 
         let outputs = tx.outputs.as_slice();
         assert_eq!(outputs.len(), 4);
@@ -2131,15 +2330,17 @@ mod tests {
                 (outpoint, output)
             })
             .collect();
-        wallet.put_utxos(&utxos)?;
+        wallet.put_utxos(&HashMap::new(), &HashMap::new(), &utxos)?;
         let dest = Address([5u8; 20]);
         let fee = bitcoin::Amount::from_sat(1_000);
 
-        let first = wallet.transfer_reputation(true, dest, 0.1, fee)?;
+        let first =
+            wallet.transfer_reputation(options(true), dest, 0.1, fee)?;
         let first_inputs: HashSet<OutPoint> =
             first.inputs.iter().map(|(outpoint, _)| *outpoint).collect();
         wallet.set_mempool_view(&HashMap::new(), &first_inputs)?;
-        let second = wallet.transfer_reputation(true, dest, 0.1, fee)?;
+        let second =
+            wallet.transfer_reputation(options(true), dest, 0.1, fee)?;
         let second_inputs: HashSet<OutPoint> = second
             .inputs
             .iter()
@@ -2166,7 +2367,7 @@ mod tests {
         let dest = Address([4u8; 20]);
         let tx = wallet.create_transaction(
             &accumulator,
-            true,
+            options(true),
             dest,
             bitcoin::Amount::from_sat(1000),
             bitcoin::Amount::from_sat(500),
@@ -2196,7 +2397,7 @@ mod tests {
         ]);
         let result = wallet.create_transaction_many(
             &accumulator,
-            true,
+            options(true),
             &dests,
             bitcoin::Amount::from_sat(500),
         );
@@ -2214,7 +2415,7 @@ mod tests {
 
         let result = wallet.create_transaction_many(
             &accumulator,
-            true,
+            options(true),
             &BTreeMap::new(),
             bitcoin::Amount::from_sat(500),
         );
@@ -2236,7 +2437,7 @@ mod tests {
         // Each coin alone is too small, so the sum decides the selection.
         let tx = wallet.create_transaction_many(
             &accumulator,
-            true,
+            options(true),
             &dests,
             bitcoin::Amount::from_sat(100),
         )?;
@@ -2245,7 +2446,7 @@ mod tests {
 
         let result = wallet.create_transaction_many(
             &accumulator,
-            true,
+            options(true),
             &dests,
             bitcoin::Amount::from_sat(1000),
         );

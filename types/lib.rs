@@ -122,15 +122,29 @@ pub struct BlockIndexSpend {
     pub m6id: M6id,
 }
 
+/// One output that a failed or dropped withdrawal bundle made again, with the
+/// bundle
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct BlockIndexReturn {
+    pub outpoint: transaction::OutPoint,
+    pub output: transaction::Output,
+    pub m6id: M6id,
+}
+
 /// Everything about a block that its body does not carry
 //  Each pair is a named struct: a tuple of ref schemas does not compose.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct BlockIndex {
     /// Transactions in body order
     pub txs: Vec<BlockIndexTx>,
-    /// Outputs that mainchain deposits created
+    /// Outputs that mainchain deposits created. Apply them before `txs`.
     pub deposits: Vec<BlockIndexDeposit>,
-    /// Outputs that a withdrawal bundle removed
+    /// Outputs that a failed or dropped withdrawal bundle made again. Apply
+    /// them before `txs`, because a transaction of the block can spend one.
+    pub bundle_returns: Vec<BlockIndexReturn>,
+    /// Outputs that a withdrawal bundle removed. Apply them after `txs`,
+    /// because the bundle that this block builds can take an output of the
+    /// block.
     pub bundle_spends: Vec<BlockIndexSpend>,
     /// Outputs that market trades and settlement created outside any
     /// transaction
@@ -402,18 +416,35 @@ pub struct AggregatedWithdrawal {
     pub main_fee: bitcoin::Amount,
 }
 
+impl AggregatedWithdrawal {
+    /// Size in bytes of the mainchain output script paying to
+    /// `main_address`; the denominator of the fee-density sort key.
+    fn main_spk_len(&self) -> usize {
+        self.main_address.assume_checked_ref().script_pubkey().len()
+    }
+}
+
 impl Ord for AggregatedWithdrawal {
     fn cmp(&self, other: &Self) -> Ordering {
-        // A *total* order (lexicographic by main_fee, value, main_address). The
-        // previous `OR of >` was not antisymmetric/transitive, so the
-        // withdrawal-bundle output order (and hence compute_m6id) depended on
-        // HashMap iteration order and could differ across nodes. A real total order makes
-        // the sorted bundle canonical regardless of aggregation order.
-        (self.main_fee, self.value, &self.main_address).cmp(&(
-            other.main_fee,
-            other.value,
-            &other.main_address,
-        ))
+        // Sort by mainchain fee density: main_fee / len(main output script).
+        // Compare without floating point:
+        //   self.fee/self.len  vs  other.fee/other.len
+        //   <=>  self.fee*other.len  vs  other.fee*self.len
+        let lhs =
+            (self.main_fee.to_sat() as u128) * (other.main_spk_len() as u128);
+        let rhs =
+            (other.main_fee.to_sat() as u128) * (self.main_spk_len() as u128);
+        // A *total* order: tie-break lexicographically by
+        // (main_fee, value, main_address), so the withdrawal-bundle output
+        // order (and hence compute_m6id) is canonical regardless of
+        // aggregation order.
+        lhs.cmp(&rhs).then_with(|| {
+            (self.main_fee, self.value, &self.main_address).cmp(&(
+                other.main_fee,
+                other.value,
+                &other.main_address,
+            ))
+        })
     }
 }
 
@@ -642,9 +673,9 @@ pub struct Tip {
     strum(serialize_all = "lowercase")
 )]
 pub enum Network {
-    #[default]
-    Betanet,
     Forknet,
+    #[default]
+    Mainnet,
     Regtest,
     Signet,
 }

@@ -325,12 +325,12 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn the_default_network_is_betanet() {
+    fn the_default_network_is_mainnet() {
         let cli = Cli::try_parse_from([
             "truthcoin",
             "--datadir=/tmp/truthcoin-cli-test",
         ])
         .unwrap();
-        assert_eq!(cli.network, Network::Betanet);
+        assert_eq!(cli.network, Network::Mainnet);
     }
 }

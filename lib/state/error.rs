@@ -7,7 +7,7 @@ use transitive::Transitive;
 use crate::types::{
     AmountOverflowError, AmountUnderflowError, BlockHash,
     ComputeMerkleRootError, M6id, MerkleRoot, OutPoint, Txid, UtreexoError,
-    Version, WithdrawalBundleError,
+    Version, WithdrawalBundleError, authorization,
 };
 
 #[derive(Debug, Error)]
@@ -95,6 +95,14 @@ impl From<db::Error> for ConnectWithdrawalBundleSubmitted {
 }
 
 #[derive(Debug, Error)]
+pub enum ImmatureOutPoint {
+    #[error("immature coinbase outpoint")]
+    Coinbase,
+    #[error("immature deposit outpoint")]
+    Deposit,
+}
+
+#[derive(Debug, Error)]
 pub enum InvalidHeader {
     #[error("expected block hash {expected}, but computed {computed}")]
     BlockHash {
@@ -128,7 +136,7 @@ pub enum InvalidHeader {
 #[transitive(from(rwtxn::Error, sneed::Error))]
 pub enum Error {
     #[error("failed to verify authorization")]
-    Authorization,
+    Authorization(#[from] authorization::Error),
     #[error(transparent)]
     Archive(Box<crate::archive::Error>),
     #[error(transparent)]
@@ -147,6 +155,8 @@ pub enum Error {
     ComputeMerkleRoot(#[from] ComputeMerkleRootError),
     #[error(transparent)]
     Db(#[from] sneed::Error),
+    #[error(transparent)]
+    ImmatureOutPoint(#[from] ImmatureOutPoint),
     #[error(
         "Incompatible DB version ({}). Please clear the DB (`{}`) and re-sync",
         .version,
@@ -176,8 +186,6 @@ pub enum Error {
     NoUtxo(#[from] NoUtxo),
     #[error("a transaction with no inputs cannot have outputs")]
     OutputsWithoutInputs,
-    #[error("withdrawal output {outpoint} cannot be spent by a transaction")]
-    SpendWithdrawalOutput { outpoint: OutPoint },
     #[error("Withdrawal bundle event block doesn't exist")]
     NoWithdrawalBundleEventBlock,
     #[error(transparent)]
@@ -204,15 +212,13 @@ pub enum Error {
     #[error("too many sigops")]
     TooManySigops,
     #[error(
-        "protocol would be insolvent after confirming unexpected withdrawal bundle {} in {}; bundle outpoint {} already spent",
+        "protocol would be insolvent after confirming unexpected withdrawal bundle {} in {}; bundle outpoints already spent",
         .m6id,
         .event_block_hash,
-        .outpoint,
     )]
-    UnexpectedWithdrawalBundleInsolvency {
+    UnexpectedWithdrawalBundleConfirmed {
         event_block_hash: bitcoin::BlockHash,
         m6id: M6id,
-        outpoint: OutPoint,
     },
     #[error("Unknown withdrawal bundle: {m6id}")]
     UnknownWithdrawalBundle { m6id: M6id },

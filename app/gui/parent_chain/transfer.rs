@@ -147,7 +147,7 @@ fn create_withdrawal(
     let accumulator = app.node.get_tip_accumulator()?;
     let tx = app.wallet.create_withdrawal(
         &accumulator,
-        app.spend_zero_conf_change,
+        app.spend_options()?,
         mainchain_address,
         amount,
         mainchain_fee,

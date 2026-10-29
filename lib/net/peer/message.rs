@@ -28,7 +28,8 @@ pub const fn magic_bytes(network: Network) -> MagicBytes {
             Network::Signet => 0b0000_0001,
             Network::Forknet => 0b0000_0010,
             // Network::Alphanet => 0b0000_0011,
-            Network::Betanet => 0b0000_0100,
+            // Network::Betanet => 0b0000_0100,
+            Network::Mainnet => 0b0000_0101,
         }
     }
     let mut res = PREFIX;
@@ -342,8 +343,8 @@ mod test {
     };
 
     const NETWORKS: [Network; 4] = [
-        Network::Betanet,
         Network::Forknet,
+        Network::Mainnet,
         Network::Regtest,
         Network::Signet,
     ];
@@ -353,7 +354,7 @@ mod test {
             Network::Regtest => 0b0000_0000,
             Network::Signet => 0b0000_0001,
             Network::Forknet => 0b0000_0010,
-            Network::Betanet => 0b0000_0100,
+            Network::Mainnet => 0b0000_0101,
         };
         [0b1000_0101, 0b0001_1000, 0b1001_0101, id]
     }
@@ -376,6 +377,8 @@ mod test {
             merkle_root: Body::compute_merkle_root::<FilledTransaction>(
                 &body.coinbase,
                 &[],
+                &body.authorizations,
+                &body.actor_proofs,
             )?,
             prev_side_hash: Some(BlockHash([1; 32])),
             prev_main_hash: bitcoin::BlockHash::all_zeros(),

@@ -858,14 +858,16 @@ impl Watchable<()> for MemPool {
 }
 
 /// The mempool transaction that could have made this outpoint. A coinbase,
-/// a deposit, a market funds or a payout outpoint names no transaction.
+/// a deposit, a market funds, a payout or an unsuccessful withdrawal
+/// outpoint names no transaction.
 fn parent_txid(outpoint: &OutPoint) -> Option<Txid> {
     match outpoint {
         OutPoint::Regular { txid, .. } => Some(*txid),
         OutPoint::Coinbase { .. }
         | OutPoint::Deposit(_)
         | OutPoint::MarketFunds { .. }
-        | OutPoint::Payout { .. } => None,
+        | OutPoint::Payout { .. }
+        | OutPoint::UnsuccessfulWithdrawal { .. } => None,
     }
 }
 
