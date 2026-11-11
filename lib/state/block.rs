@@ -16,6 +16,19 @@ use crate::{
     },
 };
 
+/// Utreexo roots compared as the bytes that the header hash commits, so an
+/// empty root matches a zero hash however a peer encoded it
+fn roots_match(
+    roots: &[UtreexoNodeHash],
+    header_roots: &[UtreexoNodeHash],
+) -> bool {
+    roots.len() == header_roots.len()
+        && roots
+            .iter()
+            .zip(header_roots)
+            .all(|(root, header_root)| **root == **header_root)
+}
+
 /// Prevalidate a block: compute and verify all read-only checks and
 /// prepare data needed for fast connection.
 pub fn prevalidate(
@@ -204,7 +217,7 @@ pub fn prevalidate(
     let () = accumulator.apply_diff(accumulator_diff.clone())?;
     let () = accumulator.apply_diff(construction_diff)?;
     let roots: Vec<UtreexoNodeHash> = accumulator.get_roots();
-    if roots != header.roots {
+    if !roots_match(&roots, &header.roots) {
         return Err(Error::UtreexoRootsMismatch);
     }
 
@@ -528,7 +541,7 @@ pub fn validate(
     // Check root consistency without committing to DB
     let () = accumulator.apply_diff(accumulator_diff)?;
     let roots: Vec<UtreexoNodeHash> = accumulator.get_roots();
-    if roots != header.roots {
+    if !roots_match(&roots, &header.roots) {
         return Err(Error::UtreexoRootsMismatch);
     }
     Ok((total_fees, merkle_root))
@@ -1040,6 +1053,107 @@ mod test {
             0.0
         );
         assert_eq!(state.reputation().count_holders(&rwtxn)?, 1);
+        Ok(())
+    }
+
+    /// An empty utreexo root and a zero hash are the same bytes in the
+    /// header hash, so a peer that swaps one for the other changes neither
+    /// the block hash nor root validation
+    #[test]
+    fn root_encoding_ignored() {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::types::{Header, MerkleRoot, UtreexoNodeHash};
+
+        let header = |root| Header {
+            merkle_root: MerkleRoot::from([1; 32]),
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: vec![UtreexoNodeHash::Some([7; 32]), root],
+        };
+        let honest = header(UtreexoNodeHash::Empty);
+        let swapped = header(UtreexoNodeHash::Some([0; 32]));
+
+        assert_eq!(honest.hash(), swapped.hash());
+        assert!(super::roots_match(&honest.roots, &swapped.roots));
+        assert!(!super::roots_match(
+            &honest.roots,
+            &header(UtreexoNodeHash::Some([8; 32])).roots
+        ));
+        assert!(!super::roots_match(&honest.roots, &honest.roots[..1]));
+    }
+
+    /// A disconnect returns the mainchain timestamp to the parent's, so a
+    /// replacement block validates against the same time on every node, even
+    /// when the disconnected block crossed into the next quarter.
+    #[test]
+    fn disconnect_restores_timestamp() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::types::{
+            AccumulatorDiff, Address, Body, Header, OutPoint, PointedOutput,
+            authorization::BatchVerificationContext,
+        };
+
+        const Q4_2026: u64 = 1_790_812_800;
+        const Q1_2027: u64 = 1_798_761_600;
+
+        let (_temp_dir, env, state) =
+            fresh_state("disconnect_restores_mainchain_timestamp")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let batch = BatchVerificationContext::new(&mut rand::rng());
+        let mut rwtxn = env.write_txn()?;
+        let mut prev_side_hash = None;
+        let mut blocks = Vec::new();
+        for (index, timestamp) in [Q4_2026, Q1_2027].into_iter().enumerate() {
+            let output = value_output(Address([index as u8 + 1; 20]), 0);
+            let body = Body::new(
+                Vec::new(),
+                Coinbase {
+                    outputs: vec![output.clone()].into(),
+                    ..Default::default()
+                },
+            );
+            let mut header = Header {
+                merkle_root: Body::compute_merkle_root::<FilledTransaction>(
+                    &body.coinbase,
+                    &[],
+                    &body.authorizations,
+                    &body.actor_proofs,
+                )?,
+                prev_side_hash,
+                prev_main_hash: bitcoin::BlockHash::all_zeros(),
+                roots: Vec::new(),
+            };
+            let mut accumulator = state.get_accumulator(&rwtxn)?;
+            let mut diff = AccumulatorDiff::default();
+            diff.insert(
+                (&PointedOutput {
+                    outpoint: OutPoint::Coinbase {
+                        txid: header.compute_coinbase_txid(),
+                        vout: 0,
+                    },
+                    output,
+                })
+                    .into(),
+            );
+            accumulator.apply_diff(diff)?;
+            header.roots = accumulator.get_roots();
+            state.apply_block(
+                &mut rwtxn, &batch, &header, 0, &body, &archive, timestamp,
+            )?;
+            archive.put_header(&mut rwtxn, &header)?;
+            prev_side_hash = Some(header.hash());
+            blocks.push((header, body));
+        }
+        assert_eq!(state.try_get_mainchain_timestamp(&rwtxn)?, Some(Q1_2027));
+
+        for (header, body) in blocks.iter().rev() {
+            state.disconnect_tip_body(&mut rwtxn, header, body)?;
+            state.disconnect_tip_header(&mut rwtxn, header)?;
+            let expected = header.prev_side_hash.map(|_| Q4_2026);
+            assert_eq!(state.try_get_mainchain_timestamp(&rwtxn)?, expected);
+        }
         Ok(())
     }
 

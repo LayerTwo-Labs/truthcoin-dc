@@ -1016,11 +1016,9 @@ where
             }
             .into(),
         };
-        let main_tip_hash = self
-            .archive
-            .side_tips()
-            .get_mainchain_tip(rwtxn)?
-            .block_hash();
+        let mainchain_tip =
+            self.archive.side_tips().get_mainchain_tip(rwtxn)?;
+        let main_tip_hash = mainchain_tip.block_hash();
         let main_tip_height =
             self.archive.get_main_height(rwtxn, main_tip_hash)?;
         // A block connects the 2WPD of its mainchain parent before its
@@ -1085,9 +1083,12 @@ where
             )?;
         let () = accumulator.apply_diff(construction_diff)?;
         header.roots = accumulator.get_roots();
-        // Before the first block, no mainchain timestamp exists yet.
-        let mainchain_timestamp =
-            self.state.try_get_mainchain_timestamp(rwtxn)?.unwrap_or(0);
+        // The template builds on the mainchain tip. Without one, as before the
+        // first block, fall back to the stored mainchain timestamp.
+        let mainchain_timestamp = match mainchain_tip.tip_info {
+            Some(tip) => tip.timestamp,
+            None => self.state.try_get_mainchain_timestamp(rwtxn)?.unwrap_or(0),
+        };
         self.state.apply_block(
             rwtxn,
             &self.batch_verification_ctxt,

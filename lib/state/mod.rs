@@ -118,6 +118,10 @@ pub struct State {
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Vec<TwoWayPegEvent>>>,
     /// Timestamp of the mainchain block that the tip names
     mainchain_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
+    /// Mainchain timestamp before each height connected, restored when that
+    /// height disconnects
+    mainchain_timestamp_undo:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<u64>>,
     /// Timestamp of the mainchain block that the genesis block names
     genesis_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
     reputation: reputation::ReputationDbs,
@@ -150,7 +154,7 @@ pub struct State {
 }
 
 impl State {
-    pub const NUM_DBS: u32 = 24
+    pub const NUM_DBS: u32 = 25
         + reputation::ReputationDbs::NUM_DBS
         + decisions::Dbs::NUM_DBS
         + MarketsDatabase::NUM_DBS
@@ -232,6 +236,11 @@ impl State {
                 .map_err(EnvError::from)?;
         let mainchain_timestamp =
             DatabaseUnique::create(env, &mut rwtxn, "mainchain_timestamp")?;
+        let mainchain_timestamp_undo = DatabaseUnique::create(
+            env,
+            &mut rwtxn,
+            "mainchain_timestamp_undo",
+        )?;
         let genesis_timestamp =
             DatabaseUnique::create(env, &mut rwtxn, "genesis_timestamp")?;
         let reputation = reputation::ReputationDbs::new(env, &mut rwtxn)?;
@@ -289,6 +298,7 @@ impl State {
             withdrawal_bundle_event_blocks,
             withdrawal_bundles,
             mainchain_timestamp,
+            mainchain_timestamp_undo,
             genesis_timestamp,
             reputation,
             decisions,

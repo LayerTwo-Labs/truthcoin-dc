@@ -1078,6 +1078,13 @@ pub(in crate::state) fn connect_end(
             .skipped_tx_indices_undo
             .put(rwtxn, &height, &indices)?;
     }
+    if let Some(prev_timestamp) =
+        state.mainchain_timestamp.try_get(rwtxn, &())?
+    {
+        state
+            .mainchain_timestamp_undo
+            .put(rwtxn, &height, &prev_timestamp)?;
+    }
     state
         .mainchain_timestamp
         .put(rwtxn, &(), &mainchain_timestamp)?;
@@ -1254,6 +1261,15 @@ pub(in crate::state) fn disconnect_end(
     state
         .decisions()
         .restore_period_pricing_undo(rwtxn, height)?;
+    match state.mainchain_timestamp_undo.try_get(rwtxn, &height)? {
+        Some(prev_timestamp) => {
+            state.mainchain_timestamp.put(rwtxn, &(), &prev_timestamp)?;
+            state.mainchain_timestamp_undo.delete(rwtxn, &height)?;
+        }
+        None => {
+            state.mainchain_timestamp.delete(rwtxn, &())?;
+        }
+    }
     Ok(())
 }
 

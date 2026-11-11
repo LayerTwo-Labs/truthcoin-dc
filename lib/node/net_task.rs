@@ -122,13 +122,9 @@ fn connect_tip_(
         body,
         archive,
     )?;
-    let mainchain_timestamp = {
-        let main_block_hash =
-            archive.get_best_main_verification(rwtxn, block_hash)?;
-        archive
-            .get_main_header_info(rwtxn, &main_block_hash)?
-            .timestamp
-    };
+    let mainchain_timestamp = archive
+        .get_main_header_info(rwtxn, &header.prev_main_hash)?
+        .timestamp;
     if tracing::enabled!(tracing::Level::DEBUG) {
         let height = state.try_get_height(rwtxn)?;
         let merkle_root = state.connect_prevalidated_block(
@@ -2081,7 +2077,7 @@ mod test {
             let tip = header.hash();
             let mut rwtxn = node.env.write_txn()?;
             node.archive.put_header(&mut rwtxn, &header)?;
-            node.state.connect_block(&mut rwtxn, &header, &body, 1000)?;
+            node.state.connect_block(&mut rwtxn, &header, &body, 0)?;
             node.state.markets().add_market(&mut rwtxn, &market)?;
             if !cost_overflow {
                 node.state.markets().add_shares_to_account(
@@ -2239,10 +2235,7 @@ mod test {
                     roots: Vec::new(),
                 };
                 node.archive.put_header(&mut rwtxn, &header)?;
-                let timestamp = 1000
-                    + u64::from(node.state.decisions().get_config().quantity);
-                node.state
-                    .connect_block(&mut rwtxn, &header, &body, timestamp)?;
+                node.state.connect_block(&mut rwtxn, &header, &body, 0)?;
                 node.state
                     .reputation()
                     .set_reputation(&mut rwtxn, &voter, 1.0)?;
@@ -2814,6 +2807,79 @@ mod test {
             })
             .await?;
             remote.close(0_u32.into(), b"test complete");
+            Ok(())
+        })
+    }
+
+    /// A block connects at the time of the mainchain block its header names,
+    /// which every node reads the same, not at the time of whichever BMM
+    /// block a node happened to see
+    #[test]
+    fn connects_at_prev_main_time() -> anyhow::Result<()> {
+        const PREV_MAIN_TIME: u64 = 1_798_761_600;
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let prev_main = BlockHeaderInfo {
+                block_hash: bitcoin::BlockHash::from_byte_array([1; 32]),
+                prev_block_hash: bitcoin::BlockHash::all_zeros(),
+                height: 0,
+                work: bitcoin::Target::MAX.to_work(),
+                timestamp: PREV_MAIN_TIME,
+            };
+            let output = Output {
+                address: crate::types::Address([1; 20]),
+                content: OutputContent::Value(bitcoin::Amount::ZERO),
+            };
+            let coinbase = Coinbase {
+                outputs: vec![output.clone()].into(),
+                ..Default::default()
+            };
+            let mut header = Header {
+                merkle_root: Body::compute_merkle_root::<
+                    crate::types::FilledTransaction,
+                >(&coinbase, &[], &[], &[])?,
+                prev_side_hash: None,
+                prev_main_hash: prev_main.block_hash,
+                roots: Vec::new(),
+            };
+            let mut rwtxn = node.env.write_txn()?;
+            let mut accumulator = node.state.get_accumulator(&rwtxn)?;
+            let mut diff = AccumulatorDiff::default();
+            diff.insert(
+                (&PointedOutput {
+                    outpoint: OutPoint::Coinbase {
+                        txid: header.compute_coinbase_txid(),
+                        vout: 0,
+                    },
+                    output,
+                })
+                    .into(),
+            );
+            accumulator.apply_diff(diff)?;
+            header.roots = accumulator.get_roots();
+            let body = Body::new(Vec::new(), coinbase);
+            node.archive.put_main_header_info(&mut rwtxn, &prev_main)?;
+            node.archive.put_header(&mut rwtxn, &header)?;
+            super::connect_tip_(
+                &mut rwtxn,
+                &node.archive,
+                &BatchVerificationContext::new(&mut rand::rng()),
+                &node.mempool,
+                &node.state,
+                &header,
+                &body,
+                &Default::default(),
+            )?;
+            assert_eq!(
+                node.state.try_get_mainchain_timestamp(&rwtxn)?,
+                Some(PREV_MAIN_TIME)
+            );
             Ok(())
         })
     }
