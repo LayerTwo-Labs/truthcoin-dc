@@ -158,10 +158,10 @@ pub enum Error {
         .db_path.display()
     )]
     IncompatibleVersion { version: Version, db_path: PathBuf },
+    #[error("invalid private key")]
+    InvalidPrivateKey(#[source] authorization::SignatureError),
     #[error("io error")]
     Io(#[from] std::io::Error),
-    #[error("no index for address {address}")]
-    NoIndex { address: Address },
     #[error(
         "wallet does not have a seed (set with RPC `set-seed-from-mnemonic`)"
     )]
@@ -250,10 +250,13 @@ pub struct Wallet {
     /// Map each message signing key index to a verifying key
     index_to_vk:
         DatabaseUnique<SerdeBincode<[u8; 4]>, SerdeBincode<VerifyingKey>>,
+    /// Private keys imported from outside the seed, keyed by their address
+    imported_keys:
+        DatabaseUnique<SerdeBincode<Address>, SerdeBincode<[u8; 32]>>,
 }
 
 impl Wallet {
-    pub const NUM_DBS: u32 = 14;
+    pub const NUM_DBS: u32 = 15;
 
     pub fn new(path: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(path)?;
@@ -337,6 +340,9 @@ impl Wallet {
         let index_to_vk =
             DatabaseUnique::create(&env, &mut rwtxn, "index_to_vk")
                 .map_err(EnvError::from)?;
+        let imported_keys =
+            DatabaseUnique::create(&env, &mut rwtxn, "imported_keys")
+                .map_err(EnvError::from)?;
         match version.try_get(&rwtxn, &()).map_err(DbError::from)? {
             Some(db_version)
                 if db_version
@@ -373,6 +379,7 @@ impl Wallet {
             index_to_epk,
             vk_to_index,
             index_to_vk,
+            imported_keys,
         })
     }
 
@@ -993,14 +1000,57 @@ impl Wallet {
 
     pub fn get_addresses(&self) -> Result<HashSet<Address>, Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
-        let addresses: HashSet<_> = self
+        let mut addresses: HashSet<_> = self
             .index_to_address
             .iter(&rotxn)
             .map_err(DbError::from)?
             .map(|(_, address)| Ok(address))
             .collect()
             .map_err(DbError::from)?;
+        let imported: Vec<_> = self
+            .imported_keys
+            .iter_keys(&rotxn)
+            .map_err(DbError::from)?
+            .collect()
+            .map_err(DbError::from)?;
+        addresses.extend(imported);
         Ok(addresses)
+    }
+
+    /// Import a private key from outside the seed, and return its address.
+    /// The seed does not back it up: restoring the seed elsewhere does not
+    /// restore it.
+    pub fn import_private_key(
+        &self,
+        secret: [u8; 32],
+    ) -> Result<Address, Error> {
+        if !self.has_seed()? {
+            return Err(Error::NoSeed);
+        }
+        let signing_key = SigningKey::deserialize(&secret)
+            .map_err(Error::InvalidPrivateKey)?;
+        let address = get_address(&(&signing_key).into());
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        self.imported_keys
+            .put(&mut rwtxn, &address, &secret)
+            .map_err(DbError::from)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        Ok(address)
+    }
+
+    fn get_imported_signing_key(
+        &self,
+        rotxn: &RoTxn,
+        address: &Address,
+    ) -> Result<Option<SigningKey>, Error> {
+        self.imported_keys
+            .try_get(rotxn, address)
+            .map_err(DbError::from)?
+            .map(|secret| {
+                SigningKey::deserialize(&secret)
+                    .map_err(Error::InvalidPrivateKey)
+            })
+            .transpose()
     }
 
     pub fn authorize<R>(
@@ -1026,15 +1076,8 @@ impl Wallet {
                         .ok_or(Error::NoUtxo)?,
                 };
             input_addresses.insert(spent_utxo.address);
-            let index = self
-                .address_to_index
-                .try_get(&txn, &spent_utxo.address)
-                .map_err(DbError::from)?
-                .ok_or(Error::NoIndex {
-                    address: spent_utxo.address,
-                })?;
-            let index = BigEndian::read_u32(&index);
-            let signing_key = self.get_signing_key(&txn, index)?;
+            let signing_key =
+                self.get_signing_key_for_addr(&txn, &spent_utxo.address)?;
             let signature = crate::types::authorization::sign_tx(
                 &mut rng,
                 &signing_key,
@@ -1245,11 +1288,15 @@ impl Wallet {
         rotxn: &RoTxn,
         address: &Address,
     ) -> Result<SigningKey, Error> {
-        let index = self
+        let Some(index) = self
             .address_to_index
             .try_get(rotxn, address)
             .map_err(DbError::from)?
-            .ok_or(Error::AddressDoesNotExist { address: *address })?;
+        else {
+            return self
+                .get_imported_signing_key(rotxn, address)?
+                .ok_or(Error::AddressDoesNotExist { address: *address });
+        };
         let signing_key =
             self.get_signing_key(rotxn, BigEndian::read_u32(&index))?;
         // sanity check that signing key corresponds to address
@@ -1304,11 +1351,16 @@ impl Wallet {
         rotxn: &RoTxn,
         vk: &VerifyingKey,
     ) -> Result<SigningKey, Error> {
-        let vk_idx = self
-            .vk_to_index
-            .try_get(rotxn, vk)
-            .map_err(DbError::from)?
-            .ok_or_else(|| Box::new(VkDoesNotExistError { vk: *vk }))?;
+        let Some(vk_idx) =
+            self.vk_to_index.try_get(rotxn, vk).map_err(DbError::from)?
+        else {
+            return self
+                .get_imported_signing_key(rotxn, &get_address(vk))?
+                .filter(|signing_key| VerifyingKey::from(signing_key) == *vk)
+                .ok_or_else(|| {
+                    Box::new(VkDoesNotExistError { vk: *vk }).into()
+                });
+        };
         let signing_key =
             self.get_message_signing_key(rotxn, BigEndian::read_u32(&vk_idx))?;
         // sanity check that signing key corresponds to vk
@@ -1870,6 +1922,7 @@ impl Watchable<()> for Wallet {
             index_to_epk,
             vk_to_index,
             index_to_vk,
+            imported_keys,
         } = self;
         let watchables = [
             seed.watch().clone(),
@@ -1883,6 +1936,7 @@ impl Watchable<()> for Wallet {
             index_to_epk.watch().clone(),
             vk_to_index.watch().clone(),
             index_to_vk.watch().clone(),
+            imported_keys.watch().clone(),
         ];
         let streams = StreamMap::from_iter(
             watchables.into_iter().map(WatchStream::new).enumerate(),
@@ -2451,6 +2505,73 @@ mod tests {
             bitcoin::Amount::from_sat(1000),
         );
         assert!(matches!(result, Err(Error::NotEnoughFunds)));
+
+        let _unused = std::fs::remove_dir_all(&test_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn imported_key_signs_like_a_seed_key() -> anyhow::Result<()> {
+        use authorization::{BatchVerificationContext, Dst};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let test_dir = std::env::temp_dir()
+            .join(format!("truthcoin_dc_test_imported_key_{nanos}"));
+        let wallet = Wallet::new(&test_dir)?;
+        let signing_key = SigningKey::new(&mut rand::rng());
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let secret: [u8; 32] = signing_key.serialize().try_into().unwrap();
+
+        assert!(matches!(
+            wallet.import_private_key(secret),
+            Err(Error::NoSeed)
+        ));
+        wallet.set_seed(&[4u8; 64])?;
+        assert!(matches!(
+            wallet.import_private_key([0xff; 32]),
+            Err(Error::InvalidPrivateKey(_))
+        ));
+        let address = wallet.import_private_key(secret)?;
+        assert_eq!(address, get_address(&verifying_key));
+        assert_eq!(wallet.import_private_key(secret)?, address);
+        assert!(wallet.get_addresses()?.contains(&address));
+
+        let outpoint = OutPoint::Regular {
+            txid: [9; 32].into(),
+            vout: 0,
+        };
+        let utxos = HashMap::from([(
+            outpoint,
+            Output {
+                address,
+                content: OutputContent::Value(bitcoin::Amount::from_sat(5_000)),
+            },
+        )]);
+        wallet.put_utxos(&HashMap::new(), &HashMap::new(), &utxos)?;
+        let tx = new_tx(spend_inputs(utxos), Vec::new());
+        let authorized = wallet.authorize(rand::rng(), tx)?;
+        assert!(
+            authorized
+                .authorizations
+                .iter()
+                .map(|authorization| authorization.verifying_key)
+                .eq([verifying_key])
+        );
+        authorization::verify_transaction(
+            &BatchVerificationContext::new(&mut rand::rng()),
+            &authorized,
+        )?;
+
+        let signature =
+            wallet.sign_arbitrary_msg(rand::rng(), &verifying_key, "msg")?;
+        assert!(authorization::verify(
+            signature,
+            &verifying_key,
+            Dst::Arbitrary,
+            b"msg"
+        ));
 
         let _unused = std::fs::remove_dir_all(&test_dir);
         Ok(())

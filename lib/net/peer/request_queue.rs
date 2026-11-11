@@ -297,7 +297,7 @@ mod test {
             magic_bytes,
             resolved_address: server_connection.addr().into(),
             mempool: MemPool::new(&env)?,
-            state: State::new(&env, None)?,
+            state: State::new(&env, None, true)?,
             env,
         };
         let (_handle, info_rx) = handle(ctxt, server_connection);

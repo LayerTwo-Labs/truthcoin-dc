@@ -2352,6 +2352,18 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         self.app.wallet.set_seed(&seed_bytes).map_err(custom_err)
     }
 
+    async fn import_private_key(
+        &self,
+        private_key: String,
+    ) -> RpcResult<Address> {
+        let secret: [u8; 32] = const_hex::decode_to_array(private_key.trim())
+            .map_err(custom_err)?;
+        self.app
+            .wallet
+            .import_private_key(secret)
+            .map_err(custom_err)
+    }
+
     async fn sign_transaction(
         &self,
         transaction: truthcoin_dc::types::Transaction,

@@ -33,7 +33,9 @@ fn compute_post_consensus_reputation(
     post
 }
 
-fn reanchor_to_initial_total(post: &mut BTreeMap<crate::types::Address, f64>) {
+pub(in crate::state) fn reanchor_to_initial_total(
+    post: &mut BTreeMap<crate::types::Address, f64>,
+) {
     use crate::math::voting::constants::INITIAL_REPUTATION_TOTAL;
 
     let sum: f64 = post.values().sum();
@@ -983,7 +985,7 @@ mod conservation_tests {
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, dir.path()) }?;
-        let state = State::new(&env, Some(10))?;
+        let state = State::new(&env, Some(10), true)?;
         let mut rwtxn = env.write_txn()?;
         let sender = addr(1);
         let receiver = addr(2);

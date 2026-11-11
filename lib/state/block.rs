@@ -809,13 +809,14 @@ pub fn disconnect_tip_body(
         &skipped_tx_indices,
         trade_share_deltas,
     )?;
-    if header.prev_side_hash.is_none()
-        && height == 0
-        && let Some(output) = body.coinbase.outputs.iter().next()
-    {
-        state
-            .reputation()
-            .delete_reputation(rwtxn, &output.address)?;
+    if header.prev_side_hash.is_none() && height == 0 {
+        let allocation = super::reputation::genesis_allocation(
+            state.genesis_reputation_to_miner,
+            body,
+        )?;
+        for address in allocation.keys() {
+            state.reputation().delete_reputation(rwtxn, address)?;
+        }
     }
     // NOTE: the tip, height, and coinbase height are NOT rolled back
     // here; that happens after 2WPD is disconnected, in
@@ -1217,6 +1218,85 @@ mod test {
             let expected = header.prev_side_hash.map(|_| Q4_2026);
             assert_eq!(state.try_get_mainchain_timestamp(&rwtxn)?, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_credits_whitelist() -> anyhow::Result<()> {
+        use std::collections::BTreeSet;
+
+        use bitcoin::hashes::Hash as _;
+
+        use crate::{
+            state::{State, reputation::GENESIS_VOTERS, test::temp_env},
+            types::{
+                AccumulatorDiff, Address, Body, Header, OutPoint,
+                PointedOutput, authorization::BatchVerificationContext,
+            },
+        };
+
+        let (_temp_dir, env) = temp_env("genesis_credits_whitelist")?;
+        let state = State::new(&env, None, false)?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let batch = BatchVerificationContext::new(&mut rand::rng());
+        let mut rwtxn = env.write_txn()?;
+        let output = value_output(Address([1; 20]), 0);
+        let body = Body::new(
+            Vec::new(),
+            Coinbase {
+                outputs: vec![output.clone()].into(),
+                ..Default::default()
+            },
+        );
+        let mut header = Header {
+            merkle_root: Body::compute_merkle_root::<FilledTransaction>(
+                &body.coinbase,
+                &[],
+                &body.authorizations,
+                &body.actor_proofs,
+            )?,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        let mut accumulator = state.get_accumulator(&rwtxn)?;
+        let mut diff = AccumulatorDiff::default();
+        diff.insert(
+            (&PointedOutput {
+                outpoint: OutPoint::Coinbase {
+                    txid: header.compute_coinbase_txid(),
+                    vout: 0,
+                },
+                output,
+            })
+                .into(),
+        );
+        accumulator.apply_diff(diff)?;
+        header.roots = accumulator.get_roots();
+        state.apply_block(
+            &mut rwtxn,
+            &batch,
+            &header,
+            0,
+            &body,
+            &archive,
+            1_700_000_000,
+        )?;
+
+        let whitelist = GENESIS_VOTERS
+            .iter()
+            .map(|address| address.parse())
+            .collect::<Result<BTreeSet<Address>, _>>()?;
+        let reputations = state.reputation().get_all_reputations(&rwtxn)?;
+        assert_eq!(
+            reputations.keys().copied().collect::<BTreeSet<_>>(),
+            whitelist
+        );
+        assert!(reputations.values().all(|&rep| (rep - 0.02).abs() < 1e-12));
+
+        state.disconnect_tip_body(&mut rwtxn, &header, &body)?;
+        state.disconnect_tip_header(&mut rwtxn, &header)?;
+        assert_eq!(state.reputation().count_holders(&rwtxn)?, 0);
         Ok(())
     }
 

@@ -249,6 +249,8 @@ pub struct Config {
     pub datadir: PathBuf,
     /// Blocks per voting period, for a test network
     pub decision_config_testing: Option<u32>,
+    /// Credit the genesis votecoin to the genesis miner, for testing
+    pub genesis_reputation_to_miner: bool,
     pub mainchain_grpc_url: url::Url,
     /// Extra CA certificate (PEM) to trust for an `https` mainchain URL
     pub mainchain_grpc_ca_cert: Option<PathBuf>,
@@ -572,6 +574,7 @@ impl App {
                 network: config.network,
                 server_names: config.server_names,
                 decision_config_testing: config.decision_config_testing,
+                genesis_reputation_to_miner: config.genesis_reputation_to_miner,
             },
             cusf_mainchain,
             cusf_mainchain_block_producer,

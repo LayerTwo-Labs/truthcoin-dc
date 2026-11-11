@@ -251,6 +251,11 @@ pub enum Command {
     OpenApiSchema,
     /// Remove a tx from the mempool
     RemoveFromMempool { txid: Txid },
+    /// Import a ristretto255 private key (32-byte FROST-serialized scalar,
+    /// hex) into the wallet, and print its address. The seed does not back
+    /// up an imported key.
+    #[command(name = "import-private-key")]
+    ImportPrivateKey { private_key: String },
     /// Set the wallet seed from a mnemonic seed phrase
     SetSeedFromMnemonic { mnemonic: String },
     /// Get total sidechain wealth
@@ -792,6 +797,10 @@ where
         Command::RemoveFromMempool { txid } => {
             let () = rpc_client.remove_from_mempool(txid).await?;
             String::default()
+        }
+        Command::ImportPrivateKey { private_key } => {
+            let address = rpc_client.import_private_key(private_key).await?;
+            format!("{address}")
         }
         Command::SetSeedFromMnemonic { mnemonic } => {
             let () = rpc_client.set_seed_from_mnemonic(mnemonic).await?;

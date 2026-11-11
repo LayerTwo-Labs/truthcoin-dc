@@ -696,7 +696,7 @@ mod tests {
         opts.map_size(64 * 1024 * 1024)
             .max_dbs(crate::state::State::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, &env_path) }.unwrap();
-        let state = crate::state::State::new(&env, None).unwrap();
+        let state = crate::state::State::new(&env, None, true).unwrap();
 
         let voter = crate::types::Address([1; 20]);
         let decision_id = DecisionId::new(false, 1, 0).unwrap();

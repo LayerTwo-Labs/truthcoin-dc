@@ -682,7 +682,7 @@ mod tests {
             .map_size(16 * 1024 * 1024)
             .max_dbs(crate::state::State::NUM_DBS);
         let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
-        let state = crate::state::State::new(&env, None).unwrap();
+        let state = crate::state::State::new(&env, None, true).unwrap();
 
         let maker = Address([1; 20]);
         let decision_id = DecisionId::new(false, 1, 0).unwrap();
@@ -867,7 +867,7 @@ mod tests {
         opts.map_size(64 * 1024 * 1024)
             .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
-        let state = State::new(&env, None).unwrap();
+        let state = State::new(&env, None, true).unwrap();
 
         let maker = Address([7; 20]);
         let decision_id = DecisionId::new(false, 1, 0).unwrap();
@@ -921,7 +921,7 @@ mod tests {
         let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
         options.map_size(16 * 1024 * 1024).max_dbs(State::NUM_DBS);
         let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
-        let state = State::new(&env, None).unwrap();
+        let state = State::new(&env, None, true).unwrap();
         let maker = Address([7; 20]);
         let decision_id = DecisionId::new(true, 1, 0).unwrap();
         let labels = match &decision_type {
@@ -1078,7 +1078,7 @@ mod tests {
         opts.map_size(64 * 1024 * 1024)
             .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
-        let state = State::new(&env, None).unwrap();
+        let state = State::new(&env, None, true).unwrap();
 
         let genesis_ts = 1_700_000_000;
         let mut rwtxn = env.write_txn().unwrap();

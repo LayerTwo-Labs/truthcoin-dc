@@ -56,6 +56,7 @@ impl TruthcoinApp {
         let mut default_args = vec![
             "--datadir".to_owned(),
             self.data_dir.display().to_string(),
+            "--genesis-reputation-to-miner".to_owned(),
             "--headless".to_owned(),
             "--mainchain-grpc-url".to_owned(),
             self.mainchain_grpc_url.clone(),

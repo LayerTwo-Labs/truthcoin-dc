@@ -76,6 +76,8 @@ pub struct Config {
     pub server_names: HashSet<String>,
     /// Blocks per voting period, for a test network
     pub decision_config_testing: Option<u32>,
+    /// Credit the genesis votecoin to the genesis miner, for testing
+    pub genesis_reputation_to_miner: bool,
 }
 
 /// A long-running task that stopped with an error
@@ -195,6 +197,7 @@ where
             add_peers,
             server_names,
             decision_config_testing,
+            genesis_reputation_to_miner,
         } = config;
         let env_path = datadir.join("data.mdb");
         // let _ = std::fs::remove_dir_all(&env_path);
@@ -241,7 +244,11 @@ where
             unsafe { Env::open(&env_open_opts, &env_path) }
                 .map_err(EnvError::from)?
         };
-        let state = State::new(&env, decision_config_testing)?;
+        let state = State::new(
+            &env,
+            decision_config_testing,
+            genesis_reputation_to_miner,
+        )?;
         let archive = Archive::new(&env)?;
         let mempool = MemPool::new(&env)?;
         let (mainchain_task_handle, mainchain_task_event_rx) =

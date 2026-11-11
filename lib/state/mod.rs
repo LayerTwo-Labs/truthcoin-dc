@@ -73,6 +73,7 @@ pub struct PrevalidatedBlock {
 
 #[derive(Clone)]
 pub struct State {
+    genesis_reputation_to_miner: bool,
     /// Sidechain heights for each coinbase txid
     pub coinbase_height:
         DatabaseUnique<SerdeBincode<CoinbaseTxid>, SerdeBincode<u32>>,
@@ -163,6 +164,7 @@ impl State {
     pub fn new<Tls>(
         env: &sneed::Env<Tls>,
         decision_config_testing: Option<u32>,
+        genesis_reputation_to_miner: bool,
     ) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
         let coinbase_height =
@@ -282,6 +284,7 @@ impl State {
             DatabaseUnique::create(env, &mut rwtxn, "market_utxos")?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
+            genesis_reputation_to_miner,
             coinbase_height,
             deposit_blocks,
             deposit_mainchain_height,
@@ -1427,7 +1430,7 @@ mod test {
         test_name: &str,
     ) -> anyhow::Result<(temp_dir::TempDir, sneed::Env, State)> {
         let (temp_dir, env) = temp_env(test_name)?;
-        let state = State::new(&env, None)?;
+        let state = State::new(&env, None, true)?;
         Ok((temp_dir, env, state))
     }
 
@@ -1593,7 +1596,7 @@ mod test {
     fn state_reopens_database() -> anyhow::Result<()> {
         let (_temp_dir, env, state) = fresh_state("state-reopen")?;
         drop(state);
-        State::new(&env, None)?;
+        State::new(&env, None, true)?;
         Ok(())
     }
 

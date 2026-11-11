@@ -17,6 +17,8 @@ pub struct Config {
     pub datadir: PathBuf,
     /// Blocks per voting period, for a test network
     pub decision_config_testing: Option<u32>,
+    /// Credit the genesis votecoin to the genesis miner, for testing
+    pub genesis_reputation_to_miner: bool,
     pub headless: bool,
     /// If None, logging to file should be disabled.
     pub log_dir: Option<PathBuf>,
@@ -44,6 +46,7 @@ impl Config {
             add_peers,
             datadir,
             decision_config_testing,
+            genesis_reputation_to_miner,
             headless,
             log_dir,
             log_level,
@@ -71,6 +74,7 @@ impl Config {
             %add_peers,
             datadir = %datadir.display(),
             ?decision_config_testing,
+            %genesis_reputation_to_miner,
             %headless,
             log_dir = log_dir.as_ref().map(|path|
                 tracing::field::display(path.display())
@@ -203,6 +207,10 @@ pub(super) struct Cli {
     /// period). If not set, uses time-based periods (production default).
     #[arg(long)]
     decision_config_testing: Option<u32>,
+    /// Credit the genesis votecoin to the genesis miner instead of the
+    /// genesis voters, for testing
+    #[arg(hide = true, long)]
+    genesis_reputation_to_miner: bool,
     /// If specified, the gui will not launch.
     #[arg(long)]
     headless: bool,
@@ -300,6 +308,7 @@ impl Cli {
             add_peers: HashSet::from_iter(self.add_peers),
             datadir,
             decision_config_testing: self.decision_config_testing,
+            genesis_reputation_to_miner: self.genesis_reputation_to_miner,
             headless: self.headless,
             log_dir,
             log_level,
@@ -325,7 +334,7 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn the_default_network_is_mainnet() {
+    fn mainnet_by_default() {
         let cli = Cli::try_parse_from([
             "truthcoin",
             "--datadir=/tmp/truthcoin-cli-test",

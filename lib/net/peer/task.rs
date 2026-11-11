@@ -1116,7 +1116,7 @@ mod tests {
                 (Ipv4Addr::LOCALHOST, 4000).into(),
             ),
             mempool: MemPool::new(&env)?,
-            state: State::new(&env, None)?,
+            state: State::new(&env, None, true)?,
             env,
         });
         let mut peer_states = LinkedHashMap::new();

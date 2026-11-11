@@ -900,7 +900,7 @@ mod test {
         let (temp_dir, env) = temp_env(test_name)?;
         let archive = Archive::new(&env)?;
         let mempool = MemPool::new(&env)?;
-        let state = State::new(&env, None)?;
+        let state = State::new(&env, None, true)?;
         let (net, info_rx, _known_peers) = Net::new(
             &tokio::runtime::Handle::current(),
             &env,
@@ -1157,7 +1157,7 @@ mod test {
             None,
             Network::Regtest,
             MemPool::new(env)?,
-            State::new(env, None)?,
+            State::new(env, None, true)?,
             (Ipv4Addr::LOCALHOST, 0).into(),
             HashSet::new(),
             HashSet::new(),

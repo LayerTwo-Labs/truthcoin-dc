@@ -782,17 +782,19 @@ pub(in crate::state) fn connect_begin(
         state
             .genesis_timestamp
             .put(rwtxn, &(), &mainchain_timestamp)?;
-        if let Some(first_coinbase) = body.coinbase.outputs.iter().next() {
-            state.reputation().set_reputation(
-                rwtxn,
-                &first_coinbase.address,
-                1.0,
-            )?;
-            tracing::info!(
-                "Genesis block: Initialized reputation for {}",
-                first_coinbase.address.as_base58()
-            );
+        let allocation = crate::state::reputation::genesis_allocation(
+            state.genesis_reputation_to_miner,
+            body,
+        )?;
+        for (address, reputation) in &allocation {
+            state
+                .reputation()
+                .set_reputation(rwtxn, address, *reputation)?;
         }
+        tracing::info!(
+            "Genesis block: Initialized reputation for {} addresses",
+            allocation.len()
+        );
     }
     let genesis_ts = state.try_get_genesis_timestamp(rwtxn)?.unwrap_or(0);
     let prev_highest_minted = state
@@ -2609,7 +2611,7 @@ mod tests {
         opts.map_size(64 * 1024 * 1024)
             .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
-        let state = State::new(&env, None).unwrap();
+        let state = State::new(&env, None, true).unwrap();
         let archive = Archive::new(&env).unwrap();
 
         let decision_id = DecisionId::new(true, 0, 0).unwrap();
@@ -3326,7 +3328,7 @@ mod tests {
         opts.map_size(64 * 1024 * 1024)
             .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, dir.path()) }?;
-        let state = State::new(&env, None)?;
+        let state = State::new(&env, None, true)?;
         let mut rwtxn = env.write_txn()?;
 
         // Leaves of the two treasury outputs that settlement spends

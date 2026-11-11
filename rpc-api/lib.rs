@@ -853,6 +853,15 @@ pub mod wallet {
         #[method(name = "mine")]
         async fn mine(&self, fee: Option<u64>) -> RpcResult<()>;
 
+        /// Import a ristretto255 private key (a 32-byte FROST-serialized
+        /// scalar, hex) into the wallet, and return its address. The wallet
+        /// must have a seed. The seed does not back up an imported key.
+        #[method(name = "import_private_key")]
+        async fn import_private_key(
+            &self,
+            private_key: String,
+        ) -> RpcResult<Address>;
+
         /// Set the wallet seed from a mnemonic seed phrase
         #[open_api_method(output_schema(ToSchema))]
         #[method(name = "set_seed_from_mnemonic")]
