@@ -525,8 +525,8 @@ pub enum Command {
     /// List this wallet's addresses that hold votecoin
     #[command(name = "voter-addresses")]
     VoterAddresses,
-    /// Submit vote(s) - use comma-separated "id:value" for batch,
-    /// "id:abstain" to abstain
+    /// Seal a ballot covering every decision in the period - use
+    /// comma-separated "id:value" for batch, "id:abstain" to abstain
     #[command(name = "vote-submit", alias = "vote")]
     VoteSubmit {
         /// Single vote: --decision-id X --vote-value Y, or batch: --votes "id1:val1,id2:abstain"
@@ -536,8 +536,22 @@ pub enum Command {
         vote_value: Option<f64>,
         #[arg(long)]
         votes: Option<String>,
-        #[arg(long, default_value = "1000")]
-        fee_sats: u64,
+        /// Defaults to the minimum fee for the ballot's size
+        #[arg(long)]
+        fee_sats: Option<u64>,
+        /// Defaults to the one wallet address that holds votecoin
+        #[arg(long)]
+        voter: Option<Address>,
+    },
+    /// Reveal this wallet's sealed ballot for a period after its voting
+    /// closes
+    #[command(name = "vote-reveal")]
+    VoteReveal {
+        #[arg(long)]
+        period: u32,
+        /// Defaults to the minimum fee for the reveal's size
+        #[arg(long)]
+        fee_sats: Option<u64>,
         /// Defaults to the one wallet address that holds votecoin
         #[arg(long)]
         voter: Option<Address>,
@@ -1360,6 +1374,14 @@ where
             let txid =
                 rpc_client.vote_submit(vote_items, fee_sats, voter).await?;
             format!("Vote submitted: {txid}")
+        }
+        Command::VoteReveal {
+            period,
+            fee_sats,
+            voter,
+        } => {
+            let txid = rpc_client.vote_reveal(period, fee_sats, voter).await?;
+            format!("Ballot revealed: {txid}")
         }
         Command::VoteList {
             voter,

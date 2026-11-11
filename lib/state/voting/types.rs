@@ -370,6 +370,14 @@ impl VoteMatrixEntry {
     }
 }
 
+/// A voter's sealed ballot for a period, kept until the period resolves so
+/// that it locks the voter's reputation through the reveal window
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SealedBallot {
+    pub commitment: crate::types::Hash,
+    pub revealed: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Ballot {
     pub period_id: VotingPeriodId,

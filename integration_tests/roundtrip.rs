@@ -17,7 +17,7 @@ use futures::{
 use tokio::time::sleep;
 use tracing::Instrument as _;
 use truthcoin_dc::types::{
-    Address, GetAddress as _, GetValue as _, OutputContent,
+    Address, GetAddress as _, GetValue as _, OutputContent, TxData,
     authorization::{Dst, Signature},
 };
 use truthcoin_dc_app_rpc_api::{
@@ -404,6 +404,103 @@ impl TruthcoinNodes {
             node.rpc_client.refresh_wallet().await?;
         }
         Ok(())
+    }
+
+    /// Mine until the decisions claimed in `claim_period` stop voting and
+    /// start revealing
+    async fn mine_until_revealing(
+        &self,
+        enforcer_post_setup: &mut EnforcerPostSetup,
+        claim_period: u32,
+    ) -> anyhow::Result<()> {
+        for _ in 0..20 {
+            self.issuer.bmm_single(enforcer_post_setup).await?;
+            sleep(std::time::Duration::from_millis(100)).await;
+            let revealing = self
+                .issuer
+                .rpc_client
+                .decision_list(Some(DecisionFilter {
+                    period: Some(claim_period),
+                    status: Some(DecisionState::Revealing),
+                }))
+                .await?;
+            if !revealing.is_empty() {
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "decisions claimed in period {claim_period} never started revealing"
+        )
+    }
+
+    fn voters(&self) -> [&PostSetup; 7] {
+        [
+            &self.voter_0,
+            &self.voter_1,
+            &self.voter_2,
+            &self.voter_3,
+            &self.voter_4,
+            &self.voter_5,
+            &self.voter_6,
+        ]
+    }
+
+    /// Wait until `node` has the issuer's tip
+    async fn sync_to_issuer_tip(&self, node: &PostSetup) -> anyhow::Result<()> {
+        let tip = self
+            .issuer
+            .rpc_client
+            .get_best_sidechain_block_hash()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("issuer has no tip"))?;
+        for _ in 0..20 {
+            drop(node.rpc_client.sync_to_tip(tip).await);
+            if node.rpc_client.get_best_sidechain_block_hash().await?
+                == Some(tip)
+            {
+                return Ok(());
+            }
+            sleep(std::time::Duration::from_millis(500)).await;
+        }
+        anyhow::bail!("node never reached the issuer tip {tip}")
+    }
+
+    /// Each voter reveals its sealed ballot for `voting_period`, paying the
+    /// minimum fee
+    async fn reveal_ballots(&self, voting_period: u32) -> anyhow::Result<()> {
+        for voter in self.voters() {
+            self.sync_to_issuer_tip(voter).await?;
+            voter.rpc_client.refresh_wallet().await?;
+            voter
+                .rpc_client
+                .vote_reveal(voting_period, None, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Wait until `count` ballot reveals reach the issuer's mempool
+    async fn wait_for_reveals(&self, count: usize) -> anyhow::Result<()> {
+        for _ in 0..40 {
+            let reveals = self
+                .issuer
+                .rpc_client
+                .list_mempool()
+                .await?
+                .into_iter()
+                .filter(|mempool_tx| {
+                    matches!(
+                        mempool_tx.tx.data,
+                        Some(TxData::RevealBallot { .. })
+                    )
+                })
+                .count();
+            if reveals == count {
+                return Ok(());
+            }
+            sleep(std::time::Duration::from_millis(500)).await;
+        }
+        anyhow::bail!("expected {count} ballot reveals in the issuer mempool")
     }
 }
 
@@ -1618,19 +1715,85 @@ async fn roundtrip_task_inner(
         &truthcoin_nodes.voter_6,
     ];
     let voting_period_id = 4u32;
-
-    for (voter_idx, votes) in vote_matrix.iter().enumerate() {
-        let voter = voters[voter_idx];
-
-        let mut vote_items = Vec::new();
-        for (decision_idx, &vote_value) in votes.iter().enumerate() {
-            vote_items.push(BallotItem {
-                decision_id: voting_decision_ids[decision_idx].clone(),
+    let ballot = |votes: &[f64]| -> Vec<BallotItem> {
+        votes
+            .iter()
+            .zip(&voting_decision_ids)
+            .map(|(&vote_value, decision_id)| BallotItem {
+                decision_id: decision_id.clone(),
                 vote_value: Some(vote_value),
-            });
-        }
+            })
+            .collect()
+    };
+    let mut pre_ballot_balances = Vec::new();
+    for voter in voters {
+        pre_ballot_balances.push(voter.rpc_client.balance().await?.total);
+    }
 
-        voter.rpc_client.vote_submit(vote_items, 1000, None).await?;
+    assert!(
+        voters[0]
+            .rpc_client
+            .vote_submit(ballot(&vote_matrix[0][..3]), None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        voters[0]
+            .rpc_client
+            .vote_submit(
+                ballot(&vote_matrix[0]),
+                None,
+                Some(voter_addresses[1])
+            )
+            .await
+            .is_err()
+    );
+    voters[2]
+        .rpc_client
+        .vote_submit(ballot(&vote_matrix[2]), None, None)
+        .await?;
+    assert!(
+        voters[2]
+            .rpc_client
+            .vote_submit(ballot(&vote_matrix[2]), None, None)
+            .await
+            .is_err()
+    );
+    sleep(std::time::Duration::from_millis(500)).await;
+    truthcoin_nodes
+        .issuer
+        .bmm_single(&mut enforcer_post_setup)
+        .await?;
+    sleep(std::time::Duration::from_secs(2)).await;
+    assert!(
+        voters[2]
+            .rpc_client
+            .vote_submit(ballot(&vote_matrix[2]), None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        voters[2]
+            .rpc_client
+            .vote_reveal(voting_period_id, None, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        voters[0]
+            .rpc_client
+            .vote_submit(ballot(&vote_matrix[0]), Some(1), None)
+            .await
+            .is_err()
+    );
+
+    for (idx, (voter, votes)) in voters.iter().zip(&vote_matrix).enumerate() {
+        if idx != 2 {
+            voter
+                .rpc_client
+                .vote_submit(ballot(votes), None, None)
+                .await?;
+        }
     }
 
     sleep(std::time::Duration::from_millis(500)).await;
@@ -1642,6 +1805,208 @@ async fn roundtrip_task_inner(
 
     truthcoin_nodes.refresh_all_wallets().await?;
     sleep(std::time::Duration::from_secs(1)).await;
+
+    anyhow::ensure!(
+        truthcoin_nodes
+            .issuer
+            .rpc_client
+            .vote_list(VoteFilter {
+                voter: None,
+                decision_id: None,
+                period_id: Some(voting_period_id),
+            })
+            .await?
+            .is_empty(),
+        "sealed votes must stay hidden while the period is voting"
+    );
+    let issuer_voter_address = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .get_voter_address()
+        .await?;
+    truthcoin_nodes
+        .issuer
+        .rpc_client
+        .create_transfer(issuer_voter_address, 100_000, 1000)
+        .await?;
+    let mut sealed_balances = Vec::new();
+    for (voter, pre_balance) in voters.iter().zip(&pre_ballot_balances) {
+        let balance = voter.rpc_client.balance().await?.total;
+        anyhow::ensure!(balance < *pre_balance, "a ballot pays its fee");
+        sealed_balances.push(balance);
+    }
+
+    tracing::info!("✓ Phase 6: Sealed ballots committed");
+
+    let period_id = voting_period_id;
+
+    // Capture pre-consensus reputation BEFORE the period closes. Consensus
+    // runs after the reveal window closes, so reputation must not move
+    // before then.
+    let mut pre_consensus_rep: HashMap<Address, f64> = HashMap::new();
+    for &voter_addr in &voter_addresses {
+        let rep = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .votecoin_balance(voter_addr)
+            .await?;
+        pre_consensus_rep.insert(voter_addr, rep);
+    }
+
+    truthcoin_nodes
+        .mine_until_revealing(&mut enforcer_post_setup, 3)
+        .await?;
+    anyhow::ensure!(
+        truthcoin_nodes
+            .issuer
+            .rpc_client
+            .decision_list(Some(DecisionFilter {
+                period: Some(3),
+                status: Some(DecisionState::Voting),
+            }))
+            .await?
+            .is_empty()
+    );
+    anyhow::ensure!(
+        truthcoin_nodes
+            .issuer
+            .rpc_client
+            .vote_period(Some(period_id))
+            .await?
+            .and_then(|info| info.consensus)
+            .is_none(),
+        "consensus must wait for the reveal window"
+    );
+    for &voter_addr in &voter_addresses {
+        let rep = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .votecoin_balance(voter_addr)
+            .await?;
+        anyhow::ensure!(rep == pre_consensus_rep[&voter_addr]);
+    }
+    anyhow::ensure!(
+        utxo_verification::get_market_treasury_utxos(
+            &truthcoin_nodes.issuer.rpc_client.list_utxos().await?,
+        ) == pre_settlement_treasury,
+        "payouts must wait for the reveal window"
+    );
+    for market in truthcoin_nodes.issuer.rpc_client.market_list().await? {
+        anyhow::ensure!(market.state == MarketStatus::Trading);
+    }
+    truthcoin_nodes
+        .sync_to_issuer_tip(&truthcoin_nodes.voter_0)
+        .await?;
+    truthcoin_nodes.refresh_all_wallets().await?;
+    for (sender, dest) in [
+        (&truthcoin_nodes.voter_0, voter_addresses[1]),
+        (&truthcoin_nodes.issuer, voter_addresses[0]),
+    ] {
+        let result = sender
+            .rpc_client
+            .transfer_votecoin(dest, 0.000001, 1000, None)
+            .await;
+        anyhow::ensure!(
+            matches!(&result, Err(err) if err.to_string().contains("locked")),
+            "expected a reputation lock, got {result:?}"
+        );
+    }
+    truthcoin_nodes
+        .sync_to_issuer_tip(&truthcoin_nodes.voter_1)
+        .await?;
+    assert!(
+        truthcoin_nodes
+            .voter_1
+            .rpc_client
+            .market_buy(MarketBuyRequest {
+                market_id: markets_during_voting[0].market_id.clone(),
+                outcome_index: 0,
+                shares_amount: 1000,
+                max_cost: Some(10_000_000),
+                dry_run: None,
+            })
+            .await
+            .is_err()
+    );
+
+    truthcoin_nodes.reveal_ballots(period_id).await?;
+    assert!(
+        voters[0]
+            .rpc_client
+            .vote_reveal(period_id, None, None)
+            .await
+            .is_err()
+    );
+    truthcoin_nodes.wait_for_reveals(voters.len()).await?;
+    for (voter, sealed_balance) in voters.iter().zip(&sealed_balances) {
+        anyhow::ensure!(
+            voter.rpc_client.balance().await?.total < *sealed_balance,
+            "a reveal pays its fee"
+        );
+    }
+    truthcoin_nodes
+        .issuer
+        .bmm_single(&mut enforcer_post_setup)
+        .await?;
+    sleep(std::time::Duration::from_secs(2)).await;
+
+    tracing::info!("✓ Phase 7: Voting period closed and ballots revealed");
+
+    // Period-transition assertion: the bulk BMM above crossed at least one
+    // period boundary. Verify that the transition code paths fired by
+    // checking a surviving period's last_reprice_block is recent and that
+    // the chain has minted forward (a period that didn't exist before now
+    // does, with sensible pricing).
+    let post_phase7_height =
+        truthcoin_nodes.issuer.rpc_client.getblockcount().await?;
+    let post_phase7_status =
+        truthcoin_nodes.issuer.rpc_client.decision_status().await?;
+    let surviving_period = post_phase7_status.current_period.saturating_add(1);
+    let surviving_pricing = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .decision_listing_fee(surviving_period)
+        .await?;
+    anyhow::ensure!(
+        u64::from(surviving_pricing.last_reprice_block) + 20
+            >= u64::from(post_phase7_height),
+        "Surviving period {surviving_period}: last_reprice_block={} \
+         far behind current height {post_phase7_height}",
+        surviving_pricing.last_reprice_block
+    );
+
+    let new_period = post_phase7_status.current_period + 19;
+    let new_pricing = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .decision_listing_fee(new_period)
+        .await?;
+    anyhow::ensure!(
+        new_pricing.claimed == 0,
+        "Newly seeded period {new_period} should have no claims, got {}",
+        new_pricing.claimed
+    );
+    anyhow::ensure!(
+        new_pricing.p_period >= new_pricing.p_floor,
+        "Newly seeded period {new_period}: p_period {} below floor {}",
+        new_pricing.p_period,
+        new_pricing.p_floor
+    );
+    tracing::info!(
+        "✓ Period-transition: surviving period {surviving_period} \
+         last_reprice_block={}, new period {new_period} \
+         seeded with p_period={}",
+        surviving_pricing.last_reprice_block,
+        new_pricing.p_period
+    );
+
+    // ==========================================================================
+    // Phase 8: Period Resolution (Consensus + Redistribution + Market Redemption)
+    // ==========================================================================
+    // Consensus runs atomically during connect_block once the reveal window
+    // closes. It already executed in the block that carried the reveals
+    // above — read the post-consensus state now.
+    // ==========================================================================
 
     for decision_id in voting_decision_ids.iter() {
         let votes = truthcoin_nodes
@@ -1701,90 +2066,6 @@ async fn roundtrip_task_inner(
         );
     }
     tracing::info!("     ╚═════╩═════╩═════╩═════╝\n");
-
-    tracing::info!("✓ Phase 6: Vote submission completed");
-
-    let period_id = voting_period_id;
-
-    // Capture pre-consensus reputation BEFORE mining advances the period.
-    // Consensus triggers during connect_block when current_period crosses
-    // the voting period boundary, so we must snapshot before that happens.
-    let mut pre_consensus_rep: HashMap<Address, f64> = HashMap::new();
-    for &voter_addr in &voter_addresses {
-        let rep = truthcoin_nodes
-            .issuer
-            .rpc_client
-            .votecoin_balance(voter_addr)
-            .await?;
-        pre_consensus_rep.insert(voter_addr, rep);
-    }
-
-    let blocks_to_mine = 10;
-    for _ in 1..=blocks_to_mine {
-        truthcoin_nodes
-            .issuer
-            .bmm_single(&mut enforcer_post_setup)
-            .await?;
-        sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    tracing::info!("✓ Phase 7: Voting period closed");
-
-    // Period-transition assertion: the bulk BMM above crossed at least one
-    // period boundary. Verify that the transition code paths fired by
-    // checking a surviving period's last_reprice_block is recent and that
-    // the chain has minted forward (a period that didn't exist before now
-    // does, with sensible pricing).
-    let post_phase7_height =
-        truthcoin_nodes.issuer.rpc_client.getblockcount().await?;
-    let post_phase7_status =
-        truthcoin_nodes.issuer.rpc_client.decision_status().await?;
-    let surviving_period = post_phase7_status.current_period.saturating_add(1);
-    let surviving_pricing = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .decision_listing_fee(surviving_period)
-        .await?;
-    anyhow::ensure!(
-        u64::from(surviving_pricing.last_reprice_block) + 20
-            >= u64::from(post_phase7_height),
-        "Surviving period {surviving_period}: last_reprice_block={} \
-         far behind current height {post_phase7_height}",
-        surviving_pricing.last_reprice_block
-    );
-
-    let new_period = post_phase7_status.current_period + 19;
-    let new_pricing = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .decision_listing_fee(new_period)
-        .await?;
-    anyhow::ensure!(
-        new_pricing.claimed == 0,
-        "Newly seeded period {new_period} should have no claims, got {}",
-        new_pricing.claimed
-    );
-    anyhow::ensure!(
-        new_pricing.p_period >= new_pricing.p_floor,
-        "Newly seeded period {new_period}: p_period {} below floor {}",
-        new_pricing.p_period,
-        new_pricing.p_floor
-    );
-    tracing::info!(
-        "✓ Period-transition: surviving period {surviving_period} \
-         last_reprice_block={}, new period {new_period} \
-         seeded with p_period={}",
-        surviving_pricing.last_reprice_block,
-        new_pricing.p_period
-    );
-
-    // ==========================================================================
-    // Phase 8: Period Resolution (Consensus + Redistribution + Market Redemption)
-    // ==========================================================================
-    // Consensus runs atomically during connect_block when current_period
-    // advances past the voting period. It already executed during the
-    // 10-block mining above — read the post-consensus state now.
-    // ==========================================================================
 
     // Mine one more block to ensure all nodes have converged
     truthcoin_nodes
@@ -3843,11 +4124,12 @@ async fn roundtrip_task_inner(
             .iter()
             .map(|(decision_id, value)| BallotItem {
                 decision_id: decision_id.clone(),
-                vote_value: Some(*value),
+                vote_value: (voter_idx != 6 || *decision_id != bin_dec_30)
+                    .then_some(*value),
             })
             .collect();
 
-        voter.rpc_client.vote_submit(vote_items, 1000, None).await?;
+        voter.rpc_client.vote_submit(vote_items, None, None).await?;
     }
 
     let misaligned = vec![BallotItem {
@@ -3858,7 +4140,7 @@ async fn roundtrip_task_inner(
         truthcoin_nodes
             .voter_0
             .rpc_client
-            .vote_submit(misaligned, 1000, None)
+            .vote_submit(misaligned, None, None)
             .await
             .is_err()
     );
@@ -3872,22 +4154,38 @@ async fn roundtrip_task_inner(
 
     tracing::info!("✓ Phase 12: Voting completed");
 
-    // Close voting period
-    let blocks_to_close = 10;
-    for _ in 0..blocks_to_close {
-        truthcoin_nodes
-            .issuer
-            .bmm_single(&mut enforcer_post_setup)
-            .await?;
-        sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    // Trigger resolution
+    // Close voting period, then resolve with the revealed ballots
+    truthcoin_nodes
+        .mine_until_revealing(&mut enforcer_post_setup, test_period)
+        .await?;
+    truthcoin_nodes.reveal_ballots(test_period + 1).await?;
+    truthcoin_nodes.wait_for_reveals(vote_matrix.len()).await?;
     truthcoin_nodes
         .issuer
         .bmm_single(&mut enforcer_post_setup)
         .await?;
     sleep(std::time::Duration::from_secs(2)).await;
+
+    let abstainer_votes = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .vote_list(VoteFilter {
+            voter: Some(voter_addresses[6]),
+            decision_id: None,
+            period_id: Some(test_period + 1),
+        })
+        .await?;
+    anyhow::ensure!(abstainer_votes.len() == vote_matrix[6].len() - 1);
+    let abstained_outcome = truthcoin_nodes
+        .issuer
+        .rpc_client
+        .vote_period(Some(test_period + 1))
+        .await?
+        .and_then(|info| info.consensus)
+        .and_then(|consensus| consensus.outcomes.get(&bin_dec_30).copied());
+    anyhow::ensure!(
+        abstained_outcome == Some(expected_phase2::binary::EXPECTED_BIN_30)
+    );
 
     // Verify consensus results
     let test_period_id = test_period;
@@ -4314,19 +4612,34 @@ async fn roundtrip_task_inner(
         sleep(std::time::Duration::from_millis(200)).await;
     }
 
-    // BMM 3 blocks: confirm claims (block 1) and span at least one reprice
-    // interval (REPRICE_INTERVAL=2 in testing config).
-    truthcoin_nodes
-        .issuer
-        .bmm(&mut enforcer_post_setup, 3)
-        .await?;
-    sleep(std::time::Duration::from_millis(500)).await;
-
-    let pricing_after_claims = truthcoin_nodes
-        .issuer
-        .rpc_client
-        .decision_listing_fee(exercise_period)
-        .await?;
+    // BMM one block at a time until a reprice covers the confirmed claims
+    // (REPRICE_INTERVAL=2 in testing config), and read p_period before a
+    // later zero-sales reprice can pull it back down.
+    let mut repriced = None;
+    for _ in 0..4 {
+        truthcoin_nodes
+            .issuer
+            .bmm_single(&mut enforcer_post_setup)
+            .await?;
+        sleep(std::time::Duration::from_millis(500)).await;
+        let pricing = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .decision_listing_fee(exercise_period)
+            .await?;
+        if pricing.claimed >= u64::from(claim_count)
+            && pricing.last_reprice_block
+                > pricing_pre_exercise.last_reprice_block
+        {
+            repriced = Some(pricing);
+            break;
+        }
+    }
+    let pricing_after_claims = repriced.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no reprice covered the claims in period {exercise_period}"
+        )
+    })?;
     anyhow::ensure!(
         pricing_after_claims.claimed >= u64::from(claim_count),
         "Expected at least {claim_count} claims, got {}",

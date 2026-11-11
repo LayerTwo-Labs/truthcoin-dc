@@ -564,3 +564,116 @@ fn test_high_period_claim() {
     assert!(entry.decision.is_some());
     assert_eq!(dbs.claimed_count_in_period(&rwtxn, period).unwrap(), 1);
 }
+
+/// Claims are rejected for a period once it is voting
+#[test]
+fn claims_close_at_voting() {
+    use super::{Dbs, DecisionConfig};
+    use std::num::NonZeroU32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
+    options.map_size(16 * 1024 * 1024).max_dbs(Dbs::NUM_DBS);
+    let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
+    let mut rwtxn = env.write_txn().unwrap();
+    let dbs = Dbs::new_with_config(
+        &env,
+        &mut rwtxn,
+        DecisionConfig::testing(NonZeroU32::new(10).unwrap()),
+    )
+    .unwrap();
+    let height = 25;
+    dbs.mint_genesis(&mut rwtxn, 0, height, 0).unwrap();
+    let current = dbs.get_current_period(0, Some(height), 0).unwrap();
+    let validate = |is_standard, period| {
+        dbs.validate_decision_claim(
+            &rwtxn,
+            DecisionId::new(is_standard, period, 0).unwrap(),
+            &make_binary_decision(),
+            0,
+            Some(height),
+            0,
+        )
+    };
+
+    for is_standard in [false, true] {
+        assert!(validate(is_standard, current - 1).is_err());
+        validate(is_standard, current).unwrap();
+    }
+}
+
+/// Open-period and resolution indexes track each transition and rollback
+#[test]
+fn decision_state_machine() {
+    use super::{Dbs, DecisionConfig};
+    use std::{collections::BTreeSet, num::NonZeroU32};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
+    options.map_size(16 * 1024 * 1024).max_dbs(Dbs::NUM_DBS);
+    let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
+    let mut rwtxn = env.write_txn().unwrap();
+    let dbs = Dbs::new_with_config(
+        &env,
+        &mut rwtxn,
+        DecisionConfig::testing(NonZeroU32::new(10).unwrap()),
+    )
+    .unwrap();
+    dbs.mint_genesis(&mut rwtxn, 0, 0, 0).unwrap();
+    let decision_id = DecisionId::new(false, 1, 0).unwrap();
+    let voting_period = decision_id.voting_period();
+    dbs.claim_decision(
+        &mut rwtxn,
+        decision_id,
+        make_binary_decision(),
+        crate::types::Txid([0; 32]),
+        Some(1),
+    )
+    .unwrap();
+    assert_eq!(
+        dbs.get_claimed_decisions_needing_voting(&rwtxn, voting_period)
+            .unwrap(),
+        vec![decision_id],
+    );
+    assert!(dbs.get_open_voting_periods(&rwtxn).unwrap().is_empty());
+
+    dbs.transition_decision_to_voting(&mut rwtxn, decision_id, 10)
+        .unwrap();
+    dbs.transition_decision_to_revealing(&mut rwtxn, decision_id, 20)
+        .unwrap();
+    assert_eq!(
+        dbs.get_open_voting_periods(&rwtxn).unwrap(),
+        BTreeSet::from([voting_period]),
+    );
+    assert_eq!(
+        dbs.get_revealing_decisions_needing_resolution(&rwtxn, 0, Some(21), 0)
+            .unwrap(),
+        vec![decision_id],
+    );
+
+    dbs.transition_decision_to_resolved(&mut rwtxn, decision_id, 21, 1.0)
+        .unwrap();
+    assert!(dbs.get_open_voting_periods(&rwtxn).unwrap().is_empty());
+    assert!(
+        dbs.get_revealing_decisions_needing_resolution(&rwtxn, 0, Some(21), 0)
+            .unwrap()
+            .is_empty()
+    );
+
+    dbs.rollback_decision_states_to_height(&mut rwtxn, 20)
+        .unwrap();
+    assert_eq!(
+        dbs.get_open_voting_periods(&rwtxn).unwrap(),
+        BTreeSet::from([voting_period]),
+    );
+
+    dbs.revert_decision_claim(&mut rwtxn, decision_id).unwrap();
+    dbs.rollback_decision_states_to_height(&mut rwtxn, 0)
+        .unwrap();
+    assert!(dbs.get_open_voting_periods(&rwtxn).unwrap().is_empty());
+    assert!(
+        dbs.get_claimed_decisions_needing_voting(&rwtxn, voting_period)
+            .unwrap()
+            .is_empty()
+    );
+}

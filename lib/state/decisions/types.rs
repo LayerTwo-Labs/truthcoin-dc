@@ -321,6 +321,23 @@ impl DecisionStateHistory {
         Ok(())
     }
 
+    pub fn transition_to_revealing(
+        &mut self,
+        height: u32,
+    ) -> Result<(), Error> {
+        let current = self.current_state();
+        if !current.can_transition_to(DecisionState::Revealing) {
+            return Err(Error::InvalidDecisionState {
+                reason: format!(
+                    "Cannot transition to Revealing from {current:?}"
+                ),
+            });
+        }
+        self.state_history
+            .push((DecisionState::Revealing, height, None));
+        Ok(())
+    }
+
     pub fn transition_to_resolved(
         &mut self,
         consensus_outcome: f64,
@@ -404,6 +421,8 @@ pub struct DecisionEntry {
 
 pub(crate) const FUTURE_PERIODS: u32 = 20;
 pub(crate) const INITIAL_DECISIONS_PER_PERIOD: u64 = 500;
+pub(crate) const REVEAL_WINDOW_SECONDS: u32 = 7 * 24 * 3600;
+pub(crate) const REVEAL_WINDOW_BLOCKS: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct DecisionConfig {
@@ -437,6 +456,14 @@ impl DecisionConfig {
 
     pub fn is_blocks_mode(&self) -> bool {
         self.is_blocks
+    }
+
+    pub fn reveal_window(&self) -> u32 {
+        if self.is_blocks {
+            REVEAL_WINDOW_BLOCKS
+        } else {
+            REVEAL_WINDOW_SECONDS
+        }
     }
 
     pub fn blocks_per_period(&self) -> Option<u32> {

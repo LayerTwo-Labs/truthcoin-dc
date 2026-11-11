@@ -43,6 +43,11 @@ pub enum Error {
     IncompatibleVersion { version: Version, db_path: PathBuf },
     #[error("can't add transaction, decision {0} already claimed in mempool")]
     DecisionAlreadyClaimedInMempool(String),
+    #[error(
+        "can't add transaction, voter {voter} already has a ballot for \
+         period {voting_period} in mempool"
+    )]
+    BallotAlreadyInMempool { voter: Address, voting_period: u32 },
     #[error("Missing transaction {0}")]
     MissingTransaction(Txid),
     #[error(transparent)]
@@ -71,10 +76,15 @@ pub struct MemPool {
     trade_insertion_order:
         DatabaseUnique<SerdeBincode<u64>, SerdeBincode<Txid>>,
     trade_order_counter: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
+    /// Pending ballots: voting period, voter and reveal flag to the txid
+    pending_ballots:
+        DatabaseUnique<SerdeBincode<BallotKey>, SerdeBincode<Txid>>,
 }
 
+type BallotKey = (u32, Address, bool);
+
 impl MemPool {
-    pub const NUM_DBS: u32 = 7;
+    pub const NUM_DBS: u32 = 8;
 
     pub fn new<Tls>(env: &sneed::Env<Tls>) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
@@ -118,6 +128,9 @@ impl MemPool {
         let trade_order_counter =
             DatabaseUnique::create(env, &mut rwtxn, "trade_order_counter")
                 .map_err(EnvError::from)?;
+        let pending_ballots =
+            DatabaseUnique::create(env, &mut rwtxn, "pending_ballots")
+                .map_err(EnvError::from)?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
             transactions,
@@ -127,6 +140,7 @@ impl MemPool {
             pending_decision_claims,
             trade_insertion_order,
             trade_order_counter,
+            pending_ballots,
         })
     }
 
@@ -273,6 +287,86 @@ impl MemPool {
         Ok(())
     }
 
+    /// Index a ballot under its key. A voter has one ballot per period and
+    /// phase in the mempool, the first one seen.
+    fn put_ballot(
+        &self,
+        rwtxn: &mut RwTxn,
+        transaction: &Transaction,
+    ) -> Result<(), Error> {
+        let Some(key) = crate::validation::vote::ballot_key(transaction) else {
+            return Ok(());
+        };
+        let txid = transaction.txid();
+        if let Some(existing_txid) =
+            self.pending_ballots.try_get(rwtxn, &key)?
+            && existing_txid != txid
+        {
+            let (voting_period, voter, _) = key;
+            return Err(Error::BallotAlreadyInMempool {
+                voter,
+                voting_period,
+            });
+        }
+        self.pending_ballots.put(rwtxn, &key, &txid)?;
+        Ok(())
+    }
+
+    fn delete_ballot(
+        &self,
+        rwtxn: &mut RwTxn,
+        transaction: &Transaction,
+    ) -> Result<(), Error> {
+        let Some(key) = crate::validation::vote::ballot_key(transaction) else {
+            return Ok(());
+        };
+        if self.pending_ballots.try_get(rwtxn, &key)?
+            == Some(transaction.txid())
+        {
+            self.pending_ballots.delete(rwtxn, &key)?;
+        }
+        Ok(())
+    }
+
+    /// The pending ballot of a voter for a period and phase
+    pub fn pending_ballot(
+        &self,
+        rotxn: &RoTxn,
+        key: &BallotKey,
+    ) -> Result<Option<Txid>, Error> {
+        Ok(self.pending_ballots.try_get(rotxn, key)?)
+    }
+
+    pub fn pending_ballots(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<(BallotKey, Txid)>, Error> {
+        self.pending_ballots
+            .iter(rotxn)
+            .map_err(DbError::from)?
+            .collect()
+            .map_err(DbError::from)
+            .map_err(Error::from)
+    }
+
+    /// Evict the mempool ballot that `confirmed_tx` takes the place of
+    pub fn evict_ballot_conflicts(
+        &self,
+        rwtxn: &mut RwTxn,
+        confirmed_tx: &Transaction,
+    ) -> Result<(), Error> {
+        let Some(key) = crate::validation::vote::ballot_key(confirmed_tx)
+        else {
+            return Ok(());
+        };
+        match self.pending_ballots.try_get(rwtxn, &key)? {
+            Some(txid) if txid != confirmed_tx.txid() => {
+                self.delete(rwtxn, txid)
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+
     pub fn put(
         &self,
         txn: &mut RwTxn,
@@ -309,6 +403,7 @@ impl MemPool {
         if !claimed_decisions.is_empty() {
             self.put_decision_claims(txn, txid, &claimed_decisions)?;
         }
+        let () = self.put_ballot(txn, &transaction.transaction)?;
         for (outpoint, _) in &transaction.transaction.inputs {
             if self
                 .spent_utxos
@@ -351,6 +446,7 @@ impl MemPool {
                 }
                 let () = self.unindex_tx_addresses(rwtxn, &tx)?;
                 let () = self.delete_decision_claims(rwtxn, &tx)?;
+                let () = self.delete_ballot(rwtxn, &tx.transaction)?;
                 if Self::is_trade_tx(&tx) {
                     self.delete_trade_order(rwtxn, &txid)?;
                 }
@@ -454,6 +550,7 @@ impl MemPool {
         }
         let () = self.unindex_tx_addresses(rwtxn, &tx)?;
         let () = self.delete_decision_claims(rwtxn, &tx)?;
+        let () = self.delete_ballot(rwtxn, &tx.transaction)?;
         if Self::is_trade_tx(&tx) {
             self.delete_trade_order(rwtxn, &txid)?;
         }
@@ -844,6 +941,7 @@ impl Watchable<()> for MemPool {
             self.transactions.watch().clone(),
             self.spent_utxos.watch().clone(),
             self.pending_decision_claims.watch().clone(),
+            self.pending_ballots.watch().clone(),
         ];
         let streams = StreamMap::from_iter(
             watchables.into_iter().map(WatchStream::new).enumerate(),
@@ -947,6 +1045,68 @@ mod tests {
             authorizations: vec![],
             actor_proof: None,
         }
+    }
+
+    fn ballot_tx(
+        input_seed: u8,
+        commitment: [u8; 32],
+    ) -> AuthorizedTransaction {
+        let tx = Transaction {
+            inputs: vec![(input_outpoint(input_seed), [0; 32])].into(),
+            proof: Default::default(),
+            outputs: vec![].into(),
+            data: Some(TransactionData::SubmitBallot {
+                voter: Address([7; 20]),
+                voting_period: 3,
+                commitment,
+            }),
+        };
+        Authorized {
+            transaction: tx,
+            authorizations: vec![],
+            actor_proof: None,
+        }
+    }
+
+    /// One pending ballot per voter, period and phase; a mined ballot frees it.
+    #[test]
+    fn one_pending_ballot_per_voter() {
+        let (env, _dir) = make_env();
+        let mempool = MemPool::new(&env).unwrap();
+        let key = (3, Address([7; 20]), false);
+        let first = ballot_tx(1, [1; 32]);
+        let second = ballot_tx(2, [2; 32]);
+        let mined = ballot_tx(3, [3; 32]);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        mempool.put(&mut rwtxn, &first).unwrap();
+        assert!(matches!(
+            mempool.put(&mut rwtxn, &second),
+            Err(Error::BallotAlreadyInMempool { .. })
+        ));
+        assert_eq!(
+            mempool.pending_ballot(&rwtxn, &key).unwrap(),
+            Some(first.transaction.txid()),
+        );
+
+        mempool
+            .evict_ballot_conflicts(&mut rwtxn, &mined.transaction)
+            .unwrap();
+        assert_eq!(mempool.pending_ballot(&rwtxn, &key).unwrap(), None);
+        assert!(
+            mempool
+                .transactions
+                .try_get(&rwtxn, &first.transaction.txid())
+                .unwrap()
+                .is_none()
+        );
+
+        mempool.put(&mut rwtxn, &second).unwrap();
+        mempool
+            .delete_confirmed(&mut rwtxn, second.transaction.txid())
+            .unwrap();
+        assert_eq!(mempool.pending_ballot(&rwtxn, &key).unwrap(), None);
+        rwtxn.commit().unwrap();
     }
 
     #[test]

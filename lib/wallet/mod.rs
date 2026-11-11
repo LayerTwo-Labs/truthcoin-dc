@@ -29,8 +29,8 @@ use crate::{
         Accumulator, Address, AmountOverflowError, AmountUnderflowError,
         AuthorizedTransaction, CoinbaseTxid, EncryptionPubKey, GetValue, Hash,
         InPoint, OutPoint, OutPointKey, Output, OutputContent, PointedOutput,
-        SpentOutput, THIS_SIDECHAIN, Transaction, TxData, UtreexoError,
-        UtreexoNodeHash, VERSION, VerifyingKey, Version,
+        RevealBallot, SpentOutput, THIS_SIDECHAIN, Transaction, TxData,
+        UtreexoError, UtreexoNodeHash, VERSION, VerifyingKey, Version,
         authorization::{
             self, Authorization, Signature, SigningKey, get_address,
             rand_core::CryptoRng,
@@ -140,6 +140,11 @@ pub enum Error {
     AmountUnderflow(#[from] AmountUnderflowError),
     #[error("authorization error")]
     Authorization(#[from] crate::types::error::Authorization),
+    #[error("ballot fee {fee} is below the minimum {min_fee}")]
+    BallotFeeBelowMinimum {
+        fee: bitcoin::Amount,
+        min_fee: bitcoin::Amount,
+    },
     #[error("bip32 error")]
     Bip32(#[from] bip32::Error),
     #[error(transparent)]
@@ -162,6 +167,8 @@ pub enum Error {
     InvalidPrivateKey(#[source] authorization::SignatureError),
     #[error("io error")]
     Io(#[from] std::io::Error),
+    #[error("failed to measure the ballot transaction")]
+    MeasureBallot(#[source] bincode::Error),
     #[error(
         "wallet does not have a seed (set with RPC `set-seed-from-mnemonic`)"
     )]
@@ -250,13 +257,17 @@ pub struct Wallet {
     /// Map each message signing key index to a verifying key
     index_to_vk:
         DatabaseUnique<SerdeBincode<[u8; 4]>, SerdeBincode<VerifyingKey>>,
+    /// Sealed ballots this wallet committed to, keyed by commitment, kept
+    /// until they are revealed
+    sealed_ballots:
+        DatabaseUnique<SerdeBincode<Hash>, SerdeBincode<RevealBallot>>,
     /// Private keys imported from outside the seed, keyed by their address
     imported_keys:
         DatabaseUnique<SerdeBincode<Address>, SerdeBincode<[u8; 32]>>,
 }
 
 impl Wallet {
-    pub const NUM_DBS: u32 = 15;
+    pub const NUM_DBS: u32 = 16;
 
     pub fn new(path: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(path)?;
@@ -340,6 +351,9 @@ impl Wallet {
         let index_to_vk =
             DatabaseUnique::create(&env, &mut rwtxn, "index_to_vk")
                 .map_err(EnvError::from)?;
+        let sealed_ballots =
+            DatabaseUnique::create(&env, &mut rwtxn, "sealed_ballots")
+                .map_err(EnvError::from)?;
         let imported_keys =
             DatabaseUnique::create(&env, &mut rwtxn, "imported_keys")
                 .map_err(EnvError::from)?;
@@ -379,6 +393,7 @@ impl Wallet {
             index_to_epk,
             vk_to_index,
             index_to_vk,
+            sealed_ballots,
             imported_keys,
         })
     }
@@ -399,6 +414,9 @@ impl Wallet {
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
         self.mempool_spent_utxos
+            .clear(&mut rwtxn)
+            .map_err(DbError::from)?;
+        self.sealed_ballots
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
         rwtxn.commit().map_err(RwTxnError::from)?;
@@ -1127,8 +1145,8 @@ impl Wallet {
                     None
                 }
             }
-            Some(TransactionData::SubmitVote { voter, .. })
-            | Some(TransactionData::SubmitBallot { voter, .. }) => {
+            Some(TransactionData::SubmitBallot { voter, .. })
+            | Some(TransactionData::RevealBallot { voter, .. }) => {
                 if !input_addresses.contains(voter) {
                     Some(*voter)
                 } else {
@@ -1766,31 +1784,111 @@ impl Wallet {
         Ok(tx)
     }
 
-    pub fn submit_ballot(
+    /// Fund a ballot commit or reveal with at least the minimum ballot fee
+    /// for its size, or with `fee` when it covers that minimum. The change
+    /// goes back to the voter address, which a ballot already names, so it
+    /// can pay for the voter's reputation transfers.
+    fn fund_ballot_tx(
         &self,
+        data: TxData,
+        voter: Address,
+        fee: Option<bitcoin::Amount>,
         options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let mut paid = bitcoin::Amount::ZERO;
+        loop {
+            let selected = self.select_coins(paid, options)?;
+            let change = selected.total - paid;
+            let outputs = if change > bitcoin::Amount::ZERO {
+                vec![Output {
+                    address: voter,
+                    content: OutputContent::Value(change),
+                }]
+            } else {
+                Vec::new()
+            };
+            let mut tx = new_tx(spend_inputs(selected.coins), outputs);
+            tx.data = Some(data.clone());
+            let min_fee = crate::validation::vote::min_ballot_fee(&tx)
+                .map_err(Error::MeasureBallot)?;
+            let required = match fee {
+                Some(fee) if fee < min_fee => {
+                    return Err(Error::BallotFeeBelowMinimum { fee, min_fee });
+                }
+                Some(fee) => fee,
+                None => min_fee,
+            };
+            if paid >= required {
+                return Ok(tx);
+            }
+            paid = required;
+        }
+    }
+
+    /// Seal a ballot. The ballot is stored before the commitment transaction
+    /// is returned, so a broadcast commitment can always be revealed.
+    pub fn submit_ballot<R>(
+        &self,
+        mut rng: R,
         voter: Address,
         votes: Vec<crate::types::BallotItem>,
         voting_period: u32,
-        fee: bitcoin::Amount,
-    ) -> Result<Transaction, Error> {
-        let tx_data = crate::types::TransactionData::SubmitBallot {
+        fee: Option<bitcoin::Amount>,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error>
+    where
+        R: CryptoRng,
+    {
+        let mut salt = [0; 32];
+        rng.fill_bytes(&mut salt);
+        let ballot = RevealBallot {
             voter,
-            votes,
             voting_period,
+            votes,
+            salt,
         };
-
-        let selected = self.select_coins(fee, options)?;
-        let change_bitcoin = selected.total - fee;
-
-        let inputs = spend_inputs(selected.coins);
-        let mut outputs = Vec::new();
-        self.push_bitcoin_change(&mut outputs, change_bitcoin)?;
-
-        let mut tx = new_tx(inputs, outputs);
-        tx.data = Some(tx_data);
-
+        let commitment = ballot.commitment();
+        let data = TxData::SubmitBallot {
+            voter: ballot.voter,
+            voting_period,
+            commitment,
+        };
+        let tx = self.fund_ballot_tx(data, voter, fee, options)?;
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        self.sealed_ballots
+            .put(&mut rwtxn, &commitment, &ballot)
+            .map_err(DbError::from)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(tx)
+    }
+
+    /// Open a sealed ballot, funding its fee
+    pub fn reveal_ballot(
+        &self,
+        ballot: RevealBallot,
+        fee: Option<bitcoin::Amount>,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let voter = ballot.voter;
+        let data = TxData::RevealBallot {
+            voter,
+            voting_period: ballot.voting_period,
+            votes: ballot.votes,
+            salt: ballot.salt,
+        };
+        self.fund_ballot_tx(data, voter, fee, options)
+    }
+
+    /// The sealed ballot with this commitment
+    pub fn sealed_ballot(
+        &self,
+        commitment: &Hash,
+    ) -> Result<Option<RevealBallot>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self
+            .sealed_ballots
+            .try_get(&rotxn, commitment)
+            .map_err(DbError::from)?)
     }
 
     pub fn transfer_reputation(
@@ -1922,6 +2020,7 @@ impl Watchable<()> for Wallet {
             index_to_epk,
             vk_to_index,
             index_to_vk,
+            sealed_ballots,
             imported_keys,
         } = self;
         let watchables = [
@@ -1936,6 +2035,7 @@ impl Watchable<()> for Wallet {
             index_to_epk.watch().clone(),
             vk_to_index.watch().clone(),
             index_to_vk.watch().clone(),
+            sealed_ballots.watch().clone(),
             imported_keys.watch().clone(),
         ];
         let streams = StreamMap::from_iter(
@@ -1960,6 +2060,86 @@ mod tests {
             main_height: 0,
             spend_zero_conf_change,
         }
+    }
+
+    /// Ballot and reveal txs each pay their minimum fee; the ballot is stored.
+    #[test]
+    fn ballot_txs_pay_min_fee() -> anyhow::Result<()> {
+        use crate::{types::BallotItem, validation::vote::min_ballot_fee};
+
+        let temp_dir = temp_dir::TempDir::with_prefix(format!(
+            "wallet-ballot-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            std::process::id()
+        ))?;
+        let wallet = Wallet::new(temp_dir.path())?;
+        wallet.set_seed(&[0x42; 64])?;
+        let coin = Output {
+            address: wallet.get_new_address()?,
+            content: OutputContent::Value(bitcoin::Amount::from_sat(100_000)),
+        };
+        let outpoint = OutPoint::Regular {
+            txid: crate::types::Txid([5; 32]),
+            vout: 0,
+        };
+        wallet.put_utxos(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::from([(outpoint, coin.clone())]),
+        )?;
+        let fee_of = |tx: &Transaction| -> anyhow::Result<bitcoin::Amount> {
+            anyhow::ensure!(tx.inputs.iter().map(|(op, _)| *op).eq([outpoint]));
+            let value_out = tx
+                .outputs
+                .iter()
+                .map(Output::get_value)
+                .sum::<bitcoin::Amount>();
+            Ok(coin.get_value() - value_out)
+        };
+        let votes = vec![BallotItem {
+            decision_id_bytes: [0, 0, 0, 1],
+            vote_value: None,
+        }];
+
+        let voter_address = wallet.voter_address()?;
+        anyhow::ensure!(matches!(
+            wallet.submit_ballot(
+                rand::rng(),
+                voter_address,
+                votes.clone(),
+                2,
+                Some(bitcoin::Amount::from_sat(1)),
+                options(false),
+            ),
+            Err(Error::BallotFeeBelowMinimum { .. })
+        ));
+        let tx = wallet.submit_ballot(
+            rand::rng(),
+            voter_address,
+            votes.clone(),
+            2,
+            None,
+            options(false),
+        )?;
+        anyhow::ensure!(fee_of(&tx)? == min_ballot_fee(&tx)?);
+        anyhow::ensure!(
+            tx.outputs
+                .iter()
+                .all(|output| output.address == voter_address)
+        );
+        let Some(TxData::SubmitBallot { commitment, .. }) = tx.data else {
+            anyhow::bail!("expected a sealed ballot, got {:?}", tx.data);
+        };
+        let ballot = wallet
+            .sealed_ballot(&commitment)?
+            .ok_or_else(|| anyhow::anyhow!("the sealed ballot is stored"))?;
+        anyhow::ensure!(ballot.votes == votes);
+
+        let reveal = wallet.reveal_ballot(ballot, None, options(false))?;
+        anyhow::ensure!(fee_of(&reveal)? == min_ballot_fee(&reveal)?);
+        Ok(())
     }
 
     #[test]

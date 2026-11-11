@@ -13,7 +13,6 @@ type NodeUpdates = PromiseStream<Pin<Box<dyn Stream<Item = ()> + Send>>>;
 
 pub(super) struct Ballot {
     rows: Vec<BallotRow>,
-    fee_sats: String,
     error: Option<String>,
     last_submit: Option<SubmitResult>,
     current_period: u32,
@@ -46,7 +45,6 @@ impl Default for Ballot {
     fn default() -> Self {
         Self {
             rows: Vec::new(),
-            fee_sats: String::from("1000"),
             error: None,
             last_submit: None,
             current_period: 0,
@@ -299,9 +297,6 @@ impl Ballot {
         if total_reputation <= 0.0 {
             return (false, Some("No voting reputation".to_string()));
         }
-        if self.fee_sats.parse::<u64>().is_err() {
-            return (false, Some("Fee must be an integer in sats".to_string()));
-        }
         let non_abstain: Vec<&BallotRow> =
             self.rows.iter().filter(|r| !r.abstain).collect();
         if non_abstain.is_empty() {
@@ -323,14 +318,6 @@ impl Ballot {
     fn submit(&mut self, app: &App) {
         self.last_submit = None;
         self.error = None;
-
-        let fee_sats = match self.fee_sats.parse::<u64>() {
-            Ok(f) => f,
-            Err(_) => {
-                self.error = Some("Invalid fee".to_string());
-                return;
-            }
-        };
 
         let mut items: Vec<BallotItem> = Vec::new();
         for row in &self.rows {
@@ -362,13 +349,7 @@ impl Ballot {
             });
         }
 
-        if items.is_empty() {
-            self.error = Some("No non-abstain votes to submit".to_string());
-            return;
-        }
-
         let vote_count = items.len();
-        let fee = bitcoin::Amount::from_sat(fee_sats);
         let period = self.current_period;
 
         let voter = match app.resolve_voter(self.voter) {
@@ -378,6 +359,11 @@ impl Ballot {
                 return;
             }
         };
+        if let Err(err) = app.node.prepare_ballot(period, voter, &items) {
+            self.error = Some(format!("Invalid ballot: {err:#}"));
+            return;
+        }
+
         let options = match app.spend_options() {
             Ok(options) => options,
             Err(err) => {
@@ -386,10 +372,14 @@ impl Ballot {
                 return;
             }
         };
-        let tx = match app
-            .wallet
-            .submit_ballot(options, voter, items, period, fee)
-        {
+        let tx = match app.wallet.submit_ballot(
+            rand::rng(),
+            voter,
+            items,
+            period,
+            None,
+            options,
+        ) {
             Ok(tx) => tx,
             Err(err) => {
                 self.error = Some(format!("Failed to build ballot: {err:#}"));
@@ -408,7 +398,6 @@ impl Ballot {
             vote_count,
         });
         self.rows.clear();
-        self.fee_sats.clear();
         self.current_period = 0;
     }
 }

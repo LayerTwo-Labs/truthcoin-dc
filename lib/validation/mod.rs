@@ -130,16 +130,11 @@ pub(crate) fn validate_market_transaction(
         )?;
         return Ok(Some(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)));
     }
-    if tx.is_submit_vote() {
-        VoteValidator::validate_vote_submission(
-            state,
-            rotxn,
-            tx,
-            override_height,
-        )?;
-    }
     if tx.is_submit_ballot() {
         VoteValidator::validate_ballot(state, rotxn, tx, override_height)?;
+    }
+    if tx.is_reveal_ballot() {
+        VoteValidator::validate_reveal(state, rotxn, tx, override_height)?;
     }
     if tx.is_transfer_reputation() {
         VoteValidator::validate_reputation_transfer(

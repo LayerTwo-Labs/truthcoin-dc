@@ -201,6 +201,7 @@ pub enum DecisionState {
     Created,
     Claimed,
     Voting,
+    Revealing,
     Resolved,
     Invalid,
 }
@@ -210,7 +211,10 @@ impl DecisionState {
         use DecisionState::*;
         matches!(
             (self, new_state),
-            (Claimed, Voting) | (Voting, Resolved) | (_, Invalid)
+            (Claimed, Voting)
+                | (Voting, Revealing)
+                | (Revealing, Resolved)
+                | (_, Invalid)
         )
     }
 
@@ -218,7 +222,23 @@ impl DecisionState {
         matches!(self, DecisionState::Voting)
     }
 
+    pub fn allows_reveal(&self) -> bool {
+        matches!(self, DecisionState::Revealing)
+    }
+
     pub fn has_consensus(&self) -> bool {
         matches!(self, DecisionState::Resolved)
+    }
+
+    /// Claimed and not yet resolved, so a later block may move it on
+    pub fn is_open(&self) -> bool {
+        match self {
+            DecisionState::Claimed
+            | DecisionState::Voting
+            | DecisionState::Revealing => true,
+            DecisionState::Created
+            | DecisionState::Resolved
+            | DecisionState::Invalid => false,
+        }
     }
 }

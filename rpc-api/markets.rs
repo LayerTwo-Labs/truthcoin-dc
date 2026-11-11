@@ -530,12 +530,6 @@ pub struct BallotItem {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct SubmitBallotRequest {
-    pub votes: Vec<BallotItem>,
-    pub fee_sats: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VoterInfo {
     pub address: String,
     pub votecoin_balance: f64,

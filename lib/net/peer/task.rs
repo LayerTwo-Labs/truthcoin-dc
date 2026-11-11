@@ -32,6 +32,17 @@ use crate::{
     util::{ErrorChain, join_set},
 };
 
+/// A transaction can be valid at a tip this node has not reached yet, such
+/// as a ballot reveal relayed before the block that opens its reveal window,
+/// so only a bad signature ends the connection.
+fn rejected_tx_is_misbehavior(err: &crate::state::Error) -> bool {
+    matches!(
+        err,
+        crate::state::Error::Authorization(_)
+            | crate::state::Error::WrongPubKeyForAddress
+    )
+}
+
 /// Maximum number of peer states retained per connection.
 /// Peer states are retained so that follow-up internal messages can be
 /// associated with the peer state that prompted them. A peer chooses the
@@ -741,7 +752,11 @@ impl ConnectionTask {
                     ResponseMessage::TransactionRejected(txid),
                 )
                 .await?;
-                Err(Error::from(err))
+                if rejected_tx_is_misbehavior(&err) {
+                    Err(Error::from(err))
+                } else {
+                    Ok(())
+                }
             }
             Ok(_) => {
                 Connection::send_response(
@@ -1037,7 +1052,7 @@ impl ConnectionTask {
 mod tests {
     use hashlink::LinkedHashMap;
 
-    use super::{ConnectionTask, MAX_PEER_STATES};
+    use super::{ConnectionTask, MAX_PEER_STATES, rejected_tx_is_misbehavior};
     use crate::{
         net::peer::{PeerState, PeerStateId},
         types::Version,
@@ -1151,5 +1166,19 @@ mod tests {
             )?;
         }
         Ok(())
+    }
+
+    /// Only a bad signature ends the connection; other rejected txs do not.
+    #[test]
+    fn bad_signature_is_misbehavior() {
+        use crate::state::Error;
+
+        assert!(rejected_tx_is_misbehavior(&Error::Authorization(
+            crate::types::authorization::Error::NotEnoughAuthorizations
+        )));
+        assert!(rejected_tx_is_misbehavior(&Error::WrongPubKeyForAddress));
+        assert!(!rejected_tx_is_misbehavior(&Error::InvalidTransaction {
+            reason: "Voting period 4 is not revealing".to_owned(),
+        }));
     }
 }

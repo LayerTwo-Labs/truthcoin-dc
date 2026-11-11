@@ -29,6 +29,8 @@ pub struct Dbs {
         SerdeBincode<DecisionId>,
         SerdeBincode<DecisionStateHistory>,
     >,
+    /// Decisions in an open state, the only ones a block can move on
+    open_decisions: DatabaseUnique<SerdeBincode<DecisionId>, SerdeBincode<()>>,
     period_pricing:
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<PeriodPricing>>,
     period_pricing_undo: DatabaseUnique<
@@ -39,7 +41,7 @@ pub struct Dbs {
 }
 
 impl Dbs {
-    pub const NUM_DBS: u32 = 4;
+    pub const NUM_DBS: u32 = 5;
 
     /// Derive claimed decision IDs from period_decisions (a decision is claimed if decision.is_some())
     fn get_claimed_decision_ids_for_period(
@@ -80,6 +82,11 @@ impl Dbs {
                 env,
                 rwtxn,
                 "decision_state_histories",
+            )?,
+            open_decisions: DatabaseUnique::create(
+                env,
+                rwtxn,
+                "open_decisions",
             )?,
             period_pricing: DatabaseUnique::create(
                 env,
@@ -511,15 +518,42 @@ impl Dbs {
         current_period: u32,
     ) -> Result<Vec<DecisionId>, Error> {
         let mut result = Vec::new();
-        let mut iter = self.decision_state_histories.iter(rotxn)?;
-        while let Some((decision_id, history)) = iter.next()? {
-            if history.current_state() == from_state
+        for (decision_id, state) in self.open_decision_states(rotxn)? {
+            if state == from_state
                 && current_period > threshold_period(&decision_id)
             {
                 result.push(decision_id);
             }
         }
         Ok(result)
+    }
+
+    fn open_decision_states(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<Vec<(DecisionId, DecisionState)>, Error> {
+        let mut result = Vec::new();
+        let mut iter = self.open_decisions.iter(rotxn)?;
+        while let Some((decision_id, ())) = iter.next()? {
+            result.push((
+                decision_id,
+                self.get_decision_current_state(rotxn, decision_id)?,
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Voting periods with decisions that are voting or revealing
+    pub fn get_open_voting_periods(
+        &self,
+        rotxn: &RoTxn,
+    ) -> Result<BTreeSet<u32>, Error> {
+        Ok(self
+            .open_decision_states(rotxn)?
+            .into_iter()
+            .filter(|(_, state)| state.allows_voting() || state.allows_reveal())
+            .map(|(decision_id, _)| decision_id.voting_period())
+            .collect())
     }
 
     pub fn get_claimed_decisions_needing_voting(
@@ -535,7 +569,7 @@ impl Dbs {
         )
     }
 
-    pub fn get_voting_decisions_needing_resolution(
+    pub fn get_voting_decisions_needing_reveal(
         &self,
         rotxn: &RoTxn,
         current_period: u32,
@@ -546,6 +580,30 @@ impl Dbs {
             |id| id.voting_period(),
             current_period,
         )
+    }
+
+    pub fn get_revealing_decisions_needing_resolution(
+        &self,
+        rotxn: &RoTxn,
+        current_ts: u64,
+        current_height: Option<u32>,
+        genesis_ts: u64,
+    ) -> Result<Vec<DecisionId>, Error> {
+        let mut result = Vec::new();
+        for (decision_id, state) in self.open_decision_states(rotxn)? {
+            if state == DecisionState::Revealing
+                && crate::state::voting::period_calculator::reveal_window_closed(
+                    decision_id.voting_period(),
+                    current_ts,
+                    current_height,
+                    genesis_ts,
+                    &self.config,
+                )
+            {
+                result.push(decision_id);
+            }
+        }
+        Ok(result)
     }
 
     pub fn get_settled_decisions(
@@ -595,6 +653,16 @@ impl Dbs {
             return Err(Error::DecisionNotAvailable {
                 decision_id,
                 reason: format!("Decision period {period_index} is settled"),
+            });
+        }
+
+        if period_index < current_period {
+            return Err(Error::DecisionNotAvailable {
+                decision_id,
+                reason: format!(
+                    "Voting for period {} has started",
+                    decision_id.voting_period()
+                ),
             });
         }
 
@@ -696,6 +764,7 @@ impl Dbs {
             &decision_id,
             &decision_history,
         )?;
+        self.open_decisions.put(rwtxn, &decision_id, &())?;
 
         if decision_id.is_standard() {
             let mut pricing = self
@@ -948,6 +1017,8 @@ impl Dbs {
         rwtxn: &mut RwTxn<'_>,
         decision_id: DecisionId,
     ) -> Result<(), Error> {
+        self.open_decisions.delete(rwtxn, &decision_id)?;
+
         let period_index = decision_id.period_index();
 
         let mut period_decisions = self
@@ -1017,6 +1088,26 @@ impl Dbs {
         Ok(())
     }
 
+    pub fn transition_decision_to_revealing(
+        &self,
+        rwtxn: &mut RwTxn,
+        decision_id: DecisionId,
+        block_height: u32,
+    ) -> Result<(), Error> {
+        let mut history = self
+            .get_decision_state_history(rwtxn, decision_id)?
+            .ok_or(Error::InvalidDecisionId {
+                reason: format!(
+                    "Decision {decision_id:?} has no state history"
+                ),
+            })?;
+
+        history.transition_to_revealing(block_height)?;
+        self.decision_state_histories
+            .put(rwtxn, &decision_id, &history)?;
+        Ok(())
+    }
+
     pub fn transition_decision_to_resolved(
         &self,
         rwtxn: &mut RwTxn,
@@ -1035,6 +1126,7 @@ impl Dbs {
         history.transition_to_resolved(consensus_outcome, block_height)?;
         self.decision_state_histories
             .put(rwtxn, &decision_id, &history)?;
+        self.open_decisions.delete(rwtxn, &decision_id)?;
         Ok(())
     }
 
@@ -1063,6 +1155,11 @@ impl Dbs {
         }
 
         for (decision_id, history) in decisions_to_update {
+            if history.current_state().is_open() {
+                self.open_decisions.put(rwtxn, &decision_id, &())?;
+            } else {
+                self.open_decisions.delete(rwtxn, &decision_id)?;
+            }
             self.decision_state_histories
                 .put(rwtxn, &decision_id, &history)?;
         }

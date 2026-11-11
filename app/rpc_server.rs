@@ -44,8 +44,7 @@ use truthcoin_dc_app_rpc_api::{
         MarketAmplifyBetaRequest, MarketBuyRequest, MarketBuyResponse,
         MarketDimension, MarketDimensionKind, MarketOutcome, MarketSellRequest,
         MarketSellResponse, MarketStatus, ParticipationStats, PeriodStats,
-        SubmitBallotRequest, VoteFilter, VoteInfo, VoterInfo, VoterInfoFull,
-        VotingPeriodFull,
+        VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
     },
     node::TxInfo,
     typewit::const_marker::Bool,
@@ -1341,9 +1340,6 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
 
         let mut results = Vec::new();
 
-        let current_period =
-            self.node().get_current_period().map_err(custom_err)?;
-
         let periods_to_check: Vec<u32> = if let Some(ref f) = filter {
             if let Some(p) = f.period {
                 vec![p]
@@ -1391,17 +1387,10 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                 .get_claimed_decisions_in_period(period_id)
                 .map_err(custom_err)?;
             for entry in claimed {
-                let voting_period = entry.decision_id.voting_period();
-                let state = if voting_period < current_period.saturating_sub(1)
-                {
-                    DecisionState::Resolved
-                } else if voting_period == current_period
-                    || voting_period == current_period.saturating_sub(1)
-                {
-                    DecisionState::Voting
-                } else {
-                    DecisionState::Claimed
-                };
+                let state = self
+                    .node()
+                    .get_decision_state(entry.decision_id)
+                    .map_err(custom_err)?;
 
                 if let Some(ref f) = filter
                     && let Some(ref status) = f.status
@@ -3147,21 +3136,19 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
     async fn vote_submit(
         &self,
         votes: Vec<truthcoin_dc_app_rpc_api::markets::BallotItem>,
-        fee_sats: u64,
+        fee_sats: Option<u64>,
         voter: Option<Address>,
     ) -> RpcResult<String> {
         use truthcoin_dc::types::BallotItem;
 
-        let request = SubmitBallotRequest { votes, fee_sats };
-
-        if request.votes.is_empty() {
+        if votes.is_empty() {
             return Err(custom_err_msg("Ballot cannot be empty"));
         }
 
         let mut batch_items = Vec::new();
         let mut period_id: Option<u32> = None;
 
-        for vote in request.votes {
+        for vote in votes {
             let decision_id = DecisionValidator::parse_decision_id_from_hex(
                 &vote.decision_id,
             )
@@ -3213,12 +3200,14 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         }
 
         let period_id = period_id.unwrap();
-        let fee = bitcoin::Amount::from_sat(request.fee_sats);
+
         let voter = self.app.resolve_voter(voter).map_err(custom_err)?;
+        self.node()
+            .prepare_ballot(period_id, voter, &batch_items)
+            .map_err(custom_err)?;
 
         tracing::info!(
-            "vote_submit: Voter attempting to submit {} \
-             votes for period {}",
+            "vote_submit: Voter sealing a ballot of {} votes for period {}",
             batch_items.len(),
             period_id
         );
@@ -3227,11 +3216,12 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .app
             .wallet
             .submit_ballot(
-                self.app.spend_options().map_err(custom_err)?,
+                rand::rng(),
                 voter,
                 batch_items,
                 period_id,
-                fee,
+                fee_sats.map(bitcoin::Amount::from_sat),
+                self.app.spend_options().map_err(custom_err)?,
             )
             .map_err(custom_err)?;
 
@@ -3240,6 +3230,47 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         self.app.sign_and_send(tx).map_err(custom_err)?;
 
         Ok(format!("{txid}"))
+    }
+
+    async fn vote_reveal(
+        &self,
+        voting_period: u32,
+        fee_sats: Option<u64>,
+        voter: Option<Address>,
+    ) -> RpcResult<String> {
+        let voter = self.app.resolve_voter(voter).map_err(custom_err)?;
+        let sealed_ballot = self
+            .node()
+            .get_sealed_ballot(voting_period, voter)
+            .map_err(custom_err)?
+            .ok_or_else(|| {
+                custom_err_msg(format!(
+                    "No sealed ballot for period {voting_period}"
+                ))
+            })?;
+        let ballot = self
+            .app
+            .wallet
+            .sealed_ballot(&sealed_ballot.commitment)
+            .map_err(custom_err)?
+            .ok_or_else(|| {
+                custom_err_msg(format!(
+                    "This wallet does not hold the sealed ballot for period \
+                     {voting_period}"
+                ))
+            })?;
+        let tx = self
+            .app
+            .wallet
+            .reveal_ballot(
+                ballot,
+                fee_sats.map(bitcoin::Amount::from_sat),
+                self.app.spend_options().map_err(custom_err)?,
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid.to_string())
     }
 
     async fn create_trade(

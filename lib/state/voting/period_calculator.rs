@@ -59,6 +59,27 @@ pub fn calculate_period_boundaries(
     }
 }
 
+/// Whether the reveal window following `voting_period` has elapsed, using the
+/// same clock as [`get_current_period`].
+pub fn reveal_window_closed(
+    voting_period: u32,
+    timestamp: u64,
+    block_height: Option<u32>,
+    genesis_ts: u64,
+    config: &DecisionConfig,
+) -> bool {
+    let (_, end) =
+        calculate_period_boundaries(voting_period, config, genesis_ts);
+    let now = if config.is_blocks {
+        u64::from(block_height.unwrap_or(0))
+    } else if genesis_ts == 0 {
+        return false;
+    } else {
+        timestamp
+    };
+    now >= end + u64::from(config.reveal_window())
+}
+
 /// Display only: determines period status from boundary timestamps.
 /// Used by RPC period queries and GUI. Not used by the block transition path.
 pub fn calculate_period_status(
@@ -91,17 +112,11 @@ pub fn get_decision_ids_for_period(
         });
     }
 
-    let claim_period = voting_period - 1;
-    let all_decisions = decisions_db.get_all_claimed_decisions(rotxn)?;
-
-    let mut decision_ids = Vec::new();
-    for entry in all_decisions {
-        if entry.decision_id.period_index() == claim_period {
-            decision_ids.push(entry.decision_id);
-        }
-    }
-
-    Ok(decision_ids)
+    Ok(decisions_db
+        .get_claimed_decisions_in_period(rotxn, voting_period - 1)?
+        .into_iter()
+        .map(|entry| entry.decision_id)
+        .collect())
 }
 
 /// Vote validation / RPC / statistics: constructs a full VotingPeriod struct.
@@ -545,9 +560,47 @@ mod tests {
             assert!(cp <= 2, "should NOT resolve at block {h}");
         }
 
-        // Resolve at block 20 (current_period=3, 3 > 2 is true)
+        // Reveal at block 20 (current_period=3, 3 > 2 is true)
         let cp = get_current_period(0, Some(20), 0, &config).unwrap();
         assert_eq!(cp, 3);
-        assert!(cp > 2, "should resolve at block 20");
+        assert!(cp > 2, "should reveal at block 20");
+        assert!(!reveal_window_closed(2, 0, Some(20), 0, &config));
+
+        // Resolve at block 21, one block after the period ends
+        assert!(reveal_window_closed(2, 0, Some(21), 0, &config));
+    }
+
+    /// In time mode the reveal window closes one week after the period ends
+    #[test]
+    fn reveal_window_one_week() {
+        let config = DecisionConfig::default();
+        let genesis_ts = 1_000;
+        let (_, end) = calculate_period_boundaries(2, &config, genesis_ts);
+        let week = 7 * 24 * 3600;
+
+        assert!(!reveal_window_closed(2, end, None, genesis_ts, &config));
+        assert!(!reveal_window_closed(
+            2,
+            end + week - 1,
+            None,
+            genesis_ts,
+            &config
+        ));
+        assert!(reveal_window_closed(
+            2,
+            end + week,
+            None,
+            genesis_ts,
+            &config
+        ));
+        assert!(!reveal_window_closed(2, end + week, None, 0, &config));
+    }
+
+    #[test]
+    fn catch_up_closes_reveal() {
+        let config = DecisionConfig::testing(TEN);
+        let cp = get_current_period(0, Some(40), 0, &config).unwrap();
+        assert!(cp > 2);
+        assert!(reveal_window_closed(2, 0, Some(40), 0, &config));
     }
 }

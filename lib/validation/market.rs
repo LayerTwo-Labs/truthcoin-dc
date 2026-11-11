@@ -326,6 +326,21 @@ impl MarketValidator {
             });
         }
 
+        for decision_id in &market.decision_ids {
+            if state
+                .decisions()
+                .get_decision_current_state(rotxn, *decision_id)?
+                .allows_reveal()
+            {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Trading halted: decision {} is revealing votes",
+                        decision_id.to_hex()
+                    ),
+                });
+            }
+        }
+
         let tip = state.try_get_tip(rotxn)?.ok_or_else(|| {
             Error::InvalidTransaction {
                 reason: "No chain tip when validating trade".to_string(),

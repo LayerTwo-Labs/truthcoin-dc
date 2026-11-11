@@ -135,19 +135,20 @@ pub enum TransactionData {
         tx_pow_nonce: Option<u64>,
         prev_block_hash: hashes::BlockHash,
     },
-    /// Submit a vote for a decision
-    SubmitVote {
-        voter: Address,
-        decision_id_bytes: [u8; 4],
-        #[borsh(serialize_with = "crate::util::borsh::serialize::f64")]
-        vote_value: f64,
-        voting_period: u32,
-    },
-    /// Submit multiple votes efficiently
+    /// Seal a voter's one ballot for a voting period
     SubmitBallot {
         voter: Address,
-        votes: Vec<BallotItem>,
         voting_period: u32,
+        #[schema(value_type = Vec<u8>)]
+        commitment: Hash,
+    },
+    /// Open a sealed ballot after its voting period closes
+    RevealBallot {
+        voter: Address,
+        voting_period: u32,
+        votes: Vec<BallotItem>,
+        #[schema(value_type = Vec<u8>)]
+        salt: [u8; 32],
     },
     TransferReputation {
         sender: Address,
@@ -179,12 +180,12 @@ impl TxData {
         matches!(self, Self::Trade { .. })
     }
 
-    pub fn is_submit_vote(&self) -> bool {
-        matches!(self, Self::SubmitVote { .. })
-    }
-
     pub fn is_submit_ballot(&self) -> bool {
         matches!(self, Self::SubmitBallot { .. })
+    }
+
+    pub fn is_reveal_ballot(&self) -> bool {
+        matches!(self, Self::RevealBallot { .. })
     }
 
     pub fn is_transfer_reputation(&self) -> bool {
@@ -242,21 +243,41 @@ impl Trade {
     }
 }
 
-/// Struct describing a vote submission
+/// Struct describing a sealed ballot submission
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SubmitVote {
-    pub voter: Address,
-    pub decision_id_bytes: [u8; 4],
-    pub vote_value: f64,
-    pub voting_period: u32,
-}
-
-/// Struct describing a ballot submission
-#[derive(Clone, Debug, PartialEq)]
 pub struct SubmitBallot {
     pub voter: Address,
-    pub votes: Vec<BallotItem>,
     pub voting_period: u32,
+    pub commitment: Hash,
+}
+
+/// Struct describing a sealed ballot reveal
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RevealBallot {
+    pub voter: Address,
+    pub voting_period: u32,
+    pub votes: Vec<BallotItem>,
+    pub salt: [u8; 32],
+}
+
+impl RevealBallot {
+    pub fn commitment(&self) -> Hash {
+        ballot_commitment(
+            self.voter,
+            self.voting_period,
+            &self.votes,
+            &self.salt,
+        )
+    }
+}
+
+pub fn ballot_commitment(
+    voter: Address,
+    voting_period: u32,
+    votes: &[BallotItem],
+    salt: &[u8; 32],
+) -> Hash {
+    hashes::hash(&(voter, voting_period, votes, salt))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -428,12 +449,12 @@ impl FilledTransaction {
         self.data().as_ref().is_some_and(TxData::is_trade)
     }
 
-    pub fn is_submit_vote(&self) -> bool {
-        self.data().as_ref().is_some_and(TxData::is_submit_vote)
-    }
-
     pub fn is_submit_ballot(&self) -> bool {
         self.data().as_ref().is_some_and(TxData::is_submit_ballot)
+    }
+
+    pub fn is_reveal_ballot(&self) -> bool {
+        self.data().as_ref().is_some_and(TxData::is_reveal_ballot)
     }
 
     pub fn is_transfer_reputation(&self) -> bool {
@@ -503,34 +524,33 @@ impl FilledTransaction {
         }
     }
 
-    /// If the tx is a vote submission, returns the corresponding [`SubmitVote`].
-    pub fn submit_vote(&self) -> Option<SubmitVote> {
+    pub fn submit_ballot(&self) -> Option<SubmitBallot> {
         match &self.transaction.data {
-            Some(TransactionData::SubmitVote {
+            Some(TransactionData::SubmitBallot {
                 voter,
-                decision_id_bytes,
-                vote_value,
                 voting_period,
-            }) => Some(SubmitVote {
+                commitment,
+            }) => Some(SubmitBallot {
                 voter: *voter,
-                decision_id_bytes: *decision_id_bytes,
-                vote_value: *vote_value,
                 voting_period: *voting_period,
+                commitment: *commitment,
             }),
             _ => None,
         }
     }
 
-    pub fn submit_ballot(&self) -> Option<SubmitBallot> {
+    pub fn reveal_ballot(&self) -> Option<RevealBallot> {
         match &self.transaction.data {
-            Some(TransactionData::SubmitBallot {
+            Some(TransactionData::RevealBallot {
                 voter,
-                votes,
                 voting_period,
-            }) => Some(SubmitBallot {
+                votes,
+                salt,
+            }) => Some(RevealBallot {
                 voter: *voter,
-                votes: votes.clone(),
                 voting_period: *voting_period,
+                votes: votes.clone(),
+                salt: *salt,
             }),
             _ => None,
         }
@@ -634,33 +654,19 @@ mod test {
                 borsh::to_vec(&([1u8; 4], Some(value))).unwrap(),
             );
         }
-        for data in [
-            TxData::SubmitBallot {
+        let transaction = Transaction {
+            data: Some(TxData::RevealBallot {
                 voter: Address::ALL_ZEROS,
+                voting_period: 2,
                 votes: vec![BallotItem {
                     decision_id_bytes: [1; 4],
                     vote_value: Some(f64::NAN),
                 }],
-                voting_period: 2,
-            },
-            TxData::SubmitVote {
-                voter: Address::ALL_ZEROS,
-                decision_id_bytes: [1; 4],
-                vote_value: f64::NAN,
-                voting_period: 2,
-            },
-            TxData::TransferReputation {
-                sender: Address::ALL_ZEROS,
-                dest: Address::ALL_ZEROS,
-                amount: f64::NAN,
-            },
-        ] {
-            let transaction = Transaction {
-                data: Some(data),
-                ..Default::default()
-            };
-            let _ = transaction.txid();
-        }
+                salt: [0; 32],
+            }),
+            ..Default::default()
+        };
+        let _ = transaction.txid();
     }
 
     // a withdrawal output must be funded for both its payout and its mainchain

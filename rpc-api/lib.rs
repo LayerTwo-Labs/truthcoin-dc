@@ -1000,14 +1000,27 @@ pub mod wallet {
             request: MarketAmplifyBetaRequest,
         ) -> RpcResult<String>;
 
-        /// Submit one or more votes (batch). The voter is `voter`, or else the
-        /// one wallet address that holds votecoin.
+        /// Seal the voter's one ballot for a period, voting on every
+        /// decision in it. The fee defaults to the minimum for its size.
+        /// The voter is `voter`, or else the one wallet address that holds
+        /// votecoin.
         #[open_api_method(output_schema(ToSchema = "String"))]
         #[method(name = "vote_submit")]
         async fn vote_submit(
             &self,
             votes: Vec<BallotItem>,
-            fee_sats: u64,
+            fee_sats: Option<u64>,
+            voter: Option<Address>,
+        ) -> RpcResult<String>;
+
+        /// Reveal the voter's sealed ballot for a period once its voting
+        /// closes. The fee defaults to the minimum for its size.
+        #[open_api_method(output_schema(ToSchema = "String"))]
+        #[method(name = "vote_reveal")]
+        async fn vote_reveal(
+            &self,
+            voting_period: u32,
+            fee_sats: Option<u64>,
             voter: Option<Address>,
         ) -> RpcResult<String>;
 

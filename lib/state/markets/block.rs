@@ -812,12 +812,11 @@ pub(in crate::state) fn connect_begin(
             genesis_ts,
             state.decisions().get_config(),
         )?;
-    // Transition Claimed → Voting (all transitions before any resolution)
-    let claimed_needing_voting = state
+    let voting_needing_reveal = state
         .decisions()
-        .get_claimed_decisions_needing_voting(rwtxn, current_period)?;
-    for decision_id in claimed_needing_voting {
-        state.decisions().transition_decision_to_voting(
+        .get_voting_decisions_needing_reveal(rwtxn, current_period)?;
+    for decision_id in voting_needing_reveal {
+        state.decisions().transition_decision_to_revealing(
             rwtxn,
             decision_id,
             height,
@@ -880,17 +879,11 @@ pub(in crate::state) fn connect_txs(
             Some(TxData::ClaimDecision(_)) => {
                 apply_decision_claim(state, rwtxn, filled_tx, height)?;
             }
-            Some(TxData::SubmitVote { .. }) => {
-                apply_submit_vote(
-                    state,
-                    rwtxn,
-                    filled_tx,
-                    &mut state_update,
-                    height,
-                )?;
-            }
             Some(TxData::SubmitBallot { .. }) => {
-                apply_submit_ballot(
+                apply_submit_ballot(state, rwtxn, filled_tx)?;
+            }
+            Some(TxData::RevealBallot { .. }) => {
+                apply_reveal_ballot(
                     state,
                     rwtxn,
                     filled_tx,
@@ -983,12 +976,29 @@ pub(in crate::state) fn connect_end(
             genesis_ts,
         )?;
     }
-    // Resolve Voting → Resolved (grouped by period, ascending order).
-    // Runs after transaction application so votes submitted in this block
+    // Transition Claimed → Voting after transaction application, so a claim
+    // in the block that opens a period votes alongside the rest of it.
+    let claimed_needing_voting = state
+        .decisions()
+        .get_claimed_decisions_needing_voting(rwtxn, current_period)?;
+    for decision_id in claimed_needing_voting {
+        state.decisions().transition_decision_to_voting(
+            rwtxn,
+            decision_id,
+            height,
+        )?;
+    }
+    // Resolve Revealing → Resolved (grouped by period, ascending order).
+    // Runs after transaction application so reveals in this block
     // count toward the closing period's consensus.
     let voting_ready = state
         .decisions()
-        .get_voting_decisions_needing_resolution(rwtxn, current_period)?;
+        .get_revealing_decisions_needing_resolution(
+            rwtxn,
+            mainchain_timestamp,
+            Some(height),
+            genesis_ts,
+        )?;
     let mut periods_to_resolve: BTreeMap<
         u32,
         Vec<crate::state::decisions::DecisionId>,
@@ -1169,11 +1179,11 @@ pub(in crate::state) fn disconnect_tx(
             )?;
             trade_share_deltas.push(delta);
         }
-        TxData::SubmitVote { .. } => {
-            let () = revert_submit_vote(state, rwtxn, &filled_tx)?;
-        }
         TxData::SubmitBallot { .. } => {
             let () = revert_submit_ballot(state, rwtxn, &filled_tx)?;
+        }
+        TxData::RevealBallot { .. } => {
+            let () = revert_reveal_ballot(state, rwtxn, &filled_tx)?;
         }
         TxData::TransferReputation { .. } => {}
         TxData::AmplifyBeta { .. } => {
@@ -2275,110 +2285,64 @@ fn revert_amplify_beta(
     Ok(())
 }
 
-fn apply_submit_vote(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-    state_update: &mut StateUpdate,
-    height: u32,
-) -> Result<(), Error> {
-    use crate::state::{
-        decisions::DecisionId,
-        voting::types::{Vote, VotingPeriodId},
-    };
-
-    let vote_data =
-        filled_tx
-            .submit_vote()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a vote submission transaction".to_string(),
-            })?;
-
-    let voter_address = vote_data.voter;
-
-    let decision_id = DecisionId::from_bytes(vote_data.decision_id_bytes)?;
-
-    let decision_claim_period = decision_id.period_index();
-    let voting_period = decision_id.voting_period();
-    let period_id = VotingPeriodId::new(voting_period);
-
-    if vote_data.voting_period != voting_period {
-        return Err(Error::InvalidTransaction {
-            reason: format!(
-                "Vote period mismatch: decision {} was claimed in period {} and must be voted on in period {}, but transaction specifies period {}",
-                const_hex::encode(vote_data.decision_id_bytes),
-                decision_claim_period,
-                voting_period,
-                vote_data.voting_period
-            ),
-        });
-    }
-
-    let timestamp =
-        state.try_get_mainchain_timestamp(rwtxn)?.ok_or_else(|| {
-            Error::InvalidTransaction {
-                reason: "No mainchain timestamp available".to_string(),
-            }
-        })?;
-
-    let decision_ref = state
-        .decisions()
-        .get_decision_entry(rwtxn, decision_id)?
-        .and_then(|e| e.decision);
-
-    let vote_value =
-        crate::validation::VoteValidator::convert_vote_value_with_decision(
-            Some(vote_data.vote_value),
-            decision_ref.as_ref(),
-        );
-
-    let vote = Vote::new(
-        voter_address,
-        period_id,
-        decision_id,
-        vote_value,
-        timestamp,
-        height,
-        filled_tx.txid().0,
-    );
-
-    state_update.add_vote_submission(vote);
-
-    Ok(())
-}
-
-fn revert_submit_vote(
-    state: &State,
-    rwtxn: &mut RwTxn,
-    filled_tx: &FilledTransaction,
-) -> Result<(), Error> {
-    use crate::state::{decisions::DecisionId, voting::types::VotingPeriodId};
-
-    let vote_data =
-        filled_tx
-            .submit_vote()
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a vote submission transaction".to_string(),
-            })?;
-
-    let voter_address = vote_data.voter;
-
-    let decision_id = DecisionId::from_bytes(vote_data.decision_id_bytes)?;
-
-    let voting_period = decision_id.voting_period();
-    let period_id = VotingPeriodId::new(voting_period);
-
-    state.voting().databases().delete_vote(
-        rwtxn,
-        period_id,
-        voter_address,
-        decision_id,
-    )?;
-
-    Ok(())
-}
-
 fn apply_submit_ballot(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    filled_tx: &FilledTransaction,
+) -> Result<(), Error> {
+    let ballot =
+        filled_tx
+            .submit_ballot()
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: "Not a ballot submission transaction".to_string(),
+            })?;
+    state.voting().databases().put_sealed_ballot(
+        rwtxn,
+        crate::state::voting::types::VotingPeriodId::new(ballot.voting_period),
+        ballot.voter,
+        &crate::state::voting::types::SealedBallot {
+            commitment: ballot.commitment,
+            revealed: false,
+        },
+    )
+}
+
+fn revert_submit_ballot(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    filled_tx: &FilledTransaction,
+) -> Result<(), Error> {
+    let ballot =
+        filled_tx
+            .submit_ballot()
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: "Not a ballot submission transaction".to_string(),
+            })?;
+    state.voting().databases().delete_sealed_ballot(
+        rwtxn,
+        crate::state::voting::types::VotingPeriodId::new(ballot.voting_period),
+        ballot.voter,
+    )
+}
+
+fn set_ballot_revealed(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    ballot: &crate::types::RevealBallot,
+    revealed: bool,
+) -> Result<(), Error> {
+    state.voting().databases().put_sealed_ballot(
+        rwtxn,
+        crate::state::voting::types::VotingPeriodId::new(ballot.voting_period),
+        ballot.voter,
+        &crate::state::voting::types::SealedBallot {
+            commitment: ballot.commitment(),
+            revealed,
+        },
+    )
+}
+
+fn apply_reveal_ballot(
     state: &State,
     rwtxn: &mut RwTxn,
     filled_tx: &FilledTransaction,
@@ -2392,9 +2356,9 @@ fn apply_submit_ballot(
 
     let ballot_data =
         filled_tx
-            .submit_ballot()
+            .reveal_ballot()
             .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a ballot submission transaction".to_string(),
+                reason: "Not a ballot reveal transaction".to_string(),
             })?;
 
     let voter_address = ballot_data.voter;
@@ -2463,10 +2427,10 @@ fn apply_submit_ballot(
         state_update.add_vote_submission(vote);
     }
 
-    Ok(())
+    set_ballot_revealed(state, rwtxn, &ballot_data, true)
 }
 
-fn revert_submit_ballot(
+fn revert_reveal_ballot(
     state: &State,
     rwtxn: &mut RwTxn,
     filled_tx: &FilledTransaction,
@@ -2475,9 +2439,9 @@ fn revert_submit_ballot(
 
     let ballot_data =
         filled_tx
-            .submit_ballot()
+            .reveal_ballot()
             .ok_or_else(|| Error::InvalidTransaction {
-                reason: "Not a ballot submission transaction".to_string(),
+                reason: "Not a ballot reveal transaction".to_string(),
             })?;
 
     let voter_address = ballot_data.voter;
@@ -2496,7 +2460,7 @@ fn revert_submit_ballot(
         )?;
     }
 
-    Ok(())
+    set_ballot_revealed(state, rwtxn, &ballot_data, false)
 }
 
 fn apply_transfer_reputation(
@@ -2847,6 +2811,75 @@ mod tests {
                 .apply(&state, &archive, &rotxn, &trade)
                 .is_err()
         );
+        Ok(())
+    }
+
+    /// Trading halts while votes are being revealed.
+    #[test]
+    fn trade_halts_on_reveal() -> anyhow::Result<()> {
+        use crate::state::decisions::{Decision, DecisionType};
+        use crate::types::Txid;
+
+        let TradingFixture {
+            env,
+            state,
+            archive,
+            market,
+            tip,
+            ..
+        } = trading_fixture();
+        let decision_id = market.decision_ids[0];
+        let trade = filled_tx(
+            TxData::Trade {
+                market_id: market.id,
+                outcome_index: 1,
+                shares: 1,
+                trader: Address::ALL_ZEROS,
+                limit_sats: 1_000,
+                tx_pow_nonce: None,
+                prev_block_hash: tip,
+            },
+            1_000,
+        );
+        let validate = || -> anyhow::Result<_> {
+            let rotxn = env.read_txn()?;
+            Ok(crate::validation::MarketValidator::validate_trade(
+                &state, &archive, &rotxn, &trade, None,
+            ))
+        };
+        let mut rwtxn = env.write_txn()?;
+        state.decisions().mint_genesis(&mut rwtxn, 0, 0, 0)?;
+        state.decisions().claim_decision(
+            &mut rwtxn,
+            decision_id,
+            Decision::new(
+                [0; 20],
+                DecisionType::Binary,
+                String::new(),
+                String::new(),
+                None,
+                None,
+                vec![],
+            )?,
+            Txid([0; 32]),
+            None,
+        )?;
+        state.decisions().transition_decision_to_voting(
+            &mut rwtxn,
+            decision_id,
+            1,
+        )?;
+        rwtxn.commit()?;
+        validate()??;
+
+        let mut rwtxn = env.write_txn()?;
+        state.decisions().transition_decision_to_revealing(
+            &mut rwtxn,
+            decision_id,
+            2,
+        )?;
+        rwtxn.commit()?;
+        assert!(validate()?.is_err());
         Ok(())
     }
 
@@ -3356,6 +3389,11 @@ mod tests {
                 &mut rwtxn,
                 decision_id,
                 1,
+            )?;
+            decisions.transition_decision_to_revealing(
+                &mut rwtxn,
+                decision_id,
+                2,
             )?;
             decisions.transition_decision_to_resolved(
                 &mut rwtxn,

@@ -750,15 +750,27 @@ where
     ) -> Result<(Vec<Authorized<FilledTransaction>>, bitcoin::Amount), Error>
     {
         let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
-        // Take non-trade txs first, a parent before its child, then trade txs
-        // in insertion order
-        let transactions = self.mempool.topological(&rwtxn, Some(number))?;
+        // Take ballot reveals first, then non-trade txs, a parent before its
+        // child, then trade txs in insertion order. Order the whole mempool,
+        // so a reveal is never cut before it moves to the front.
+        let transactions = self.mempool.topological(&rwtxn, None)?;
+        let (reveals, transactions): (Vec<_>, Vec<_>) =
+            transactions.into_iter().partition(|tx| {
+                tx.transaction
+                    .data
+                    .as_ref()
+                    .is_some_and(crate::types::TxData::is_reveal_ballot)
+            });
         let trade_txs = self.mempool.take_trades_ordered(&rwtxn)?;
         let trade_txids: HashSet<_> =
             trade_txs.iter().map(|tx| tx.transaction.txid()).collect();
-        let transactions: Vec<_> = transactions
+        let transactions: Vec<_> = reveals
             .into_iter()
-            .filter(|tx| !trade_txids.contains(&tx.transaction.txid()))
+            .chain(
+                transactions
+                    .into_iter()
+                    .filter(|tx| !trade_txids.contains(&tx.transaction.txid())),
+            )
             .chain(trade_txs)
             .take(number)
             .collect();
@@ -782,6 +794,8 @@ where
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
         let mut selected_votes = HashSet::new();
+        let mut sealing_voters = HashSet::new();
+        let mut transfer_parties = HashSet::new();
         let mut trades = TradeSimulation::default();
         let mut reputation = HashMap::new();
         // Outputs the transactions already taken for this block make.
@@ -807,8 +821,31 @@ where
             if body_size + transaction_size > size_limit {
                 continue;
             }
-            if crate::validation::vote::vote_keys(&transaction.transaction)
-                .any(|key| selected_votes.contains(&key))
+            let ballot_key =
+                crate::validation::vote::ballot_key(&transaction.transaction);
+            if ballot_key.is_some_and(|key| selected_votes.contains(&key)) {
+                continue;
+            }
+            let sealing_voter = match ballot_key {
+                Some((_, voter, false)) => Some(voter),
+                Some((_, _, true)) | None => None,
+            };
+            let transfer =
+                if let Some(crate::types::TxData::TransferReputation {
+                    sender,
+                    dest,
+                    ..
+                }) = &transaction.transaction.data
+                {
+                    Some([*sender, *dest])
+                } else {
+                    None
+                };
+            if sealing_voter
+                .is_some_and(|voter| transfer_parties.contains(&voter))
+                || transfer.is_some_and(|parties| {
+                    parties.iter().any(|party| sealing_voters.contains(party))
+                })
             {
                 continue;
             }
@@ -914,9 +951,9 @@ where
                     .iter()
                     .cloned(),
             );
-            selected_votes.extend(crate::validation::vote::vote_keys(
-                &filled_transaction.transaction.transaction,
-            ));
+            selected_votes.extend(ballot_key);
+            sealing_voters.extend(sealing_voter);
+            transfer_parties.extend(transfer.into_iter().flatten());
             returned_transactions.push(filled_transaction);
             sigops += transaction_sigops;
             body_size += transaction_size;
@@ -1815,6 +1852,59 @@ where
             .state
             .decisions()
             .get_claimed_decisions_in_period(&rotxn, period_id.as_u32())?)
+    }
+
+    pub fn get_decision_state(
+        &self,
+        decision_id: crate::state::decisions::DecisionId,
+    ) -> Result<crate::state::decisions::DecisionState, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .decisions()
+            .get_decision_current_state(&rotxn, decision_id)?)
+    }
+
+    pub fn get_sealed_ballot(
+        &self,
+        voting_period: u32,
+        voter: Address,
+    ) -> Result<Option<crate::state::voting::types::SealedBallot>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.voting().databases().get_sealed_ballot(
+            &rotxn,
+            crate::state::voting::types::VotingPeriodId::new(voting_period),
+            voter,
+        )?)
+    }
+
+    /// Check a ballot before sealing it. A voter seals one ballot per
+    /// period, so one waiting in the mempool counts.
+    pub fn prepare_ballot(
+        &self,
+        voting_period: u32,
+        voter: Address,
+        votes: &[crate::types::BallotItem],
+    ) -> Result<(), Error> {
+        let rotxn = self.env.read_txn()?;
+        if self
+            .mempool
+            .pending_ballot(&rotxn, &(voting_period, voter, false))?
+            .is_some()
+        {
+            return Err(mempool::Error::BallotAlreadyInMempool {
+                voter,
+                voting_period,
+            }
+            .into());
+        }
+        Ok(crate::validation::VoteValidator::prepare_ballot(
+            &self.state,
+            &rotxn,
+            voter,
+            voting_period,
+            votes,
+        )?)
     }
 
     pub fn is_decision_in_voting(

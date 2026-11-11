@@ -963,43 +963,185 @@ mod conservation_tests {
         );
     }
 
-    #[test]
-    fn period_close_accepts_a_full_reputation_transfer() -> anyhow::Result<()> {
+    /// A transaction that spends one coin of `payer` worth `value_sats` and
+    /// pays all of it as fee
+    fn funded_tx(
+        data: crate::types::TransactionData,
+        payer: Address,
+        value_sats: u64,
+    ) -> crate::types::FilledTransaction {
+        use crate::types::{OutPoint, Output, OutputContent, PointedOutputRef};
+
+        let input = Output {
+            address: payer,
+            content: OutputContent::Value(bitcoin::Amount::from_sat(
+                value_sats,
+            )),
+        };
+        let outpoint = OutPoint::Regular {
+            txid: crate::types::Txid([3; 32]),
+            vout: 0,
+        };
+        let input_hash = crate::types::hash(&PointedOutputRef {
+            outpoint,
+            output: &input,
+        });
+        crate::types::FilledTransaction {
+            transaction: crate::types::Transaction {
+                inputs: vec![(outpoint, input_hash)].into(),
+                data: Some(data),
+                ..Default::default()
+            },
+            spent_utxos: vec![input],
+            actor_address: Some(payer),
+        }
+    }
+
+    fn sealed_ballot_tx(
+        reveal: &crate::types::RevealBallot,
+    ) -> crate::types::FilledTransaction {
+        funded_tx(
+            crate::types::TransactionData::SubmitBallot {
+                voter: reveal.voter,
+                voting_period: reveal.voting_period,
+                commitment: reveal.commitment(),
+            },
+            reveal.voter,
+            10_000,
+        )
+    }
+
+    fn reveal_ballot_tx(
+        reveal: &crate::types::RevealBallot,
+    ) -> crate::types::FilledTransaction {
+        funded_tx(
+            crate::types::TransactionData::RevealBallot {
+                voter: reveal.voter,
+                voting_period: reveal.voting_period,
+                votes: reveal.votes.clone(),
+                salt: reveal.salt,
+            },
+            reveal.voter,
+            10_000,
+        )
+    }
+
+    /// The transaction alone, without the coin it spends, which these
+    /// tests never put in the utxo set
+    fn without_inputs(
+        filled_tx: &crate::types::FilledTransaction,
+    ) -> crate::types::Transaction {
+        crate::types::Transaction {
+            inputs: Default::default(),
+            ..filled_tx.transaction.clone()
+        }
+    }
+
+    fn transfer_tx(
+        sender: Address,
+        dest: Address,
+        amount: f64,
+    ) -> crate::types::FilledTransaction {
+        let mut transfer = funded_tx(
+            crate::types::TransactionData::TransferReputation {
+                sender,
+                dest,
+                amount,
+            },
+            sender,
+            1000,
+        );
+        transfer.actor_address = None;
+        transfer
+    }
+
+    fn binary_ballot(
+        voter: Address,
+        decision_id: crate::state::decisions::DecisionId,
+        vote_value: f64,
+        salt: u8,
+    ) -> crate::types::RevealBallot {
+        crate::types::RevealBallot {
+            voter,
+            voting_period: decision_id.voting_period(),
+            votes: vec![crate::types::BallotItem {
+                decision_id_bytes: decision_id.as_bytes(),
+                vote_value: Some(vote_value),
+            }],
+            salt: [salt; 32],
+        }
+    }
+
+    fn connect_height(
+        state: &crate::state::State,
+        rwtxn: &mut sneed::RwTxn,
+        height: u32,
+        transactions: &[crate::types::FilledTransaction],
+    ) -> anyhow::Result<()> {
+        use crate::{
+            state::markets::block,
+            types::{AccumulatorDiff, Body, Coinbase},
+        };
+
+        let timestamp = 1000 + u64::from(height);
+        state.mainchain_timestamp.put(rwtxn, &(), &timestamp)?;
+        let context = block::connect_begin(
+            state,
+            rwtxn,
+            &Body::new(vec![], Coinbase::default()),
+            height,
+            timestamp,
+        )?;
+        let changes = block::connect_txs(
+            state,
+            rwtxn,
+            &context,
+            transactions,
+            bitcoin::Amount::ZERO,
+        )?;
+        block::connect_end(
+            state,
+            rwtxn,
+            &mut AccumulatorDiff::default(),
+            context,
+            changes,
+        )?;
+        Ok(())
+    }
+
+    fn sealed_ballot_state(
+        dir: &tempfile::TempDir,
+        reputations: &[(Address, f64)],
+    ) -> anyhow::Result<(
+        sneed::Env,
+        crate::state::State,
+        crate::state::decisions::DecisionId,
+    )> {
         use crate::{
             state::{
                 State,
-                decisions::{
-                    Decision, DecisionId, DecisionState, DecisionType,
-                },
-                markets::block,
+                decisions::{Decision, DecisionId, DecisionType},
             },
-            types::{
-                AccumulatorDiff, Body, Coinbase, FilledTransaction, OutPoint,
-                Output, OutputContent, PointedOutputRef, Transaction,
-                TransactionData, Txid,
-            },
-            validation::VoteValidator,
+            types::Txid,
         };
 
-        let dir = tempfile::tempdir()?;
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, dir.path()) }?;
         let state = State::new(&env, Some(10), true)?;
         let mut rwtxn = env.write_txn()?;
-        let sender = addr(1);
-        let receiver = addr(2);
-        state
-            .reputation()
-            .set_reputation(&mut rwtxn, &sender, 0.4)?;
-        state
-            .reputation()
-            .set_reputation(&mut rwtxn, &receiver, 0.6)?;
+        for (voter, reputation) in reputations {
+            state.reputation().set_reputation(
+                &mut rwtxn,
+                voter,
+                *reputation,
+            )?;
+        }
         state.genesis_timestamp.put(&mut rwtxn, &(), &1000)?;
         state.decisions().mint_genesis(&mut rwtxn, 1000, 0, 1000)?;
         let decision_id = DecisionId::new(true, 1, 0)?;
         let decision = Decision::new(
-            sender.0,
+            reputations[0].0.0,
             DecisionType::Binary,
             "Test decision".to_owned(),
             String::new(),
@@ -1014,116 +1156,281 @@ mod conservation_tests {
             Txid([0; 32]),
             Some(1),
         )?;
-        let votes =
-            [(sender, 0.0), (receiver, 1.0)].map(|(voter, vote_value)| {
-                FilledTransaction {
-                    transaction: Transaction {
-                        data: Some(TransactionData::SubmitVote {
-                            voter,
-                            decision_id_bytes: decision_id.as_bytes(),
-                            vote_value,
-                            voting_period: decision_id.voting_period(),
-                        }),
-                        ..Default::default()
-                    },
-                    spent_utxos: vec![],
-                    actor_address: Some(voter),
-                }
-            });
-        let input = Output {
-            address: sender,
-            content: OutputContent::Value(bitcoin::Amount::from_sat(1000)),
+        rwtxn.commit()?;
+        Ok((env, state, decision_id))
+    }
+
+    /// Reputation transfers are locked from the sealed ballot until resolution
+    #[test]
+    fn ballot_locks_reputation() -> anyhow::Result<()> {
+        use crate::{
+            state::decisions::DecisionState, validation::VoteValidator,
         };
-        let outpoint = OutPoint::Regular {
-            txid: Txid([3; 32]),
-            vout: 0,
-        };
-        let input_hash = crate::types::hash(&PointedOutputRef {
-            outpoint,
-            output: &input,
-        });
-        let transfer = FilledTransaction {
-            transaction: Transaction {
-                inputs: vec![(outpoint, input_hash)].into(),
-                outputs: vec![input.clone()].into(),
-                data: Some(TransactionData::TransferReputation {
-                    sender,
-                    dest: receiver,
-                    amount: 0.4,
-                }),
-                ..Default::default()
+
+        let dir = tempfile::tempdir()?;
+        let sender = addr(1);
+        let receiver = addr(2);
+        let outsider = addr(3);
+        let (env, state, decision_id) = sealed_ballot_state(
+            &dir,
+            &[(sender, 0.4), (receiver, 0.5), (outsider, 0.1)],
+        )?;
+        let mut rwtxn = env.write_txn()?;
+        let ballots = [(sender, 0.0, 1), (receiver, 1.0, 2)].map(
+            |(voter, vote_value, salt)| {
+                binary_ballot(voter, decision_id, vote_value, salt)
             },
-            spent_utxos: vec![input],
-            actor_address: None,
+        );
+        let seals = ballots.each_ref().map(sealed_ballot_tx);
+        let reveals = ballots.each_ref().map(reveal_ballot_tx);
+        let locked_transfers = [
+            transfer_tx(sender, outsider, 0.01),
+            transfer_tx(outsider, receiver, 0.01),
+        ];
+        let is_locked = |rwtxn: &sneed::RwTxn| -> anyhow::Result<bool> {
+            let mut locked = true;
+            for transfer in &locked_transfers {
+                locked &= VoteValidator::validate_reputation_transfer(
+                    &state, rwtxn, transfer, None,
+                )
+                .is_err();
+            }
+            Ok(locked)
         };
-        for height in [10, 11, 20] {
-            let timestamp = 1000 + u64::from(height);
-            state.mainchain_timestamp.put(&mut rwtxn, &(), &timestamp)?;
-            let context = block::connect_begin(
-                &state,
-                &mut rwtxn,
-                &Body::new(vec![], Coinbase::default()),
-                height,
-                timestamp,
-            )?;
-            let transactions = match height {
-                10 => {
-                    for vote in &votes {
-                        VoteValidator::validate_vote_submission(
-                            &state,
-                            &rwtxn,
-                            vote,
-                            Some(height),
-                        )?;
-                    }
-                    votes.as_slice()
-                }
-                11 => {
-                    VoteValidator::validate_reputation_transfer(
-                        &state,
-                        &rwtxn,
-                        &transfer,
-                        Some(height),
-                    )?;
-                    std::slice::from_ref(&transfer)
-                }
-                _ => &[],
-            };
-            let changes = block::connect_txs(
-                &state,
-                &mut rwtxn,
-                &context,
-                transactions,
-                bitcoin::Amount::ZERO,
-            )?;
-            block::connect_end(
-                &state,
-                &mut rwtxn,
-                &mut AccumulatorDiff::default(),
-                context,
-                changes,
-            )?;
-        }
-        assert_eq!(state.reputation().get_reputation(&rwtxn, &sender)?, 0.0);
-        assert_eq!(state.reputation().get_reputation(&rwtxn, &receiver)?, 1.0);
+
+        connect_height(&state, &mut rwtxn, 10, &[])?;
+        assert!(!is_locked(&rwtxn)?);
+        connect_height(&state, &mut rwtxn, 11, &seals)?;
+        assert!(is_locked(&rwtxn)?);
+        VoteValidator::validate_reputation_transfer(
+            &state,
+            &rwtxn,
+            &transfer_tx(outsider, addr(4), 0.01),
+            None,
+        )?;
+        connect_height(&state, &mut rwtxn, 20, &[])?;
+        assert_eq!(
+            state
+                .decisions()
+                .get_decision_current_state(&rwtxn, decision_id)?,
+            DecisionState::Revealing,
+        );
+        assert!(is_locked(&rwtxn)?);
+        connect_height(&state, &mut rwtxn, 21, &reveals)?;
         assert_eq!(
             state
                 .decisions()
                 .get_decision_current_state(&rwtxn, decision_id)?,
             DecisionState::Resolved,
         );
+        for transfer in &locked_transfers {
+            VoteValidator::validate_reputation_transfer(
+                &state, &rwtxn, transfer, None,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A claim in the block opening its voting period votes with it
+    #[test]
+    fn late_claim_votes() -> anyhow::Result<()> {
+        use crate::{
+            state::{
+                decisions::{
+                    Decision, DecisionId, DecisionState, DecisionType,
+                },
+                markets::block,
+            },
+            types::{AccumulatorDiff, Body, Coinbase, Txid},
+        };
+
+        let dir = tempfile::tempdir()?;
+        let (env, state, early) = sealed_ballot_state(&dir, &[(addr(1), 1.0)])?;
+        let mut rwtxn = env.write_txn()?;
+        let late = DecisionId::new(true, 1, 1)?;
+        let height = 10;
+        let timestamp = 1000 + u64::from(height);
+        state.mainchain_timestamp.put(&mut rwtxn, &(), &timestamp)?;
+        let context = block::connect_begin(
+            &state,
+            &mut rwtxn,
+            &Body::new(vec![], Coinbase::default()),
+            height,
+            timestamp,
+        )?;
+        state.decisions().claim_decision(
+            &mut rwtxn,
+            late,
+            Decision::new(
+                addr(1).0,
+                DecisionType::Binary,
+                "Late decision".to_owned(),
+                String::new(),
+                None,
+                None,
+                vec![],
+            )?,
+            Txid([1; 32]),
+            Some(height),
+        )?;
+        let changes = block::connect_txs(
+            &state,
+            &mut rwtxn,
+            &context,
+            &[],
+            bitcoin::Amount::ZERO,
+        )?;
+        block::connect_end(
+            &state,
+            &mut rwtxn,
+            &mut AccumulatorDiff::default(),
+            context,
+            changes,
+        )?;
+        for decision_id in [early, late] {
+            assert_eq!(
+                state
+                    .decisions()
+                    .get_decision_current_state(&rwtxn, decision_id)?,
+                DecisionState::Voting,
+            );
+        }
+        Ok(())
+    }
+
+    /// Sealed ballots resolve once the reveal window closes
+    #[test]
+    fn sealed_ballots_resolve() -> anyhow::Result<()> {
+        use crate::{
+            state::{decisions::DecisionState, markets::block},
+            types::AccumulatorDiff,
+            validation::VoteValidator,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let [late, early, silent] = [addr(1), addr(2), addr(3)];
+        let (env, state, decision_id) = sealed_ballot_state(
+            &dir,
+            &[(late, 0.5), (early, 0.3), (silent, 0.2)],
+        )?;
+        let mut rwtxn = env.write_txn()?;
         let period_id = VotingPeriodId::new(decision_id.voting_period());
+        let late_ballot = binary_ballot(late, decision_id, 1.0, 1);
+        let second_ballot = binary_ballot(late, decision_id, 0.0, 2);
+        let early_ballot = binary_ballot(early, decision_id, 1.0, 3);
+        let silent_ballot = binary_ballot(silent, decision_id, 0.0, 4);
+        let seals = [
+            sealed_ballot_tx(&late_ballot),
+            sealed_ballot_tx(&early_ballot),
+            sealed_ballot_tx(&silent_ballot),
+        ];
+        let reveals = [
+            reveal_ballot_tx(&late_ballot),
+            reveal_ballot_tx(&early_ballot),
+        ];
+        let sealed = |rwtxn: &sneed::RwTxn, voter| {
+            state
+                .voting()
+                .databases()
+                .get_sealed_ballot(rwtxn, period_id, voter)
+        };
+
+        connect_height(&state, &mut rwtxn, 10, &[])?;
+        for seal in &seals {
+            VoteValidator::validate_ballot(&state, &rwtxn, seal, None)?;
+        }
+        connect_height(&state, &mut rwtxn, 11, &seals)?;
+        assert!(
+            VoteValidator::validate_ballot(
+                &state,
+                &rwtxn,
+                &sealed_ballot_tx(&second_ballot),
+                None,
+            )
+            .is_err()
+        );
+
+        connect_height(&state, &mut rwtxn, 20, &[])?;
+        assert_eq!(
+            state
+                .decisions()
+                .get_decision_current_state(&rwtxn, decision_id)?,
+            DecisionState::Revealing,
+        );
+        assert!(
+            !state
+                .voting()
+                .databases()
+                .has_consensus(&rwtxn, period_id)?
+        );
+        assert_eq!(state.reputation().get_reputation(&rwtxn, &late)?, 0.5);
+        assert!(
+            VoteValidator::validate_reveal(
+                &state,
+                &rwtxn,
+                &reveal_ballot_tx(&second_ballot),
+                None,
+            )
+            .is_err()
+        );
+        for reveal in &reveals {
+            VoteValidator::validate_reveal(&state, &rwtxn, reveal, None)?;
+        }
+
+        connect_height(&state, &mut rwtxn, 21, &reveals)?;
+        assert_eq!(
+            state
+                .decisions()
+                .get_decision_current_state(&rwtxn, decision_id)?,
+            DecisionState::Resolved,
+        );
         let outcomes =
             state.voting().resolve_period_decisions(&rwtxn, period_id)?;
-        assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].outcome_value, 1.0);
+        let votes = state.voting().get_votes_for_period(&rwtxn, period_id)?;
+        assert_eq!(votes.len(), 2);
+        assert_eq!(
+            state
+                .voting()
+                .databases()
+                .get_vote(&rwtxn, period_id, late, decision_id)?
+                .map(|entry| entry.value),
+            Some(types::VoteValue::Binary(true)),
+        );
+        assert!(state.reputation().get_reputation(&rwtxn, &silent)? < 0.2);
+        assert!(sealed(&rwtxn, early)?.is_some_and(|ballot| ballot.revealed));
+        assert!(sealed(&rwtxn, silent)?.is_some_and(|ballot| !ballot.revealed));
+
+        let mut diff = AccumulatorDiff::default();
+        block::disconnect_tx(
+            &state,
+            &mut rwtxn,
+            &mut diff,
+            &without_inputs(&reveals[1]),
+            &mut Vec::new(),
+        )?;
         assert_eq!(
             state
                 .voting()
                 .get_votes_for_period(&rwtxn, period_id)?
                 .len(),
-            2
+            1
         );
+        assert_eq!(
+            sealed(&rwtxn, early)?,
+            Some(types::SealedBallot {
+                commitment: early_ballot.commitment(),
+                revealed: false,
+            }),
+        );
+        block::disconnect_tx(
+            &state,
+            &mut rwtxn,
+            &mut diff,
+            &without_inputs(&seals[0]),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(sealed(&rwtxn, late)?, None);
         Ok(())
     }
 }
