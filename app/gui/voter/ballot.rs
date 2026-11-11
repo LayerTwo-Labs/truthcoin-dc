@@ -4,7 +4,7 @@ use std::task::Poll;
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use futures::Stream;
 use truthcoin_dc::state::decisions::{Decision, DecisionId, DecisionType};
-use truthcoin_dc::types::BallotItem;
+use truthcoin_dc::types::{Address, BallotItem};
 
 use crate::util::PromiseStream;
 use crate::{app::App, gui::util::UiExt};
@@ -19,6 +19,8 @@ pub(super) struct Ballot {
     current_period: u32,
     node_updated: Option<NodeUpdates>,
     needs_initial_load: bool,
+    holders: Vec<(Address, f64)>,
+    voter: Option<Address>,
 }
 
 struct BallotRow {
@@ -50,6 +52,8 @@ impl Default for Ballot {
             current_period: 0,
             node_updated: None,
             needs_initial_load: true,
+            holders: Vec::new(),
+            voter: None,
         }
     }
 }
@@ -83,6 +87,17 @@ impl Ballot {
             return;
         }
         self.needs_initial_load = false;
+
+        self.holders = match app.voter_addresses() {
+            Ok(holders) => holders,
+            Err(err) => {
+                self.error = Some(format!("Failed to load voters: {err:#}"));
+                return;
+            }
+        };
+        self.voter = self.voter.filter(|voter| {
+            self.holders.iter().any(|(address, _)| address == voter)
+        });
 
         let rotxn = match app.node.read_txn() {
             Ok(t) => t,
@@ -234,6 +249,28 @@ impl Ballot {
                     ui.separator();
                     ui.add_space(8.0);
 
+                    if self.holders.len() > 1 {
+                        ui.horizontal(|ui| {
+                            ui.label("Vote as:");
+                            let selected = self.voter.map_or(
+                                "Choose a voter".to_string(),
+                                |voter| voter.to_string(),
+                            );
+                            egui::ComboBox::from_id_salt("ballot_voter")
+                                .selected_text(selected)
+                                .show_ui(ui, |ui| {
+                                    for (address, votecoin) in &self.holders {
+                                        ui.selectable_value(
+                                            &mut self.voter,
+                                            Some(*address),
+                                            format!("{address} ({votecoin})"),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.add_space(8.0);
+                    }
+
                     let (enabled, disabled_reason) =
                         self.submit_gate(total_reputation);
 
@@ -327,6 +364,13 @@ impl Ballot {
         let fee = bitcoin::Amount::from_sat(fee_sats);
         let period = self.current_period;
 
+        let voter = match app.resolve_voter(self.voter) {
+            Ok(voter) => voter,
+            Err(err) => {
+                self.error = Some(format!("Invalid voter: {err:#}"));
+                return;
+            }
+        };
         let options = match app.spend_options() {
             Ok(options) => options,
             Err(err) => {
@@ -335,7 +379,10 @@ impl Ballot {
                 return;
             }
         };
-        let tx = match app.wallet.submit_ballot(options, items, period, fee) {
+        let tx = match app
+            .wallet
+            .submit_ballot(options, voter, items, period, fee)
+        {
             Ok(tx) => tx,
             Err(err) => {
                 self.error = Some(format!("Failed to build ballot: {err:#}"));

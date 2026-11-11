@@ -1769,11 +1769,11 @@ impl Wallet {
     pub fn submit_ballot(
         &self,
         options: SpendOptions,
+        voter: Address,
         votes: Vec<crate::types::BallotItem>,
         voting_period: u32,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
-        let voter = self.voter_address()?;
         let tx_data = crate::types::TransactionData::SubmitBallot {
             voter,
             votes,
@@ -1796,11 +1796,11 @@ impl Wallet {
     pub fn transfer_reputation(
         &self,
         options: SpendOptions,
+        voter_addr: Address,
         dest: Address,
         amount: f64,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
-        let voter_addr = self.voter_address()?;
         let tx_data = crate::types::TransactionData::TransferReputation {
             sender: voter_addr,
             dest,
@@ -2388,12 +2388,12 @@ mod tests {
         let fee = bitcoin::Amount::from_sat(1_000);
 
         let first =
-            wallet.transfer_reputation(options(true), dest, 0.1, fee)?;
+            wallet.transfer_reputation(options(true), voter, dest, 0.1, fee)?;
         let first_inputs: HashSet<OutPoint> =
             first.inputs.iter().map(|(outpoint, _)| *outpoint).collect();
         wallet.set_mempool_view(&HashMap::new(), &first_inputs)?;
         let second =
-            wallet.transfer_reputation(options(true), dest, 0.1, fee)?;
+            wallet.transfer_reputation(options(true), voter, dest, 0.1, fee)?;
         let second_inputs: HashSet<OutPoint> = second
             .inputs
             .iter()
@@ -2542,15 +2542,26 @@ mod tests {
             txid: [9; 32].into(),
             vout: 0,
         };
-        let utxos = HashMap::from([(
-            outpoint,
-            Output {
-                address,
-                content: OutputContent::Value(bitcoin::Amount::from_sat(5_000)),
-            },
-        )]);
-        wallet.put_utxos(&HashMap::new(), &HashMap::new(), &utxos)?;
-        let tx = new_tx(spend_inputs(utxos), Vec::new());
+        wallet.put_utxos(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::from([(
+                outpoint,
+                Output {
+                    address,
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        5_000,
+                    )),
+                },
+            )]),
+        )?;
+        let tx = wallet.transfer_reputation(
+            options(true),
+            address,
+            Address([5u8; 20]),
+            0.1,
+            bitcoin::Amount::from_sat(1_000),
+        )?;
         let authorized = wallet.authorize(rand::rng(), tx)?;
         assert!(
             authorized

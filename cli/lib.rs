@@ -522,6 +522,9 @@ pub enum Command {
     /// List all registered voters
     #[command(name = "vote-voters", alias = "voters")]
     VoteVoters,
+    /// List this wallet's addresses that hold votecoin
+    #[command(name = "voter-addresses")]
+    VoterAddresses,
     /// Submit vote(s) - use comma-separated "id:value" for batch
     #[command(name = "vote-submit", alias = "vote")]
     VoteSubmit {
@@ -534,6 +537,9 @@ pub enum Command {
         votes: Option<String>,
         #[arg(long, default_value = "1000")]
         fee_sats: u64,
+        /// Defaults to the one wallet address that holds votecoin
+        #[arg(long)]
+        voter: Option<Address>,
     },
     /// Query votes with filters
     #[command(name = "vote-list")]
@@ -559,6 +565,9 @@ pub enum Command {
         amount: f64,
         #[arg(long, default_value = "1000")]
         fee_sats: u64,
+        /// Defaults to the one wallet address that holds votecoin
+        #[arg(long)]
+        sender: Option<Address>,
     },
     /// Get votecoin balance
     #[command(name = "votecoin-balance")]
@@ -1304,11 +1313,16 @@ where
             let voters = rpc_client.vote_voters().await?;
             json_response(&voters)?
         }
+        Command::VoterAddresses => {
+            let voters = rpc_client.voter_addresses().await?;
+            json_response(&voters)?
+        }
         Command::VoteSubmit {
             decision_id,
             vote_value,
             votes,
             fee_sats,
+            voter,
         } => {
             use truthcoin_dc_app_rpc_api::markets::BallotItem;
             let vote_items = if let Some(batch) = votes {
@@ -1339,7 +1353,8 @@ where
                         .to_string(),
                 );
             };
-            let txid = rpc_client.vote_submit(vote_items, fee_sats).await?;
+            let txid =
+                rpc_client.vote_submit(vote_items, fee_sats, voter).await?;
             format!("Vote submitted: {txid}")
         }
         Command::VoteList {
@@ -1364,9 +1379,11 @@ where
             dest,
             amount,
             fee_sats,
+            sender,
         } => {
-            let txid =
-                rpc_client.transfer_votecoin(dest, amount, fee_sats).await?;
+            let txid = rpc_client
+                .transfer_votecoin(dest, amount, fee_sats, sender)
+                .await?;
             format!("Votecoin transferred: {txid}")
         }
         Command::VotecoinBalance { address } => {

@@ -701,6 +701,11 @@ pub mod node {
         #[method(name = "vote_voters")]
         async fn vote_voters(&self) -> RpcResult<Vec<VoterInfo>>;
 
+        /// List this wallet's addresses that hold votecoin
+        #[open_api_method(output_schema(ToSchema = "Vec<VoterInfo>"))]
+        #[method(name = "voter_addresses")]
+        async fn voter_addresses(&self) -> RpcResult<Vec<VoterInfo>>;
+
         /// Get votecoin balance for an address
         #[open_api_method(output_schema(ToSchema = "f64"))]
         #[method(name = "votecoin_balance")]
@@ -940,13 +945,15 @@ pub mod wallet {
         #[method(name = "get_voter_address")]
         async fn get_voter_address(&self) -> RpcResult<Address>;
 
-        /// Transfer votecoin to the specified address
+        /// Transfer votecoin to the specified address, from `sender` or else
+        /// the one wallet address that holds votecoin.
         #[method(name = "transfer_votecoin")]
         async fn transfer_votecoin(
             &self,
             dest: Address,
             amount: f64,
             fee_sats: u64,
+            sender: Option<Address>,
         ) -> RpcResult<Txid>;
 
         /// Claim one or more decisions.
@@ -993,13 +1000,15 @@ pub mod wallet {
             request: MarketAmplifyBetaRequest,
         ) -> RpcResult<String>;
 
-        /// Submit one or more votes (batch)
+        /// Submit one or more votes (batch). The voter is `voter`, or else the
+        /// one wallet address that holds votecoin.
         #[open_api_method(output_schema(ToSchema = "String"))]
         #[method(name = "vote_submit")]
         async fn vote_submit(
             &self,
             votes: Vec<BallotItem>,
             fee_sats: u64,
+            voter: Option<Address>,
         ) -> RpcResult<String>;
 
         /// Build and sign a Trade transaction with a caller-supplied

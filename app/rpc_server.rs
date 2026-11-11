@@ -2133,6 +2133,29 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         Ok(voter_infos)
     }
 
+    async fn voter_addresses(&self) -> RpcResult<Vec<VoterInfo>> {
+        let holders = self.app.voter_addresses().map_err(custom_err)?;
+        let rotxn = self.node().read_txn().map_err(custom_err)?;
+        holders
+            .into_iter()
+            .map(|(address, votecoin_balance)| {
+                let votes = self
+                    .app
+                    .node
+                    .voting_state()
+                    .databases()
+                    .get_votes_by_voter(&rotxn, address)
+                    .map_err(custom_err)?;
+                Ok(VoterInfo {
+                    address: address.to_string(),
+                    votecoin_balance,
+                    total_votes: votes.len() as u64,
+                    is_active: !votes.is_empty(),
+                })
+            })
+            .collect()
+    }
+
     async fn votecoin_balance(&self, address: Address) -> RpcResult<f64> {
         let rotxn = self.node().read_txn().map_err(custom_err)?;
 
@@ -2489,12 +2512,15 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         dest: Address,
         amount: f64,
         fee_sats: u64,
+        sender: Option<Address>,
     ) -> RpcResult<Txid> {
+        let sender = self.app.resolve_voter(sender).map_err(custom_err)?;
         let tx = self
             .app
             .wallet
             .transfer_reputation(
                 self.app.spend_options().map_err(custom_err)?,
+                sender,
                 dest,
                 amount,
                 Amount::from_sat(fee_sats),
@@ -3122,6 +3148,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         &self,
         votes: Vec<truthcoin_dc_app_rpc_api::markets::BallotItem>,
         fee_sats: u64,
+        voter: Option<Address>,
     ) -> RpcResult<String> {
         use truthcoin_dc::types::BallotItem;
 
@@ -3185,6 +3212,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
 
         let period_id = period_id.unwrap();
         let fee = bitcoin::Amount::from_sat(request.fee_sats);
+        let voter = self.app.resolve_voter(voter).map_err(custom_err)?;
 
         tracing::info!(
             "vote_submit: Voter attempting to submit {} \
@@ -3198,6 +3226,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .wallet
             .submit_ballot(
                 self.app.spend_options().map_err(custom_err)?,
+                voter,
                 batch_items,
                 period_id,
                 fee,

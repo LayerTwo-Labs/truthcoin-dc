@@ -484,9 +484,16 @@ async fn roundtrip_task_inner(
     ];
 
     let mut voter_addrs = Vec::new();
-    for voter in &voters {
+    for voter in &voters[..6] {
         voter_addrs.push(voter.rpc_client.get_voter_address().await?);
     }
+    voter_addrs.push(
+        truthcoin_nodes
+            .voter_6
+            .rpc_client
+            .import_private_key(const_hex::encode([7u8; 32]))
+            .await?,
+    );
     let [
         voter_addr_0,
         voter_addr_1,
@@ -514,7 +521,7 @@ async fn roundtrip_task_inner(
         truthcoin_nodes
             .issuer
             .rpc_client
-            .transfer_votecoin(voter_addr, VOTER_ALLOCATION, 1000)
+            .transfer_votecoin(voter_addr, VOTER_ALLOCATION, 1000, None)
             .await?;
 
         truthcoin_nodes
@@ -1623,7 +1630,7 @@ async fn roundtrip_task_inner(
             });
         }
 
-        voter.rpc_client.vote_submit(vote_items, 1000).await?;
+        voter.rpc_client.vote_submit(vote_items, 1000, None).await?;
     }
 
     sleep(std::time::Duration::from_millis(500)).await;
@@ -3840,7 +3847,7 @@ async fn roundtrip_task_inner(
             })
             .collect();
 
-        voter.rpc_client.vote_submit(vote_items, 1000).await?;
+        voter.rpc_client.vote_submit(vote_items, 1000, None).await?;
     }
 
     let misaligned = vec![BallotItem {
@@ -3851,7 +3858,7 @@ async fn roundtrip_task_inner(
         truthcoin_nodes
             .voter_0
             .rpc_client
-            .vote_submit(misaligned, 1000)
+            .vote_submit(misaligned, 1000, None)
             .await
             .is_err()
     );
