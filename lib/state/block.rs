@@ -870,8 +870,9 @@ mod test {
         types::FilledTransaction,
     };
 
+    /// Block actor proofs obey the signature limit.
     #[test]
-    fn block_actor_proofs_obey_signature_limit() -> anyhow::Result<()> {
+    fn actor_proofs_obey_limit() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::{
@@ -958,8 +959,9 @@ mod test {
         Ok(())
     }
 
+    /// A genesis reorg replaces the reputation credit.
     #[test]
-    fn genesis_reorg_replaces_reputation_credit() -> anyhow::Result<()> {
+    fn genesis_reorg_replaces_credit() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::types::{
@@ -1041,8 +1043,9 @@ mod test {
         Ok(())
     }
 
+    /// Validation rejects an outpoint whose UTXO hash does not match.
     #[test]
-    fn validation_rejects_outpoint_utxo_hash_mismatch() -> anyhow::Result<()> {
+    fn utxo_hash_mismatch_rejected() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::types::{
@@ -1406,8 +1409,9 @@ mod test {
         Ok((temp_dir, env, state, header, body, batch_verification_ctxt))
     }
 
+    /// A block may carry a parent transaction and its child.
     #[test]
-    fn a_block_carries_a_parent_and_its_child() -> anyhow::Result<()> {
+    fn parent_and_child_accepted() -> anyhow::Result<()> {
         let (_temp_dir, env, state, header, body, ctxt) =
             chained_block("a_block_carries_a_parent_and_its_child", false)?;
         let archive = crate::archive::Archive::new(&env)?;
@@ -1435,7 +1439,7 @@ mod test {
     }
 
     #[test]
-    fn a_child_before_its_parent_is_rejected() -> anyhow::Result<()> {
+    fn child_before_parent_rejected() -> anyhow::Result<()> {
         let (_temp_dir, env, state, header, body, ctxt) =
             chained_block("a_child_before_its_parent_is_rejected", true)?;
         let archive = crate::archive::Archive::new(&env)?;
@@ -1589,8 +1593,9 @@ mod test {
         Ok(())
     }
 
+    /// The body size limit counts utreexo proofs.
     #[test]
-    fn body_size_counts_utreexo_proofs() -> anyhow::Result<()> {
+    fn body_size_counts_proofs() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::{
@@ -1650,8 +1655,9 @@ mod test {
         Ok(())
     }
 
+    /// A block rejects outputs without inputs.
     #[test]
-    fn a_block_rejects_outputs_without_inputs() -> anyhow::Result<()> {
+    fn inputless_outputs_rejected() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::{

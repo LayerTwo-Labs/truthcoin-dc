@@ -82,7 +82,7 @@ fn consensus_bits(result: &voting::DetailedConsensusResult) -> Vec<f64> {
 }
 
 #[test]
-fn consensus_output_bits_match_golden_hash() {
+fn consensus_golden_hash() {
     let result = consensus_fixture(9, 7);
     assert_eq!(result.first_loading.len(), 7);
     assert_eq!(
@@ -92,7 +92,7 @@ fn consensus_output_bits_match_golden_hash() {
 }
 
 #[test]
-fn lmsr_output_bits_match_golden_hash() {
+fn lmsr_golden_hash() {
     let share_sets: [&[f64]; 4] = [
         &[0.0, 0.0],
         &[125.0, -40.5, 310.25],
@@ -119,7 +119,7 @@ fn lmsr_output_bits_match_golden_hash() {
 }
 
 #[test]
-fn block_limits_match_golden_hash() {
+fn block_limits_golden_hash() {
     let mut hasher = blake3::Hasher::new();
     for month in 0..=121u32 {
         let height = month * 6 * 24 * 30;

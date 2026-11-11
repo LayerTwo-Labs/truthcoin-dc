@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_reprice_idempotent_at_open_block() {
+    fn reprice_noop_at_open() {
         let mut p = PeriodPricing::new_seeded(8_000, 50);
         apply_reprice_with_floor(&mut p, 50);
         assert_eq!(p.p_period, 8_000);

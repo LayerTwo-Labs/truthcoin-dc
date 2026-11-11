@@ -910,8 +910,9 @@ mod test {
         }
     }
 
+    /// The ancestor walk asks for 20,000 headers in one request.
     #[test]
-    fn ancestor_walk_asks_for_20000_headers() -> anyhow::Result<()> {
+    fn ancestor_walk_batch_size() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env()?;
         let archive = Archive::new(&env)?;
         let mock = MockValidator::default();
@@ -932,8 +933,9 @@ mod test {
         Ok(())
     }
 
+    /// Sync progress walks the headers, writing and state phases, then idles.
     #[test]
-    fn sync_progress_walks_headers_writing_then_state() -> anyhow::Result<()> {
+    fn sync_progress_phases() -> anyhow::Result<()> {
         const TIP_HEIGHT: u32 = 20_099;
         let (_temp_dir, env) = temp_env()?;
         let archive = Archive::new(&env)?;
@@ -1034,7 +1036,7 @@ mod test {
     /// A disconnect must return the mainchain tip to the parent of the block
     /// it removes, so that the same block connects again.
     #[test]
-    fn a_disconnect_returns_the_tip_to_the_parent() -> anyhow::Result<()> {
+    fn disconnect_restores_parent() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env()?;
         let archive = Archive::new(&env)?;
         let (mut event_tx, _event_rx) = mpsc::unbounded();
@@ -1084,8 +1086,7 @@ mod test {
     /// The mainchain node can go away, and the task must take a request after
     /// it does. A task that stops for good closes the request channel.
     #[tokio::test]
-    async fn the_task_takes_a_request_after_the_mainchain_node_fails()
-    -> anyhow::Result<()> {
+    async fn survives_mainchain_failure() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env()?;
         let archive = Archive::new(&env)?;
         // Port 1 accepts nothing, so every call to the validator service fails.

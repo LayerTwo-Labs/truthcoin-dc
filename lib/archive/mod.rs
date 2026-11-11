@@ -1795,7 +1795,7 @@ pub(crate) mod test {
     /// leaves the mainchain, so a later BMM of the same block connects it
     /// again.
     #[test]
-    fn mainchain_reorg_disconnects_bmm_side_tip() -> anyhow::Result<()> {
+    fn reorg_drops_bmm_side_tip() -> anyhow::Result<()> {
         use crate::{
             archive::side_tips::{BmmCommitment, SidechainHeaderData},
             types::BlockHash,

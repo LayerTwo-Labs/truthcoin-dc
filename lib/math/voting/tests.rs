@@ -42,7 +42,7 @@ fn test_sparse_vote_matrix_creation() {
 }
 
 #[test]
-fn test_sparse_vote_matrix_vote_operations() {
+fn test_sparse_matrix_votes() {
     let voters = create_test_voter_ids(3);
     let decisions = create_test_decision_ids(2);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
@@ -137,7 +137,7 @@ fn test_reputation_vector_clamping() {
 }
 
 #[test]
-fn test_resolve_categorical_plurality_clear_winner() {
+fn test_plurality_clear_winner() {
     let mut matrix = nalgebra::DMatrix::from_element(3, 1, f64::NAN);
     matrix[(0, 0)] = 1.0;
     matrix[(1, 0)] = 1.0;
@@ -158,7 +158,7 @@ fn test_resolve_categorical_plurality_clear_winner() {
 }
 
 #[test]
-fn test_resolve_categorical_plurality_three_way_tie() {
+fn test_plurality_three_way_tie() {
     let mut matrix = nalgebra::DMatrix::from_element(3, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 1.0;
@@ -179,7 +179,7 @@ fn test_resolve_categorical_plurality_three_way_tie() {
 }
 
 #[test]
-fn test_resolve_categorical_plurality_two_way_tie() {
+fn test_plurality_two_way_tie() {
     let mut matrix = nalgebra::DMatrix::from_element(4, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 1.0;
@@ -201,7 +201,7 @@ fn test_resolve_categorical_plurality_two_way_tie() {
 }
 
 #[test]
-fn test_resolve_categorical_inconclusive_wins_outright() {
+fn test_plurality_inconclusive_wins() {
     let mut matrix = nalgebra::DMatrix::from_element(5, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 1.0;
@@ -226,7 +226,7 @@ fn test_resolve_categorical_inconclusive_wins_outright() {
 }
 
 #[test]
-fn test_resolve_categorical_tie_with_inconclusive_voters() {
+fn test_plurality_tie_with_inconclusive() {
     let mut matrix = nalgebra::DMatrix::from_element(5, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 0.0;
@@ -250,8 +250,9 @@ fn test_resolve_categorical_tie_with_inconclusive_voters() {
     assert_eq!(matrix[(4, 0)], 1.0);
 }
 
+/// An inconclusive categorical winner resolves to the neutral value 0.5.
 #[test]
-fn test_resolve_categorical_inconclusive_outcome_is_neutral_value() {
+fn test_inconclusive_outcome_neutral() {
     let voters = create_test_voter_ids(4);
     let decisions = create_test_decision_ids(1);
 
@@ -280,7 +281,7 @@ fn test_resolve_categorical_inconclusive_outcome_is_neutral_value() {
 }
 
 #[test]
-fn test_resolve_categorical_plurality_all_abstain() {
+fn test_plurality_all_abstain() {
     let mut matrix = nalgebra::DMatrix::from_element(3, 1, f64::NAN);
 
     let mut categorical_columns = std::collections::HashMap::new();
@@ -298,7 +299,7 @@ fn test_resolve_categorical_plurality_all_abstain() {
 }
 
 #[test]
-fn test_resolve_categorical_plurality_single_voter() {
+fn test_plurality_single_voter() {
     let mut matrix = nalgebra::DMatrix::from_element(1, 1, f64::NAN);
     matrix[(0, 0)] = 2.0;
 
@@ -315,7 +316,7 @@ fn test_resolve_categorical_plurality_single_voter() {
 }
 
 #[test]
-fn test_resolve_categorical_with_nan_entries() {
+fn test_plurality_nan_entries() {
     let mut matrix = nalgebra::DMatrix::from_element(4, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 0.0;
@@ -337,7 +338,7 @@ fn test_resolve_categorical_with_nan_entries() {
 }
 
 #[test]
-fn test_mixed_binary_and_categorical_columns() {
+fn test_mixed_binary_categorical() {
     let voters = create_test_voter_ids(3);
     let decisions = create_test_decision_ids(2);
 
@@ -372,7 +373,7 @@ fn test_mixed_binary_and_categorical_columns() {
 }
 
 #[test]
-fn test_consensus_categorical_clear_winner() {
+fn test_categorical_clear_winner() {
     let voters = create_test_voter_ids(5);
     let decisions = create_test_decision_ids(1);
 
@@ -403,8 +404,9 @@ fn test_consensus_categorical_clear_winner() {
     assert!((outcome - 1.0).abs() < 0.01);
 }
 
+/// Whitepaper figure 5: reputation is conserved and the dissenter loses.
 #[test]
-fn test_reputation_conservation_whitepaper_figure5() {
+fn test_figure5_conservation() {
     let voters = create_test_voter_ids(7);
     let decisions = create_test_decision_ids(4);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
@@ -456,8 +458,9 @@ fn test_reputation_conservation_whitepaper_figure5() {
     );
 }
 
+/// Reputation ranks full > partial > absent, absent below its start.
 #[test]
-fn test_absent_voter_penalized_relative_to_attendance() {
+fn test_absence_penalized() {
     let voters = create_test_voter_ids(3);
     let decisions = create_test_decision_ids(4);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
@@ -500,8 +503,9 @@ fn test_absent_voter_penalized_relative_to_attendance() {
     );
 }
 
+/// Full participation: only compliance moves reputation, total conserved.
 #[test]
-fn test_full_participation_leaves_compliance_only() {
+fn test_full_participation() {
     let voters = create_test_voter_ids(5);
     let decisions = create_test_decision_ids(3);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
@@ -549,8 +553,9 @@ fn test_full_participation_leaves_compliance_only() {
     );
 }
 
+/// Under heavy absence a dissenting voter still outranks a fully absent one.
 #[test]
-fn test_high_absence_dominates_consensus() {
+fn test_high_absence() {
     let voters = create_test_voter_ids(4);
     let decisions = create_test_decision_ids(4);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());

@@ -1000,8 +1000,9 @@ mod tests {
         rwtxn.commit().unwrap();
     }
 
+    /// Eviction is a no-op when the block tx is the pending claim itself.
     #[test]
-    fn evict_noop_when_in_block_tx_equals_pending_claim() {
+    fn evict_noop_same_claim() {
         let (env, _dir) = make_env();
         let mempool = MemPool::new(&env).unwrap();
         let did: [u8; 4] = [1, 2, 3, 4];
@@ -1034,8 +1035,9 @@ mod tests {
         rwtxn.commit().unwrap();
     }
 
+    /// Eviction is a no-op for a block tx that claims no decision.
     #[test]
-    fn evict_noop_when_tx_is_not_claim_decision() {
+    fn evict_noop_non_claim() {
         let (env, _dir) = make_env();
         let mempool = MemPool::new(&env).unwrap();
         let did: [u8; 4] = [9, 9, 9, 9];
@@ -1066,8 +1068,9 @@ mod tests {
         rwtxn.commit().unwrap();
     }
 
+    /// A partial overlap evicts a multi-decision claim and clears all its rows.
     #[test]
-    fn evict_multi_decision_partial_overlap_clears_all_zombie_rows() {
+    fn evict_partial_overlap() {
         let (env, _dir) = make_env();
         let mempool = MemPool::new(&env).unwrap();
         let x: [u8; 4] = [1, 1, 1, 1];
@@ -1206,7 +1209,7 @@ mod test {
     }
 
     #[test]
-    fn topological_puts_a_parent_before_its_child() -> anyhow::Result<()> {
+    fn topological_parent_first() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("topological")?;
         let mempool = MemPool::new(&env)?;
         let (_key, address) = owner();
@@ -1238,7 +1241,7 @@ mod test {
     }
 
     #[test]
-    fn the_mempool_refuses_a_chain_past_the_limit() -> anyhow::Result<()> {
+    fn refuses_chain_past_limit() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("ancestor_limit")?;
         let mempool = MemPool::new(&env)?;
         let (_key, address) = owner();
@@ -1261,7 +1264,7 @@ mod test {
     }
 
     #[test]
-    fn a_confirmed_parent_leaves_its_child_behind() -> anyhow::Result<()> {
+    fn confirmed_parent_keeps_child() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("delete_confirmed")?;
         let mempool = MemPool::new(&env)?;
         let (_key, address) = owner();
@@ -1290,7 +1293,7 @@ mod test {
     }
 
     #[test]
-    fn a_double_spending_parent_takes_its_child() -> anyhow::Result<()> {
+    fn double_spend_drops_child() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("delete_cascades")?;
         let mempool = MemPool::new(&env)?;
         let (_key, address) = owner();
@@ -1310,9 +1313,9 @@ mod test {
         Ok(())
     }
 
+    /// Own unconfirmed change is spendable; a stranger's payment is not.
     #[test]
-    fn own_change_is_spendable_and_a_stranger_output_is_not()
-    -> anyhow::Result<()> {
+    fn only_own_change_trusted() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("trust")?;
         let mempool = MemPool::new(&env)?;
         let (_key, address) = owner();
@@ -1360,7 +1363,7 @@ mod test {
     }
 
     #[test]
-    fn an_untrusted_ancestor_stops_the_whole_chain() -> anyhow::Result<()> {
+    fn untrusted_ancestor_stops_chain() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("trust_chain")?;
         let mempool = MemPool::new(&env)?;
         let (_key, address) = owner();
@@ -1400,7 +1403,7 @@ mod test {
     /// A chain at the limit stays visible, so the balance shows the money.
     /// The mempool refuses the next link, and the user reads a clear error.
     #[test]
-    fn a_chain_at_the_limit_stays_visible() -> anyhow::Result<()> {
+    fn chain_at_limit_visible() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("ancestor_boundary")?;
         let mempool = MemPool::new(&env)?;
         let (_key, address) = owner();
@@ -1453,7 +1456,7 @@ mod test {
     }
 
     #[test]
-    fn a_spent_unconfirmed_output_is_not_offered() -> anyhow::Result<()> {
+    fn spent_unconfirmed_not_offered() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("trust_spent")?;
         let mempool = MemPool::new(&env)?;
         let (_key, address) = owner();

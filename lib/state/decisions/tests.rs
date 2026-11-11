@@ -29,7 +29,7 @@ fn make_scaled_decision(min: f64, max: f64, increment: f64) -> Decision {
 }
 
 #[test]
-fn test_binary_decision_no_normalization() {
+fn test_binary_passthrough() {
     let decision = make_binary_decision();
 
     // Binary decisions pass through unchanged
@@ -43,7 +43,7 @@ fn test_binary_decision_no_normalization() {
 }
 
 #[test]
-fn test_scaled_decision_normalization() {
+fn test_scaled_normalize() {
     // Electoral votes: 0-538
     let decision = make_scaled_decision(0.0, 538.0, 1.0);
 
@@ -55,7 +55,7 @@ fn test_scaled_decision_normalization() {
 }
 
 #[test]
-fn test_scaled_decision_denormalization() {
+fn test_scaled_denormalize() {
     // Electoral votes: 0-538
     let decision = make_scaled_decision(0.0, 538.0, 1.0);
 
@@ -66,7 +66,7 @@ fn test_scaled_decision_denormalization() {
 }
 
 #[test]
-fn test_scaled_decision_with_offset() {
+fn test_scaled_offset() {
     // Score: 50 to 150 (range of 100)
     let decision = make_scaled_decision(50.0, 150.0, 1.0);
 
@@ -96,7 +96,7 @@ fn test_roundtrip_normalization() {
 }
 
 #[test]
-fn test_validate_and_normalize_success() {
+fn test_validate_in_range() {
     let decision = make_scaled_decision(0.0, 100.0, 1.0);
 
     // Valid values
@@ -110,7 +110,7 @@ fn test_validate_and_normalize_success() {
 }
 
 #[test]
-fn test_validate_and_normalize_out_of_bounds() {
+fn test_validate_out_of_range() {
     let decision = make_scaled_decision(0.0, 100.0, 1.0);
 
     // Out of bounds
@@ -119,7 +119,7 @@ fn test_validate_and_normalize_out_of_bounds() {
 }
 
 #[test]
-fn test_validate_and_normalize_nan_abstain() {
+fn test_validate_nan_abstains() {
     let decision = make_scaled_decision(0.0, 100.0, 1.0);
     // NaN is valid - it means "abstain" in voting
     let result = decision.validate_and_normalize(f64::NAN);
@@ -179,8 +179,9 @@ fn try_new_scaled(
     )
 }
 
+/// Scaled claims reject bad bounds, non-positive or unaligned increments
 #[test]
-fn test_scaled_claim_rejects_invalid_bounds() {
+fn test_scaled_rejects_invalid() {
     use crate::state::Error::InvalidScaled;
     assert!(matches!(
         try_new_scaled(0.0, 10.0, 0.0),
@@ -209,7 +210,7 @@ fn test_scaled_claim_rejects_invalid_bounds() {
 }
 
 #[test]
-fn test_scaled_claim_accepts_aligned_range() {
+fn test_scaled_accepts_aligned() {
     assert!(try_new_scaled(0.0, 10.0, 1.0).is_ok());
     assert!(try_new_scaled(0.0, 10.0, 2.0).is_ok());
     assert!(try_new_scaled(32.0, 100.0, 0.5).is_ok());
@@ -217,7 +218,7 @@ fn test_scaled_claim_accepts_aligned_range() {
 }
 
 #[test]
-fn test_validate_and_normalize_step_alignment() {
+fn test_validate_step_alignment() {
     use crate::state::Error::InvalidVoteValue;
 
     let integer_step = make_scaled_decision(0.0, 10.0, 2.0);
@@ -253,7 +254,7 @@ fn test_validate_and_normalize_step_alignment() {
 }
 
 #[test]
-fn test_denormalize_roundtrips_step_values() {
+fn test_step_values_roundtrip() {
     let decision = make_scaled_decision(32.0, 100.0, 0.5);
     for v in [32.0, 32.5, 65.0, 99.5, 100.0] {
         let normalized = decision.normalize_value(v);
@@ -322,7 +323,7 @@ fn test_decision_id_hex_roundtrip() {
 }
 
 #[test]
-fn test_decision_id_standard_bit_encoding() {
+fn test_decision_id_standard_bit() {
     let std_id = DecisionId::new(true, 1, 0).unwrap();
     let nonstd_id = DecisionId::new(false, 1, 0).unwrap();
     assert_ne!(std_id.as_bytes(), nonstd_id.as_bytes());
@@ -333,7 +334,7 @@ fn test_decision_id_standard_bit_encoding() {
 }
 
 #[test]
-fn category_claim_accepts_option_limit() {
+fn category_accepts_max() {
     let decision = Decision::new(
         [0; 20],
         DecisionType::Category {
@@ -350,7 +351,7 @@ fn category_claim_accepts_option_limit() {
 }
 
 #[test]
-fn category_claim_rejects_excess_options() {
+fn category_rejects_excess() {
     let result = Decision::new(
         [0; 20],
         DecisionType::Category {
@@ -448,13 +449,15 @@ fn check_claim_rollback(direct: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reverting a claim then rolling back matches a clean state
 #[test]
-fn claim_reorg_preserves_period_and_prices() -> anyhow::Result<()> {
+fn claim_revert_matches_clean() -> anyhow::Result<()> {
     check_claim_rollback(true)
 }
 
+/// Rolling back without reverting the claim matches a clean state
 #[test]
-fn state_rollback_preserves_period_and_prices() -> anyhow::Result<()> {
+fn rollback_matches_clean() -> anyhow::Result<()> {
     check_claim_rollback(false)
 }
 
@@ -465,8 +468,9 @@ fn decision_id_key_bytes(id: &DecisionId) -> Vec<u8> {
         .into_owned()
 }
 
+/// Decision ids with periods above 127 round-trip through every encoding
 #[test]
-fn test_decision_id_period_above_127_roundtrips() {
+fn test_high_period_roundtrip() {
     for (is_standard, period, index) in
         [(true, 128, 0), (true, 200, 7), (false, 32767, 65535)]
     {
@@ -495,7 +499,7 @@ fn test_decision_id_period_above_127_roundtrips() {
 }
 
 #[test]
-fn test_decision_id_key_order_follows_period() {
+fn test_key_order_by_period() {
     for is_standard in [false, true] {
         let ids: Vec<DecisionId> = [(1, 65535), (127, 0), (128, 0), (300, 5)]
             .into_iter()
@@ -513,8 +517,9 @@ fn test_decision_id_key_order_follows_period() {
     }
 }
 
+/// A decision can be claimed in a period above 127
 #[test]
-fn test_claim_decision_in_period_above_127() {
+fn test_high_period_claim() {
     use super::{Dbs, DecisionConfig};
     use crate::types::{Hash, Txid};
     use std::num::NonZeroU32;

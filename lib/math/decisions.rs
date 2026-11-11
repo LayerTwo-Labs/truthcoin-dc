@@ -274,12 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn reprice_zero_available_no_change() {
+    fn reprice_zero_available() {
         assert_eq!(reprice(10_000, 0, 0), 10_000);
     }
 
+    /// Quarter sales reprice to p * 2^(-0.5) within one sat.
     #[test]
-    fn reprice_quarter_sales_within_one_sat() {
+    fn reprice_quarter_sales() {
         let p = 1_000_000u64;
         let r = reprice(p, 25, 100);
         let expected = (p as f64 * 2f64.powf(2.0 * 0.25 - 1.0)) as u64;
@@ -287,8 +288,9 @@ mod tests {
         assert!(diff <= 1, "got {r}, expected {expected}");
     }
 
+    /// Three-quarter sales reprice to p * 2^(0.5) within one sat.
     #[test]
-    fn reprice_three_quarter_sales_within_one_sat() {
+    fn reprice_three_quarter_sales() {
         let p = 1_000_000u64;
         let r = reprice(p, 75, 100);
         let expected = (p as f64 * 2f64.powf(2.0 * 0.75 - 1.0)) as u64;

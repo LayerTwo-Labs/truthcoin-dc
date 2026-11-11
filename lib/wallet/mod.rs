@@ -1909,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn wallet_opens_a_database_it_created() -> anyhow::Result<()> {
+    fn wallet_reopens_its_db() -> anyhow::Result<()> {
         let temp_dir = temp_dir::TempDir::with_prefix(format!(
             "wallet-reopen-{}-{}",
             std::time::SystemTime::now()
@@ -1927,8 +1927,7 @@ mod tests {
     /// too, so the output moves to the unconfirmed side, where the proof code
     /// leaves it out.
     #[test]
-    fn a_disconnected_output_leaves_the_confirmed_table() -> anyhow::Result<()>
-    {
+    fn disconnect_unconfirms_output() -> anyhow::Result<()> {
         use crate::types::OutputContent;
 
         let temp_dir = temp_dir::TempDir::with_prefix(format!(
@@ -2152,7 +2151,7 @@ mod tests {
     }
 
     #[test]
-    fn coin_selection_stops_at_the_requested_value() -> anyhow::Result<()> {
+    fn coin_selection_stops_at_value() -> anyhow::Result<()> {
         for (values, value, total, count, takes_unconfirmed) in [
             (vec![1_000], 1_000, 1_000, 1, false),
             (vec![1_000], 1_001, 3_000, 2, true),
@@ -2211,6 +2210,7 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction_many` pays each destination, then wallet change.
     #[test]
     fn coin_selection_waits_for_maturity() -> anyhow::Result<()> {
         let temp_dir = temp_dir::TempDir::new()?;
@@ -2269,7 +2269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_transaction_many_pays_each_address() -> anyhow::Result<()> {
+    fn test_many_pays_each_address() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_many", &[10_000])?;
 
@@ -2303,8 +2303,7 @@ mod tests {
     /// The node marks the inputs of a mempool transaction as mempool-spent.
     /// A second reputation transfer before a block must take another coin.
     #[test]
-    fn a_second_reputation_transfer_skips_mempool_spent_coins()
-    -> anyhow::Result<()> {
+    fn reputation_transfer_skips_spent() -> anyhow::Result<()> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
@@ -2358,9 +2357,9 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction` yields one payment output plus wallet change.
     #[test]
-    fn test_create_transaction_keeps_one_payment_and_change()
-    -> anyhow::Result<()> {
+    fn test_one_payment_and_change() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_one", &[10_000])?;
 
@@ -2384,9 +2383,9 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction_many` rejects destinations whose sum overflows.
     #[test]
-    fn test_create_transaction_many_rejects_an_overflow() -> anyhow::Result<()>
-    {
+    fn test_many_rejects_overflow() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_overflow", &[10_000])?;
 
@@ -2407,9 +2406,9 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction_many` rejects an empty destination map.
     #[test]
-    fn test_create_transaction_many_needs_a_destination() -> anyhow::Result<()>
-    {
+    fn test_many_needs_destination() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_none", &[10_000])?;
 
@@ -2425,8 +2424,9 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction_many` selects coins by the summed destination value.
     #[test]
-    fn test_create_transaction_many_totals_the_values() -> anyhow::Result<()> {
+    fn test_many_totals_values() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_total", &[1000, 1000])?;
 

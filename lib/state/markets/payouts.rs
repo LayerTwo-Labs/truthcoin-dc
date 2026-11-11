@@ -309,8 +309,9 @@ mod payout_tests {
         assert!(!is_vote_correct(&VoteValue::Abstain, 1.0, &decision));
     }
 
+    /// is_vote_correct on a categorical decision with a real winning option.
     #[test]
-    fn test_is_vote_correct_categorical_real_winner() {
+    fn test_categorical_winner() {
         use crate::state::decisions::{Decision, DecisionType};
         use crate::state::voting::types::VoteValue;
 
@@ -332,8 +333,9 @@ mod payout_tests {
         assert!(!is_vote_correct(&VoteValue::Categorical(3), 1.0, &decision));
     }
 
+    /// is_vote_correct on a categorical decision with an inconclusive outcome.
     #[test]
-    fn test_is_vote_correct_categorical_inconclusive() {
+    fn test_categorical_inconclusive() {
         use crate::state::decisions::{Decision, DecisionType};
         use crate::state::voting::types::VoteValue;
 

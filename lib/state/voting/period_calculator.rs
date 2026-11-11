@@ -411,7 +411,7 @@ mod tests {
     // --- get_current_period tests ---
 
     #[test]
-    fn test_get_current_period_blocks_mode() {
+    fn test_current_period_blocks() {
         let config = DecisionConfig::testing(TEN);
 
         // Block 0-9 → period 1
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_current_period_time_mode() {
+    fn test_current_period_time() {
         let config = DecisionConfig {
             is_blocks: false,
             quantity: 600,
@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_current_period_zero_genesis() {
+    fn test_zero_genesis_period() {
         let config = DecisionConfig::default();
         // genesis_ts == 0 → period 0
         assert_eq!(get_current_period(500, None, 0, &config).unwrap(), 0);
@@ -468,7 +468,7 @@ mod tests {
     // --- Transition rule tests ---
 
     #[test]
-    fn test_claimed_to_voting_transition_rule() {
+    fn test_claimed_to_voting() {
         // With DecisionConfig::testing(TEN), a decision claimed in period 1 (period_index=1)
         // should transition to Voting when current_period > 1.
         let config = DecisionConfig::testing(TEN);
@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn test_voting_to_resolved_transition_rule() {
+    fn test_voting_to_resolved() {
         // With DecisionConfig::testing(TEN), a decision with period_index=1 has voting_period=2.
         // It should resolve when current_period > 2.
         let config = DecisionConfig::testing(TEN);

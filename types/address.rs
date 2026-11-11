@@ -120,32 +120,36 @@ mod test {
         assert_eq!(Address::from_deposit_address(&formatted).unwrap(), address);
     }
 
+    /// A deposit address with a truncated checksum is rejected
     #[test]
-    fn deposit_address_rejects_a_short_checksum() {
+    fn deposit_short_checksum() {
         let address = Address([9u8; 20]);
         let formatted = address.format_for_deposit();
         let short = &formatted[..formatted.len() - 1];
         assert!(Address::from_deposit_address(short).is_err());
     }
 
+    /// A deposit address with a wrong checksum is rejected
     #[test]
-    fn deposit_address_rejects_a_wrong_checksum() {
+    fn deposit_wrong_checksum() {
         let address = Address([3u8; 20]);
         let formatted =
             format!("s{}_{}_ffffff", THIS_SIDECHAIN, address.as_base58());
         assert!(Address::from_deposit_address(&formatted).is_err());
     }
 
+    /// A deposit address for another sidechain is rejected
     #[test]
-    fn deposit_address_rejects_another_sidechain() {
+    fn deposit_other_sidechain() {
         let address = Address([3u8; 20]);
         let formatted =
             format!("s{}_{}_000000", THIS_SIDECHAIN + 1, address.as_base58());
         assert!(Address::from_deposit_address(&formatted).is_err());
     }
 
+    /// A bare base58 address is not a deposit address
     #[test]
-    fn deposit_address_rejects_a_bare_address() {
+    fn deposit_bare_address() {
         let address = Address([3u8; 20]);
         assert!(Address::from_deposit_address(&address.as_base58()).is_err());
     }

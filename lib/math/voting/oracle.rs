@@ -816,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn test_weighted_median_dimension_mismatch() {
+    fn test_weighted_median_mismatch() {
         let values = DVector::from_vec(vec![1.0, 2.0]);
         let weights = DVector::from_vec(vec![0.5]);
         assert!(weighted_median(&values, &weights).is_err());
@@ -834,15 +834,17 @@ mod tests {
         assert_eq!(catch_tl(0.16, 0.7), BITCOIN_HIVEMIND_NEUTRAL_VALUE);
     }
 
+    /// With zero_nan, all-zero weights normalize to uniform.
     #[test]
-    fn test_normalize_weights_zero_nan_all_zeros_returns_uniform() {
+    fn test_normalize_zero_nan_zeros() {
         let vec = DVector::from_vec(vec![0.0, 0.0, 0.0, 0.0]);
         let result = normalize_weights(&vec, true);
         assert_eq!(result, DVector::from_vec(vec![0.25, 0.25, 0.25, 0.25]));
     }
 
+    /// With zero_nan, all-NaN weights normalize to uniform.
     #[test]
-    fn test_normalize_weights_zero_nan_all_nan_returns_uniform() {
+    fn test_normalize_zero_nan_nans() {
         let vec = DVector::from_vec(vec![f64::NAN, f64::NAN, f64::NAN]);
         let result = normalize_weights(&vec, true);
         let expected = 1.0 / 3.0;
@@ -855,8 +857,9 @@ mod tests {
         }
     }
 
+    /// With zero_nan, finite weights normalize proportionally.
     #[test]
-    fn test_normalize_weights_zero_nan_normal_values() {
+    fn test_normalize_zero_nan_finite() {
         let vec = DVector::from_vec(vec![2.0, 3.0, 5.0]);
         let result = normalize_weights(&vec, true);
         assert!((result[0] - 0.2).abs() < 1e-10);
@@ -864,8 +867,9 @@ mod tests {
         assert!((result[2] - 0.5).abs() < 1e-10);
     }
 
+    /// Without zero_nan, all-zero weights normalize to uniform.
     #[test]
-    fn test_normalize_weights_no_nan_all_zeros_returns_uniform() {
+    fn test_normalize_no_nan_zeros() {
         let vec = DVector::from_vec(vec![0.0, 0.0, 0.0]);
         let result = normalize_weights(&vec, false);
         let expected = 1.0 / 3.0;
@@ -912,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn test_factory_single_unanimous_voter() {
+    fn test_factory_single_voter() {
         let m = DMatrix::from_row_slice(1, 1, &[1.0]);
         let rep = DVector::from_vec(vec![1.0]);
         let result = factory(&m, Some(&rep), None, None);

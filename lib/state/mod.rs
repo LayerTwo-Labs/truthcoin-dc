@@ -1429,8 +1429,9 @@ mod test {
         }
     }
 
+    /// A body's size is the sum of its transactions' sizes.
     #[test]
-    fn body_size_is_the_sum_of_its_transactions() -> anyhow::Result<()> {
+    fn body_size_sums_txs() -> anyhow::Result<()> {
         use crate::types::{
             Authorization, AuthorizedTransaction, Body, Coinbase, Transaction,
             UtreexoNodeHash, UtreexoProof,
@@ -1479,8 +1480,9 @@ mod test {
         Ok(())
     }
 
+    /// Filling an authorized transaction sets its actor address.
     #[test]
-    fn fill_authorized_transaction_sets_actor_address() -> anyhow::Result<()> {
+    fn fill_sets_actor_address() -> anyhow::Result<()> {
         use crate::types::authorization::{SigningKey, authorize, get_address};
 
         let (_temp_dir, env, state) =
@@ -1578,7 +1580,7 @@ mod test {
     }
 
     #[test]
-    fn state_opens_a_database_it_created() -> anyhow::Result<()> {
+    fn state_reopens_database() -> anyhow::Result<()> {
         let (_temp_dir, env, state) = fresh_state("state-reopen")?;
         drop(state);
         State::new(&env, None)?;

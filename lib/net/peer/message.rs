@@ -359,8 +359,9 @@ mod test {
         [0b1000_0101, 0b0001_1000, 0b1001_0101, id]
     }
 
+    /// Magic bytes differ from thunder's on every network pair.
     #[test]
-    fn magic_bytes_differ_from_thunder_on_every_network() {
+    fn magic_differs_from_thunder() {
         for ours in NETWORKS {
             for theirs in NETWORKS {
                 assert_ne!(magic_bytes(ours), thunder_magic_bytes(theirs));
@@ -371,7 +372,7 @@ mod test {
     const BLOCKS_PER_MONTH: u32 = 6 * 24 * 30;
 
     #[test]
-    fn largest_block_message_fits_read_cap() -> anyhow::Result<()> {
+    fn largest_block_fits_read_cap() -> anyhow::Result<()> {
         let body = Body::new(Vec::new(), Coinbase::default());
         let header = Header {
             merkle_root: Body::compute_merkle_root::<FilledTransaction>(

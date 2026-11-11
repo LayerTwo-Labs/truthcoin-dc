@@ -917,9 +917,9 @@ mod test {
         Ok((temp_dir, env, net, info_rx))
     }
 
+    /// A rejected duplicate connection emits no peer close event.
     #[tokio::test]
-    async fn rejected_duplicate_has_no_peer_close_event() -> anyhow::Result<()>
-    {
+    async fn duplicate_emits_no_close() -> anyhow::Result<()> {
         let (_temp_dir, env, net, info_rx) = temp_net("peer-duplicate")?;
         let (remote, _) = make_server_endpoint(
             (Ipv4Addr::LOCALHOST, 0).into(),
@@ -957,9 +957,9 @@ mod test {
         Ok(())
     }
 
+    /// An IPv4 endpoint dials only the IPv4 addresses a name resolves to.
     #[tokio::test]
-    async fn connect_peer_skips_ipv6_on_an_ipv4_endpoint() -> anyhow::Result<()>
-    {
+    async fn connect_peer_skips_ipv6() -> anyhow::Result<()> {
         let (_temp_dir, env, net, mut info_rx) = temp_net("peer-family")?;
         let (remote, _) = make_server_endpoint(
             (Ipv4Addr::LOCALHOST, 0).into(),
@@ -1004,9 +1004,9 @@ mod test {
         Ok(())
     }
 
+    /// With no usable address, the error names the last invalid one.
     #[tokio::test]
-    async fn connect_peer_returns_the_last_invalid_address()
-    -> anyhow::Result<()> {
+    async fn connect_peer_last_invalid() -> anyhow::Result<()> {
         let (_temp_dir, env, net, _info_rx) = temp_net("peer-ipv6")?;
         let addr = SocketAddr::from((Ipv6Addr::LOCALHOST, 4009));
         let resolved = ResolvedPeerAddress::Domain {
@@ -1031,7 +1031,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn connect_peer_keeps_a_static_ipv4_address() -> anyhow::Result<()> {
+    async fn connect_peer_static_ipv4() -> anyhow::Result<()> {
         let (_temp_dir, env, net, _info_rx) = temp_net("peer-static")?;
         let (remote, _) = make_server_endpoint(
             (Ipv4Addr::LOCALHOST, 0).into(),
@@ -1047,8 +1047,9 @@ mod test {
         Ok(())
     }
 
+    /// Quinn errors other than an invalid address are returned as is.
     #[tokio::test]
-    async fn connect_peer_returns_other_quinn_errors() -> anyhow::Result<()> {
+    async fn connect_peer_quinn_error() -> anyhow::Result<()> {
         let (_temp_dir, env, net, _info_rx) = temp_net("peer-closed")?;
         net.server.close(0_u32.into(), b"test complete");
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 4009));
@@ -1111,7 +1112,7 @@ mod test {
     /// A peer that holds a connection takes no redial, and the loop starts no
     /// second connection to it.
     #[tokio::test]
-    async fn a_connected_peer_takes_no_redial() -> anyhow::Result<()> {
+    async fn connected_peer_no_redial() -> anyhow::Result<()> {
         let (_temp_dir, env, net, _info_rx) = temp_net("peer-redial-skip")?;
         let (remote, _) = make_server_endpoint(
             (Ipv4Addr::LOCALHOST, 0).into(),
@@ -1176,7 +1177,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn a_banned_ip_is_refused_on_accept() -> anyhow::Result<()> {
+    async fn banned_ip_refused_on_accept() -> anyhow::Result<()> {
         let (_temp_dir, env, net, _info_rx) = temp_net("peer-ban-accept")?;
         let (remote, _) = make_server_endpoint(
             (Ipv4Addr::LOCALHOST, 0).into(),
@@ -1247,7 +1248,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn an_ended_ban_is_removed_on_restart() -> anyhow::Result<()> {
+    async fn ended_ban_removed_on_restart() -> anyhow::Result<()> {
         let (_temp_dir, env, net, _info_rx) = temp_net("peer-ban-end")?;
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let ended = std::time::SystemTime::now() - Duration::from_secs(1);
@@ -1271,7 +1272,7 @@ mod test {
     /// A datadir made before a seed existed still learns it, and a second
     /// start adds no row.
     #[test]
-    fn seeds_reach_an_existing_database() -> anyhow::Result<()> {
+    fn seeds_reach_existing_db() -> anyhow::Result<()> {
         let (_temp_dir, env) = temp_env("seed-peers")?;
         let network = Network::Mainnet;
         let known_peers = {
@@ -1300,7 +1301,7 @@ mod test {
 
     /// A seed names a host and a port, and the resolver keeps both.
     #[tokio::test]
-    async fn a_seed_name_resolves_with_its_port() -> anyhow::Result<()> {
+    async fn seed_resolves_with_port() -> anyhow::Result<()> {
         let dns_resolver =
             hickory_resolver::Resolver::builder_tokio()?.build()?;
         let peer_addr: PeerAddress = "localhost:4009".parse()?;

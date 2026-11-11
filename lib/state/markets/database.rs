@@ -1287,8 +1287,9 @@ mod payout_reclaim_tests {
         }
     }
 
+    /// Reclaiming takes round-ups but never drops a payout below its floor.
     #[test]
-    fn reclaim_takes_roundups_never_below_floor() {
+    fn reclaim_respects_floor() {
         let mut payouts =
             vec![rec(3, 0.5, 2), rec(3, 0.6, 2), rec(10, 1.0, 10)];
         reclaim_payout_roundups(&mut payouts, 2);
@@ -1300,8 +1301,9 @@ mod payout_reclaim_tests {
         assert_eq!(total, 12);
     }
 
+    /// Reclaiming takes from the largest fractional round-up first.
     #[test]
-    fn reclaim_prefers_largest_fraction_first() {
+    fn reclaim_largest_first() {
         let mut payouts = vec![rec(3, 0.5, 2), rec(3, 0.6, 2)];
         reclaim_payout_roundups(&mut payouts, 1);
 

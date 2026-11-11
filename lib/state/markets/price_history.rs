@@ -309,8 +309,9 @@ mod tests {
         .prices()
     }
 
+    /// market_changes drops skipped transactions and those of other markets.
     #[test]
-    fn market_changes_drop_skipped_and_other_market_txs() {
+    fn changes_skip_foreign_txs() {
         let body = Body {
             coinbase: Default::default(),
             transactions: vec![
@@ -399,8 +400,9 @@ mod tests {
         Ok(())
     }
 
+    /// Rebuilding fails without the market's creation block.
     #[test]
-    fn rebuild_without_creation_block_fails() {
+    fn rebuild_needs_creation() {
         let result = rebuild_price_history(
             MARKET_ID,
             MarketSnapshot {

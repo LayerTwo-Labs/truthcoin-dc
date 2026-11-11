@@ -3489,8 +3489,9 @@ mod tests {
     use truthcoin_dc::types::Address;
     use truthcoin_dc_app_rpc_api::markets::MarketDimensionKind;
 
+    /// A market buy's cost limit counts the miner fee
     #[test]
-    fn market_buy_limit_counts_the_miner_fee() -> anyhow::Result<()> {
+    fn buy_limit_miner_fee() -> anyhow::Result<()> {
         let buy_cost = BuyCost {
             base_cost_sats: 1001,
             trading_fee_sats: 10,
@@ -3508,8 +3509,9 @@ mod tests {
         Ok(())
     }
 
+    /// A multidimensional market exposes ordered categorical and scaled axes
     #[test]
-    fn multidimensional_market_exposes_ordered_categorical_and_scaled_axes() {
+    fn multidimensional_axes() {
         let category_id = DecisionId::new(true, 1, 0).unwrap();
         let scaled_id = DecisionId::new(true, 1, 1).unwrap();
         let mut decisions = HashMap::new();
@@ -3634,7 +3636,7 @@ mod tests {
     /// A page that rebinds its domain to 127.0.0.1 sends its own name in
     /// `Host`.
     #[tokio::test]
-    async fn loopback_rpc_refuses_a_foreign_host() -> anyhow::Result<()> {
+    async fn refuse_foreign_host() -> anyhow::Result<()> {
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let server = Server::builder()
             .set_http_middleware(

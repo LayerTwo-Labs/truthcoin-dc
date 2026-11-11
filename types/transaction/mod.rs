@@ -617,7 +617,7 @@ mod test {
     // a withdrawal output must be funded for both its payout and its mainchain
     // fee, since both leave the treasury
     #[test]
-    fn withdrawal_value_includes_main_fee() {
+    fn withdrawal_main_fee() {
         let value = bitcoin::Amount::from_sat(1000);
         let main_fee = bitcoin::Amount::from_sat(300);
         let main_address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
@@ -656,7 +656,7 @@ mod test {
     }
 
     #[test]
-    fn claim_decision_variant_wire_format() -> anyhow::Result<()> {
+    fn claim_decision_wire_format() -> anyhow::Result<()> {
         use crate::{
             decision::DecisionType,
             transaction::{

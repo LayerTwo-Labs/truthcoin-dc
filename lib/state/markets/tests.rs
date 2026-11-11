@@ -32,8 +32,9 @@ fn test_dimension_parsing() {
     assert!(result.is_err());
 }
 
+/// LMSR initialization complies with the spec.
 #[test]
-fn test_lmsr_initialization_spec_compliance() {
+fn test_lmsr_init_spec() {
     let beta: f64 = 7.0;
     let n_outcomes: f64 = 2.0;
     let target_liquidity: f64 = 100.0;
@@ -230,8 +231,9 @@ fn test_fee_split_proportions() {
     assert_eq!(voter + decision_author + market_author, 1000);
 }
 
+/// MarketBuilder's id matches compute_market_id.
 #[test]
-fn built_market_id_matches_compute_market_id() {
+fn built_id_matches_computed() {
     use crate::state::MarketBuilder;
     use crate::state::decisions::{Decision, DecisionId, DecisionType};
     use crate::state::markets::compute_market_id;

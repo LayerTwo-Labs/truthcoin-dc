@@ -1992,14 +1992,15 @@ mod test {
         })
     }
 
+    /// Block selection never spends more reputation than the balance holds.
     #[test]
-    fn block_selection_keeps_reputation_balance() -> anyhow::Result<()> {
+    fn block_selection_caps_reputation() -> anyhow::Result<()> {
         check_reputation_selection(1.0, &[0.75, 0.75], 1)
     }
 
+    /// Block selection keeps every reputation transfer the balance funds.
     #[test]
-    fn block_selection_keeps_funded_reputation_transfers() -> anyhow::Result<()>
-    {
+    fn block_selection_keeps_funded() -> anyhow::Result<()> {
         check_reputation_selection(1.0, &[0.25, 0.25], 2)
     }
 
@@ -2361,7 +2362,7 @@ mod test {
     }
 
     #[test]
-    fn block_selection_obeys_body_size_limit() -> anyhow::Result<()> {
+    fn block_selection_size_limit() -> anyhow::Result<()> {
         use crate::types::{
             AuthorizedTransaction, Body, Coinbase,
             authorization::{self, Authorization, SigningKey},
@@ -2573,7 +2574,7 @@ mod test {
     }
 
     #[test]
-    fn peer_transaction_conflicts_do_not_stop_net_task() -> anyhow::Result<()> {
+    fn peer_tx_conflicts_not_fatal() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let (temp_dir, node) = temp_node(&runtime)?;
@@ -2711,8 +2712,9 @@ mod test {
         })
     }
 
+    /// A connection that times out before its first message is retried.
     #[test]
-    fn retry_connection_timeout_before_first_message() -> anyhow::Result<()> {
+    fn retry_on_connect_timeout() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let (_temp_dir, node) = temp_node(&runtime)?;
@@ -2752,8 +2754,9 @@ mod test {
         })
     }
 
+    /// A duplicate close before the first message is retried.
     #[test]
-    fn retry_duplicate_close_before_first_message() -> anyhow::Result<()> {
+    fn retry_on_duplicate_close() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let (_temp_dir, node) = temp_node(&runtime)?;
@@ -2815,9 +2818,9 @@ mod test {
         })
     }
 
+    /// An invalid best side tip is not connected and the net task keeps going.
     #[test]
-    fn an_invalid_best_side_tip_does_not_stop_the_net_task()
-    -> anyhow::Result<()> {
+    fn invalid_side_tip_not_fatal() -> anyhow::Result<()> {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let temp_dir = temp_dir::TempDir::new()?;
@@ -2950,7 +2953,7 @@ mod test {
     // transaction whose parent just left the mempool, must not stop the net
     // task
     #[test]
-    fn a_peer_transaction_this_node_refuses_is_not_fatal() {
+    fn refused_peer_tx_not_fatal() {
         use crate::{mempool, node::net_task::is_fatal_peer_tx_error};
 
         assert!(!is_fatal_peer_tx_error(&Error::MemPool(
@@ -2970,9 +2973,9 @@ mod test {
         assert!(is_fatal_peer_tx_error(&Error::PeerInfoRxClosed));
     }
 
+    /// Block selection drops transactions that conflict at block connect.
     #[test]
-    fn block_selection_drops_transactions_that_conflict_at_connect()
-    -> anyhow::Result<()> {
+    fn block_selection_drops_conflicts() -> anyhow::Result<()> {
         use crate::{
             state::{
                 decisions::{Decision, DecisionId, DecisionType},

@@ -1483,8 +1483,9 @@ mod tests {
         assert!(result.is_err(), "the CLI accepted a second map: {result:?}");
     }
 
+    /// Text after a transfer map is refused
     #[test]
-    fn refuse_text_after_a_transfer_map() {
+    fn refuse_trailing_text() {
         let address = Address([1u8; 20]);
         let result = Cli::try_parse_from([
             "truthcoin-cli",
@@ -1496,8 +1497,9 @@ mod tests {
         assert!(result.is_err(), "the CLI accepted extra text: {result:?}");
     }
 
+    /// A transfer parse error starts with the offending address path
     #[test]
-    fn the_transfer_error_has_the_address_path() {
+    fn transfer_error_path() {
         let address = Address([1u8; 20]);
         let error = JsonParser::<TransferDests>::parse(&format!(
             "{{\"{address}\": \"invalid\"}}"

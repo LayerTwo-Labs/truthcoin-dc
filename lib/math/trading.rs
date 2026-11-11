@@ -252,8 +252,9 @@ mod tests {
         assert!((prices[1] - 0.5).abs() < 1e-6);
     }
 
+    /// Payouts never exceed the treasury when beta is liquidity-base derived.
     #[test]
-    fn fixed_redemption_solvent_under_liquidity_base_beta() {
+    fn fixed_redemption_solvent() {
         use ndarray::Array1;
 
         let mut seed: u64 = 0x1234_5678_9abc_def0;

@@ -1078,9 +1078,9 @@ mod tests {
         }
     }
 
+    /// Delayed messages for removed peer states do not stop the connection.
     #[test]
-    fn delayed_messages_for_removed_peer_states_do_not_stop_the_connection()
-    -> anyhow::Result<()> {
+    fn stale_peer_state_messages() -> anyhow::Result<()> {
         use std::{net::Ipv4Addr, sync::Arc};
 
         use futures::channel::mpsc;

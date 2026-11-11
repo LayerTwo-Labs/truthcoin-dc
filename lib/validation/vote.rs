@@ -472,24 +472,27 @@ mod tests {
         );
     }
 
+    /// 0.0 converts to a binary false vote
     #[test]
-    fn convert_zero_returns_binary_false() {
+    fn convert_zero() {
         assert_eq!(
             VoteValidator::convert_vote_value(0.0),
             VoteValue::Binary(false)
         );
     }
 
+    /// 1.0 converts to a binary true vote
     #[test]
-    fn convert_one_returns_binary_true() {
+    fn convert_one() {
         assert_eq!(
             VoteValidator::convert_vote_value(1.0),
             VoteValue::Binary(true)
         );
     }
 
+    /// A fractional value converts to a scalar vote
     #[test]
-    fn convert_fractional_returns_scalar() {
+    fn convert_fractional() {
         assert_eq!(
             VoteValidator::convert_vote_value(0.5),
             VoteValue::Scalar(0.5)
@@ -562,8 +565,9 @@ mod tests {
         assert!(VoteValidator::validate_vote_value(&d, -0.1).is_err());
     }
 
+    /// The index past the last option (inconclusive) is a valid vote
     #[test]
-    fn categorical_vote_accepts_inconclusive_index() {
+    fn categorical_inconclusive_ok() {
         use crate::state::decisions::{Decision, DecisionType};
 
         let d = Decision::new(
@@ -585,8 +589,9 @@ mod tests {
         assert!(VoteValidator::validate_vote_value(&d, f64::NAN).is_ok());
     }
 
+    /// Indices at and just below the option limit validate and convert intact
     #[test]
-    fn categorical_vote_preserves_limit_indices() {
+    fn categorical_limit_indices() {
         use crate::state::decisions::{Decision, DecisionType};
 
         let decision = Decision::new(
@@ -624,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn categorical_vote_rejects_out_of_range() {
+    fn categorical_out_of_range_err() {
         use crate::state::decisions::{Decision, DecisionType};
 
         let d = Decision::new(

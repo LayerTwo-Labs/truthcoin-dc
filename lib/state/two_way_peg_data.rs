@@ -1559,7 +1559,7 @@ mod test {
     // failure must delete the recreations; the original STXO record
     // remains untouched
     #[test]
-    fn disconnect_failed_bundle_removes_recreated_utxo() -> anyhow::Result<()> {
+    fn disconnect_failed_bundle() -> anyhow::Result<()> {
         let (_temp_dir, env, state) =
             fresh_state("disconnect_failed_bundle_removes_recreated_utxo")?;
         let outpoint = OutPoint::Regular {
@@ -2061,8 +2061,7 @@ mod test {
     // withdrawal_bundle_event_blocks record, not a deposit_blocks record that
     // happens to share the same sequence index
     #[test]
-    fn disconnect_withdrawal_event_block_uses_correct_db() -> anyhow::Result<()>
-    {
+    fn disconnect_uses_event_db() -> anyhow::Result<()> {
         let (_temp_dir, env, state) =
             fresh_state("disconnect_withdrawal_event_block_uses_correct_db")?;
 
@@ -2195,9 +2194,9 @@ mod test {
         Ok(res)
     }
 
+    /// Collecting one P2WPKH output past the claimed max stays within weight.
     #[test]
-    fn collect_withdrawal_bundle_p2wpkh_off_by_one_does_not_exceed_weight()
-    -> anyhow::Result<()> {
+    fn bundle_within_weight() -> anyhow::Result<()> {
         const CLAIMED_MAX_BUNDLE_OUTPUTS: u32 = 3_222;
 
         let bundle = with_state_with_withdrawals(
@@ -2231,7 +2230,7 @@ mod test {
     /// every output the state holds, including a deposit that the same
     /// mainchain block created.
     #[test]
-    fn a_bundle_spends_a_deposit_of_the_same_block() -> anyhow::Result<()> {
+    fn bundle_spends_new_deposit() -> anyhow::Result<()> {
         let (_temp_dir, env, state) =
             fresh_state("a_bundle_spends_a_deposit_of_the_same_block")?;
         let m6id = M6id(bitcoin::Txid::from_byte_array([5; 32]));
@@ -2341,9 +2340,9 @@ mod test {
         Ok(bytes)
     }
 
+    /// An unknown bundle confirmed above genesis round-trips.
     #[test]
-    fn unknown_bundle_confirmed_above_genesis_round_trips() -> anyhow::Result<()>
-    {
+    fn unknown_bundle_round_trips() -> anyhow::Result<()> {
         let (_temp_dir, env, state) =
             fresh_state("unknown_bundle_confirmed_above_genesis_round_trips")?;
         let block_height = 5;
@@ -2548,7 +2547,7 @@ mod test {
     // deposit block hash by reverse iteration (yielding the oldest block) and
     // panicked on the consistency assert against the newest hash connect stored.
     #[test]
-    fn disconnect_two_deposit_blocks_restores_state() -> anyhow::Result<()> {
+    fn disconnect_two_deposits() -> anyhow::Result<()> {
         fn deposit_block(salt: u8) -> (bitcoin::BlockHash, BlockInfo) {
             let dep = Deposit {
                 tx_index: 0,

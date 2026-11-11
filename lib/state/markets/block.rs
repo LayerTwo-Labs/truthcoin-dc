@@ -2698,8 +2698,9 @@ mod tests {
         Ok(())
     }
 
+    /// Consolidation records every UTXO write it makes.
     #[test]
-    fn consolidation_records_each_utxo_write() -> anyhow::Result<()> {
+    fn consolidation_records_writes() -> anyhow::Result<()> {
         use crate::state::markets::{
             generate_market_author_fee_address,
             generate_market_treasury_address,
@@ -2872,7 +2873,7 @@ mod tests {
     }
 
     #[test]
-    fn sell_rollback_restores_market_volume() -> anyhow::Result<()> {
+    fn sell_rollback_restores_volume() -> anyhow::Result<()> {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
         use crate::state::markets::generate_market_treasury_address;
         use crate::types::{Output, Txid};
@@ -2965,8 +2966,9 @@ mod tests {
         Ok(())
     }
 
+    /// Trade simulation prices at a beta amplified earlier in the same block.
     #[test]
-    fn trade_simulation_prices_at_same_block_amplified_beta() {
+    fn sim_uses_amplified_beta() {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
 
         let TradingFixture {
@@ -3019,8 +3021,9 @@ mod tests {
         ));
     }
 
+    /// Trade simulation rejects selling shares bought in the same block.
     #[test]
-    fn trade_simulation_rejects_sell_of_same_block_buy() {
+    fn sim_rejects_same_block_sell() {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
 
         let TradingFixture {
@@ -3069,8 +3072,9 @@ mod tests {
         );
     }
 
+    /// A sell beyond the shares left after a same-block sell is rejected.
     #[test]
-    fn test_double_spend_protection_same_block() {
+    fn double_spend_rejected() {
         let mut state_update = StateUpdate::new();
         let trader = Address::ALL_ZEROS;
         let market_id = MarketId::new([1u8; 6]);
@@ -3108,8 +3112,9 @@ mod tests {
         );
     }
 
+    /// Buying then selling within the same block is allowed.
     #[test]
-    fn test_buy_then_sell_same_block_allowed() {
+    fn buy_then_sell_allowed() {
         let mut state_update = StateUpdate::new();
         let trader = Address::ALL_ZEROS;
         let market_id = MarketId::new([2u8; 6]);
@@ -3141,8 +3146,9 @@ mod tests {
         );
     }
 
+    /// A same-block sell of one outcome leaves other outcomes untouched.
     #[test]
-    fn test_multiple_sells_different_outcomes_same_block() {
+    fn sells_isolated_by_outcome() {
         let mut state_update = StateUpdate::new();
         let trader = Address::ALL_ZEROS;
         let market_id = MarketId::new([3u8; 6]);
@@ -3173,8 +3179,9 @@ mod tests {
         assert!(effective_owned_1 >= 100);
     }
 
+    /// Same-block sells of one outcome accumulate against the owned shares.
     #[test]
-    fn test_cumulative_sells_same_outcome_same_block() {
+    fn sells_accumulate() {
         let mut state_update = StateUpdate::new();
         let trader = Address::ALL_ZEROS;
         let market_id = MarketId::new([4u8; 6]);
@@ -3217,8 +3224,9 @@ mod tests {
         assert!(effective_owned >= 30);
     }
 
+    /// Same-block buys fold into the effective shares while beta stays fixed.
     #[test]
-    fn same_block_buys_fold_shares_not_beta() {
+    fn buys_fold_shares_not_beta() {
         use crate::math::trading;
         use ndarray::array;
 
@@ -3285,7 +3293,7 @@ mod tests {
     /// the reverse order, and the replay of the same block must reach the
     /// same roots.
     #[test]
-    fn settlement_replay_keeps_the_roots() -> anyhow::Result<()> {
+    fn replay_keeps_roots() -> anyhow::Result<()> {
         use crate::archive::Archive;
         use crate::state::MarketBuilder;
         use crate::state::decisions::{Decision, DecisionId, DecisionType};

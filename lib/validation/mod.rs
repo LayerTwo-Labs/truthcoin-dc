@@ -232,14 +232,16 @@ mod tests {
         }
     }
 
+    /// A coinbase may always pay a bitcoin output
     #[test]
-    fn coinbase_bitcoin_output_always_valid() {
+    fn coinbase_bitcoin_output() {
         let outputs = vec![bitcoin_output(5000)];
         assert!(super::validate_coinbase_outputs(&outputs).is_ok());
     }
 
+    /// A coinbase may never pay market funds
     #[test]
-    fn coinbase_market_funds_always_rejected() {
+    fn coinbase_market_funds() {
         let outputs = vec![Output {
             address: Address::ALL_ZEROS,
             content: OutputContent::MarketFunds {
@@ -258,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_fees_coinbase_exceeds_fees_rejected() {
+    fn coinbase_exceeds_fees() {
         let coinbase = bitcoin::Amount::from_sat(1000);
         assert!(super::validate_fees(coinbase, &[], &HashSet::new()).is_err());
     }
@@ -286,8 +288,9 @@ mod tests {
         }
     }
 
+    /// The miner fee excludes an amplify-beta deposit
     #[test]
-    fn miner_fee_excludes_amplify_beta_deposit() {
+    fn miner_fee_beta_deposit() {
         use crate::{
             math::trading::TRADE_MINER_FEE_SATS,
             state::markets::MarketId,
@@ -314,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_decision_claim_across_txs_rejected() {
+    fn duplicate_claim_across_txs() {
         let txs = vec![claim_tx(&[[1, 2, 3, 4]]), claim_tx(&[[1, 2, 3, 4]])];
         assert!(super::check_duplicate_decision_claims(&txs).is_err());
     }

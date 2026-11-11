@@ -657,19 +657,19 @@ mod tests {
     }
 
     #[test]
-    fn market_negative_shares_rejected() {
+    fn market_negative_shares() {
         let shares = Array1::from_vec(vec![100, -1]);
         assert!(MarketValidator::validate_market_shares(&shares).is_err());
     }
 
     #[test]
-    fn market_fewer_than_two_outcomes_rejected() {
+    fn market_too_few_outcomes() {
         let shares = Array1::from_vec(vec![100]);
         assert!(MarketValidator::validate_market_shares(&shares).is_err());
     }
 
     #[test]
-    fn market_creation_duplicate_dimension_rejected() {
+    fn market_duplicate_dimension() {
         use crate::state::decisions::Decision;
         use crate::state::markets::compute_market_id;
         use crate::types::{
@@ -859,8 +859,9 @@ mod tests {
         }
     }
 
+    /// The treasury output must pay the market's treasury address
     #[test]
-    fn treasury_output_must_pay_market_treasury_address() {
+    fn treasury_output_address() {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(64 * 1024 * 1024)
@@ -1004,13 +1005,15 @@ mod tests {
         }
     }
 
+    /// A binary market validates only when paying exactly its storage fee
     #[test]
-    fn market_storage_fee_exact_and_below() {
+    fn binary_storage_fee() {
         check_market_fee(DecisionType::Binary, false);
     }
 
+    /// A categorical market's storage fee scales with its option count
     #[test]
-    fn market_category_storage_fee_uses_option_count() {
+    fn category_storage_fee() {
         check_market_fee(
             DecisionType::Category {
                 options: vec!["a".into(), "b".into(), "c".into()],
@@ -1019,13 +1022,15 @@ mod tests {
         );
     }
 
+    /// The market fee includes the fee for a newly claimed decision
     #[test]
-    fn market_fee_includes_new_claim_fee() {
+    fn market_claim_fee() {
         check_market_fee(DecisionType::Binary, true);
     }
 
+    /// A newly claimed categorical decision's fee uses its option count
     #[test]
-    fn market_new_category_fee_uses_option_count() {
+    fn category_claim_fee() {
         check_market_fee(
             DecisionType::Category {
                 options: vec!["a".into(), "b".into(), "c".into()],

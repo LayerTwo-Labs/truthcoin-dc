@@ -235,8 +235,9 @@ pub struct MarketPayoutSummary {
 mod tests {
     use super::{MarketId, ShareAccount};
 
+    /// ShareAccount positions iterate in canonical order.
     #[test]
-    fn share_account_positions_iterate_in_canonical_order() {
+    fn positions_iterate_canonically() {
         let market_id = MarketId::new([1u8; 6]);
         let mut account = ShareAccount::new();
         account.add_shares(market_id, 2, 10, 0);

@@ -1135,7 +1135,7 @@ mod test {
     /// The node may start before the mainchain node, so it waits for the
     /// validator service instead of an error.
     #[tokio::test]
-    async fn wait_for_the_validator_service() -> anyhow::Result<()> {
+    async fn wait_for_validator() -> anyhow::Result<()> {
         let reserved =
             reserve_port::ReservedSocketAddr::reserve_random_socket_addr()?;
         let addr = reserved.socket_addr();

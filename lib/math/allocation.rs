@@ -253,7 +253,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_allocation_uses_nearest_rounding() {
+    fn test_nearest_rounding() {
         // With 3 participants of equal weight and pool of 100,
         // each should get 33 or 34 (100/3 = 33.33...)
         let participants = vec![("a", 1.0), ("b", 1.0), ("c", 1.0)];
@@ -279,8 +279,9 @@ mod tests {
         assert_eq!(result.total_allocated, pool);
     }
 
+    /// An under-allocated remainder goes to the largest share.
     #[test]
-    fn test_remainder_to_largest_when_under() {
+    fn test_remainder_under() {
         // Create scenario where rounding leaves remainder
         // 3 equal participants, pool of 100 -> 33.33 each
         // Rounds to 33 each = 99, remainder 1 goes to one of them
@@ -294,8 +295,9 @@ mod tests {
         assert!(counts.contains(&34) || counts.iter().all(|&x| x == 33));
     }
 
+    /// An over-allocated remainder is taken from the smallest share.
     #[test]
-    fn test_remainder_from_smallest_when_over() {
+    fn test_remainder_over() {
         // Create scenario where rounding over-allocates
         // This is harder to construct, but the logic is tested
         let participants = vec![("a", 0.5), ("b", 0.5)];
@@ -304,8 +306,9 @@ mod tests {
         assert_eq!(result.total_allocated, 101);
     }
 
+    /// 100 equal weights sharing a 50 sat pool still conserve the pool.
     #[test]
-    fn test_u64_pathological_over_allocation() {
+    fn test_u64_over_allocation() {
         let participants: Vec<(usize, f64)> =
             (0..100).map(|i| (i, 1.0)).collect();
         let pool = 50u64;
@@ -315,8 +318,9 @@ mod tests {
         assert_eq!(result.total_allocated, pool);
     }
 
+    /// 1000 equal weights over an uneven pool conserve every sat.
     #[test]
-    fn test_u64_many_tiny_allocations_conserve() {
+    fn test_u64_many_tiny() {
         let participants: Vec<(usize, f64)> =
             (0..1000).map(|i| (i, 1.0)).collect();
         let pool = 1_000_001u64;
@@ -368,8 +372,9 @@ mod tests {
         assert_eq!(result.total_allocated, 0);
     }
 
+    /// When every share rounds to zero the first participant gets the pool.
     #[test]
-    fn test_all_round_to_zero_conserves_u64() {
+    fn test_u64_round_to_zero() {
         let participants = vec![("a", 1.0), ("b", 1.0), ("c", 1.0)];
         let result = allocate_proportionally_u64(participants, 1).unwrap();
         let sum: u64 = result.allocations.iter().map(|(_, a)| *a).sum();
@@ -379,8 +384,9 @@ mod tests {
         assert_eq!(result.allocations[0].0, "a");
     }
 
+    /// When every share rounds to zero a signed pool is still conserved.
     #[test]
-    fn test_all_round_to_zero_conserves_i64() {
+    fn test_i64_round_to_zero() {
         let participants = vec![("a", 1.0), ("b", 1.0), ("c", 1.0)];
         let result = allocate_proportionally_i64(participants, 1).unwrap();
         let sum: i64 = result.allocations.iter().map(|(_, a)| *a).sum();
@@ -397,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_weight_participants_skipped() {
+    fn test_zero_weight_skipped() {
         let participants = vec![
             ("a", 100.0),
             ("b", 0.0), // Should be skipped

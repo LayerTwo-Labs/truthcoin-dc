@@ -835,8 +835,9 @@ mod conservation_tests {
         m
     }
 
+    /// Updates overwrite prior reputation and zeroed voters are dropped
     #[test]
-    fn compute_post_replaces_and_drops() {
+    fn compute_post_replaces() {
         let pre = pre_state_unit();
         let mut updates = BTreeMap::new();
         updates.insert(addr(1), 0.5);
@@ -873,7 +874,7 @@ mod conservation_tests {
     }
 
     #[test]
-    fn per_block_accepts_within_epsilon() {
+    fn per_block_accepts_epsilon() {
         let pre = pre_state_unit();
         let mut post = pre.clone();
         post.insert(addr(1), 0.6 + 1e-11);
@@ -882,7 +883,7 @@ mod conservation_tests {
     }
 
     #[test]
-    fn anchor_rejects_cumulative_drift() {
+    fn anchor_rejects_drift() {
         let mut pre = BTreeMap::new();
         pre.insert(addr(1), 0.6 + 1.5e-6);
         pre.insert(addr(2), 0.4);
@@ -895,7 +896,7 @@ mod conservation_tests {
     }
 
     #[test]
-    fn anchor_accepts_within_epsilon() {
+    fn anchor_accepts_epsilon() {
         let mut pre = BTreeMap::new();
         pre.insert(addr(1), 0.6 + 5e-8);
         pre.insert(addr(2), 0.4);
@@ -904,7 +905,7 @@ mod conservation_tests {
     }
 
     #[test]
-    fn compute_post_preserves_untouched_voters() {
+    fn compute_post_keeps_others() {
         let pre = pre_state_unit();
         let mut updates = BTreeMap::new();
         updates.insert(addr(1), 0.7);
@@ -913,7 +914,7 @@ mod conservation_tests {
     }
 
     #[test]
-    fn reanchor_restores_unit_sum_after_drift() {
+    fn reanchor_restores_sum() {
         let mut post = BTreeMap::new();
         post.insert(addr(1), 0.5 + 1e-10);
         post.insert(addr(2), 0.5 - 2e-10);
@@ -929,8 +930,9 @@ mod conservation_tests {
         assert!(post.is_empty());
     }
 
+    /// Drift correction goes to the largest voter with a deterministic tiebreak
     #[test]
-    fn reanchor_targets_largest_voter_with_deterministic_tiebreak() {
+    fn reanchor_targets_largest() {
         let mut post = BTreeMap::new();
         post.insert(addr(2), 0.5);
         post.insert(addr(1), 0.5 - 3e-10);
@@ -940,8 +942,9 @@ mod conservation_tests {
         assert!(*post.get(&addr(2)).unwrap() > 0.5);
     }
 
+    /// Repeated drift and reanchoring never accumulates error in the sum
     #[test]
-    fn reanchor_repeated_drift_never_accumulates() {
+    fn reanchor_no_accumulation() {
         let mut post = BTreeMap::new();
         post.insert(addr(1), 0.6);
         post.insert(addr(2), 0.4);

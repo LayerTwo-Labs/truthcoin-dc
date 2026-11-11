@@ -238,8 +238,9 @@ mod test {
         .into()
     }
 
+    /// The inbound budget refuses a request once the burst is spent.
     #[test]
-    fn the_budget_refuses_a_request_over_the_burst() {
+    fn budget_caps_burst() {
         let budget = InboundBudget::new();
         let request = get_headers();
         let burst = INBOUND_REQUEST_QUOTA.burst_size().get()

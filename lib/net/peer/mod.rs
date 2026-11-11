@@ -597,7 +597,7 @@ mod tests {
     /// response over a congested link is not spuriously aborted (which would
     /// stall IBD).
     #[test]
-    fn large_response_read_timeout_leaves_headroom() {
+    fn large_response_headroom() {
         let get_block = GetBlockRequest {
             block_hash: BlockHash([0u8; 32]),
             descendant_tip: None,
@@ -619,7 +619,7 @@ mod tests {
     /// heartbeat, so an absurd height must not be able to inflate the read
     /// budget (and with it, the response read timeout) without bound.
     #[test]
-    fn get_headers_read_response_limit_is_bounded() {
+    fn get_headers_limit_bounded() {
         let get_headers = GetHeadersRequest {
             start: HashSet::new(),
             end: BlockHash([0u8; 32]),
@@ -641,7 +641,7 @@ mod tests {
     /// A tiny response is still bounded, but never below the base allowance
     /// covering round-trip latency.
     #[test]
-    fn small_response_read_timeout_at_least_base() {
+    fn small_response_min_timeout() {
         let limit = NonZeroUsize::new(256).unwrap();
         let timeout = Connection::response_read_timeout(limit);
         assert_eq!(timeout, Connection::MIN_READ_RESPONSE_TIMEOUT);

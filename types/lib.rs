@@ -767,7 +767,7 @@ mod withdrawal_bundle_order_regression {
     // were aggregated (HashMap iteration order is randomized per process). Before the
     // total-order fix, the comparator was non-transitive and this failed.
     #[test]
-    fn m6id_is_independent_of_aggregation_order() {
+    fn m6id_order_independent() {
         let a = aw(1, 3);
         let b = aw(3, 2);
         let c = aw(2, 1);
@@ -802,7 +802,7 @@ mod same_block_chain {
     /// `modify_memforest`; validation walks `AccumulatorDiff`. A leaf the
     /// block makes and spends reaches neither.
     #[test]
-    fn the_template_and_validation_agree() -> anyhow::Result<()> {
+    fn template_matches_validation() -> anyhow::Result<()> {
         let address = get_address(&(&SigningKey::new(&mut rand::rng())).into());
         let value_output = |sats: u64| Output {
             address,
