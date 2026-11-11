@@ -2328,7 +2328,7 @@ fn apply_submit_vote(
 
     let vote_value =
         crate::validation::VoteValidator::convert_vote_value_with_decision(
-            vote_data.vote_value,
+            Some(vote_data.vote_value),
             decision_ref.as_ref(),
         );
 

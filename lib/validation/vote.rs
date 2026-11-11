@@ -51,20 +51,20 @@ pub struct VoteValidator;
 
 impl VoteValidator {
     pub fn convert_vote_value(
-        vote_value: f64,
+        vote_value: Option<f64>,
     ) -> crate::state::voting::types::VoteValue {
         Self::convert_vote_value_with_decision(vote_value, None)
     }
 
     pub fn convert_vote_value_with_decision(
-        vote_value: f64,
+        vote_value: Option<f64>,
         decision: Option<&crate::state::decisions::Decision>,
     ) -> crate::state::voting::types::VoteValue {
         use crate::state::voting::types::VoteValue;
 
-        if vote_value.is_nan() {
+        let Some(vote_value) = vote_value else {
             return VoteValue::Abstain;
-        }
+        };
 
         if let Some(d) = decision
             && d.is_categorical()
@@ -121,7 +121,10 @@ impl VoteValidator {
         vote_value: f64,
     ) -> Result<(), Error> {
         if vote_value.is_nan() {
-            return Ok(());
+            return Err(Error::InvalidTransaction {
+                reason: "Vote value is NaN; omit the value to abstain"
+                    .to_string(),
+            });
         }
 
         if decision.is_categorical() {
@@ -398,15 +401,18 @@ impl VoteValidator {
                         other => other,
                     })?;
 
-            Self::validate_vote_value(&decision, vote_item.vote_value)
-                .map_err(|e| match e {
-                    Error::InvalidTransaction { reason } => {
-                        Error::InvalidTransaction {
-                            reason: format!("Ballot item {idx}: {reason}"),
+            if let Some(vote_value) = vote_item.vote_value {
+                Self::validate_vote_value(&decision, vote_value).map_err(
+                    |e| match e {
+                        Error::InvalidTransaction { reason } => {
+                            Error::InvalidTransaction {
+                                reason: format!("Ballot item {idx}: {reason}"),
+                            }
                         }
-                    }
-                    other => other,
-                })?;
+                        other => other,
+                    },
+                )?;
+            }
 
             Self::validate_voting_period(state, rotxn, decision_id).map_err(
                 |e| match e {
@@ -464,19 +470,17 @@ mod tests {
     use super::*;
     use crate::state::voting::types::VoteValue;
 
+    /// A missing vote value converts to an abstention
     #[test]
-    fn convert_nan_returns_abstain() {
-        assert_eq!(
-            VoteValidator::convert_vote_value(f64::NAN),
-            VoteValue::Abstain
-        );
+    fn convert_none() {
+        assert_eq!(VoteValidator::convert_vote_value(None), VoteValue::Abstain);
     }
 
     /// 0.0 converts to a binary false vote
     #[test]
     fn convert_zero() {
         assert_eq!(
-            VoteValidator::convert_vote_value(0.0),
+            VoteValidator::convert_vote_value(Some(0.0)),
             VoteValue::Binary(false)
         );
     }
@@ -485,7 +489,7 @@ mod tests {
     #[test]
     fn convert_one() {
         assert_eq!(
-            VoteValidator::convert_vote_value(1.0),
+            VoteValidator::convert_vote_value(Some(1.0)),
             VoteValue::Binary(true)
         );
     }
@@ -494,7 +498,7 @@ mod tests {
     #[test]
     fn convert_fractional() {
         assert_eq!(
-            VoteValidator::convert_vote_value(0.5),
+            VoteValidator::convert_vote_value(Some(0.5)),
             VoteValue::Scalar(0.5)
         );
     }
@@ -518,7 +522,7 @@ mod tests {
 
         assert_eq!(
             VoteValidator::convert_vote_value_with_decision(
-                2.0,
+                Some(2.0),
                 Some(&decision)
             ),
             VoteValue::Categorical(2)
@@ -543,7 +547,6 @@ mod tests {
         assert!(VoteValidator::validate_vote_value(&d, 0.0).is_ok());
         assert!(VoteValidator::validate_vote_value(&d, 0.5).is_ok());
         assert!(VoteValidator::validate_vote_value(&d, 1.0).is_ok());
-        assert!(VoteValidator::validate_vote_value(&d, f64::NAN).is_ok());
     }
 
     #[test]
@@ -563,6 +566,7 @@ mod tests {
 
         assert!(VoteValidator::validate_vote_value(&d, 1.5).is_err());
         assert!(VoteValidator::validate_vote_value(&d, -0.1).is_err());
+        assert!(VoteValidator::validate_vote_value(&d, f64::NAN).is_err());
     }
 
     /// The index past the last option (inconclusive) is a valid vote
@@ -586,7 +590,6 @@ mod tests {
         assert!(VoteValidator::validate_vote_value(&d, 0.0).is_ok());
         assert!(VoteValidator::validate_vote_value(&d, 2.0).is_ok());
         assert!(VoteValidator::validate_vote_value(&d, 3.0).is_ok());
-        assert!(VoteValidator::validate_vote_value(&d, f64::NAN).is_ok());
     }
 
     /// Indices at and just below the option limit validate and convert intact
@@ -613,7 +616,7 @@ mod tests {
             );
             assert_eq!(
                 VoteValidator::convert_vote_value_with_decision(
-                    value,
+                    Some(value),
                     Some(&decision),
                 ),
                 VoteValue::Categorical(index),
@@ -806,7 +809,7 @@ mod tests {
                     voter: f.voter,
                     votes: vec![crate::types::BallotItem {
                         decision_id_bytes: f.decision_id.as_bytes(),
-                        vote_value: 1.0,
+                        vote_value: Some(1.0),
                     }],
                     voting_period,
                 },
@@ -847,7 +850,7 @@ mod tests {
                     voting_period: 2,
                     votes: vec![BallotItem {
                         decision_id_bytes: second,
-                        vote_value: 1.0,
+                        vote_value: Some(1.0),
                     }],
                 }),
                 ..Default::default()
@@ -877,7 +880,7 @@ mod tests {
                 votes: vec![
                     BallotItem {
                         decision_id_bytes: [1, 0, 0, 0],
-                        vote_value: 0.0
+                        vote_value: Some(0.0)
                     };
                     2
                 ],

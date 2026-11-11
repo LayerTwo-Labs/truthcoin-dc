@@ -1626,7 +1626,7 @@ async fn roundtrip_task_inner(
         for (decision_idx, &vote_value) in votes.iter().enumerate() {
             vote_items.push(BallotItem {
                 decision_id: voting_decision_ids[decision_idx].clone(),
-                vote_value,
+                vote_value: Some(vote_value),
             });
         }
 
@@ -3843,7 +3843,7 @@ async fn roundtrip_task_inner(
             .iter()
             .map(|(decision_id, value)| BallotItem {
                 decision_id: decision_id.clone(),
-                vote_value: *value,
+                vote_value: Some(*value),
             })
             .collect();
 
@@ -3852,7 +3852,7 @@ async fn roundtrip_task_inner(
 
     let misaligned = vec![BallotItem {
         decision_id: scaled_dec_0.clone(),
-        vote_value: 152_557.0,
+        vote_value: Some(152_557.0),
     }];
     assert!(
         truthcoin_nodes

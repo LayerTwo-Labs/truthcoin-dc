@@ -525,10 +525,11 @@ pub enum Command {
     /// List this wallet's addresses that hold votecoin
     #[command(name = "voter-addresses")]
     VoterAddresses,
-    /// Submit vote(s) - use comma-separated "id:value" for batch
+    /// Submit vote(s) - use comma-separated "id:value" for batch,
+    /// "id:abstain" to abstain
     #[command(name = "vote-submit", alias = "vote")]
     VoteSubmit {
-        /// Single vote: --decision-id X --vote-value Y, or batch: --votes "id1:val1,id2:val2"
+        /// Single vote: --decision-id X --vote-value Y, or batch: --votes "id1:val1,id2:abstain"
         #[arg(long)]
         decision_id: Option<String>,
         #[arg(long)]
@@ -1332,7 +1333,10 @@ where
                     .filter_map(|pair| {
                         let parts: Vec<&str> = pair.trim().split(':').collect();
                         if parts.len() == 2 {
-                            let val: f64 = parts[1].parse().ok()?;
+                            let val = match parts[1] {
+                                "abstain" => None,
+                                val => Some(val.parse().ok()?),
+                            };
                             Some(BallotItem {
                                 decision_id: parts[0].to_string(),
                                 vote_value: val,
@@ -1345,7 +1349,7 @@ where
             } else if let (Some(id), Some(val)) = (decision_id, vote_value) {
                 vec![BallotItem {
                     decision_id: id,
-                    vote_value: val,
+                    vote_value: Some(val),
                 }]
             } else {
                 return Ok(

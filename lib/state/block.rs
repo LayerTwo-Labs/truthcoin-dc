@@ -1791,7 +1791,7 @@ mod test {
                             voting_period: 2,
                             votes: vec![crate::types::BallotItem {
                                 decision_id_bytes: decision_id.as_bytes(),
-                                vote_value: value,
+                                vote_value: Some(value),
                             }],
                         }
                     } else {

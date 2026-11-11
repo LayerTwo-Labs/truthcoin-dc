@@ -72,8 +72,10 @@ pub enum InPoint {
 pub struct BallotItem {
     /// 4 byte decision ID
     pub decision_id_bytes: [u8; 4],
-    /// The vote value (0.0-1.0 for binary, scaled range for scaled decisions)
-    pub vote_value: f64,
+    /// The vote value (0.0-1.0 for binary, scaled range for scaled decisions),
+    /// or `None` to abstain
+    #[borsh(serialize_with = "crate::util::borsh::serialize::option_f64")]
+    pub vote_value: Option<f64>,
 }
 
 #[derive(
@@ -114,6 +116,7 @@ pub enum TransactionData {
         #[schema(value_type = Vec<String>)]
         dimension_specs: Vec<DimensionSpec>,
         new_claims: Vec<ClaimDecisionPayload>,
+        #[borsh(serialize_with = "crate::util::borsh::serialize::option_f64")]
         trading_fee: Option<f64>,
         tx_pow_hash_selector: Option<u8>,
         tx_pow_ordering: Option<u8>,
@@ -136,6 +139,7 @@ pub enum TransactionData {
     SubmitVote {
         voter: Address,
         decision_id_bytes: [u8; 4],
+        #[borsh(serialize_with = "crate::util::borsh::serialize::f64")]
         vote_value: f64,
         voting_period: u32,
     },
@@ -148,6 +152,7 @@ pub enum TransactionData {
     TransferReputation {
         sender: Address,
         dest: Address,
+        #[borsh(serialize_with = "crate::util::borsh::serialize::f64")]
         amount: f64,
     },
     /// Amplify a market's LMSR beta by funding its treasury.
@@ -613,6 +618,50 @@ mod test {
             Transaction,
         },
     };
+
+    // a float encodes as borsh encodes it, and a NaN hashes too
+    #[test]
+    fn float_hashing() {
+        use crate::transaction::{BallotItem, TxData};
+
+        for value in [0.0, 1.0, -2.5, f64::MAX, f64::INFINITY] {
+            let item = BallotItem {
+                decision_id_bytes: [1; 4],
+                vote_value: Some(value),
+            };
+            assert_eq!(
+                borsh::to_vec(&item).unwrap(),
+                borsh::to_vec(&([1u8; 4], Some(value))).unwrap(),
+            );
+        }
+        for data in [
+            TxData::SubmitBallot {
+                voter: Address::ALL_ZEROS,
+                votes: vec![BallotItem {
+                    decision_id_bytes: [1; 4],
+                    vote_value: Some(f64::NAN),
+                }],
+                voting_period: 2,
+            },
+            TxData::SubmitVote {
+                voter: Address::ALL_ZEROS,
+                decision_id_bytes: [1; 4],
+                vote_value: f64::NAN,
+                voting_period: 2,
+            },
+            TxData::TransferReputation {
+                sender: Address::ALL_ZEROS,
+                dest: Address::ALL_ZEROS,
+                amount: f64::NAN,
+            },
+        ] {
+            let transaction = Transaction {
+                data: Some(data),
+                ..Default::default()
+            };
+            let _ = transaction.txid();
+        }
+    }
 
     // a withdrawal output must be funded for both its payout and its mainchain
     // fee, since both leave the treasury

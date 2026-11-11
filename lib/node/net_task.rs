@@ -2392,7 +2392,7 @@ mod test {
                             voting_period: 2,
                             votes: vec![BallotItem {
                                 decision_id_bytes,
-                                vote_value: 1.0,
+                                vote_value: Some(1.0),
                             }],
                         }
                     } else {

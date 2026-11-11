@@ -3200,8 +3200,10 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 ))
             })?;
 
-            let normalized_value = decision
-                .validate_and_normalize(vote.vote_value)
+            let normalized_value = vote
+                .vote_value
+                .map(|value| decision.validate_and_normalize(value))
+                .transpose()
                 .map_err(|e| custom_err_msg(format!("{e}")))?;
 
             batch_items.push(BallotItem {

@@ -333,7 +333,14 @@ impl Ballot {
         };
 
         let mut items: Vec<BallotItem> = Vec::new();
-        for row in self.rows.iter().filter(|r| !r.abstain) {
+        for row in &self.rows {
+            if row.abstain {
+                items.push(BallotItem {
+                    decision_id_bytes: row.decision_id.as_bytes(),
+                    vote_value: None,
+                });
+                continue;
+            }
             let user_value = match row_user_value(row) {
                 Ok(v) => v,
                 Err(reason) => {
@@ -351,7 +358,7 @@ impl Ballot {
                 };
             items.push(BallotItem {
                 decision_id_bytes: row.decision_id.as_bytes(),
-                vote_value: normalized,
+                vote_value: Some(normalized),
             });
         }
 

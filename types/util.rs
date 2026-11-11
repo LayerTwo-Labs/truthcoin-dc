@@ -87,6 +87,25 @@ pub(crate) mod borsh {
             BorshSerialize::serialize(&(txid_bytes, vout), writer)
         }
 
+        /// Bit pattern of the float, as borsh writes every non-NaN float, so
+        /// a NaN hashes instead of failing to encode.
+        pub fn f64<W>(value: &f64, writer: &mut W) -> borsh::io::Result<()>
+        where
+            W: borsh::io::Write,
+        {
+            BorshSerialize::serialize(&value.to_bits(), writer)
+        }
+
+        pub fn option_f64<W>(
+            value: &Option<f64>,
+            writer: &mut W,
+        ) -> borsh::io::Result<()>
+        where
+            W: borsh::io::Write,
+        {
+            BorshSerialize::serialize(&value.map(f64::to_bits), writer)
+        }
+
         pub fn bitcoin_txid<W>(
             txid: &bitcoin::Txid,
             writer: &mut W,

@@ -525,7 +525,8 @@ pub struct BallotItem {
     /// For scaled decisions, the value must equal `min + k * increment`
     /// for some non-negative integer `k`, with `vote_value <= max`.
     /// For binary decisions, use 0.0 (No) or 1.0 (Yes).
-    pub vote_value: f64,
+    /// `None` abstains.
+    pub vote_value: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]

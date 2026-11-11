@@ -131,8 +131,17 @@ impl DecisionId {
 )]
 pub enum DecisionType {
     Binary,
-    Scaled { min: f64, max: f64, increment: f64 },
-    Category { options: Vec<String> },
+    Scaled {
+        #[borsh(serialize_with = "crate::util::borsh::serialize::f64")]
+        min: f64,
+        #[borsh(serialize_with = "crate::util::borsh::serialize::f64")]
+        max: f64,
+        #[borsh(serialize_with = "crate::util::borsh::serialize::f64")]
+        increment: f64,
+    },
+    Category {
+        options: Vec<String>,
+    },
 }
 
 impl PartialEq for DecisionType {
