@@ -593,6 +593,8 @@ impl NetTask {
             crate::types::BlockHash,
             HashMap<Tip, HashSet<SocketAddr>>,
         >,
+        // The peer that supplied each stored body that is not yet connected
+        body_suppliers: &mut HashMap<crate::types::BlockHash, SocketAddr>,
         new_tip_ready_tx: &UnboundedSender<NewTipReadyMessage>,
         addr: SocketAddr,
         resp: PeerResponse,
@@ -623,9 +625,31 @@ impl NetTask {
                     let () = ctxt.net.remove_active_peer(addr);
                     return Ok::<_, Error>(());
                 }
+                let input_count: usize = block
+                    .body
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.inputs.len())
+                    .sum();
+                if block.body.authorizations.len() != input_count
+                    || block.body.actor_proofs.len()
+                        != block.body.transactions.len()
+                {
+                    tracing::warn!(
+                        %addr,
+                        ?req,
+                        "Invalid response from peer; body authorizations or \
+                         actor proofs do not match its transactions"
+                    );
+                    let () = ctxt.net.remove_active_peer(addr);
+                    return Ok::<_, Error>(());
+                }
                 {
                     let mut rwtxn =
                         ctxt.env.write_txn().map_err(EnvError::from)?;
+                    if !ctxt.archive.contains_body(&rwtxn, &block_hash)? {
+                        body_suppliers.insert(block_hash, addr);
+                    }
                     let () = ctxt.archive.put_body(
                         &mut rwtxn,
                         block_hash,
@@ -903,6 +927,18 @@ impl NetTask {
                             .invalidated_block(&rotxn, &header.hash())?
                         {
                             tracing::warn!(%addr, ?req, ?headers,"Invalid response from peer; invalidated block header");
+                            let () = ctxt.net.remove_active_peer(addr);
+                            return Ok(());
+                        }
+                        if ctxt
+                            .archive
+                            .try_get_main_successors(
+                                &rotxn,
+                                header.prev_main_hash,
+                            )?
+                            .is_none()
+                        {
+                            tracing::warn!(%addr, ?req, ?headers, "Invalid response from peer; header builds on an unknown mainchain block");
                             let () = ctxt.net.remove_active_peer(addr);
                             return Ok(());
                         }
@@ -1203,6 +1239,10 @@ impl NetTask {
             crate::types::BlockHash,
             HashMap<Tip, HashSet<SocketAddr>>,
         >::new();
+        // The peer that supplied each stored body that is not yet connected,
+        // so a body that fails to connect penalizes its supplier
+        let mut body_suppliers =
+            HashMap::<crate::types::BlockHash, SocketAddr>::new();
         // Map associating mainchain task requests with the peer(s) that
         // caused the request, and the request peer state ID
         let mut mainchain_task_request_sources = HashMap::<
@@ -1312,12 +1352,69 @@ impl NetTask {
                                 err = format!("{:#}", ErrorChain::new(&err)),
                                 "rejecting invalid tip from peer"
                             );
-                            if let Some(addr) = addr {
-                                let () = self.ctxt.net.remove_active_peer(addr);
+                            // A body that failed to connect was deleted. Its
+                            // supplier is at fault, not the peer that only
+                            // announced the tip.
+                            let suppliers = {
+                                let rotxn = self
+                                    .ctxt
+                                    .env
+                                    .read_txn()
+                                    .map_err(EnvError::from)?;
+                                let mut suppliers = Vec::new();
+                                for (block_hash, supplier) in &body_suppliers {
+                                    if !self
+                                        .ctxt
+                                        .archive
+                                        .contains_body(&rotxn, block_hash)?
+                                    {
+                                        suppliers
+                                            .push((*block_hash, *supplier));
+                                    }
+                                }
+                                suppliers
+                            };
+                            for (block_hash, _) in &suppliers {
+                                body_suppliers.remove(block_hash);
+                            }
+                            if suppliers.is_empty() {
+                                if let Some(addr) = addr {
+                                    let () =
+                                        self.ctxt.net.remove_active_peer(addr);
+                                }
+                            } else {
+                                for (_, supplier) in suppliers {
+                                    let () = self
+                                        .ctxt
+                                        .net
+                                        .remove_active_peer(supplier);
+                                }
                             }
                             false
                         }
                     };
+                    if reorg_applied {
+                        let rotxn =
+                            self.ctxt.env.read_txn().map_err(EnvError::from)?;
+                        if let Some(tip_height) =
+                            self.ctxt.state.try_get_height(&rotxn)?
+                        {
+                            let mut connected = Vec::new();
+                            for block_hash in body_suppliers.keys() {
+                                if self
+                                    .ctxt
+                                    .archive
+                                    .try_get_height(&rotxn, *block_hash)?
+                                    .is_none_or(|height| height <= tip_height)
+                                {
+                                    connected.push(*block_hash);
+                                }
+                            }
+                            for block_hash in connected {
+                                body_suppliers.remove(&block_hash);
+                            }
+                        }
+                    }
                     if let Some(resp_tx) = resp_tx {
                         let () = resp_tx
                             .send(reorg_applied)
@@ -1568,6 +1665,7 @@ impl NetTask {
                                 Self::handle_response(
                                     &self.ctxt,
                                     &mut descendant_tips,
+                                    &mut body_suppliers,
                                     &self.new_tip_ready_tx,
                                     addr,
                                     resp,
@@ -2807,6 +2905,158 @@ mod test {
             })
             .await?;
             remote.close(0_u32.into(), b"test complete");
+            Ok(())
+        })
+    }
+
+    /// A body whose authorizations do not cover its inputs is refused before
+    /// it is stored, so it cannot stand in for the honest body
+    #[test]
+    fn unauthorized_body_not_stored() -> anyhow::Result<()> {
+        use crate::{
+            net::{PeerRequest, PeerResponse, PeerStateId, peer_message},
+            types::{Block, Tip},
+        };
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let header = Header {
+                merkle_root: MerkleRoot::from([1; 32]),
+                prev_side_hash: None,
+                prev_main_hash: bitcoin::BlockHash::all_zeros(),
+                roots: Vec::new(),
+            };
+            let block_hash = header.hash();
+            let stripped = Body {
+                coinbase: Coinbase::default(),
+                transactions: vec![Transaction {
+                    inputs: vec![(
+                        OutPoint::Regular {
+                            txid: crate::types::Txid([3; 32]),
+                            vout: 0,
+                        },
+                        [0; 32],
+                    )]
+                    .into(),
+                    ..Default::default()
+                }],
+                authorizations: Vec::new(),
+                actor_proofs: vec![None],
+            };
+            let ctxt = NetTaskContext {
+                env: node.env.clone(),
+                archive: node.archive.clone(),
+                mainchain_task: node.task_handles.mainchain.clone(),
+                mempool: node.mempool.clone(),
+                net: node.net.clone(),
+                state: node.state.clone(),
+            };
+            let (new_tip_ready_tx, _new_tip_ready_rx) = mpsc::unbounded();
+            let mut body_suppliers = HashMap::new();
+            NetTask::handle_response(
+                &ctxt,
+                &mut HashMap::new(),
+                &mut body_suppliers,
+                &new_tip_ready_tx,
+                "127.0.0.1:1".parse()?,
+                PeerResponse::Block(Box::new(Block {
+                    header,
+                    body: stripped,
+                })),
+                PeerRequest::GetBlock(peer_message::GetBlockRequest {
+                    block_hash,
+                    descendant_tip: Some(Tip {
+                        block_hash,
+                        main_block_hash: bitcoin::BlockHash::all_zeros(),
+                    }),
+                    ancestor: None,
+                    height: Some(0),
+                    peer_state_id: Some(PeerStateId::from_hash([0; 32])),
+                }),
+            )?;
+            let rotxn = node.env.read_txn()?;
+            assert!(!node.archive.contains_body(&rotxn, &block_hash)?);
+            assert!(body_suppliers.is_empty());
+            Ok(())
+        })
+    }
+
+    /// A peer's headers that build on a mainchain block this node does not
+    /// know are refused, and the net task keeps running
+    #[test]
+    fn unknown_main_block_refused() -> anyhow::Result<()> {
+        use crate::net::{
+            PeerRequest, PeerResponse, PeerStateId, peer_message,
+        };
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let main_block = BlockHeaderInfo {
+                block_hash: bitcoin::BlockHash::from_byte_array([1; 32]),
+                prev_block_hash: bitcoin::BlockHash::all_zeros(),
+                height: 0,
+                work: bitcoin::Target::MAX.to_work(),
+                timestamp: 0,
+            };
+            {
+                let mut rwtxn = node.env.write_txn()?;
+                node.archive.put_main_header_info(&mut rwtxn, &main_block)?;
+                rwtxn.commit()?;
+            }
+            let first = Header {
+                merkle_root: MerkleRoot::from([1; 32]),
+                prev_side_hash: None,
+                prev_main_hash: main_block.block_hash,
+                roots: Vec::new(),
+            };
+            let second = Header {
+                merkle_root: MerkleRoot::from([2; 32]),
+                prev_side_hash: Some(first.hash()),
+                prev_main_hash: bitcoin::BlockHash::from_byte_array([9; 32]),
+                roots: Vec::new(),
+            };
+            let ctxt = NetTaskContext {
+                env: node.env.clone(),
+                archive: node.archive.clone(),
+                mainchain_task: node.task_handles.mainchain.clone(),
+                mempool: node.mempool.clone(),
+                net: node.net.clone(),
+                state: node.state.clone(),
+            };
+            let (new_tip_ready_tx, _new_tip_ready_rx) = mpsc::unbounded();
+            NetTask::handle_response(
+                &ctxt,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &new_tip_ready_tx,
+                "127.0.0.1:1".parse()?,
+                PeerResponse::Headers(vec![first.clone(), second.clone()]),
+                PeerRequest::GetHeaders(peer_message::GetHeadersRequest {
+                    start: HashSet::new(),
+                    end: second.hash(),
+                    height: Some(1),
+                    peer_state_id: Some(PeerStateId::from_hash([0; 32])),
+                }),
+            )?;
+            let rotxn = node.env.read_txn()?;
+            assert!(
+                node.archive.try_get_header(&rotxn, first.hash())?.is_none()
+            );
+            assert!(
+                node.archive
+                    .try_get_header(&rotxn, second.hash())?
+                    .is_none()
+            );
             Ok(())
         })
     }

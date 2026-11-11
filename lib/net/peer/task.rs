@@ -1012,6 +1012,7 @@ impl ConnectionTask {
                     .await?;
                 }
                 MailboxItem::PeerResponse(peer_response) => {
+                    self.mailbox_tx.request_tx.forget(&peer_response.request);
                     let info = match peer_response.response {
                         Ok(resp) => Info::Response(Box::new((
                             resp,

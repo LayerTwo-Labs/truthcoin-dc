@@ -84,6 +84,13 @@ pub struct PeerState {
 #[repr(transparent)]
 pub struct PeerStateId(Hash);
 
+#[cfg(test)]
+impl PeerStateId {
+    pub(crate) fn from_hash(hash: Hash) -> Self {
+        Self(hash)
+    }
+}
+
 impl From<&PeerState> for PeerStateId {
     fn from(peer_state: &PeerState) -> Self {
         Self(hash(peer_state))

@@ -688,13 +688,17 @@ impl Archive {
         Ok(())
     }
 
-    /// Store a block body. The header must already exist.
+    /// Store a block body. The header must already exist. A body already
+    /// stored for the block is kept.
     pub fn put_body(
         &self,
         rwtxn: &mut RwTxn,
         block_hash: BlockHash,
         body: &Body,
     ) -> Result<(), Error> {
+        if self.contains_body(rwtxn, &block_hash)? {
+            return Ok(());
+        }
         let header = self.get_header(rwtxn, block_hash)?;
         self.bodies
             .put(rwtxn, &block_hash, body)
@@ -1788,6 +1792,59 @@ pub(crate) mod test {
         archive
             .side_tips()
             .connect_mainchain_tip(&mut rwtxn, child, None)?;
+        Ok(())
+    }
+
+    /// A second body for a block, as a late peer response carries, leaves the
+    /// stored body and its transaction index as they were.
+    #[test]
+    fn a_stored_body_is_never_replaced() -> anyhow::Result<()> {
+        use crate::types::{
+            Address, Body, Coinbase, Header, MerkleRoot, Output, OutputContent,
+            Transaction,
+        };
+
+        let (_temp_dir, env) = temp_env("a-stored-body-is-never-replaced")?;
+        let archive = Archive::new(&env)?;
+        let mut rwtxn = env.write_txn()?;
+        let header = Header {
+            merkle_root: MerkleRoot::from([1; 32]),
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        let block_hash = header.hash();
+        archive.put_header(&mut rwtxn, &header)?;
+        let body = |memo: u8| Body {
+            coinbase: Coinbase {
+                memo: vec![memo],
+                ..Default::default()
+            },
+            transactions: vec![Transaction {
+                outputs: vec![Output {
+                    address: Address([memo; 20]),
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        u64::from(memo),
+                    )),
+                }]
+                .into(),
+                ..Transaction::default()
+            }],
+            authorizations: Vec::new(),
+            actor_proofs: vec![None],
+        };
+        let stored = body(1);
+        let late = body(2);
+        archive.put_body(&mut rwtxn, block_hash, &stored)?;
+        archive.put_body(&mut rwtxn, block_hash, &late)?;
+
+        let kept = archive.get_body(&rwtxn, block_hash)?;
+        assert_eq!(kept.coinbase.memo, stored.coinbase.memo);
+        assert!(
+            archive
+                .get_tx_inclusions(&rwtxn, late.transactions[0].txid())?
+                .is_empty()
+        );
         Ok(())
     }
 

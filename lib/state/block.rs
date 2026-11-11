@@ -122,25 +122,14 @@ pub fn prevalidate(
         if !accumulator.verify(&transaction.proof, &spent_utxo_hashes)? {
             return Err(Error::UtreexoProofFailed { txid });
         }
-        let filled_tx = FilledTransaction {
+        filled_transactions.push(FilledTransaction {
             spent_utxos,
             transaction: transaction.clone(),
             actor_address: actor_address(body, tx_idx),
-        };
-        total_fees = total_fees
-            .checked_add(state.validate_filled_transaction(
-                rotxn,
-                prev_main_height,
-                &filled_tx,
-                archive,
-                Some(next_height),
-            )?)
-            .ok_or(AmountOverflowError)?;
-        filled_transactions.push(filled_tx);
+        });
     }
-    let () =
-        crate::validation::check_duplicate_decision_claims(&body.transactions)?;
-    crate::validation::vote::check_duplicate_votes(&body.transactions)?;
+    // A body that does not match its header fails here, before the costlier
+    // per-transaction validation below.
     let computed_merkle_root = Body::compute_merkle_root(
         &body.coinbase,
         filled_transactions.as_slice(),
@@ -154,6 +143,20 @@ pub fn prevalidate(
         };
         return Err(err);
     }
+    for filled_tx in &filled_transactions {
+        total_fees = total_fees
+            .checked_add(state.validate_filled_transaction(
+                rotxn,
+                prev_main_height,
+                filled_tx,
+                archive,
+                Some(next_height),
+            )?)
+            .ok_or(AmountOverflowError)?;
+    }
+    let () =
+        crate::validation::check_duplicate_decision_claims(&body.transactions)?;
+    crate::validation::vote::check_duplicate_votes(&body.transactions)?;
     {
         use rayon::prelude::ParallelSliceMut;
         all_input_keys.par_sort_unstable();
@@ -1053,6 +1056,66 @@ mod test {
             0.0
         );
         assert_eq!(state.reputation().count_holders(&rwtxn)?, 1);
+        Ok(())
+    }
+
+    /// A body that does not match its header fails on the merkle root,
+    /// before any transaction is validated
+    #[test]
+    fn body_mismatch_fails_early() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::{
+            state::Error,
+            types::{
+                Body, Header, MerkleRoot, Transaction, TransactionData,
+                authorization::BatchVerificationContext,
+            },
+        };
+
+        let (_temp_dir, env, state) =
+            fresh_state("a_mismatched_body_fails_before_validation")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let header = Header {
+            merkle_root: MerkleRoot::from([9; 32]),
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        // A claim with no inputs fails validation (no maker), but only after
+        // the merkle root check
+        let body = Body::new(
+            vec![crate::types::Authorized {
+                transaction: Transaction {
+                    data: Some(TransactionData::ClaimDecision(
+                        crate::types::ClaimDecisionPayload {
+                            decision_type:
+                                crate::state::decisions::DecisionType::Binary,
+                            decisions: Vec::new(),
+                        },
+                    )),
+                    ..Default::default()
+                },
+                authorizations: Vec::new(),
+                actor_proof: None,
+            }],
+            Coinbase::default(),
+        );
+        let rotxn = env.read_txn()?;
+        let result = super::prevalidate(
+            &BatchVerificationContext::new(&mut rand::rng()),
+            &state,
+            &rotxn,
+            &header,
+            0,
+            &body,
+            &archive,
+        );
+        assert!(
+            matches!(result, Err(Error::InvalidBody { .. })),
+            "{:?}",
+            result.err()
+        );
         Ok(())
     }
 
