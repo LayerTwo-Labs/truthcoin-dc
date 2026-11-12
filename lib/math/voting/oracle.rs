@@ -223,12 +223,32 @@ struct RewardWeightsResult {
     pub smooth_rep: DVector<f64>,
 }
 
+/// The outcome each voter is measured against, per column: the pinned
+/// outcome when the column has one, else the caught weighted mean
+fn reference_outcomes(
+    raw_outcomes: &DVector<f64>,
+    catch_p: f64,
+    pinned: &[Option<f64>],
+) -> DVector<f64> {
+    DVector::from_iterator(
+        raw_outcomes.len(),
+        raw_outcomes.iter().enumerate().map(|(j, &raw)| {
+            pinned
+                .get(j)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| catch_tl(raw, catch_p))
+        }),
+    )
+}
+
 fn get_reward_weights(
     vote_matrix: &DMatrix<f64>,
     rep: Option<&DVector<f64>>,
     alpha: f64,
     voter_participation: &DVector<f64>,
     participation_total: f64,
+    pinned: &[Option<f64>],
 ) -> Result<RewardWeightsResult, VotingMathError> {
     let num_voters = vote_matrix.nrows();
 
@@ -256,8 +276,11 @@ fn get_reward_weights(
 
         let (raw_outcomes, _) =
             compute_weighted_column_means(vote_matrix, &old_rep);
-        let old_rep_outcomes =
-            raw_outcomes.map(|x| catch_tl(x, CONSENSUS_CATCH_TOLERANCE));
+        let old_rep_outcomes = reference_outcomes(
+            &raw_outcomes,
+            CONSENSUS_CATCH_TOLERANCE,
+            pinned,
+        );
 
         let mut distance =
             DMatrix::zeros(vote_matrix.nrows(), vote_matrix.ncols());
@@ -323,11 +346,12 @@ fn get_reward_weights(
 
     let old_rep_normalized = normalize_weights(&old_rep, true);
 
-    let participation_sum = voter_participation.sum();
+    let weighted_participation = voter_participation.component_mul(&old_rep);
+    let participation_sum = weighted_participation.sum();
     let p_rel = if participation_sum > f64::EPSILON {
-        voter_participation / participation_sum
+        weighted_participation / participation_sum
     } else {
-        DVector::from_element(num_voters, 1.0 / num_voters as f64)
+        old_rep_normalized.clone()
     };
     let r_blend =
         &new_rep * participation_total + &p_rel * (1.0 - participation_total);
@@ -352,44 +376,44 @@ fn fill_na(
     m_na: &DMatrix<f64>,
     rep: Option<&DVector<f64>>,
     catch_p: f64,
+    pinned: &[Option<f64>],
 ) -> FillNaResult {
     let mut m_new = m_na.clone();
     let num_voters = m_na.nrows();
     let num_decisions = m_na.ncols();
 
+    let rep = match rep {
+        Some(r) => r.clone(),
+        None => DVector::from_element(num_voters, 1.0 / num_voters as f64),
+    };
+
     let mut voter_participation = DVector::zeros(num_voters);
-    let mut total_cast: usize = 0;
     for i in 0..num_voters {
         let cast = (0..num_decisions)
             .filter(|&j| !m_na[(i, j)].is_nan())
             .count();
-        total_cast += cast;
         voter_participation[i] = if num_decisions == 0 {
             0.0
         } else {
             cast as f64 / num_decisions as f64
         };
     }
-    let expected_cells = num_voters * num_decisions;
-    let participation_total = if expected_cells == 0 {
-        0.0
+    let rep_sum = rep.sum();
+    let participation_total = if rep_sum > 0.0 {
+        voter_participation.dot(&rep) / rep_sum
     } else {
-        total_cast as f64 / expected_cells as f64
+        0.0
     };
 
     let has_votes;
     let has_nan = m_na.iter().any(|&x| x.is_nan());
 
     if has_nan {
-        let rep = match rep {
-            Some(r) => r.clone(),
-            None => DVector::from_element(num_voters, 1.0 / num_voters as f64),
-        };
-
         let (raw_outcomes, votes_present) =
             compute_weighted_column_means(m_na, &rep);
         has_votes = votes_present;
-        let decision_outcomes = raw_outcomes.map(|x| catch_tl(x, catch_p));
+        let decision_outcomes =
+            reference_outcomes(&raw_outcomes, catch_p, pinned);
 
         for i in 0..m_new.nrows() {
             for j in 0..m_new.ncols() {
@@ -430,6 +454,7 @@ fn factory(
     rep: Option<&DVector<f64>>,
     catch_p: Option<f64>,
     scaled_indices: Option<&[bool]>,
+    pinned: &[Option<f64>],
 ) -> Result<FactoryResult, VotingMathError> {
     let catch_p = catch_p.unwrap_or(CONSENSUS_CATCH_TOLERANCE);
     let num_decisions = m0.ncols();
@@ -443,7 +468,7 @@ fn factory(
         .map(|s| s.to_vec())
         .unwrap_or_else(|| vec![false; num_decisions]);
 
-    let fill_result = fill_na(m0, rep, catch_p);
+    let fill_result = fill_na(m0, rep, catch_p, pinned);
     let filled = fill_result.filled;
     let has_votes = fill_result.has_votes;
     let voter_participation = fill_result.voter_participation;
@@ -456,6 +481,7 @@ fn factory(
         REPUTATION_SMOOTHING_ALPHA,
         &voter_participation,
         participation_total,
+        pinned,
     )?;
 
     // Calculate outcomes differently for binary vs scaled decisions
@@ -540,65 +566,76 @@ fn factory(
     })
 }
 
-/// Resolve categorical decisions by plurality vote.
+/// The result of a reputation-weighted plurality vote on a categorical
+/// decision
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Plurality {
+    /// One option has the most reputation behind it. `option_count` is
+    /// "Inconclusive".
+    Winner(u16),
+    /// The top options hold equal reputation
+    Tie,
+}
+
+/// The plurality over the options in `0..=option_count`. `None` when no
+/// vote picks one of them.
+pub fn weighted_plurality(
+    votes: impl IntoIterator<Item = (u16, f64)>,
+    option_count: u16,
+) -> Option<Plurality> {
+    let mut weights: BTreeMap<u16, f64> = BTreeMap::new();
+    for (option, weight) in votes {
+        if option <= option_count {
+            *weights.entry(option).or_insert(0.0) += weight;
+        }
+    }
+    let max_weight = weights.values().copied().reduce(f64::max)?;
+    let mut winners = weights
+        .iter()
+        .filter(|(_, weight)| **weight == max_weight)
+        .map(|(option, _)| *option);
+    match (winners.next(), winners.next()) {
+        (Some(winner), None) => Some(Plurality::Winner(winner)),
+        _ => Some(Plurality::Tie),
+    }
+}
+
+/// Resolve categorical decisions by reputation-weighted plurality vote.
 ///
 /// Each categorical decision implicitly exposes one extra option at index
 /// `option_count` representing "Inconclusive". Voters may pick any index in
-/// `0..=option_count`. The winner is the option with the highest count; if
-/// Inconclusive wins outright or any tie occurs among the top options, the
-/// decision resolves inconclusive.
+/// `0..=option_count`. The winner is the option with the most reputation
+/// behind it, Inconclusive included. When the top options tie, no option
+/// wins and the decision resolves inconclusive.
 ///
-/// Matrix rewrite:
-///   * Real winner `i < option_count`: voters at `i` -> 1.0, others -> 0.0.
-///   * Inconclusive (winner == option_count or multi-way tie): voters at
-///     `option_count` -> 1.0, all other (non-NaN) voters -> 0.0.
-///
-/// Return:
-///   * `Some(i)` for `i < option_count` when a single real option wins.
-///   * `Some(option_count)` when the decision resolves inconclusive.
-///   * `None` only when no votes were cast at all.
+/// Matrix rewrite, for a winner (Inconclusive included): voters at the
+/// winner -> 1.0, all other (non-NaN) voters -> 0.0. A tied column is left as
+/// it is, since consensus leaves it out.
 pub fn resolve_categorical_plurality(
     dense_matrix: &mut DMatrix<f64>,
     categorical_columns: &HashMap<usize, u16>,
+    rep: &DVector<f64>,
 ) -> HashMap<usize, super::CategoricalResult> {
     let mut results = HashMap::new();
 
     for (&col_idx, &option_count) in categorical_columns {
-        let mut vote_counts: HashMap<u16, usize> = HashMap::new();
-
-        for row in 0..dense_matrix.nrows() {
+        let votes = (0..dense_matrix.nrows()).filter_map(|row| {
             let val = dense_matrix[(row, col_idx)];
-            if !val.is_nan() {
-                let idx = val.round() as u16;
-                if idx <= option_count {
-                    *vote_counts.entry(idx).or_insert(0) += 1;
-                }
+            (!val.is_nan()).then(|| (val.round() as u16, rep[row]))
+        });
+        let effective_winner = match weighted_plurality(votes, option_count) {
+            Some(Plurality::Winner(winner)) => winner,
+            plurality => {
+                results.insert(
+                    col_idx,
+                    super::CategoricalResult {
+                        winning_option: None,
+                        tied: plurality == Some(Plurality::Tie),
+                    },
+                );
+                continue;
             }
-        }
-
-        if vote_counts.is_empty() {
-            results.insert(
-                col_idx,
-                super::CategoricalResult {
-                    winning_option: None,
-                },
-            );
-            continue;
-        }
-
-        let max_count = vote_counts.values().copied().max().unwrap_or(0);
-        let winners: Vec<u16> = vote_counts
-            .iter()
-            .filter(|(_, count)| **count == max_count)
-            .map(|(opt, _)| *opt)
-            .collect();
-
-        let effective_winner =
-            if winners.len() == 1 && winners[0] < option_count {
-                winners[0]
-            } else {
-                option_count
-            };
+        };
 
         for row in 0..dense_matrix.nrows() {
             let val = dense_matrix[(row, col_idx)];
@@ -617,6 +654,7 @@ pub fn resolve_categorical_plurality(
             col_idx,
             super::CategoricalResult {
                 winning_option: Some(effective_winner),
+                tied: false,
             },
         );
     }
@@ -662,9 +700,6 @@ pub fn run_consensus(
         }
     }
 
-    let categorical_results =
-        resolve_categorical_plurality(&mut dense_matrix, &categorical_columns);
-
     let mut rep_vector = DVector::zeros(num_voters);
     for (i, voter_id) in voters.iter().enumerate() {
         rep_vector[i] = reputation_vector.get_reputation(*voter_id);
@@ -677,12 +712,44 @@ pub fn run_consensus(
         rep_vector = DVector::from_element(num_voters, 1.0 / num_voters as f64);
     }
 
-    let result = factory(
-        &dense_matrix,
-        Some(&rep_vector),
-        Some(CONSENSUS_CATCH_TOLERANCE),
-        Some(&scaled_indices),
-    )?;
+    let categorical_results = resolve_categorical_plurality(
+        &mut dense_matrix,
+        &categorical_columns,
+        &rep_vector,
+    );
+
+    let svd_columns: Vec<usize> = (0..num_decisions)
+        .filter(|j| !categorical_results.get(j).is_some_and(|r| r.tied))
+        .collect();
+    let svd_matrix = dense_matrix.select_columns(&svd_columns);
+    let svd_scaled: Vec<bool> =
+        svd_columns.iter().map(|&j| scaled_indices[j]).collect();
+    let svd_pinned: Vec<Option<f64>> = svd_columns
+        .iter()
+        .map(|j| {
+            categorical_results
+                .get(j)
+                .and_then(|r| r.winning_option)
+                .map(|_| 1.0)
+        })
+        .collect();
+    let svd_index: HashMap<usize, usize> = svd_columns
+        .iter()
+        .enumerate()
+        .map(|(svd_j, &j)| (j, svd_j))
+        .collect();
+
+    let result = if svd_columns.is_empty() {
+        None
+    } else {
+        Some(factory(
+            &svd_matrix,
+            Some(&rep_vector),
+            Some(CONSENSUS_CATCH_TOLERANCE),
+            Some(&svd_scaled),
+            &svd_pinned,
+        )?)
+    };
 
     let mut categorical_winners = HashMap::new();
     let mut outcomes = HashMap::new();
@@ -696,9 +763,11 @@ pub fn run_consensus(
             };
             outcomes.insert(*decision_id, Some(outcome_val));
             categorical_winners.insert(*decision_id, cat_result.winning_option);
-        } else {
-            let outcome = if result.has_votes[j] {
-                Some(round_outcome(result.decisions[j]))
+        } else if let (Some(result), Some(&svd_j)) =
+            (&result, svd_index.get(&j))
+        {
+            let outcome = if result.has_votes[svd_j] {
+                Some(round_outcome(result.decisions[svd_j]))
             } else {
                 tracing::warn!(
                     "Decision {} has no votes cast \
@@ -711,11 +780,21 @@ pub fn run_consensus(
         }
     }
 
+    let (old_rep, smooth_rep, first_loading, certainty) = match result {
+        Some(result) => (
+            result.agents.old_rep,
+            result.agents.smooth_rep,
+            result.first_loading.iter().copied().collect(),
+            result.certainty,
+        ),
+        None => (rep_vector.clone(), rep_vector, Vec::new(), 0.0),
+    };
+
     let original_total: f64 = voters
         .iter()
         .map(|v| reputation_vector.get_reputation(*v))
         .sum();
-    let consensus_total: f64 = result.agents.smooth_rep.sum();
+    let consensus_total: f64 = smooth_rep.sum();
     let scale_factor = if consensus_total > 0.0 && original_total > 0.0 {
         original_total / consensus_total
     } else {
@@ -726,8 +805,7 @@ pub fn run_consensus(
     let mut max_voter: Option<(crate::types::Address, f64)> = None;
 
     for (i, voter_id) in voters.iter().enumerate() {
-        let scaled_reputation =
-            round_reputation(result.agents.smooth_rep[i] * scale_factor);
+        let scaled_reputation = round_reputation(smooth_rep[i] * scale_factor);
         updated_reputations.insert(*voter_id, scaled_reputation);
 
         match max_voter {
@@ -759,14 +837,9 @@ pub fn run_consensus(
         );
     }
 
-    let first_loading: Vec<f64> =
-        result.first_loading.iter().cloned().collect();
-
     let mut outliers = Vec::new();
     for (i, voter_id) in voters.iter().enumerate() {
-        let old_rep = result.agents.old_rep[i];
-        let new_rep = result.agents.smooth_rep[i];
-        if new_rep < old_rep * 0.5 {
+        if smooth_rep[i] < old_rep[i] * 0.5 {
             outliers.push(*voter_id);
         }
     }
@@ -774,7 +847,7 @@ pub fn run_consensus(
     Ok(DetailedConsensusResult {
         outcomes,
         first_loading,
-        certainty: result.certainty,
+        certainty,
         updated_reputations,
         outliers,
         categorical_winners,
@@ -911,7 +984,7 @@ mod tests {
     fn test_factory_empty_decisions() {
         let m = DMatrix::from_row_slice(3, 0, &[]);
         let rep = DVector::from_vec(vec![0.33, 0.33, 0.34]);
-        let result = factory(&m, Some(&rep), None, None);
+        let result = factory(&m, Some(&rep), None, None, &[]);
         assert!(result.is_err());
     }
 
@@ -919,7 +992,7 @@ mod tests {
     fn test_factory_single_voter() {
         let m = DMatrix::from_row_slice(1, 1, &[1.0]);
         let rep = DVector::from_vec(vec![1.0]);
-        let result = factory(&m, Some(&rep), None, None);
+        let result = factory(&m, Some(&rep), None, None, &[]);
         assert!(result.is_ok());
     }
 }

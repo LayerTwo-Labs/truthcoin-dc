@@ -244,10 +244,11 @@ impl Default for VotingWeightVector {
 #[derive(Debug, Clone)]
 pub struct CategoricalResult {
     /// `Some(i)` with `i < option_count` indicates a single real option won.
-    /// `Some(option_count)` indicates the decision resolved inconclusive
-    /// (either because "Inconclusive" won the plurality or because the top
-    /// options tied). `None` only occurs when no votes were cast.
+    /// `Some(option_count)` indicates "Inconclusive" won the plurality.
+    /// `None` occurs when the top options tied or no votes were cast.
     pub winning_option: Option<u16>,
+    /// The top options tied, so the decision changes no reputation
+    pub tied: bool,
 }
 
 #[derive(Debug, Clone)]

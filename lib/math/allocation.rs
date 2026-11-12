@@ -77,13 +77,15 @@ pub fn allocate_proportionally_u64<K: Clone>(
     let mut fallback: Option<(K, f64)> = None;
 
     for (key, weight) in participants {
-        if weight < f64::EPSILON {
-            continue;
+        if weight > 0.0 {
+            match &fallback {
+                Some((_, best)) if *best >= weight => {}
+                _ => fallback = Some((key.clone(), weight)),
+            }
         }
 
-        match &fallback {
-            Some((_, best)) if *best >= weight => {}
-            _ => fallback = Some((key.clone(), weight)),
+        if weight < f64::EPSILON {
+            continue;
         }
 
         let proportion = weight / total_weight;
@@ -263,6 +265,16 @@ mod tests {
         for (_, amt) in &result.allocations {
             assert!(*amt == 33 || *amt == 34);
         }
+    }
+
+    /// The largest weight below epsilon receives the whole pool
+    #[test]
+    fn sub_epsilon_weight_wins() {
+        let participants = vec![("dust", 5.5e-17), ("smaller", 1e-17)];
+        let result = allocate_proportionally_u64(participants, 250).unwrap();
+
+        assert_eq!(result.allocations, vec![("dust", 250)]);
+        assert_eq!(result.total_allocated, 250);
     }
 
     #[test]
