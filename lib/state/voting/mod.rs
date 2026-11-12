@@ -208,13 +208,18 @@ impl VotingSystem {
 
         let mut voters: Vec<_> = reputations.keys().copied().collect();
         voters.sort();
-        let mut decisions: Vec<_> = all_decision_ids.to_vec();
+        let mut decisions: Vec<_> = all_decision_ids
+            .iter()
+            .copied()
+            .filter(|decision_id| decision_id.is_standard())
+            .collect();
         decisions.sort();
+        let has_standard_decisions = !decisions.is_empty();
 
         let mut scaled_decisions: HashSet<DecisionId> = HashSet::new();
         let mut categorical_decisions: HashMap<DecisionId, u16> =
             HashMap::new();
-        for decision_id in &decisions {
+        for decision_id in all_decision_ids {
             if let Some(entry) =
                 state.decisions().get_decision_entry(rotxn, *decision_id)?
                 && let Some(decision) = &entry.decision
@@ -228,12 +233,19 @@ impl VotingSystem {
         }
 
         let mut vote_matrix = SparseVoteMatrix::new(voters, decisions);
+        let mut unguaranteed_votes: BTreeMap<
+            DecisionId,
+            BTreeMap<crate::types::Address, (f64, f64)>,
+        > = BTreeMap::new();
 
         for (vote_key, vote_entry) in &all_votes {
-            if !reputations.contains_key(&vote_key.voter_address) {
+            let Some(&weight) = reputations.get(&vote_key.voter_address) else {
                 continue;
-            }
-            if let Some(vote_value) = vote_entry.to_float_opt() {
+            };
+            let Some(vote_value) = vote_entry.to_float_opt() else {
+                continue;
+            };
+            if vote_key.decision_id.is_standard() {
                 vote_matrix
                     .set_vote(
                         vote_key.voter_address,
@@ -243,44 +255,99 @@ impl VotingSystem {
                     .map_err(|e| Error::InvalidTransaction {
                         reason: format!("Failed to set vote in matrix: {e:?}"),
                     })?;
+            } else {
+                unguaranteed_votes
+                    .entry(vote_key.decision_id)
+                    .or_default()
+                    .insert(vote_key.voter_address, (vote_value, weight));
             }
         }
 
-        let weight_vector =
-            VotingWeightVector::from_reputation_map(&reputations);
-        let math_result = math_calculate_consensus(
-            &vote_matrix,
-            &weight_vector,
-            &scaled_decisions,
-            &categorical_decisions,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Failed to calculate consensus: {e:?}"),
-        })?;
+        let math_result = if has_standard_decisions {
+            let weight_vector =
+                VotingWeightVector::from_reputation_map(&reputations);
+            Some(
+                math_calculate_consensus(
+                    &vote_matrix,
+                    &weight_vector,
+                    &scaled_decisions,
+                    &categorical_decisions,
+                )
+                .map_err(|e| Error::InvalidTransaction {
+                    reason: format!("Failed to calculate consensus: {e:?}"),
+                })?,
+            )
+        } else {
+            None
+        };
 
         let mut period_stats = self
             .databases
             .get_period_stats(rotxn, period_id)?
             .unwrap_or_else(|| VotingPeriodStats::new(period_id, 0));
 
-        period_stats.first_loading = Some(math_result.first_loading.clone());
-        period_stats.certainty = Some(math_result.certainty);
+        let mut resolved: Vec<(DecisionId, Option<f64>, Option<Option<u16>>)> =
+            Vec::new();
+        if let Some(math_result) = &math_result {
+            period_stats.first_loading =
+                Some(math_result.first_loading.clone());
+            period_stats.certainty = Some(math_result.certainty);
 
-        let mut score_changes: BTreeMap<crate::types::Address, (f64, f64)> =
-            BTreeMap::new();
-        for (&voter_id, &new_score) in &math_result.updated_reputations {
-            let old_rep = reputations.get(&voter_id).copied().unwrap_or(0.0);
-            score_changes.insert(voter_id, (old_rep, new_score));
+            let mut score_changes: BTreeMap<crate::types::Address, (f64, f64)> =
+                BTreeMap::new();
+            for (&voter_id, &new_score) in &math_result.updated_reputations {
+                let old_rep =
+                    reputations.get(&voter_id).copied().unwrap_or(0.0);
+                score_changes.insert(voter_id, (old_rep, new_score));
+            }
+            if !score_changes.is_empty() {
+                period_stats.reputation_changes = Some(score_changes);
+            }
+
+            resolved.extend(math_result.outcomes.iter().map(
+                |(decision_id, outcome_value)| {
+                    (
+                        *decision_id,
+                        *outcome_value,
+                        math_result
+                            .categorical_winners
+                            .get(decision_id)
+                            .copied(),
+                    )
+                },
+            ));
         }
-        if !score_changes.is_empty() {
-            period_stats.reputation_changes = Some(score_changes);
+
+        for (decision_id, votes) in &unguaranteed_votes {
+            let votes: Vec<(f64, f64)> = votes.values().copied().collect();
+            let Some((outcome_value, winner)) =
+                crate::math::voting::oracle::resolve_unguaranteed(
+                    &votes,
+                    scaled_decisions.contains(decision_id),
+                    categorical_decisions.get(decision_id).copied(),
+                )
+                .map_err(|e| Error::InvalidTransaction {
+                    reason: format!(
+                        "Failed to resolve non-standard decision: {e:?}"
+                    ),
+                })?
+            else {
+                continue;
+            };
+            resolved.push((
+                *decision_id,
+                Some(outcome_value),
+                categorical_decisions
+                    .contains_key(decision_id)
+                    .then_some(winner),
+            ));
         }
 
         let mut decision_outcomes = Vec::new();
         let mut decision_resolutions = Vec::new();
         let mut resolved_by_svd: HashSet<DecisionId> = HashSet::new();
 
-        for (decision_id, outcome_value) in &math_result.outcomes {
+        for (decision_id, outcome_value, cat_winner) in &resolved {
             let outcome_f64 = match outcome_value {
                 Some(v) => *v,
                 None => {
@@ -301,9 +368,6 @@ impl VotingSystem {
                 DecisionResolution::new(*decision_id, period_id, 0, 1, 0, 0);
             resolution.mark_outcome_ready();
 
-            let cat_winner =
-                math_result.categorical_winners.get(decision_id).copied();
-
             let outcome = DecisionOutcome::new(
                 *decision_id,
                 period_id,
@@ -317,7 +381,7 @@ impl VotingSystem {
                 0,
                 true,
                 resolution,
-                cat_winner,
+                *cat_winner,
             );
 
             decision_outcomes.push(outcome);
@@ -374,7 +438,9 @@ impl VotingSystem {
         result.period_stats = period_stats;
         result.decision_outcomes = decision_outcomes;
         result.decision_resolutions = decision_resolutions;
-        result.updated_reputations = math_result.updated_reputations.clone();
+        if let Some(math_result) = math_result {
+            result.updated_reputations = math_result.updated_reputations;
+        }
 
         Ok(Some(result))
     }
@@ -1431,6 +1497,140 @@ mod conservation_tests {
             &mut Vec::new(),
         )?;
         assert_eq!(sealed(&rwtxn, late)?, None);
+        Ok(())
+    }
+
+    fn claim_nonstandard(
+        state: &crate::state::State,
+        rwtxn: &mut sneed::RwTxn,
+        period: u32,
+    ) -> anyhow::Result<crate::state::decisions::DecisionId> {
+        use crate::state::decisions::{Decision, DecisionId, DecisionType};
+
+        let decision_id = DecisionId::new(false, period, 0)?;
+        let decision = Decision::new(
+            [0; 20],
+            DecisionType::Binary,
+            "Optional decision".to_owned(),
+            String::new(),
+            None,
+            None,
+            vec![],
+        )?;
+        state.decisions().claim_decision(
+            rwtxn,
+            decision_id,
+            decision,
+            crate::types::Txid([1; 32]),
+            Some(1),
+        )?;
+        Ok(decision_id)
+    }
+
+    fn ballot(
+        voter: Address,
+        voting_period: u32,
+        votes: &[(crate::state::decisions::DecisionId, f64)],
+        salt: u8,
+    ) -> crate::types::RevealBallot {
+        crate::types::RevealBallot {
+            voter,
+            voting_period,
+            votes: votes
+                .iter()
+                .map(|(decision_id, vote_value)| crate::types::BallotItem {
+                    decision_id_bytes: decision_id.as_bytes(),
+                    vote_value: Some(*vote_value),
+                })
+                .collect(),
+            salt: [salt; 32],
+        }
+    }
+
+    fn outcome_of(
+        state: &crate::state::State,
+        rotxn: &sneed::RoTxn,
+        decision_id: crate::state::decisions::DecisionId,
+    ) -> anyhow::Result<Option<f64>> {
+        let period_id = VotingPeriodId::new(decision_id.voting_period());
+        Ok(state
+            .voting()
+            .resolve_period_decisions(rotxn, period_id)?
+            .into_iter()
+            .find(|outcome| outcome.decision_id == decision_id)
+            .map(|outcome| outcome.outcome_value))
+    }
+
+    /// A non-standard decision resolves from the reputation behind its
+    /// votes, and dissent on it costs no reputation
+    #[test]
+    fn nonstandard_skips_svd() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let voters = [(addr(1), 0.5), (addr(2), 0.3), (addr(3), 0.2)];
+        let (env, state, standard) = sealed_ballot_state(&dir, &voters)?;
+        let mut rwtxn = env.write_txn()?;
+        let optional = claim_nonstandard(&state, &mut rwtxn, 1)?;
+        let voting_period = standard.voting_period();
+        let ballots: Vec<_> = voters
+            .iter()
+            .zip([0.0, 0.0, 1.0])
+            .enumerate()
+            .map(|(salt, ((voter, _), optional_vote))| {
+                ballot(
+                    *voter,
+                    voting_period,
+                    &[(standard, 1.0), (optional, optional_vote)],
+                    salt as u8,
+                )
+            })
+            .collect();
+
+        connect_height(&state, &mut rwtxn, 10, &[])?;
+        let seals: Vec<_> = ballots.iter().map(sealed_ballot_tx).collect();
+        connect_height(&state, &mut rwtxn, 11, &seals)?;
+        connect_height(&state, &mut rwtxn, 20, &[])?;
+        let reveals: Vec<_> = ballots.iter().map(reveal_ballot_tx).collect();
+        connect_height(&state, &mut rwtxn, 21, &reveals)?;
+
+        assert_eq!(outcome_of(&state, &rwtxn, standard)?, Some(1.0));
+        assert_eq!(outcome_of(&state, &rwtxn, optional)?, Some(0.0));
+        for (voter, reputation) in voters {
+            let after = state.reputation().get_reputation(&rwtxn, &voter)?;
+            assert!((after - reputation).abs() < 1e-9);
+        }
+        Ok(())
+    }
+
+    /// A period of only non-standard decisions resolves them and leaves
+    /// reputation as it was
+    #[test]
+    fn nonstandard_only_period() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let voters = [(addr(1), 0.5), (addr(2), 0.3), (addr(3), 0.2)];
+        let (env, state, _) = sealed_ballot_state(&dir, &voters)?;
+        let mut rwtxn = env.write_txn()?;
+        let optional = claim_nonstandard(&state, &mut rwtxn, 2)?;
+        let voting_period = optional.voting_period();
+        let ballots = [
+            ballot(voters[0].0, voting_period, &[(optional, 1.0)], 1),
+            ballot(voters[1].0, voting_period, &[(optional, 1.0)], 2),
+            ballot(voters[2].0, voting_period, &[], 3),
+        ];
+
+        connect_height(&state, &mut rwtxn, 20, &[])?;
+        let seals: Vec<_> = ballots.iter().map(sealed_ballot_tx).collect();
+        connect_height(&state, &mut rwtxn, 21, &seals)?;
+        connect_height(&state, &mut rwtxn, 30, &[])?;
+        let reveals: Vec<_> = ballots.iter().map(reveal_ballot_tx).collect();
+        connect_height(&state, &mut rwtxn, 31, &reveals)?;
+
+        assert_eq!(outcome_of(&state, &rwtxn, optional)?, Some(1.0));
+        let before: BTreeMap<_, _> = voters.into_iter().collect();
+        let after = state.reputation().get_all_reputations(&rwtxn)?;
+        assert_eq!(after.len(), before.len());
+        for (voter, reputation) in &before {
+            assert!((after[voter] - reputation).abs() < 1e-9);
+        }
         Ok(())
     }
 }

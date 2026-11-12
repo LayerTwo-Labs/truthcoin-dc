@@ -106,6 +106,49 @@ impl TaskError {
 /// so the owner of the process should exit on the first one.
 pub type FatalErrorTx = futures::channel::mpsc::UnboundedSender<TaskError>;
 
+/// Refuse a transaction whose non-standard decision claims, with those
+/// already claimed and those pending in the mempool, would exceed a period's
+/// cap
+pub(crate) fn check_pending_nonstandard_cap<E>(
+    state: &State,
+    mempool: &MemPool,
+    rotxn: &RoTxn,
+    transaction: &Transaction,
+) -> Result<(), E>
+where
+    E: From<mempool::Error> + From<state::Error>,
+{
+    use crate::{
+        math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX,
+        state::decisions::DecisionId,
+    };
+
+    let mut claims_per_period = std::collections::BTreeMap::new();
+    for decision_id_bytes in MemPool::get_claimed_decision_ids(transaction) {
+        if let Ok(decision_id) = DecisionId::from_bytes(decision_id_bytes)
+            && !decision_id.is_standard()
+        {
+            *claims_per_period
+                .entry(decision_id.period_index())
+                .or_insert(0u64) += 1;
+        }
+    }
+    for (period, claims) in claims_per_period {
+        let claimed = state
+            .decisions()
+            .get_nonstandard_claimed_count_in_period(rotxn, period)?;
+        let pending = mempool.pending_nonstandard_claims(rotxn, period)?;
+        if claimed.saturating_add(pending).saturating_add(claims)
+            > NONSTANDARD_SLOTS_PER_PERIOD_MAX
+        {
+            return Err(
+                mempool::Error::NonstandardCapInMempool { period }.into()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Wrap a task that must run for the life of the node, reporting on
 /// `fatal_error_tx` however it ends: an error, a panic, or returning at all.
 /// A panic unwinds only the task, and a return leaves nothing running in its
@@ -404,6 +447,12 @@ where
                 main_tip_height,
                 transaction.borrow(),
                 &self.archive,
+            )?;
+            check_pending_nonstandard_cap::<Error>(
+                &self.state,
+                &self.mempool,
+                &rotxn,
+                &transaction.borrow().transaction,
             )?;
             self.mempool.put(&mut rotxn, transaction.borrow())?;
             let () = self.update_mempool_market(
@@ -959,25 +1008,34 @@ where
             body_size += transaction_size;
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
-        let returned_transactions =
+        let (returned_transactions, dropped_txids) =
             self.drop_unconnectable_transactions(returned_transactions)?;
+        if !dropped_txids.is_empty() {
+            let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+            for txid in dropped_txids {
+                self.mempool.delete(&mut rwtxn, txid)?;
+            }
+            rwtxn.commit().map_err(RwTxnError::from)?;
+        }
         let fee = template_fee(&returned_transactions)?;
         Ok((returned_transactions, fee))
     }
 
     /// Remove each transaction that block connect rejects after the
     /// transactions before it. Also remove each transaction that spends an
-    /// output of a removed transaction.
+    /// output of a removed transaction. Returns the kept transactions and
+    /// the txids of the removed ones.
     fn drop_unconnectable_transactions(
         &self,
         mut transactions: Vec<Authorized<FilledTransaction>>,
-    ) -> Result<Vec<Authorized<FilledTransaction>>, Error> {
+    ) -> Result<(Vec<Authorized<FilledTransaction>>, Vec<Txid>), Error> {
         // The first `connects` transactions connect as one block.
         let mut connects = 0;
         let mut empty_connects = false;
+        let mut all_dropped = Vec::new();
         loop {
             let Err(err) = self.connect_template(&transactions)? else {
-                return Ok(transactions);
+                return Ok((transactions, all_dropped));
             };
             if !empty_connects {
                 if let Err(err) = self.connect_template(&[])? {
@@ -1017,6 +1075,7 @@ where
                 }
                 !spends_dropped
             });
+            all_dropped.extend(dropped_txids);
         }
     }
 

@@ -338,7 +338,7 @@ fn category_accepts_max() {
     let decision = Decision::new(
         [0; 20],
         DecisionType::Category {
-            options: vec![String::new(); usize::from(u16::MAX)],
+            options: vec![String::new(); super::types::MAX_CATEGORY_OPTIONS],
         },
         String::new(),
         String::new(),
@@ -347,7 +347,10 @@ fn category_accepts_max() {
         vec![],
     )
     .unwrap();
-    assert_eq!(decision.inconclusive_index(), Some(u16::MAX));
+    assert_eq!(
+        decision.inconclusive_index(),
+        Some(super::types::MAX_CATEGORY_OPTIONS as u16)
+    );
 }
 
 #[test]
@@ -355,7 +358,10 @@ fn category_rejects_excess() {
     let result = Decision::new(
         [0; 20],
         DecisionType::Category {
-            options: vec![String::new(); usize::from(u16::MAX) + 1],
+            options: vec![
+                String::new();
+                super::types::MAX_CATEGORY_OPTIONS + 1
+            ],
         },
         String::new(),
         String::new(),
@@ -676,4 +682,139 @@ fn decision_state_machine() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Nonstandard claims past the period cap fail while standard claims still pass
+#[test]
+fn nonstandard_claim_cap() -> anyhow::Result<()> {
+    use crate::math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX;
+    use crate::state::test::fresh_state;
+
+    let (_dir, env, state) = fresh_state("nonstandard_claims_cap")?;
+    let decisions = state.decisions();
+    let mut rwtxn = env.write_txn()?;
+    decisions.mint_genesis(&mut rwtxn, 1000, 0, 1000)?;
+    let decision = make_binary_decision();
+    let cap = NONSTANDARD_SLOTS_PER_PERIOD_MAX as u32;
+    for index in 0..cap {
+        decisions.claim_decision(
+            &mut rwtxn,
+            DecisionId::new(false, 2, index)?,
+            decision.clone(),
+            crate::types::Txid([1; 32]),
+            Some(1),
+        )?;
+    }
+
+    let over_cap = DecisionId::new(false, 2, cap)?;
+    assert!(
+        decisions
+            .validate_decision_claim(
+                &rwtxn,
+                over_cap,
+                &decision,
+                1000,
+                Some(1),
+                1000,
+            )
+            .is_err()
+    );
+    assert!(
+        decisions
+            .claim_decision(
+                &mut rwtxn,
+                over_cap,
+                decision.clone(),
+                crate::types::Txid([1; 32]),
+                Some(1),
+            )
+            .is_err()
+    );
+    decisions.validate_decision_claim(
+        &rwtxn,
+        DecisionId::new(true, 2, 0)?,
+        &decision,
+        1000,
+        Some(1),
+        1000,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn option_labels_capped() {
+    let label = |len: usize| "x".repeat(len);
+    let binary = |option_0: String| {
+        Decision::new(
+            [0; 20],
+            DecisionType::Binary,
+            String::new(),
+            String::new(),
+            Some(option_0),
+            None,
+            vec![],
+        )
+    };
+    let category = |option: String| {
+        Decision::new(
+            [0; 20],
+            DecisionType::Category {
+                options: vec![option, "B".into()],
+            },
+            String::new(),
+            String::new(),
+            None,
+            None,
+            vec![],
+        )
+    };
+    let max = super::types::MAX_OPTION_LABEL_BYTES;
+
+    binary(label(max)).unwrap();
+    assert!(binary(label(max + 1)).is_err());
+    category(label(max)).unwrap();
+    assert!(category(label(max + 1)).is_err());
+}
+
+#[test]
+fn decisions_keyed_by_id() -> anyhow::Result<()> {
+    use crate::state::test::fresh_state;
+
+    let (_dir, env, state) = fresh_state("decisions_by_id")?;
+    let decisions = state.decisions();
+    let mut rwtxn = env.write_txn()?;
+    decisions.mint_genesis(&mut rwtxn, 1000, 0, 1000)?;
+    let ids: Vec<DecisionId> = (0..300)
+        .map(|index| DecisionId::new(false, 2, index))
+        .collect::<Result<_, _>>()?;
+    for (index, id) in ids.iter().enumerate() {
+        let mut decision = make_binary_decision();
+        decision.header = format!("decision {index}");
+        decisions.claim_decision(
+            &mut rwtxn,
+            *id,
+            decision,
+            crate::types::Txid([1; 32]),
+            Some(1),
+        )?;
+    }
+
+    let found = decisions
+        .get_decision_entry(&rwtxn, ids[123])?
+        .and_then(|entry| entry.decision)
+        .map(|decision| decision.header);
+    assert_eq!(found.as_deref(), Some("decision 123"));
+    assert_eq!(
+        decisions.get_claimed_decisions_in_period(&rwtxn, 2)?.len(),
+        300
+    );
+
+    decisions.revert_decision_claim(&mut rwtxn, ids[123])?;
+    assert!(decisions.get_decision_entry(&rwtxn, ids[123])?.is_none());
+    assert_eq!(
+        decisions.get_claimed_decisions_in_period(&rwtxn, 2)?.len(),
+        299
+    );
+    assert_eq!(decisions.get_highest_minted_period(&rwtxn)?, Some(20));
+    Ok(())
 }

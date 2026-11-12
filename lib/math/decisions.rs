@@ -21,6 +21,15 @@ pub const TIER_COUNT: usize = 5;
 pub const SLOTS_PER_TIER_PER_MINT: u64 = 5;
 pub const SLOTS_PER_TIER: u64 = 100;
 pub const SLOTS_PER_PERIOD_MAX: u64 = SLOTS_PER_TIER * TIER_COUNT as u64;
+pub const NONSTANDARD_SLOTS_PER_PERIOD_MAX: u64 = 500;
+/// A non-standard claim pays at least this, however low the period's
+/// tier-0 price falls
+pub const NONSTANDARD_MIN_LISTING_FEE_SATS: u64 = 1_000;
+
+/// Listing fee of a non-standard decision in a period priced at `p_period`
+pub fn nonstandard_listing_fee(p_period: u64) -> u64 {
+    slot_price(p_period, 0).max(NONSTANDARD_MIN_LISTING_FEE_SATS)
+}
 pub const MID_PERIOD_REPRICES: u32 = 5;
 pub const TIER_MULTIPLIERS_NUM: [u64; TIER_COUNT] = [1, 2, 4, 8, 16];
 pub const TIER_MULTIPLIERS_DEN: u64 = 4;

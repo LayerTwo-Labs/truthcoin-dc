@@ -44,6 +44,11 @@ pub enum Error {
     #[error("can't add transaction, decision {0} already claimed in mempool")]
     DecisionAlreadyClaimedInMempool(String),
     #[error(
+        "can't add transaction, its non-standard claims would exceed the cap \
+         of period {period} with those claimed and pending"
+    )]
+    NonstandardCapInMempool { period: u32 },
+    #[error(
         "can't add transaction, voter {voter} already has a ballot for \
          period {voting_period} in mempool"
     )]
@@ -216,8 +221,37 @@ impl MemPool {
         )
     }
 
+    /// Non-standard decision claims pending in the mempool for a period
+    pub fn pending_nonstandard_claims(
+        &self,
+        rotxn: &RoTxn,
+        period: u32,
+    ) -> Result<u64, Error> {
+        let mut pending = 0;
+        let mut iter = self
+            .pending_decision_claims
+            .iter(rotxn)
+            .map_err(DbError::from)?;
+        while let Some((decision_id_bytes, _)) =
+            iter.next().map_err(DbError::from)?
+        {
+            if let Ok(decision_id) =
+                crate::state::decisions::DecisionId::from_bytes(
+                    decision_id_bytes,
+                )
+                && !decision_id.is_standard()
+                && decision_id.period_index() == period
+            {
+                pending += 1;
+            }
+        }
+        Ok(pending)
+    }
+
     /// Extract decision IDs being claimed by this transaction
-    fn get_claimed_decision_ids(transaction: &Transaction) -> Vec<[u8; 4]> {
+    pub(crate) fn get_claimed_decision_ids(
+        transaction: &Transaction,
+    ) -> Vec<[u8; 4]> {
         use crate::types::TransactionData;
 
         let mut decision_ids = Vec::new();

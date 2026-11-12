@@ -14,5 +14,6 @@ pub use pricing::{
 };
 pub use types::{
     Decision, DecisionConfig, DecisionEntry, DecisionId, DecisionState,
-    DecisionStateHistory, DecisionType, period_to_name, period_to_string,
+    DecisionStateHistory, DecisionType, MAX_CATEGORY_OPTIONS,
+    MAX_OPTION_LABEL_BYTES, period_to_name, period_to_string,
 };

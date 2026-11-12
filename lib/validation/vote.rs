@@ -427,8 +427,8 @@ impl VoteValidator {
         Ok(())
     }
 
-    /// The ballot votes on each decision of `expected` exactly once, with a
-    /// valid value or an abstain
+    /// The ballot votes at most once on each decision of `expected`, with a
+    /// valid value or an abstain, and on every standard decision of it
     fn validate_ballot_votes(
         state: &crate::state::State,
         rotxn: &RoTxn,
@@ -464,12 +464,14 @@ impl VoteValidator {
                 Self::validate_vote_value(&decision, vote_value)?;
             }
         }
-        if seen.len() != expected.len() {
+        if let Some(missing) = expected
+            .iter()
+            .find(|id| id.is_standard() && !seen.contains(id))
+        {
             return Err(Error::InvalidTransaction {
                 reason: format!(
-                    "Ballot covers {} of the {} decisions in its period",
-                    seen.len(),
-                    expected.len()
+                    "Ballot omits standard decision {} of its period",
+                    missing.to_hex()
                 ),
             });
         }
@@ -722,7 +724,10 @@ mod tests {
         let decision = Decision::new(
             [0; 20],
             DecisionType::Category {
-                options: vec![String::new(); usize::from(u16::MAX)],
+                options: vec![
+                    String::new();
+                    crate::state::decisions::MAX_CATEGORY_OPTIONS
+                ],
             },
             String::new(),
             String::new(),
@@ -731,7 +736,8 @@ mod tests {
             vec![],
         )
         .unwrap();
-        for index in [u16::MAX - 1, u16::MAX] {
+        let limit = crate::state::decisions::MAX_CATEGORY_OPTIONS as u16;
+        for index in [limit - 1, limit] {
             let value = f64::from(index);
             assert!(
                 VoteValidator::validate_vote_value(&decision, value).is_ok()
@@ -747,7 +753,7 @@ mod tests {
         assert!(
             VoteValidator::validate_vote_value(
                 &decision,
-                f64::from(u16::MAX) + 1.0,
+                f64::from(limit) + 1.0
             )
             .is_err()
         );
@@ -808,7 +814,7 @@ mod tests {
         env: sneed::Env,
         state: crate::state::State,
         voter: crate::types::Address,
-        decision_ids: [crate::state::decisions::DecisionId; 2],
+        decision_ids: [crate::state::decisions::DecisionId; 3],
     }
 
     const VOTING_PERIOD: u32 = 2;
@@ -827,11 +833,16 @@ mod tests {
 
         let voter = crate::types::Address([1; 20]);
         let decision_ids = [
+            DecisionId::new(true, VOTING_PERIOD - 1, 0).unwrap(),
+            DecisionId::new(true, VOTING_PERIOD - 1, 1).unwrap(),
             DecisionId::new(false, VOTING_PERIOD - 1, 0).unwrap(),
-            DecisionId::new(false, VOTING_PERIOD - 1, 1).unwrap(),
         ];
 
         let mut rwtxn = env.write_txn().unwrap();
+        state
+            .decisions()
+            .mint_genesis(&mut rwtxn, 1000, 0, 1000)
+            .unwrap();
         state
             .reputation()
             .set_reputation(&mut rwtxn, &voter, 1.0)
@@ -1120,6 +1131,40 @@ mod tests {
         validate(&reveal).unwrap();
         f.seal(reveal.commitment(), true);
         assert!(validate(&reveal).is_err());
+    }
+
+    /// A ballot may omit a non-standard decision but not a standard one
+    #[test]
+    fn omit_nonstandard_decision() {
+        let f = voting_fixture();
+        let prepare = |votes: Vec<crate::types::BallotItem>| {
+            let rotxn = f.env.read_txn().unwrap();
+            VoteValidator::prepare_ballot(
+                &f.state,
+                &rotxn,
+                f.voter,
+                VOTING_PERIOD,
+                &votes,
+            )
+        };
+
+        prepare(vec![f.item(0, Some(1.0)), f.item(1, None)]).unwrap();
+        prepare(vec![
+            f.item(0, Some(1.0)),
+            f.item(1, None),
+            f.item(2, Some(0.0)),
+        ])
+        .unwrap();
+        assert!(prepare(vec![f.item(0, Some(1.0)), f.item(2, None)]).is_err());
+        assert!(
+            prepare(vec![
+                f.item(0, Some(1.0)),
+                f.item(1, None),
+                f.item(2, None),
+                f.item(2, None),
+            ])
+            .is_err()
+        );
     }
 
     /// A reveal must cover every decision exactly once with valid values

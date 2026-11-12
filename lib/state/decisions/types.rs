@@ -5,6 +5,9 @@ use std::num::NonZeroU32;
 
 pub use truthcoin_dc_types::decision::{DecisionId, DecisionType};
 
+pub const MAX_CATEGORY_OPTIONS: usize = 256;
+pub const MAX_OPTION_LABEL_BYTES: usize = 64;
+
 fn is_step_aligned(delta: f64, step: f64) -> bool {
     let k = (delta / step).round();
     let tolerance = (step.abs() * 1e-9).max(1e-12);
@@ -56,6 +59,16 @@ impl Decision {
                 });
             }
         }
+        for label in [&option_0_label, &option_1_label].into_iter().flatten() {
+            if label.len() > MAX_OPTION_LABEL_BYTES {
+                return Err(Error::InvalidDecisionId {
+                    reason: format!(
+                        "Option label '{label}' exceeds \
+                         {MAX_OPTION_LABEL_BYTES} byte limit"
+                    ),
+                });
+            }
+        }
 
         match &decision_type {
             DecisionType::Binary => {}
@@ -95,11 +108,23 @@ impl Decision {
                             .to_string(),
                     });
                 }
-                if options.len() > usize::from(u16::MAX) {
+                if options.len() > MAX_CATEGORY_OPTIONS {
                     return Err(Error::InvalidDecisionId {
-                        reason:
-                            "Category decisions permit at most 65535 options"
-                                .to_string(),
+                        reason: format!(
+                            "Category decisions permit at most \
+                             {MAX_CATEGORY_OPTIONS} options"
+                        ),
+                    });
+                }
+                if let Some(option) = options
+                    .iter()
+                    .find(|option| option.len() > MAX_OPTION_LABEL_BYTES)
+                {
+                    return Err(Error::InvalidDecisionId {
+                        reason: format!(
+                            "Category option '{option}' exceeds \
+                             {MAX_OPTION_LABEL_BYTES} byte limit"
+                        ),
                     });
                 }
             }

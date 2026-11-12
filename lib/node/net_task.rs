@@ -382,6 +382,7 @@ fn is_fatal_peer_tx_error(err: &Error) -> bool {
             | mempool::Error::DbWrite(_)
             | mempool::Error::IncompatibleVersion { .. } => true,
             mempool::Error::DecisionAlreadyClaimedInMempool(_)
+            | mempool::Error::NonstandardCapInMempool { .. }
             | mempool::Error::BallotAlreadyInMempool { .. }
             | mempool::Error::MissingTransaction(_)
             | mempool::Error::Utreexo(_)
@@ -1676,11 +1677,22 @@ impl NetTask {
                                     &unconfirmed,
                                     &mut new_tx.transaction,
                                 ) {
-                                    Ok(()) => self
-                                        .ctxt
-                                        .mempool
-                                        .put(&mut rwtxn, &new_tx)
-                                        .map_err(Error::from),
+                                    Ok(()) => {
+                                        super::check_pending_nonstandard_cap::<
+                                            Error,
+                                        >(
+                                            &self.ctxt.state,
+                                            &self.ctxt.mempool,
+                                            &rwtxn,
+                                            &new_tx.transaction,
+                                        )
+                                        .and_then(|()| {
+                                            self.ctxt
+                                                .mempool
+                                                .put(&mut rwtxn, &new_tx)
+                                                .map_err(Error::from)
+                                        })
+                                    }
                                     Err(err) => Err(Error::from(err)),
                                 };
                             match accepted {
@@ -3054,6 +3066,96 @@ mod test {
         })
     }
 
+    /// A transaction cannot take a non-standard claim into the mempool once
+    /// the period's claimed and pending claims fill the cap
+    #[test]
+    fn pending_claims_hit_cap() -> anyhow::Result<()> {
+        use crate::{
+            math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX,
+            mempool,
+            state::decisions::{Decision, DecisionId, DecisionType},
+            types::{
+                Authorized, ClaimDecisionPayload, DecisionClaimEntry,
+                TransactionData,
+            },
+        };
+
+        let claim = |index: u32| -> anyhow::Result<Transaction> {
+            Ok(Transaction {
+                data: Some(TransactionData::ClaimDecision(
+                    ClaimDecisionPayload {
+                        decision_type: DecisionType::Binary,
+                        decisions: vec![DecisionClaimEntry {
+                            decision_id_bytes: DecisionId::new(
+                                false, 2, index,
+                            )?
+                            .as_bytes(),
+                            header: "decision".to_string(),
+                            description: String::new(),
+                            option_0_label: None,
+                            option_1_label: None,
+                            option_labels: None,
+                            tags: None,
+                        }],
+                    },
+                )),
+                ..Default::default()
+            })
+        };
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let claimed = NONSTANDARD_SLOTS_PER_PERIOD_MAX as u32 - 1;
+            let mut rwtxn = node.env.write_txn()?;
+            for index in 0..claimed {
+                node.state.decisions().claim_decision(
+                    &mut rwtxn,
+                    DecisionId::new(false, 2, index)?,
+                    Decision::new(
+                        [0; 20],
+                        DecisionType::Binary,
+                        "decision".to_string(),
+                        String::new(),
+                        None,
+                        None,
+                        vec![],
+                    )?,
+                    crate::types::Txid([1; 32]),
+                    Some(1),
+                )?;
+            }
+            let check = |rwtxn: &sneed::RwTxn, tx: &Transaction| {
+                crate::node::check_pending_nonstandard_cap::<Error>(
+                    &node.state,
+                    &node.mempool,
+                    rwtxn,
+                    tx,
+                )
+            };
+            let pending = claim(claimed)?;
+            check(&rwtxn, &pending)?;
+            node.mempool.put(
+                &mut rwtxn,
+                &Authorized {
+                    transaction: pending,
+                    authorizations: Vec::new(),
+                    actor_proof: None,
+                },
+            )?;
+            assert!(matches!(
+                check(&rwtxn, &claim(claimed + 1)?),
+                Err(Error::MemPool(mempool::Error::NonstandardCapInMempool {
+                    period: 2
+                }))
+            ));
+            Ok(())
+        })
+    }
+
     /// A body whose authorizations do not cover its inputs is refused before
     /// it is stored, so it cannot stand in for the honest body
     #[test]
@@ -3608,6 +3710,24 @@ mod test {
                 vec![market_txs[kept].txid(), child_txids[kept]]
             );
             assert_eq!(fee.to_sat(), 2_000);
+            // The block template's dropped transactions leave the mempool, so
+            // they hold no inputs or claims there.
+            {
+                let rotxn = node.env.read_txn()?;
+                for (index, market_tx) in market_txs.iter().enumerate() {
+                    let in_mempool =
+                        |txid| node.mempool.transactions.try_get(&rotxn, &txid);
+                    let expected = index == kept;
+                    assert_eq!(
+                        in_mempool(market_tx.txid())?.is_some(),
+                        expected
+                    );
+                    assert_eq!(
+                        in_mempool(child_txids[index])?.is_some(),
+                        expected
+                    );
+                }
+            }
             let body = Body::new(
                 selected.iter().cloned().map(Into::into).collect(),
                 Coinbase::default(),

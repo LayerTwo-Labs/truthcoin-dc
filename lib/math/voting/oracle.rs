@@ -600,6 +600,48 @@ pub fn weighted_plurality(
     }
 }
 
+/// Outcome of a decision that SVD leaves out, from the `(value, weight)`
+/// votes cast on it, with the winning option of a categorical decision
+/// (`None` on a tie). `None` when no vote carries weight.
+pub fn resolve_unguaranteed(
+    votes: &[(f64, f64)],
+    scaled: bool,
+    option_count: Option<u16>,
+) -> Result<Option<(f64, Option<u16>)>, VotingMathError> {
+    let total_weight: f64 = votes.iter().map(|(_, weight)| weight).sum();
+    if total_weight <= 0.0 {
+        return Ok(None);
+    }
+    if let Some(option_count) = option_count {
+        let plurality = weighted_plurality(
+            votes
+                .iter()
+                .map(|&(value, weight)| (value.round() as u16, weight)),
+            option_count,
+        );
+        return Ok(plurality.map(|plurality| match plurality {
+            Plurality::Winner(winner) if winner < option_count => {
+                (winner as f64, Some(winner))
+            }
+            Plurality::Winner(winner) => {
+                (BITCOIN_HIVEMIND_NEUTRAL_VALUE, Some(winner))
+            }
+            Plurality::Tie => (BITCOIN_HIVEMIND_NEUTRAL_VALUE, None),
+        }));
+    }
+    let outcome = if scaled {
+        weighted_median(
+            &DVector::from_iterator(votes.len(), votes.iter().map(|v| v.0)),
+            &DVector::from_iterator(votes.len(), votes.iter().map(|v| v.1)),
+        )?
+    } else {
+        let weighted_sum: f64 =
+            votes.iter().map(|(value, weight)| value * weight).sum();
+        catch_tl(weighted_sum / total_weight, CONSENSUS_CATCH_TOLERANCE)
+    };
+    Ok(Some((round_outcome(outcome), None)))
+}
+
 /// Resolve categorical decisions by reputation-weighted plurality vote.
 ///
 /// Each categorical decision implicitly exposes one extra option at index

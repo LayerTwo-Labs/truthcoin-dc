@@ -1350,6 +1350,15 @@ impl DecisionValidationInterface for State {
             .get_standard_claimed_count_in_period(rotxn, period_index)
     }
 
+    fn get_nonstandard_claimed_count_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<u64, Error> {
+        self.decisions()
+            .get_nonstandard_claimed_count_in_period(rotxn, period_index)
+    }
+
     fn get_available_decisions(
         &self,
         rotxn: &RoTxn,

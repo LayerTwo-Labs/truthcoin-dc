@@ -1,3 +1,4 @@
+use crate::math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX;
 use crate::state::Error;
 use crate::types::Txid;
 use crate::validation::DecisionValidationInterface;
@@ -21,10 +22,12 @@ pub type PeriodPricingUndoEntry = (u32, Option<PeriodPricing>);
 
 #[derive(Clone)]
 pub struct Dbs {
-    period_decisions: DatabaseUnique<
-        SerdeBincode<u32>,
-        SerdeBincode<BTreeSet<DecisionEntry>>,
-    >,
+    /// The IDs of the decisions claimed in each minted period
+    period_decisions:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<BTreeSet<DecisionId>>>,
+    /// Each claimed decision, so a lookup decodes only its own entry
+    decision_entries:
+        DatabaseUnique<SerdeBincode<DecisionId>, SerdeBincode<DecisionEntry>>,
     decision_state_histories: DatabaseUnique<
         SerdeBincode<DecisionId>,
         SerdeBincode<DecisionStateHistory>,
@@ -41,23 +44,54 @@ pub struct Dbs {
 }
 
 impl Dbs {
-    pub const NUM_DBS: u32 = 5;
+    pub const NUM_DBS: u32 = 6;
 
-    /// Derive claimed decision IDs from period_decisions (a decision is claimed if decision.is_some())
     fn get_claimed_decision_ids_for_period(
         &self,
         rotxn: &RoTxn,
         period_index: u32,
     ) -> Result<BTreeSet<DecisionId>, Error> {
-        let period_decisions = self
+        Ok(self
             .period_decisions
             .try_get(rotxn, &period_index)?
-            .unwrap_or_default();
-        Ok(period_decisions
-            .iter()
-            .filter(|entry| entry.decision.is_some())
-            .map(|entry| entry.decision_id)
-            .collect())
+            .unwrap_or_default())
+    }
+
+    /// The entries of the decisions claimed in a period
+    fn period_entries(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<Vec<DecisionEntry>, Error> {
+        let mut entries = Vec::new();
+        for decision_id in
+            self.get_claimed_decision_ids_for_period(rotxn, period_index)?
+        {
+            if let Some(entry) =
+                self.decision_entries.try_get(rotxn, &decision_id)?
+            {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Remove a claimed decision from its period and delete its entry
+    fn remove_decision_entry(
+        &self,
+        rwtxn: &mut RwTxn<'_>,
+        decision_id: DecisionId,
+    ) -> Result<bool, Error> {
+        let period_index = decision_id.period_index();
+        let mut decision_ids =
+            self.get_claimed_decision_ids_for_period(rwtxn, period_index)?;
+        let removed = decision_ids.remove(&decision_id);
+        if removed {
+            self.period_decisions
+                .put(rwtxn, &period_index, &decision_ids)?;
+        }
+        self.decision_entries.delete(rwtxn, &decision_id)?;
+        Ok(removed)
     }
 
     pub fn new<Tls>(
@@ -77,6 +111,11 @@ impl Dbs {
                 env,
                 rwtxn,
                 "period_decisions",
+            )?,
+            decision_entries: DatabaseUnique::create(
+                env,
+                rwtxn,
+                "decision_entries",
             )?,
             decision_state_histories: DatabaseUnique::create(
                 env,
@@ -369,7 +408,7 @@ impl Dbs {
             }
         }
 
-        let empty_period: BTreeSet<DecisionEntry> = BTreeSet::new();
+        let empty_period: BTreeSet<DecisionId> = BTreeSet::new();
         for period in (highest_existing + 1)..=target_period {
             self.period_decisions.put(rwtxn, &period, &empty_period)?;
         }
@@ -411,6 +450,11 @@ impl Dbs {
             }
         }
         for period in &to_delete {
+            for decision_id in
+                self.get_claimed_decision_ids_for_period(rwtxn, *period)?
+            {
+                self.decision_entries.delete(rwtxn, &decision_id)?;
+            }
             self.period_decisions.delete(rwtxn, period)?;
         }
         Ok(())
@@ -615,16 +659,20 @@ impl Dbs {
     ) -> Result<Vec<DecisionEntry>, Error> {
         let mut settled_entries = Vec::new();
 
+        let mut settled_periods = Vec::new();
         let mut iter = self.period_decisions.iter(rotxn)?;
-        while let Some((period, entries)) = iter.next()? {
+        while let Some((period, _)) = iter.next()? {
             if self.is_period_settled(
                 period,
                 current_ts,
                 current_height,
                 genesis_ts,
             ) {
-                settled_entries.extend(entries.iter().cloned());
+                settled_periods.push(period);
             }
+        }
+        for period in settled_periods {
+            settled_entries.extend(self.period_entries(rotxn, period)?);
         }
 
         Ok(settled_entries)
@@ -729,6 +777,22 @@ impl Dbs {
             return Err(Error::DecisionAlreadyClaimed { decision_id });
         }
 
+        if !decision_id.is_standard()
+            && claimed_decisions
+                .iter()
+                .filter(|id| !id.is_standard())
+                .count() as u64
+                >= NONSTANDARD_SLOTS_PER_PERIOD_MAX
+        {
+            return Err(Error::DecisionNotAvailable {
+                decision_id,
+                reason: format!(
+                    "period {period_index} already holds \
+                     {NONSTANDARD_SLOTS_PER_PERIOD_MAX} non-standard decisions"
+                ),
+            });
+        }
+
         Ok(())
     }
 
@@ -742,19 +806,33 @@ impl Dbs {
     ) -> Result<(), Error> {
         let period_index = decision_id.period_index();
 
-        let mut period_decisions = self
-            .period_decisions
-            .try_get(rwtxn, &period_index)?
-            .unwrap_or_default();
+        let mut period_decisions =
+            self.get_claimed_decision_ids_for_period(rwtxn, period_index)?;
 
         let new_entry = DecisionEntry {
             decision_id,
             decision: Some(decision),
             claiming_txid,
         };
-        period_decisions.insert(new_entry);
+        period_decisions.insert(decision_id);
+        if !decision_id.is_standard()
+            && period_decisions
+                .iter()
+                .filter(|id| !id.is_standard())
+                .count() as u64
+                > NONSTANDARD_SLOTS_PER_PERIOD_MAX
+        {
+            return Err(Error::DecisionNotAvailable {
+                decision_id,
+                reason: format!(
+                    "period {period_index} already holds \
+                     {NONSTANDARD_SLOTS_PER_PERIOD_MAX} non-standard decisions"
+                ),
+            });
+        }
         self.period_decisions
             .put(rwtxn, &period_index, &period_decisions)?;
+        self.decision_entries.put(rwtxn, &decision_id, &new_entry)?;
 
         let block_height = current_height.unwrap_or(0);
         let decision_history = DecisionStateHistory::new(block_height);
@@ -787,30 +865,7 @@ impl Dbs {
         rotxn: &sneed::RoTxn,
         decision_id: DecisionId,
     ) -> Result<Option<DecisionEntry>, Error> {
-        let period = decision_id.period_index();
-        if let Some(period_decisions) =
-            self.period_decisions.try_get(rotxn, &period)?
-        {
-            let search_entry = DecisionEntry {
-                decision_id,
-                decision: None,
-                claiming_txid: Txid([0u8; 32]),
-            };
-
-            if let Some(found) = period_decisions.get(&search_entry) {
-                return Ok(Some(found.clone()));
-            }
-
-            for entry in period_decisions.range(search_entry..) {
-                if entry.decision_id == decision_id {
-                    return Ok(Some(entry.clone()));
-                }
-                if entry.decision_id > decision_id {
-                    break;
-                }
-            }
-        }
-        Ok(None)
+        Ok(self.decision_entries.try_get(rotxn, &decision_id)?)
     }
 
     pub fn get_available_decisions_in_period(
@@ -865,19 +920,7 @@ impl Dbs {
         rotxn: &sneed::RoTxn,
         period_index: u32,
     ) -> Result<Vec<DecisionEntry>, Error> {
-        let mut claimed_decisions = Vec::new();
-
-        if let Some(period_decisions) =
-            self.period_decisions.try_get(rotxn, &period_index)?
-        {
-            for entry in &period_decisions {
-                if entry.decision.is_some() {
-                    claimed_decisions.push(entry.clone());
-                }
-            }
-        }
-
-        Ok(claimed_decisions)
+        self.period_entries(rotxn, period_index)
     }
 
     pub fn claimed_count_in_period(
@@ -898,6 +941,16 @@ impl Dbs {
         let claimed_ids =
             self.get_claimed_decision_ids_for_period(rotxn, period_index)?;
         Ok(claimed_ids.iter().filter(|id| id.is_standard()).count() as u64)
+    }
+
+    pub fn get_nonstandard_claimed_count_in_period(
+        &self,
+        rotxn: &sneed::RoTxn,
+        period_index: u32,
+    ) -> Result<u64, Error> {
+        let claimed_ids =
+            self.get_claimed_decision_ids_for_period(rotxn, period_index)?;
+        Ok(claimed_ids.iter().filter(|id| !id.is_standard()).count() as u64)
     }
 
     pub fn get_listing_fee_info(
@@ -923,6 +976,11 @@ impl Dbs {
             .ok_or_else(|| Error::InvalidTransaction {
                 reason: format!("no pricing record for period {period_index}"),
             })?;
+        if !decision_id.is_standard() {
+            return Ok(crate::math::decisions::nonstandard_listing_fee(
+                pricing.p_period,
+            ));
+        }
         pricing::fee_for_index(
             pricing.p_period,
             pricing.mints,
@@ -939,12 +997,10 @@ impl Dbs {
     ) -> Result<Vec<DecisionEntry>, Error> {
         let mut all_claimed_decisions = Vec::new();
 
-        let mut iter = self.period_decisions.iter(rotxn)?;
-        while let Some((_period, period_decisions)) = iter.next()? {
-            for entry in &period_decisions {
-                if entry.decision.is_some() {
-                    all_claimed_decisions.push(entry.clone());
-                }
+        let mut iter = self.decision_entries.iter(rotxn)?;
+        while let Some((_decision_id, entry)) = iter.next()? {
+            if entry.decision.is_some() {
+                all_claimed_decisions.push(entry);
             }
         }
 
@@ -1019,27 +1075,7 @@ impl Dbs {
     ) -> Result<(), Error> {
         self.open_decisions.delete(rwtxn, &decision_id)?;
 
-        let period_index = decision_id.period_index();
-
-        let mut period_decisions = self
-            .period_decisions
-            .try_get(rwtxn, &period_index)?
-            .unwrap_or_default();
-
-        let target_decision = period_decisions
-            .iter()
-            .find(|entry| entry.decision_id == decision_id)
-            .cloned();
-
-        if let Some(decision_to_remove) = target_decision {
-            period_decisions.remove(&decision_to_remove);
-
-            self.period_decisions.put(
-                rwtxn,
-                &period_index,
-                &period_decisions,
-            )?;
-        } else {
+        if !self.remove_decision_entry(rwtxn, decision_id)? {
             tracing::debug!(
                 "Attempted to revert decision {:?} that wasn't found",
                 decision_id
@@ -1165,18 +1201,8 @@ impl Dbs {
         }
 
         for decision_id in decisions_to_unclaim {
-            let period_index = decision_id.period_index();
-
-            if let Some(mut period_decisions) =
-                self.period_decisions.try_get(rwtxn, &period_index)?
-            {
-                period_decisions.retain(|s| s.decision_id != decision_id);
-                self.period_decisions.put(
-                    rwtxn,
-                    &period_index,
-                    &period_decisions,
-                )?;
-            }
+            let _removed: bool =
+                self.remove_decision_entry(rwtxn, decision_id)?;
         }
 
         Ok(())
@@ -1240,6 +1266,14 @@ impl DecisionValidationInterface for Dbs {
         period_index: u32,
     ) -> Result<u64, Error> {
         self.get_standard_claimed_count_in_period(rotxn, period_index)
+    }
+
+    fn get_nonstandard_claimed_count_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<u64, Error> {
+        self.get_nonstandard_claimed_count_in_period(rotxn, period_index)
     }
 
     fn get_available_decisions(

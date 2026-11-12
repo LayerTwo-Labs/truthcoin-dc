@@ -51,6 +51,12 @@ pub trait DecisionValidationInterface {
         period_index: u32,
     ) -> Result<u64, Error>;
 
+    fn get_nonstandard_claimed_count_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<u64, Error>;
+
     fn get_available_decisions(
         &self,
         rotxn: &RoTxn,

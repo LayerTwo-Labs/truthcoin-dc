@@ -784,3 +784,25 @@ fn test_categorical_tie_no_change() {
         );
     }
 }
+
+/// resolve_unguaranteed handles a tie, an inconclusive win and a plain winner.
+#[test]
+fn test_unguaranteed_categorical() {
+    use super::oracle::resolve_unguaranteed;
+
+    assert_eq!(
+        resolve_unguaranteed(&[(0.0, 0.5), (1.0, 0.5)], false, Some(3))
+            .unwrap(),
+        Some((0.5, None))
+    );
+    assert_eq!(
+        resolve_unguaranteed(&[(3.0, 0.6), (1.0, 0.4)], false, Some(3))
+            .unwrap(),
+        Some((0.5, Some(3)))
+    );
+    assert_eq!(
+        resolve_unguaranteed(&[(1.0, 0.6), (0.0, 0.4)], false, Some(3))
+            .unwrap(),
+        Some((1.0, Some(1)))
+    );
+}

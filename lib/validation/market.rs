@@ -99,6 +99,11 @@ impl MarketValidator {
                     .insert(decision_id, payload.decision_type.clone());
             }
         }
+        DecisionValidator::validate_nonstandard_cap(
+            state,
+            rotxn,
+            pending_claims.keys().copied(),
+        )?;
 
         let dimension_specs = view.dimension_specs;
 
@@ -1070,6 +1075,74 @@ mod tests {
         tx
     }
 
+    /// One market creation cannot claim more non-standard decisions than a
+    /// period's cap holds, even with claims no dimension uses
+    #[test]
+    fn new_claims_nonstandard_cap() {
+        use crate::{
+            math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX,
+            types::ClaimDecisionPayload,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None, true).unwrap();
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .put_timestamps_for_test(&mut rwtxn, 1000, 1000)
+            .unwrap();
+        state
+            .decisions()
+            .mint_genesis(&mut rwtxn, 1000, 0, 1000)
+            .unwrap();
+        rwtxn.commit().unwrap();
+        let rotxn = env.read_txn().unwrap();
+
+        let maker = Address([9; 20]);
+        let market_with_claims = |claims: u64| {
+            let mut tx = create_market_with_new_claim_tx(
+                maker,
+                DecisionId::new(false, 2, 0).unwrap(),
+            );
+            tx.spent_utxos[0].content =
+                OutputContent::Value(bitcoin::Amount::from_sat(100_000_000));
+            if let Some(TransactionData::CreateMarket { new_claims, .. }) =
+                &mut tx.transaction.data
+            {
+                new_claims.extend((1..claims).map(|index| {
+                    ClaimDecisionPayload {
+                        decision_type: DecisionType::Binary,
+                        decisions: vec![DecisionClaimEntry {
+                            decision_id_bytes: DecisionId::new(
+                                false,
+                                2,
+                                index as u32,
+                            )
+                            .unwrap()
+                            .as_bytes(),
+                            header: "decision".to_string(),
+                            description: String::new(),
+                            option_0_label: None,
+                            option_1_label: None,
+                            option_labels: None,
+                            tags: None,
+                        }],
+                    }
+                }));
+            }
+            MarketValidator::validate_market_creation(&state, &rotxn, &tx, None)
+        };
+
+        market_with_claims(NONSTANDARD_SLOTS_PER_PERIOD_MAX).unwrap();
+        let over_cap = market_with_claims(NONSTANDARD_SLOTS_PER_PERIOD_MAX + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(over_cap.contains("cap"), "{over_cap}");
+    }
+
     /// New decision claims must fall in the current period's window
     #[test]
     fn new_claim_window() {
@@ -1090,6 +1163,10 @@ mod tests {
         let mut rwtxn = env.write_txn().unwrap();
         state
             .put_timestamps_for_test(&mut rwtxn, genesis_ts, tenth_period_ts)
+            .unwrap();
+        state
+            .decisions()
+            .mint_genesis(&mut rwtxn, tenth_period_ts, 0, genesis_ts)
             .unwrap();
         rwtxn.commit().unwrap();
         let rotxn = env.read_txn().unwrap();
