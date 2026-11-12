@@ -234,8 +234,16 @@ impl Sidechain for PostSetup {
             );
         tracing::debug!("Started truthcoin");
         sleep(Duration::from_secs(1)).await;
-        let cookie = std::fs::read_to_string(&cookie_path)
-            .map_err(Self::SetupError::ReadCookie)?;
+        // A first launch of a fresh build can take longer to write it
+        let mut cookie = std::fs::read_to_string(&cookie_path);
+        for _ in 0..50 {
+            if cookie.is_ok() {
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+            cookie = std::fs::read_to_string(&cookie_path);
+        }
+        let cookie = cookie.map_err(Self::SetupError::ReadCookie)?;
         let authorization =
             http::HeaderValue::from_str(&format!("Bearer {}", cookie.trim()))?;
         let rpc_client = jsonrpsee::http_client::HttpClient::builder()

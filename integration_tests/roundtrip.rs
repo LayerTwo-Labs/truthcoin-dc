@@ -130,18 +130,21 @@ mod expected_phase2 {
         pub const EXPECTED_BIN_30: f64 = 1.0;
         /// bin_31 (Fed cuts): 5/7 = 0.714 > 0.6 → 1.0
         pub const EXPECTED_BIN_31: f64 = 1.0;
-        /// bin_32 (Unemployment): 3/7 = 0.429, 0.4≤x≤0.6 → 0.5
-        pub const EXPECTED_BIN_32: f64 = 0.5;
+        /// bin_32 (Unemployment): voters 0-2 vote YES. Phase 8 consensus
+        /// cut voter 2's reputation, so they hold 0.404 of it, and the
+        /// SVD-smoothed weights that resolve the period put them under the
+        /// 0.4 line → 0.0
+        pub const EXPECTED_BIN_32: f64 = 0.0;
         /// bin_33 (GDP growth): 5/7 = 0.714 > 0.6 → 1.0
         pub const EXPECTED_BIN_33: f64 = 1.0;
-        /// bin_34 (Housing): 4/7 = 0.571, 0.4≤x≤0.6 → 0.5
-        pub const EXPECTED_BIN_34: f64 = 0.5;
-        /// bin_35 (Consumer conf): 4/7 = 0.571 → 0.5
-        pub const EXPECTED_BIN_35: f64 = 0.5;
-        /// bin_36 (Retail): 4/7 = 0.571 → 0.5
-        pub const EXPECTED_BIN_36: f64 = 0.5;
-        /// bin_37 (Manufacturing): 4/7 = 0.571 → 0.5
-        pub const EXPECTED_BIN_37: f64 = 0.5;
+        /// bin_34 (Housing): voters 0-2 vote YES, as on bin_32 → 0.0
+        pub const EXPECTED_BIN_34: f64 = 0.0;
+        /// bin_35 (Consumer conf): voters 0-2 vote YES, as on bin_32 → 0.0
+        pub const EXPECTED_BIN_35: f64 = 0.0;
+        /// bin_36 (Retail): voters 0-2 vote YES, as on bin_32 → 0.0
+        pub const EXPECTED_BIN_36: f64 = 0.0;
+        /// bin_37 (Manufacturing): voters 0-2 vote YES, as on bin_32 → 0.0
+        pub const EXPECTED_BIN_37: f64 = 0.0;
     }
 
     /// Market structure verification - expected outcome counts
@@ -4438,13 +4441,19 @@ async fn roundtrip_task_inner(
         abstained_outcome == Some(expected_phase2::binary::EXPECTED_BIN_30)
     );
 
-    // Verify consensus results
-    let test_period_id = test_period;
+    // Verify consensus results for the period the decisions were voted in
+    let test_period_id = test_period + 1;
     let period_info = truthcoin_nodes
         .issuer
         .rpc_client
         .vote_period(Some(test_period_id))
         .await?;
+    anyhow::ensure!(
+        period_info
+            .as_ref()
+            .is_some_and(|info| info.consensus.is_some()),
+        "voting period {test_period_id} has no consensus"
+    );
 
     if let Some(info) = &period_info
         && let Some(consensus) = &info.consensus
@@ -4453,7 +4462,9 @@ async fn roundtrip_task_inner(
         if let Some(&outcome) = consensus.outcomes.get(&scaled_dec_0) {
             debug_helpers::assert_float_eq(
                 outcome,
-                expected_phase2::scaled::EXPECTED_BTC_CONSENSUS,
+                btc_min
+                    + expected_phase2::scaled::EXPECTED_BTC_CONSENSUS
+                        * btc_range,
                 expected_phase2::FLOAT_TOLERANCE,
                 "Scaled BTC consensus",
             )?;
@@ -4462,7 +4473,9 @@ async fn roundtrip_task_inner(
         if let Some(&outcome) = consensus.outcomes.get(&scaled_dec_1) {
             debug_helpers::assert_float_eq(
                 outcome,
-                expected_phase2::scaled::EXPECTED_ETH_BTC_CONSENSUS,
+                eth_btc_min
+                    + expected_phase2::scaled::EXPECTED_ETH_BTC_CONSENSUS
+                        * eth_btc_range,
                 expected_phase2::FLOAT_TOLERANCE,
                 "Scaled ETH/BTC consensus",
             )?;
