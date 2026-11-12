@@ -23,17 +23,19 @@ struct StateUpdate {
     market_creations: Vec<MarketCreation>,
     share_account_changes: HashMap<(Address, MarketId), HashMap<u32, i64>>,
     vote_submissions: Vec<VoteSubmission>,
-    pending_sell_payouts: Vec<PendingSellPayout>,
-    pending_buy_settlements: Vec<PendingBuySettlement>,
-    pending_sell_input_changes: Vec<(Address, u64, [u8; 32])>,
+    pending_trade_settlements: Vec<PendingTradeSettlement>,
 }
 
 struct MarketStateUpdate {
     market_id: MarketId,
-    share_delta: Option<(usize, i64)>,
-    transaction_id: Option<[u8; 32]>,
-    volume_sats: Option<u64>,
-    fee_sats: Option<u64>,
+    legs: Vec<TradeLeg>,
+}
+
+/// One outcome a trade moves, with its share of the trade's volume
+struct TradeLeg {
+    outcome_index: usize,
+    shares: i64,
+    volume_sats: u64,
 }
 
 struct MarketCreation {
@@ -44,21 +46,15 @@ struct VoteSubmission {
     vote: crate::state::voting::types::Vote,
 }
 
-pub struct PendingSellPayout {
-    pub market_id: MarketId,
-    pub seller_address: Address,
-    pub payout_sats: u64,
-    pub fee_sats: u64,
-    pub outcome_index: u32,
-    pub transaction_id: [u8; 32],
-}
-
-pub struct PendingBuySettlement {
+/// The money of a trade or an `AmplifyBeta` deposit, settled when the block
+/// consolidates its market's treasury
+pub struct PendingTradeSettlement {
     pub market_id: MarketId,
     pub trader_address: Address,
     pub input_value_sats: u64,
-    pub lmsr_cost_sats: u64,
-    pub market_fee_sats: u64,
+    pub buy_cost_sats: u64,
+    pub sell_gross_sats: u64,
+    pub fee_sats: u64,
     pub transaction_id: [u8; 32],
     pub is_amplify: bool,
 }
@@ -70,15 +66,7 @@ pub enum TradeApplyResult {
 
 impl StateUpdate {
     fn new() -> Self {
-        Self {
-            market_updates: Vec::new(),
-            market_creations: Vec::new(),
-            share_account_changes: HashMap::new(),
-            vote_submissions: Vec::new(),
-            pending_sell_payouts: Vec::new(),
-            pending_buy_settlements: Vec::new(),
-            pending_sell_input_changes: Vec::new(),
-        }
+        Self::default()
     }
 
     fn verify_internal_consistency(&self) -> Result<(), Error> {
@@ -169,25 +157,16 @@ impl StateUpdate {
                 })?;
         }
 
-        let mut aggregated_deltas: crate::state::type_aliases::AggregatedDeltas =
-            std::collections::HashMap::new();
-
+        let mut legs_by_market: HashMap<MarketId, Vec<&TradeLeg>> =
+            HashMap::new();
         for update in &self.market_updates {
-            if let Some((outcome_index, delta)) = update.share_delta {
-                aggregated_deltas
-                    .entry(update.market_id)
-                    .or_default()
-                    .push((
-                        outcome_index,
-                        delta,
-                        update.volume_sats,
-                        update.fee_sats,
-                        update.transaction_id,
-                    ));
-            }
+            legs_by_market
+                .entry(update.market_id)
+                .or_default()
+                .extend(&update.legs);
         }
 
-        for (market_id, deltas) in aggregated_deltas {
+        for (market_id, legs) in legs_by_market {
             let mut market = state
                 .markets()
                 .get_market(rwtxn, &market_id)?
@@ -197,16 +176,13 @@ impl StateUpdate {
 
             let mut new_shares = market.shares().clone();
 
-            for (outcome_index, delta, volume_sats, _fee_sats, _txid) in &deltas
-            {
-                new_shares[*outcome_index] += *delta;
-                if let Some(vol) = volume_sats {
-                    market
-                        .update_trading_volume(*outcome_index, *vol)
-                        .map_err(|e| Error::InvalidTransaction {
-                            reason: format!("Failed to update volume: {e:?}"),
-                        })?;
-                }
+            for leg in legs {
+                new_shares[leg.outcome_index] += leg.shares;
+                market
+                    .update_trading_volume(leg.outcome_index, leg.volume_sats)
+                    .map_err(|e| Error::InvalidTransaction {
+                        reason: format!("Failed to update volume: {e:?}"),
+                    })?;
             }
 
             market
@@ -221,10 +197,10 @@ impl StateUpdate {
 
         let mut amplify_by_market: std::collections::HashMap<MarketId, u64> =
             std::collections::HashMap::new();
-        for settlement in &self.pending_buy_settlements {
+        for settlement in &self.pending_trade_settlements {
             if settlement.is_amplify {
                 *amplify_by_market.entry(settlement.market_id).or_default() +=
-                    settlement.lmsr_cost_sats;
+                    settlement.buy_cost_sats;
             }
         }
         for (market_id, amount) in amplify_by_market {
@@ -302,37 +278,13 @@ impl StateUpdate {
             accumulator_diff,
             market_utxos,
             height,
-            &self.pending_sell_payouts,
-            &self.pending_buy_settlements,
-            &self.pending_sell_input_changes,
+            &self.pending_trade_settlements,
         )?;
 
         Ok(consolidation_undo)
     }
 
-    pub fn generate_sell_payout_outpoint(
-        market_id: &MarketId,
-        seller_address: &Address,
-        transaction_id: [u8; 32],
-    ) -> OutPoint {
-        use blake3::Hasher;
-
-        let mut hasher = Hasher::new();
-        hasher.update(b"SELL_PAYOUT");
-        hasher.update(&market_id.0);
-        hasher.update(&seller_address.0);
-        hasher.update(&transaction_id);
-
-        let hash = hasher.finalize();
-        let merkle_root = MerkleRoot::from(*hash.as_bytes());
-
-        OutPoint::Payout {
-            hash: merkle_root,
-            vout: 0,
-        }
-    }
-
-    pub fn generate_buy_change_outpoint(
+    pub fn generate_trade_change_outpoint(
         market_id: &MarketId,
         trader_address: &Address,
         transaction_id: [u8; 32],
@@ -340,7 +292,7 @@ impl StateUpdate {
         use blake3::Hasher;
 
         let mut hasher = Hasher::new();
-        hasher.update(b"BUY_CHANGE");
+        hasher.update(b"TRADE_CHANGE");
         hasher.update(&market_id.0);
         hasher.update(&trader_address.0);
         hasher.update(&transaction_id);
@@ -354,36 +306,13 @@ impl StateUpdate {
         }
     }
 
-    pub fn generate_sell_input_change_outpoint(
-        trader_address: &Address,
-        transaction_id: [u8; 32],
-    ) -> OutPoint {
-        use blake3::Hasher;
-
-        let mut hasher = Hasher::new();
-        hasher.update(b"SELL_INPUT_CHANGE");
-        hasher.update(&trader_address.0);
-        hasher.update(&transaction_id);
-
-        let hash = hasher.finalize();
-        let merkle_root = MerkleRoot::from(*hash.as_bytes());
-
-        OutPoint::Payout {
-            hash: merkle_root,
-            vout: 0,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn consolidate_market_utxos(
         state: &State,
         rwtxn: &mut RwTxn,
         accumulator_diff: &mut AccumulatorDiff,
         market_utxos: &mut MarketUtxoChanges,
         height: u32,
-        pending_sell_payouts: &[PendingSellPayout],
-        pending_buy_settlements: &[PendingBuySettlement],
-        pending_sell_input_changes: &[(Address, u64, [u8; 32])],
+        pending_trade_settlements: &[PendingTradeSettlement],
     ) -> Result<Option<crate::state::undo::ConsolidationUndoData>, Error> {
         use crate::math::trading::TRADE_MINER_FEE_SATS;
         use crate::state::markets::{
@@ -394,15 +323,13 @@ impl StateUpdate {
         use std::collections::BTreeSet;
 
         // Accumulator insertion order must match on every node.
-        let markets_to_consolidate: BTreeSet<[u8; 6]> = pending_sell_payouts
-            .iter()
-            .map(|p| p.market_id.0)
-            .chain(pending_buy_settlements.iter().map(|s| s.market_id.0))
-            .collect();
+        let markets_to_consolidate: BTreeSet<[u8; 6]> =
+            pending_trade_settlements
+                .iter()
+                .map(|settlement| settlement.market_id.0)
+                .collect();
 
-        if markets_to_consolidate.is_empty()
-            && pending_sell_input_changes.is_empty()
-        {
+        if markets_to_consolidate.is_empty() {
             return Ok(None);
         }
 
@@ -446,188 +373,126 @@ impl StateUpdate {
                 fee_utxos_to_consume.push(existing_outpoint);
             }
 
-            let market_buy_settlements: Vec<&PendingBuySettlement> =
-                pending_buy_settlements
+            let settlements: Vec<&PendingTradeSettlement> =
+                pending_trade_settlements
                     .iter()
-                    .filter(|s| s.market_id == market_id)
+                    .filter(|settlement| settlement.market_id == market_id)
                     .collect();
 
-            for settlement in &market_buy_settlements {
-                treasury_total += settlement.lmsr_cost_sats;
-                fee_total += settlement.market_fee_sats;
+            let mut total_sell_gross = 0u64;
+            for settlement in &settlements {
+                treasury_total += settlement.buy_cost_sats;
+                total_sell_gross += settlement.sell_gross_sats;
+                fee_total += settlement.fee_sats;
             }
 
-            let market_sell_payouts: Vec<&PendingSellPayout> =
-                pending_sell_payouts
-                    .iter()
-                    .filter(|p| p.market_id == market_id)
-                    .collect();
-            let total_sell_payouts: u64 =
-                market_sell_payouts.iter().map(|p| p.payout_sats).sum();
-            let total_sell_fees: u64 =
-                market_sell_payouts.iter().map(|p| p.fee_sats).sum();
-            fee_total += total_sell_fees;
-
-            let total_sell_gross = total_sell_payouts + total_sell_fees;
-            if total_sell_gross > treasury_total {
-                return Err(Error::InvalidTransaction {
+            let remaining_treasury = treasury_total
+                .checked_sub(total_sell_gross)
+                .ok_or_else(|| Error::InvalidTransaction {
                     reason: format!(
                         "Treasury underflow: sell gross {total_sell_gross} \
-                         (payouts {total_sell_payouts} + fees \
-                         {total_sell_fees}) exceed treasury \
-                         {treasury_total} for market {market_id:?}",
+                         exceeds treasury {treasury_total} for market \
+                         {market_id:?}",
                     ),
-                });
-            }
+                })?;
 
             let mut new_treasury_utxo = None;
             let mut new_fee_utxo = None;
-            let mut sell_payout_utxos = Vec::new();
-            let mut buy_change_utxos = Vec::new();
+            let mut trade_change_utxos = Vec::new();
 
-            let has_treasury_work = !treasury_utxos_to_consume.is_empty()
-                || !market_sell_payouts.is_empty()
-                || !market_buy_settlements.is_empty();
+            for outpoint in &treasury_utxos_to_consume {
+                state.delete_market_utxo(
+                    rwtxn,
+                    accumulator_diff,
+                    market_utxos,
+                    outpoint,
+                    MarketUtxoReason::Treasury,
+                )?;
+            }
+            state
+                .markets()
+                .clear_market_funds_utxo(rwtxn, &market_id, false)?;
 
-            if has_treasury_work
-                && (treasury_total > 0 || !market_sell_payouts.is_empty())
-            {
-                for outpoint in &treasury_utxos_to_consume {
-                    state.delete_market_utxo(
-                        rwtxn,
-                        accumulator_diff,
-                        market_utxos,
-                        outpoint,
-                        MarketUtxoReason::Treasury,
-                    )?;
-                }
-                state
-                    .markets()
-                    .clear_market_funds_utxo(rwtxn, &market_id, false)?;
-
-                for payout in market_sell_payouts.iter() {
-                    let payout_outpoint = Self::generate_sell_payout_outpoint(
-                        &market_id,
-                        &payout.seller_address,
-                        payout.transaction_id,
-                    );
-                    let payout_output = Output {
-                        address: payout.seller_address,
-                        content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(payout.payout_sats),
-                        ),
-                    };
-                    state.insert_market_utxo(
-                        rwtxn,
-                        accumulator_diff,
-                        market_utxos,
-                        MarketUtxo {
-                            outpoint: payout_outpoint,
-                            output: payout_output,
-                            reason: MarketUtxoReason::SellPayout,
-                        },
-                    )?;
-                    sell_payout_utxos.push(payout_outpoint);
-                }
-
-                for settlement in &market_buy_settlements {
-                    let change = settlement
-                        .input_value_sats
-                        .checked_sub(TRADE_MINER_FEE_SATS)
-                        .and_then(|v| v.checked_sub(settlement.lmsr_cost_sats))
-                        .and_then(|v| v.checked_sub(settlement.market_fee_sats))
-                        .ok_or_else(|| Error::InvalidTransaction {
-                            reason: format!(
-                                "Buy change underflow: input {} < \
-                                 fees {} + cost {} + market_fee {}",
-                                settlement.input_value_sats,
-                                TRADE_MINER_FEE_SATS,
-                                settlement.lmsr_cost_sats,
-                                settlement.market_fee_sats,
-                            ),
-                        })?;
-                    if change > 0 {
-                        let change_outpoint =
-                            Self::generate_buy_change_outpoint(
-                                &market_id,
-                                &settlement.trader_address,
-                                settlement.transaction_id,
-                            );
-                        let change_output = Output {
-                            address: settlement.trader_address,
-                            content: OutputContent::Value(
-                                bitcoin::Amount::from_sat(change),
-                            ),
-                        };
-                        state.insert_market_utxo(
-                            rwtxn,
-                            accumulator_diff,
-                            market_utxos,
-                            MarketUtxo {
-                                outpoint: change_outpoint,
-                                output: change_output,
-                                reason: MarketUtxoReason::BuyChange,
-                            },
-                        )?;
-                        buy_change_utxos.push(change_outpoint);
-                    }
-                }
-
-                let remaining_treasury = treasury_total
-                    .checked_sub(total_sell_payouts)
-                    .and_then(|v| v.checked_sub(total_sell_fees))
+            for settlement in &settlements {
+                let change = settlement
+                    .input_value_sats
+                    .checked_add(settlement.sell_gross_sats)
+                    .and_then(|v| v.checked_sub(TRADE_MINER_FEE_SATS))
+                    .and_then(|v| v.checked_sub(settlement.buy_cost_sats))
+                    .and_then(|v| v.checked_sub(settlement.fee_sats))
                     .ok_or_else(|| Error::InvalidTransaction {
                         reason: format!(
-                            "Treasury remainder underflow: \
-                             treasury {treasury_total} < \
-                             payouts {total_sell_payouts} + \
-                             fees {total_sell_fees}"
+                            "Trade change underflow: input {} + sell {} < \
+                             miner fee {} + buy {} + market fee {}",
+                            settlement.input_value_sats,
+                            settlement.sell_gross_sats,
+                            TRADE_MINER_FEE_SATS,
+                            settlement.buy_cost_sats,
+                            settlement.fee_sats,
                         ),
                     })?;
-
-                if remaining_treasury > 0 {
-                    let treasury_address =
-                        generate_market_treasury_address(&market_id);
-                    let new_outpoint = OutPoint::MarketFunds {
-                        market_id: *market_id_bytes,
-                        block_height: height,
-                        is_fee: false,
-                    };
-                    let new_output = Output {
-                        address: treasury_address,
-                        content: OutputContent::MarketFunds {
-                            market_id: *market_id_bytes,
-                            amount: bitcoin::Amount::from_sat(
-                                remaining_treasury,
-                            ),
-                            is_fee: false,
-                        },
+                if change > 0 {
+                    let change_outpoint = Self::generate_trade_change_outpoint(
+                        &market_id,
+                        &settlement.trader_address,
+                        settlement.transaction_id,
+                    );
+                    let change_output = Output {
+                        address: settlement.trader_address,
+                        content: OutputContent::Value(
+                            bitcoin::Amount::from_sat(change),
+                        ),
                     };
                     state.insert_market_utxo(
                         rwtxn,
                         accumulator_diff,
                         market_utxos,
                         MarketUtxo {
-                            outpoint: new_outpoint,
-                            output: new_output,
-                            reason: MarketUtxoReason::Treasury,
+                            outpoint: change_outpoint,
+                            output: change_output,
+                            reason: MarketUtxoReason::TradeChange,
                         },
                     )?;
-                    state.markets().set_market_funds_utxo(
-                        rwtxn,
-                        &market_id,
-                        false,
-                        &new_outpoint,
-                    )?;
-                    new_treasury_utxo = Some(new_outpoint);
+                    trade_change_utxos.push(change_outpoint);
                 }
             }
 
-            let has_fee_work = !fee_utxos_to_consume.is_empty()
-                || total_sell_fees > 0
-                || !market_buy_settlements.is_empty();
+            if remaining_treasury > 0 {
+                let treasury_address =
+                    generate_market_treasury_address(&market_id);
+                let new_outpoint = OutPoint::MarketFunds {
+                    market_id: *market_id_bytes,
+                    block_height: height,
+                    is_fee: false,
+                };
+                let new_output = Output {
+                    address: treasury_address,
+                    content: OutputContent::MarketFunds {
+                        market_id: *market_id_bytes,
+                        amount: bitcoin::Amount::from_sat(remaining_treasury),
+                        is_fee: false,
+                    },
+                };
+                state.insert_market_utxo(
+                    rwtxn,
+                    accumulator_diff,
+                    market_utxos,
+                    MarketUtxo {
+                        outpoint: new_outpoint,
+                        output: new_output,
+                        reason: MarketUtxoReason::Treasury,
+                    },
+                )?;
+                state.markets().set_market_funds_utxo(
+                    rwtxn,
+                    &market_id,
+                    false,
+                    &new_outpoint,
+                )?;
+                new_treasury_utxo = Some(new_outpoint);
+            }
 
-            if has_fee_work && fee_total > 0 {
+            if fee_total > 0 {
                 for outpoint in &fee_utxos_to_consume {
                     state.delete_market_utxo(
                         rwtxn,
@@ -683,39 +548,12 @@ impl StateUpdate {
                 old_fee_pointer,
                 new_treasury_utxo,
                 new_fee_utxo,
-                sell_payout_utxos,
-                buy_change_utxos,
+                trade_change_utxos,
             });
-        }
-
-        let mut sell_input_change_utxos = Vec::new();
-        for (address, change_sats, tx_id) in pending_sell_input_changes {
-            if *change_sats > 0 {
-                let change_outpoint =
-                    Self::generate_sell_input_change_outpoint(address, *tx_id);
-                let change_output = Output {
-                    address: *address,
-                    content: OutputContent::Value(bitcoin::Amount::from_sat(
-                        *change_sats,
-                    )),
-                };
-                state.insert_market_utxo(
-                    rwtxn,
-                    accumulator_diff,
-                    market_utxos,
-                    MarketUtxo {
-                        outpoint: change_outpoint,
-                        output: change_output,
-                        reason: MarketUtxoReason::SellInputChange,
-                    },
-                )?;
-                sell_input_change_utxos.push(change_outpoint);
-            }
         }
 
         Ok(Some(crate::state::undo::ConsolidationUndoData {
             entries: undo_entries,
-            sell_input_change_utxos,
         }))
     }
 
@@ -743,22 +581,11 @@ impl StateUpdate {
         self.vote_submissions.push(VoteSubmission { vote });
     }
 
-    fn add_pending_sell_payout(&mut self, payout: PendingSellPayout) {
-        self.pending_sell_payouts.push(payout);
-    }
-
-    fn add_pending_buy_settlement(&mut self, settlement: PendingBuySettlement) {
-        self.pending_buy_settlements.push(settlement);
-    }
-
-    fn add_pending_sell_input_change(
+    fn add_pending_trade_settlement(
         &mut self,
-        address: Address,
-        change_sats: u64,
-        tx_id: [u8; 32],
+        settlement: PendingTradeSettlement,
     ) {
-        self.pending_sell_input_changes
-            .push((address, change_sats, tx_id));
+        self.pending_trade_settlements.push(settlement);
     }
 }
 
@@ -1171,13 +998,12 @@ pub(in crate::state) fn disconnect_tx(
             let () = revert_create_market(state, rwtxn, &filled_tx)?;
         }
         TxData::Trade { .. } => {
-            let delta = revert_trade_market_state(
+            trade_share_deltas.extend(revert_trade_market_state(
                 state,
                 rwtxn,
                 accumulator_diff,
                 &filled_tx,
-            )?;
-            trade_share_deltas.push(delta);
+            )?);
         }
         TxData::SubmitBallot { .. } => {
             let () = revert_submit_ballot(state, rwtxn, &filled_tx)?;
@@ -1317,10 +1143,7 @@ fn revert_consolidation(
         if let Some(ref outpoint) = entry.new_fee_utxo {
             revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
         }
-        for outpoint in &entry.sell_payout_utxos {
-            revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
-        }
-        for outpoint in &entry.buy_change_utxos {
+        for outpoint in &entry.trade_change_utxos {
             revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
         }
 
@@ -1372,11 +1195,6 @@ fn revert_consolidation(
                 true,
             )?;
         }
-    }
-
-    // Delete sell input change UTXOs
-    for outpoint in &undo.sell_input_change_utxos {
-        revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
     }
 
     tracing::info!(
@@ -1622,19 +1440,20 @@ fn running_market_state(
     state_update: &StateUpdate,
 ) -> (ndarray::Array1<i64>, f64) {
     let mut effective_shares = market.shares().clone();
-    for update in &state_update.market_updates {
-        if update.market_id == *market_id
-            && let Some((outcome_index, delta)) = update.share_delta
-        {
-            effective_shares[outcome_index] += delta;
-        }
+    for leg in state_update
+        .market_updates
+        .iter()
+        .filter(|update| update.market_id == *market_id)
+        .flat_map(|update| &update.legs)
+    {
+        effective_shares[leg.outcome_index] += leg.shares;
     }
 
     let pending_amplify: u64 = state_update
-        .pending_buy_settlements
+        .pending_trade_settlements
         .iter()
         .filter(|s| s.market_id == *market_id && s.is_amplify)
-        .map(|s| s.lmsr_cost_sats)
+        .map(|s| s.buy_cost_sats)
         .sum();
     let running_base =
         market.liquidity_base_sats.saturating_add(pending_amplify);
@@ -1704,17 +1523,42 @@ pub(in crate::state) struct TradeShareDelta {
     share_delta: i64,
 }
 
+/// A trade's legs, its volume split across them in proportion to the shares
+/// each moves, the remainder to the first leg
+fn trade_legs(
+    deltas: &[crate::types::ShareDelta],
+    gross_sats: u64,
+) -> Vec<TradeLeg> {
+    let total_shares: u128 = deltas
+        .iter()
+        .map(|delta| u128::from(delta.shares.unsigned_abs()))
+        .sum();
+    let mut legs: Vec<TradeLeg> = deltas
+        .iter()
+        .map(|delta| TradeLeg {
+            outcome_index: delta.outcome_index as usize,
+            shares: delta.shares,
+            volume_sats: (u128::from(gross_sats)
+                * u128::from(delta.shares.unsigned_abs())
+                / total_shares.max(1)) as u64,
+        })
+        .collect();
+    let assigned: u64 = legs.iter().map(|leg| leg.volume_sats).sum();
+    if let Some(first) = legs.first_mut() {
+        first.volume_sats += gross_sats - assigned;
+    }
+    legs
+}
+
 fn revert_trade_market_state(
     state: &State,
     rwtxn: &mut RwTxn,
     accumulator_diff: &mut AccumulatorDiff,
     filled_tx: &FilledTransaction,
-) -> Result<TradeShareDelta, Error> {
+) -> Result<Vec<TradeShareDelta>, Error> {
     let trade = filled_tx.trade().ok_or_else(|| Error::InvalidTransaction {
         reason: "Not a trade transaction".to_string(),
     })?;
-
-    let is_buy = trade.is_buy();
     let height = state.try_get_height(rwtxn)?.unwrap_or(0);
 
     let mut market = state
@@ -1724,130 +1568,57 @@ fn revert_trade_market_state(
             reason: "Market not found during trade revert".to_string(),
         })?;
 
-    let shares_delta = trade.shares_abs() as i64;
-    let outcome = trade.outcome_index as usize;
-
-    let beta = market_beta(&market);
-
-    if is_buy {
-        let mut pre_trade_shares = market.shares().clone();
-        pre_trade_shares[outcome] -= shares_delta;
-
-        let base_cost = trading::calculate_update_cost(
-            &pre_trade_shares,
-            market.shares(),
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("LMSR calc failed during buy trade revert: {e:?}"),
-        })?;
-        let buy_cost =
-            trading::calculate_buy_cost(base_cost, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!(
-                        "Buy cost calc failed during trade revert: {e}"
-                    ),
-                })?;
+    let mut pre_trade_shares = market.shares().clone();
+    for delta in &trade.deltas {
+        pre_trade_shares[delta.outcome_index as usize] -= delta.shares;
+    }
+    let quote = trading::quote_trade(
+        &pre_trade_shares,
+        &trade.deltas,
+        market_beta(&market),
+        market.trading_fee(),
+    )
+    .map_err(|e| Error::InvalidTransaction {
+        reason: format!("Trade quote failed during trade revert: {e}"),
+    })?;
+    for leg in trade_legs(&trade.deltas, quote.gross_sats()) {
         market
-            .revert_trading_volume(outcome, buy_cost.total_cost_sats)
+            .revert_trading_volume(leg.outcome_index, leg.volume_sats)
             .map_err(|e| Error::InvalidTransaction {
                 reason: format!(
-                    "Volume revert failed during buy trade revert: \
-                     {e:?}"
+                    "Volume revert failed during trade revert: {e:?}"
                 ),
-            })?;
-
-        market
-            .update_shares(pre_trade_shares, height)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Failed to revert market shares: {e:?}"),
-            })?;
-    } else {
-        let mut pre_trade_shares = market.shares().clone();
-        pre_trade_shares[outcome] += shares_delta;
-
-        let base_cost = trading::calculate_update_cost(
-            market.shares(),
-            &pre_trade_shares,
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("LMSR calc failed during sell trade revert: {e:?}"),
-        })?;
-        let sell_proceeds =
-            trading::calculate_sell_proceeds(base_cost, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                reason: format!(
-                    "Sell proceeds calc failed during trade \
-                         revert: {e}"
-                ),
-            })?;
-        market
-            .revert_trading_volume(outcome, sell_proceeds.net_proceeds_sats)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!(
-                    "Volume revert failed during sell trade revert: \
-                     {e:?}"
-                ),
-            })?;
-
-        market
-            .update_shares(pre_trade_shares, height)
-            .map_err(|e| Error::InvalidTransaction {
-                reason: format!("Failed to revert market shares: {e:?}"),
             })?;
     }
-
+    market
+        .update_shares(pre_trade_shares, height)
+        .map_err(|e| Error::InvalidTransaction {
+            reason: format!("Failed to revert market shares: {e:?}"),
+        })?;
     state.markets().update_market(rwtxn, &market)?;
 
-    if is_buy {
-        let change_outpoint = StateUpdate::generate_buy_change_outpoint(
-            &trade.market_id,
-            &trade.trader,
-            filled_tx.txid().0,
+    let change_outpoint = StateUpdate::generate_trade_change_outpoint(
+        &trade.market_id,
+        &trade.trader,
+        filled_tx.txid().0,
+    );
+    if let Err(e) = state.delete_utxo(rwtxn, &change_outpoint, accumulator_diff)
+    {
+        tracing::trace!(
+            "UTXO not found during trade revert (expected if 0 change): {e:?}"
         );
-        if let Err(e) =
-            state.delete_utxo(rwtxn, &change_outpoint, accumulator_diff)
-        {
-            tracing::trace!(
-                "UTXO not found during trade revert (expected if 0 change): {e:?}"
-            );
-        }
-    } else {
-        let payout_outpoint = StateUpdate::generate_sell_payout_outpoint(
-            &trade.market_id,
-            &trade.trader,
-            filled_tx.txid().0,
-        );
-        if let Err(e) =
-            state.delete_utxo(rwtxn, &payout_outpoint, accumulator_diff)
-        {
-            tracing::trace!(
-                "UTXO not found during trade revert (expected if 0 change): {e:?}"
-            );
-        }
-
-        let change_outpoint = StateUpdate::generate_sell_input_change_outpoint(
-            &trade.trader,
-            filled_tx.txid().0,
-        );
-        if let Err(e) =
-            state.delete_utxo(rwtxn, &change_outpoint, accumulator_diff)
-        {
-            tracing::trace!(
-                "UTXO not found during trade revert (expected if 0 change): {e:?}"
-            );
-        }
     }
 
-    let account_delta = if is_buy { -shares_delta } else { shares_delta };
-
-    Ok(TradeShareDelta {
-        address: trade.trader,
-        market_id: trade.market_id,
-        outcome_index: trade.outcome_index,
-        share_delta: account_delta,
-    })
+    Ok(trade
+        .deltas
+        .iter()
+        .map(|delta| TradeShareDelta {
+            address: trade.trader,
+            market_id: trade.market_id,
+            outcome_index: delta.outcome_index,
+            share_delta: -delta.shares,
+        })
+        .collect())
 }
 
 /// Trades and `AmplifyBeta` deposits of a block under construction, applied
@@ -1886,15 +1657,9 @@ fn apply_trade(
     filled_tx: &FilledTransaction,
     state_update: &mut StateUpdate,
 ) -> Result<TradeApplyResult, Error> {
-    use crate::math::trading::TRADE_MINER_FEE_SATS;
-
     let trade = filled_tx.trade().ok_or_else(|| Error::InvalidTransaction {
         reason: "Not a trade transaction".to_string(),
     })?;
-
-    let is_buy = trade.is_buy();
-    let shares_abs = trade.shares_abs();
-    let outcome_index = trade.outcome_index as usize;
 
     let market = state
         .markets()
@@ -1914,19 +1679,56 @@ fn apply_trade(
 
     let (effective_shares, beta) =
         running_market_state(&trade.market_id, &market, state_update);
+    let quote = trading::quote_trade(
+        &effective_shares,
+        &trade.deltas,
+        beta,
+        market.trading_fee(),
+    )
+    .map_err(|e| Error::InvalidTransaction {
+        reason: format!("Invalid trade: {e}"),
+    })?;
 
-    let mut new_shares = effective_shares.clone();
-    new_shares[outcome_index] = new_shares[outcome_index]
-        .checked_add(trade.shares)
-        .ok_or_else(|| Error::InvalidTransaction {
-            reason: "Market share count overflow".to_string(),
-        })?;
+    if trade.sells() {
+        let seller_account = state
+            .markets()
+            .get_user_share_account(rotxn, &trade.trader)?;
+        let pending_changes = state_update
+            .share_account_changes
+            .get(&(trade.trader, trade.market_id));
+        for delta in trade.deltas.iter().filter(|delta| delta.shares < 0) {
+            let owned = seller_account
+                .as_ref()
+                .and_then(|account| {
+                    account
+                        .positions
+                        .get(&(trade.market_id, delta.outcome_index))
+                        .copied()
+                })
+                .unwrap_or(0);
+            let pending = pending_changes
+                .and_then(|outcomes| outcomes.get(&delta.outcome_index))
+                .copied()
+                .unwrap_or(0);
+            let effective_owned = owned + pending;
+            if effective_owned < -delta.shares {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Insufficient shares: trying to sell {} but only \
+                         own {owned} (effective: {effective_owned}) for \
+                         outcome {}",
+                        -delta.shares, delta.outcome_index
+                    ),
+                });
+            }
+        }
+    }
 
-    if new_shares[outcome_index] < 0 {
-        return Err(Error::InvalidTransaction {
+    if quote.net_cost_sats > trade.max_cost {
+        return Ok(TradeApplyResult::Skipped {
             reason: format!(
-                "Trade would result in negative market shares: {} for outcome {}",
-                new_shares[outcome_index], outcome_index
+                "Trade net cost {} sats exceeds max cost {} sats",
+                quote.net_cost_sats, trade.max_cost
             ),
         });
     }
@@ -1938,147 +1740,30 @@ fn apply_trade(
         })?
         .to_sat();
 
-    let (volume_sats, fee_sats) = if is_buy {
-        // Buy: cost = LMSR(current -> new)
-        let base_cost = trading::calculate_update_cost(
-            &effective_shares,
-            &new_shares,
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Failed to calculate trade cost: {e:?}"),
-        })?;
-
-        let buy_cost =
-            trading::calculate_buy_cost(base_cost, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!("Buy cost calculation failed: {e}"),
-                })?;
-
-        if buy_cost.exceeds_limit(trade.limit_sats) {
-            return Ok(TradeApplyResult::Skipped {
-                reason: format!(
-                    "Buy cost {} sats + miner fee {} sats exceeds max cost {} sats",
-                    buy_cost.total_cost_sats,
-                    TRADE_MINER_FEE_SATS,
-                    trade.limit_sats
-                ),
-            });
-        }
-
-        state_update.add_pending_buy_settlement(PendingBuySettlement {
-            market_id: trade.market_id,
-            trader_address: trade.trader,
-            input_value_sats,
-            lmsr_cost_sats: buy_cost.base_cost_sats,
-            market_fee_sats: buy_cost.trading_fee_sats,
-            transaction_id: filled_tx.transaction.txid().0,
-            is_amplify: false,
-        });
-
-        (buy_cost.total_cost_sats, buy_cost.trading_fee_sats)
-    } else {
-        let seller_account = state
-            .markets()
-            .get_user_share_account(rotxn, &trade.trader)?;
-
-        let owned_shares = seller_account
-            .as_ref()
-            .and_then(|account| {
-                account
-                    .positions
-                    .get(&(trade.market_id, trade.outcome_index))
-                    .copied()
-            })
-            .unwrap_or(0);
-
-        // Check pending share changes from earlier transactions in this block
-        let pending_delta = state_update
-            .share_account_changes
-            .get(&(trade.trader, trade.market_id))
-            .and_then(|outcomes| outcomes.get(&trade.outcome_index))
-            .copied()
-            .unwrap_or(0);
-
-        let effective_owned = owned_shares + pending_delta;
-
-        if effective_owned < shares_abs as i64 {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Insufficient shares: trying to sell {} but only own {} (effective: {}) for outcome {}",
-                    shares_abs,
-                    owned_shares,
-                    effective_owned,
-                    trade.outcome_index
-                ),
-            });
-        }
-
-        // Sell: proceeds = LMSR(new -> current) since shares decreased
-        let proceeds = trading::calculate_update_cost(
-            &new_shares,
-            &effective_shares,
-            beta,
-        )
-        .map_err(|e| Error::InvalidTransaction {
-            reason: format!("Failed to calculate sell proceeds: {e:?}"),
-        })?;
-
-        let sell_proceeds =
-            trading::calculate_sell_proceeds(proceeds, market.trading_fee())
-                .map_err(|e| Error::InvalidTransaction {
-                    reason: format!("Sell proceeds calculation failed: {e}"),
-                })?;
-
-        let net_proceeds_sats = sell_proceeds.net_proceeds_sats;
-        let fee_sats = sell_proceeds.trading_fee_sats;
-
-        if net_proceeds_sats < trade.limit_sats {
-            return Ok(TradeApplyResult::Skipped {
-                reason: format!(
-                    "Sell proceeds {} sats below minimum {} sats",
-                    net_proceeds_sats, trade.limit_sats
-                ),
-            });
-        }
-
-        state_update.add_pending_sell_payout(PendingSellPayout {
-            market_id: trade.market_id,
-            seller_address: trade.trader,
-            payout_sats: net_proceeds_sats,
-            fee_sats,
-            outcome_index: trade.outcome_index,
-            transaction_id: filled_tx.transaction.txid().0,
-        });
-
-        // Record sell input change (input_value - miner_fee)
-        let sell_input_change =
-            input_value_sats.saturating_sub(TRADE_MINER_FEE_SATS);
-        if sell_input_change > 0 {
-            state_update.add_pending_sell_input_change(
-                trade.trader,
-                sell_input_change,
-                filled_tx.transaction.txid().0,
-            );
-        }
-
-        (net_proceeds_sats, fee_sats)
-    };
+    state_update.add_pending_trade_settlement(PendingTradeSettlement {
+        market_id: trade.market_id,
+        trader_address: trade.trader,
+        input_value_sats,
+        buy_cost_sats: quote.buy_cost_sats,
+        sell_gross_sats: quote.sell_gross_sats,
+        fee_sats: quote.fee_sats,
+        transaction_id: filled_tx.transaction.txid().0,
+        is_amplify: false,
+    });
 
     state_update.add_market_update(MarketStateUpdate {
         market_id: trade.market_id,
-        share_delta: Some((outcome_index, trade.shares)),
-        transaction_id: Some(filled_tx.transaction.txid().0),
-        volume_sats: Some(volume_sats),
-        fee_sats: Some(fee_sats),
+        legs: trade_legs(&trade.deltas, quote.gross_sats()),
     });
 
-    state_update.add_share_account_change(
-        trade.trader,
-        trade.market_id,
-        trade.outcome_index,
-        trade.shares,
-    );
+    for delta in &trade.deltas {
+        state_update.add_share_account_change(
+            trade.trader,
+            trade.market_id,
+            delta.outcome_index,
+            delta.shares,
+        );
+    }
 
     Ok(TradeApplyResult::Applied)
 }
@@ -2242,12 +1927,13 @@ fn apply_amplify_beta(
         })?
         .to_sat();
 
-    state_update.add_pending_buy_settlement(PendingBuySettlement {
+    state_update.add_pending_trade_settlement(PendingTradeSettlement {
         market_id: amplify.market_id,
         trader_address: amplify.market_author,
         input_value_sats,
-        lmsr_cost_sats: amplify.amount,
-        market_fee_sats: 0,
+        buy_cost_sats: amplify.amount,
+        sell_gross_sats: 0,
+        fee_sats: 0,
         transaction_id: filled_tx.transaction.txid().0,
         is_amplify: true,
     });
@@ -2526,7 +2212,7 @@ fn apply_transfer_reputation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Output;
+    use crate::types::{Output, ShareDelta};
 
     fn bitcoin_input(sats: u64) -> Output {
         Output {
@@ -2621,18 +2307,18 @@ mod tests {
         }
     }
 
-    fn buy_cost(market: &crate::state::Market, shares: i64) -> u64 {
-        let mut new_shares = market.shares.clone();
-        new_shares[0] += shares;
-        let base_cost = trading::calculate_update_cost(
+    fn buy_cost(market: &crate::state::Market, shares: i64) -> i64 {
+        trading::quote_trade(
             &market.shares,
-            &new_shares,
+            &[ShareDelta {
+                outcome_index: 0,
+                shares,
+            }],
             market_beta(market),
+            market.trading_fee(),
         )
-        .unwrap();
-        trading::calculate_buy_cost(base_cost, market.trading_fee())
-            .unwrap()
-            .total_cost_sats
+        .unwrap()
+        .net_cost_sats
     }
 
     fn utxo_set(
@@ -2734,24 +2420,28 @@ mod tests {
             &mut AccumulatorDiff::default(),
             &mut changes,
             HEIGHT,
-            &[PendingSellPayout {
-                market_id,
-                seller_address: seller,
-                payout_sats: 3_000,
-                fee_sats: 30,
-                outcome_index: 0,
-                transaction_id: [3; 32],
-            }],
-            &[PendingBuySettlement {
-                market_id,
-                trader_address: buyer,
-                input_value_sats: 50_000,
-                lmsr_cost_sats: 2_000,
-                market_fee_sats: 20,
-                transaction_id: [4; 32],
-                is_amplify: false,
-            }],
-            &[(seller, 500, [3; 32])],
+            &[
+                PendingTradeSettlement {
+                    market_id,
+                    trader_address: seller,
+                    input_value_sats: 1_500,
+                    buy_cost_sats: 0,
+                    sell_gross_sats: 3_030,
+                    fee_sats: 30,
+                    transaction_id: [3; 32],
+                    is_amplify: false,
+                },
+                PendingTradeSettlement {
+                    market_id,
+                    trader_address: buyer,
+                    input_value_sats: 50_000,
+                    buy_cost_sats: 2_000,
+                    sell_gross_sats: 0,
+                    fee_sats: 20,
+                    transaction_id: [4; 32],
+                    is_amplify: false,
+                },
+            ],
         )?;
         let after = utxo_set(state, &rwtxn)?;
         ensure_changes_match(&before, &after, &changes)?;
@@ -2762,11 +2452,10 @@ mod tests {
         anyhow::ensure!(
             reasons(&changes.creates)
                 == [
-                    MarketUtxoReason::SellPayout,
-                    MarketUtxoReason::BuyChange,
+                    MarketUtxoReason::TradeChange,
+                    MarketUtxoReason::TradeChange,
                     MarketUtxoReason::Treasury,
                     MarketUtxoReason::AuthorFee,
-                    MarketUtxoReason::SellInputChange,
                 ],
             "creates: {:?}",
             reasons(&changes.creates)
@@ -2777,6 +2466,274 @@ mod tests {
             "deletes: {:?}",
             reasons(&changes.deletes)
         );
+        Ok(())
+    }
+
+    /// The trading fixture with `Address::ALL_ZEROS` holding the market's
+    /// 20 000 shares of outcome 1, and a funded treasury
+    fn funded_trading_fixture(
+        rwtxn: &mut RwTxn,
+        state: &State,
+        market: &crate::state::Market,
+    ) -> anyhow::Result<AccumulatorDiff> {
+        use crate::state::markets::generate_market_treasury_address;
+        use crate::types::Txid;
+
+        state.markets().add_shares_to_account(
+            rwtxn,
+            &Address::ALL_ZEROS,
+            market.id,
+            1,
+            20_000,
+            0,
+        )?;
+        let treasury = OutPoint::Regular {
+            txid: Txid([8; 32]),
+            vout: 0,
+        };
+        let mut diff = AccumulatorDiff::default();
+        state.insert_utxo(
+            rwtxn,
+            &treasury,
+            &Output {
+                address: generate_market_treasury_address(&market.id),
+                content: OutputContent::MarketFunds {
+                    market_id: market.id.0,
+                    amount: bitcoin::Amount::from_sat(40_000),
+                    is_fee: false,
+                },
+            },
+            &mut diff,
+        )?;
+        state
+            .markets()
+            .set_market_funds_utxo(rwtxn, &market.id, false, &treasury)?;
+        Ok(diff)
+    }
+
+    fn vector_trade(
+        market: &crate::state::Market,
+        tip: crate::types::BlockHash,
+        deltas: Vec<ShareDelta>,
+        max_cost: i64,
+        input_sats: u64,
+    ) -> FilledTransaction {
+        filled_tx(
+            TxData::Trade {
+                market_id: market.id,
+                deltas,
+                trader: Address::ALL_ZEROS,
+                max_cost,
+                tx_pow_nonce: None,
+                prev_block_hash: tip,
+            },
+            input_sats,
+        )
+    }
+
+    fn sell_one_buy_zero() -> Vec<ShareDelta> {
+        vec![
+            ShareDelta {
+                outcome_index: 0,
+                shares: 1_000,
+            },
+            ShareDelta {
+                outcome_index: 1,
+                shares: -2_000,
+            },
+        ]
+    }
+
+    /// A vector trade settles every leg at once; a rollback reverts them all.
+    #[test]
+    fn vector_trade_round_trips() -> anyhow::Result<()> {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
+        let TradingFixture {
+            env,
+            state,
+            archive,
+            market,
+            tip,
+            ..
+        } = trading_fixture();
+        let mut rwtxn = env.write_txn()?;
+        let mut diff = funded_trading_fixture(&mut rwtxn, &state, &market)?;
+        let initial_utxos = state.get_utxos(&rwtxn)?;
+        let quote = trading::quote_trade(
+            &market.shares,
+            &sell_one_buy_zero(),
+            market_beta(&market),
+            market.trading_fee(),
+        )?;
+        assert!(quote.buy_cost_sats > 0 && quote.sell_gross_sats > 0);
+        let input_sats =
+            quote.net_cost_sats.max(0) as u64 + TRADE_MINER_FEE_SATS;
+        let trade = vector_trade(
+            &market,
+            tip,
+            sell_one_buy_zero(),
+            quote.net_cost_sats,
+            input_sats,
+        );
+        crate::validation::MarketValidator::validate_trade(
+            &state, &archive, &rwtxn, &trade, None,
+        )?;
+        let mut update = StateUpdate::new();
+        assert!(matches!(
+            apply_trade(&state, &rwtxn, &trade, &mut update)?,
+            TradeApplyResult::Applied
+        ));
+        assert_eq!(update.pending_trade_settlements.len(), 1);
+
+        let mut changes = MarketUtxoChanges::default();
+        let undo = update
+            .apply_all_changes(&state, &mut rwtxn, &mut diff, &mut changes, 1)?
+            .unwrap();
+        let after = state.markets().get_market(&rwtxn, &market.id)?.unwrap();
+        assert_eq!(after.shares.to_vec(), vec![1_000, 18_000]);
+        assert_eq!(
+            after.total_volume_sats,
+            market.total_volume_sats + quote.gross_sats()
+        );
+        let positions = state
+            .markets()
+            .get_user_share_account(&rwtxn, &Address::ALL_ZEROS)?
+            .unwrap()
+            .positions;
+        assert_eq!(positions.get(&(market.id, 0)), Some(&1_000));
+        assert_eq!(positions.get(&(market.id, 1)), Some(&18_000));
+        state.markets().verify_share_invariant(&rwtxn, &market.id)?;
+
+        let created = |reason| {
+            changes
+                .creates
+                .iter()
+                .filter(|utxo| utxo.reason == reason)
+                .map(|utxo| utxo.output.get_value().to_sat())
+                .collect::<Vec<_>>()
+        };
+        let trader_change = (input_sats as i64
+            - TRADE_MINER_FEE_SATS as i64
+            - quote.net_cost_sats) as u64;
+        assert_eq!(created(MarketUtxoReason::TradeChange), vec![trader_change]);
+        assert_eq!(
+            created(MarketUtxoReason::Treasury),
+            vec![40_000 + quote.buy_cost_sats - quote.sell_gross_sats]
+        );
+        assert_eq!(created(MarketUtxoReason::AuthorFee), vec![quote.fee_sats]);
+
+        revert_consolidation(&state, &mut rwtxn, &mut diff, &undo)?;
+        let deltas =
+            revert_trade_market_state(&state, &mut rwtxn, &mut diff, &trade)?;
+        disconnect_end(&state, &mut rwtxn, 1, &HashSet::new(), deltas)?;
+        let restored = state.markets().get_market(&rwtxn, &market.id)?.unwrap();
+        assert_eq!(restored.shares, market.shares);
+        assert_eq!(restored.total_volume_sats, market.total_volume_sats);
+        assert_eq!(restored.outcome_volumes_sats, market.outcome_volumes_sats);
+        state.markets().verify_share_invariant(&rwtxn, &market.id)?;
+        assert_eq!(state.get_utxos(&rwtxn)?, initial_utxos);
+        Ok(())
+    }
+
+    #[test]
+    fn over_max_cost_skips_legs() -> anyhow::Result<()> {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
+        let TradingFixture {
+            env,
+            state,
+            market,
+            tip,
+            ..
+        } = trading_fixture();
+        let mut rwtxn = env.write_txn()?;
+        funded_trading_fixture(&mut rwtxn, &state, &market)?;
+        let quote = trading::quote_trade(
+            &market.shares,
+            &sell_one_buy_zero(),
+            market_beta(&market),
+            market.trading_fee(),
+        )?;
+        let trade = vector_trade(
+            &market,
+            tip,
+            sell_one_buy_zero(),
+            quote.net_cost_sats - 1,
+            100_000 + TRADE_MINER_FEE_SATS,
+        );
+        let mut update = StateUpdate::new();
+        assert!(matches!(
+            apply_trade(&state, &rwtxn, &trade, &mut update)?,
+            TradeApplyResult::Skipped { .. }
+        ));
+        assert!(update.pending_trade_settlements.is_empty());
+        assert!(update.market_updates.is_empty());
+        assert!(update.share_account_changes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn validation_checks_every_leg() -> anyhow::Result<()> {
+        use crate::math::trading::TRADE_MINER_FEE_SATS;
+
+        let TradingFixture {
+            env,
+            state,
+            archive,
+            market,
+            tip,
+            ..
+        } = trading_fixture();
+        let mut rwtxn = env.write_txn()?;
+        funded_trading_fixture(&mut rwtxn, &state, &market)?;
+        state.markets().add_shares_to_account(
+            &mut rwtxn,
+            &Address([9; 20]),
+            market.id,
+            1,
+            10,
+            0,
+        )?;
+        let leg = |outcome_index, shares| ShareDelta {
+            outcome_index,
+            shares,
+        };
+        let validate = |trade: &FilledTransaction| {
+            crate::validation::MarketValidator::validate_trade(
+                &state, &archive, &rwtxn, trade, None,
+            )
+        };
+        let funded = |deltas, max_cost| {
+            vector_trade(&market, tip, deltas, max_cost, 1_000_000)
+        };
+
+        validate(&funded(vec![leg(0, 10), leg(1, -10)], 0))?;
+        assert!(validate(&funded(vec![], 0)).is_err());
+        assert!(validate(&funded(vec![leg(1, -10), leg(0, 10)], 0)).is_err());
+        assert!(validate(&funded(vec![leg(0, 10), leg(0, 10)], 0)).is_err());
+        assert!(validate(&funded(vec![leg(0, 0)], 0)).is_err());
+        assert!(validate(&funded(vec![leg(2, 10)], 0)).is_err());
+        assert!(
+            validate(&funded(vec![leg(0, 10), leg(1, -20_001)], 0)).is_err()
+        );
+        assert!(
+            validate(&vector_trade(
+                &market,
+                tip,
+                vec![leg(0, 10)],
+                5_000,
+                5_000 + TRADE_MINER_FEE_SATS - 1,
+            ))
+            .is_err()
+        );
+        let mut stranger = funded(vec![leg(1, -10)], 0);
+        if let Some(TxData::Trade { trader, .. }) =
+            &mut stranger.transaction.data
+        {
+            *trader = Address([9; 20]);
+        }
+        assert!(validate(&stranger).is_err());
         Ok(())
     }
 
@@ -2793,10 +2750,12 @@ mod tests {
         let trade = filled_tx(
             TxData::Trade {
                 market_id: market.id,
-                outcome_index: 1,
-                shares: i64::MAX,
+                deltas: vec![ShareDelta {
+                    outcome_index: 1,
+                    shares: i64::MAX,
+                }],
                 trader: Address::ALL_ZEROS,
-                limit_sats: 1_000,
+                max_cost: 0,
                 tx_pow_nonce: None,
                 prev_block_hash: tip,
             },
@@ -2832,10 +2791,12 @@ mod tests {
         let trade = filled_tx(
             TxData::Trade {
                 market_id: market.id,
-                outcome_index: 1,
-                shares: 1,
+                deltas: vec![ShareDelta {
+                    outcome_index: 1,
+                    shares: 1,
+                }],
                 trader: Address::ALL_ZEROS,
-                limit_sats: 1_000,
+                max_cost: 0,
                 tx_pow_nonce: None,
                 prev_block_hash: tip,
             },
@@ -2902,10 +2863,12 @@ mod tests {
         let trade = filled_tx(
             TxData::Trade {
                 market_id: market.id,
-                outcome_index: 0,
-                shares: i64::MAX,
+                deltas: vec![ShareDelta {
+                    outcome_index: 0,
+                    shares: i64::MAX,
+                }],
                 trader: Address::ALL_ZEROS,
-                limit_sats: 1_000,
+                max_cost: 0,
                 tx_pow_nonce: None,
                 prev_block_hash: tip,
             },
@@ -2974,10 +2937,12 @@ mod tests {
         let trade = filled_tx(
             TxData::Trade {
                 market_id: market.id,
-                outcome_index: 1,
-                shares: -2_000,
+                deltas: vec![ShareDelta {
+                    outcome_index: 1,
+                    shares: -2_000,
+                }],
                 trader: Address::ALL_ZEROS,
-                limit_sats: 0,
+                max_cost: 0,
                 tx_pow_nonce: None,
                 prev_block_hash: tip,
             },
@@ -2991,8 +2956,9 @@ mod tests {
             apply_trade(&state, &rwtxn, &trade, &mut update)?,
             TradeApplyResult::Applied
         ));
-        let net = update.pending_sell_payouts[0].payout_sats;
-        assert!(net > 0);
+        let settlement = &update.pending_trade_settlements[0];
+        let gross = settlement.sell_gross_sats;
+        assert!(gross > settlement.fee_sats);
         let undo = update
             .apply_all_changes(
                 &state,
@@ -3003,11 +2969,11 @@ mod tests {
             )?
             .unwrap();
         let after = state.markets().get_market(&rwtxn, &market.id)?.unwrap();
-        assert_eq!(after.total_volume_sats, market.total_volume_sats + net);
+        assert_eq!(after.total_volume_sats, market.total_volume_sats + gross);
         revert_consolidation(&state, &mut rwtxn, &mut diff, &undo)?;
-        let delta =
+        let deltas =
             revert_trade_market_state(&state, &mut rwtxn, &mut diff, &trade)?;
-        disconnect_end(&state, &mut rwtxn, 1, &HashSet::new(), vec![delta])?;
+        disconnect_end(&state, &mut rwtxn, 1, &HashSet::new(), deltas)?;
         let restored = state.markets().get_market(&rwtxn, &market.id)?.unwrap();
         assert_eq!(restored.total_volume_sats, market.total_volume_sats);
         assert_eq!(restored.outcome_volumes_sats, market.outcome_volumes_sats);
@@ -3036,10 +3002,12 @@ mod tests {
         let trade = filled_tx(
             TxData::Trade {
                 market_id: market.id,
-                outcome_index: 0,
-                shares,
+                deltas: vec![ShareDelta {
+                    outcome_index: 0,
+                    shares,
+                }],
                 trader: Address::ALL_ZEROS,
-                limit_sats: buy_cost(&market, shares) + TRADE_MINER_FEE_SATS,
+                max_cost: buy_cost(&market, shares),
                 tx_pow_nonce: None,
                 prev_block_hash: tip,
             },
@@ -3075,8 +3043,6 @@ mod tests {
     /// Trade simulation rejects selling shares bought in the same block.
     #[test]
     fn sim_rejects_same_block_sell() {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
-
         let TradingFixture {
             env,
             state,
@@ -3088,22 +3054,23 @@ mod tests {
         let rotxn = env.read_txn().unwrap();
 
         let shares = 20_000;
-        let trade = |shares, limit_sats| {
+        let trade = |shares, max_cost| {
             filled_tx(
                 TxData::Trade {
                     market_id: market.id,
-                    outcome_index: 0,
-                    shares,
+                    deltas: vec![ShareDelta {
+                        outcome_index: 0,
+                        shares,
+                    }],
                     trader: Address::ALL_ZEROS,
-                    limit_sats,
+                    max_cost,
                     tx_pow_nonce: None,
                     prev_block_hash: tip,
                 },
                 100_000,
             )
         };
-        let buy =
-            trade(shares, buy_cost(&market, shares) + TRADE_MINER_FEE_SATS);
+        let buy = trade(shares, buy_cost(&market, shares));
         let sell = trade(-shares, 0);
 
         let mut trades = TradeSimulation::default();
@@ -3296,45 +3263,39 @@ mod tests {
         let mut state_update = StateUpdate::new();
         state_update.add_market_update(MarketStateUpdate {
             market_id,
-            share_delta: Some((0, 100_000)),
-            transaction_id: None,
-            volume_sats: None,
-            fee_sats: None,
+            legs: vec![TradeLeg {
+                outcome_index: 0,
+                shares: 100_000,
+                volume_sats: 0,
+            }],
         });
-        state_update.add_pending_buy_settlement(PendingBuySettlement {
+        state_update.add_pending_trade_settlement(PendingTradeSettlement {
             market_id,
             trader_address: Address::ALL_ZEROS,
             input_value_sats: 0,
-            lmsr_cost_sats: 12_345,
-            market_fee_sats: 0,
+            buy_cost_sats: 12_345,
+            sell_gross_sats: 0,
+            fee_sats: 0,
             transaction_id: [0u8; 32],
             is_amplify: false,
         });
 
         let mut effective = s0.clone();
-        for update in &state_update.market_updates {
-            if update.market_id == market_id
-                && let Some((oi, d)) = update.share_delta
-            {
-                effective[oi] += d;
-            }
+        for leg in state_update
+            .market_updates
+            .iter()
+            .filter(|update| update.market_id == market_id)
+            .flat_map(|update| &update.legs)
+        {
+            effective[leg.outcome_index] += leg.shares;
         }
         assert_eq!(effective, after_one);
 
-        let base1 = trading::calculate_buy_cost(
-            trading::calculate_update_cost(&s0, &after_one, beta).unwrap(),
-            0.0,
-        )
-        .unwrap()
-        .base_cost_sats;
-
-        let base2_sequential = trading::calculate_buy_cost(
+        let base1 =
+            trading::calculate_update_cost(&s0, &after_one, beta).unwrap();
+        let base2_sequential =
             trading::calculate_update_cost(&after_one, &after_two, beta)
-                .unwrap(),
-            0.0,
-        )
-        .unwrap()
-        .base_cost_sats;
+                .unwrap();
 
         assert!(base2_sequential > base1);
     }

@@ -91,7 +91,7 @@ pub mod node {
         BlockIndexDeposit, BlockIndexReturn, BlockIndexSpend, BlockIndexTx,
         Body, ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
         Header, InPoint, M6id, MainchainSyncPhase, MainchainSyncProgress,
-        MerkleRoot, OutPoint, Output, OutputContent, PointedOutput,
+        MerkleRoot, OutPoint, Output, OutputContent, PointedOutput, ShareDelta,
         SpentOutput, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
         WithdrawalBundleStatus,
         authorization::Signature,
@@ -255,7 +255,7 @@ pub mod node {
                 Address, Authorization, Block, BlockHash, Body,
                 ClaimDecisionPayload, Coinbase, CoinbaseTxid,
                 DecisionClaimEntry, Header, M6id, MerkleRoot, Output,
-                OutputContent, Transaction, TxData, Txid,
+                OutputContent, ShareDelta, Transaction, TxData, Txid,
                 authorization::Signature, market::MarketId,
                 transaction::Outputs,
             };
@@ -294,10 +294,9 @@ pub mod node {
             #[open_api(ref_schemas[
                 Address, Authorization, BallotItem, Block, BlockHash,
                 BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, Coinbase,
-                CoinbaseTxid, DecisionClaimEntry, Header, M6id, MarketId,
-                MerkleRoot, Output, OutputContent, Outputs, Signature,
-                Transaction, TransactionVerbose, TxData, Txid,
-                schema::BitcoinAddr,
+                CoinbaseTxid, DecisionClaimEntry, Header, M6id, MarketId, MerkleRoot,
+                Output, OutputContent, Outputs, Signature, Transaction,
+                ShareDelta, TransactionVerbose, TxData, Txid, schema::BitcoinAddr,
                 schema::BitcoinBlockHash, schema::BitcoinOutPoint,
                 schema::UtreexoNodeHash, schema::UtreexoProof,
             ])]
@@ -387,7 +386,8 @@ pub mod node {
             MerkleRoot, OutPoint, Output,
             OutputContent, Outputs, ParticipationStats, PeerConnectionStatus,
             PeriodStats, ScoreChange, SharePosition, Signature, SpentOutput,
-            Transaction, TxData, TxIn, Txid, WinningOutcome, WithdrawalBundle,
+            ShareDelta, Transaction, TxData, TxIn, Txid, WinningOutcome,
+            WithdrawalBundle,
             WithdrawalBundleInfo, WithdrawalBundleStatus, schema::BitcoinAddr,
             schema::BitcoinBlockHash, schema::BitcoinOutPoint,
             schema::BitcoinTransaction, schema::SocketAddr,
@@ -721,7 +721,8 @@ pub mod wallet {
         Address, Authorization, Authorized, Block, BlockHash, Body,
         ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
         EncryptionPubKey, Header, M6id, MerkleRoot, OutPoint, Output,
-        OutputContent, PointedOutput, Transaction, TxData, Txid, VerifyingKey,
+        OutputContent, PointedOutput, ShareDelta, Transaction, TxData, Txid,
+        VerifyingKey,
         authorization::{Dst, Signature},
         market::MarketId,
         transaction::Outputs,
@@ -736,6 +737,7 @@ pub mod wallet {
             DecisionClaimResponse, DimensionInput, MarketAmplifyBetaRequest,
             MarketBuyRequest, MarketBuyResponse, MarketCreateRequest,
             MarketCreateResponse, MarketSellRequest, MarketSellResponse,
+            MarketTradeRequest, MarketTradeResponse,
         },
         open_api, schema,
     };
@@ -754,9 +756,9 @@ pub mod wallet {
     #[open_api(ref_schemas[
         Address, Authorization, BallotItem, Block, BlockHash, Body,
         ClaimDecisionPayload, ClaimedDecisionInfo, Coinbase, CoinbaseTxid,
-        DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, M6id,
-        MarketId, MerkleRoot, OutPoint, Output, OutputContent, Outputs,
-        Signature, Transaction, TxData, Txid, schema::BitcoinAddr,
+        DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, M6id, MarketId,
+        MerkleRoot, OutPoint, Output, OutputContent, Outputs, Signature,
+        ShareDelta, Transaction, TxData, Txid, schema::BitcoinAddr,
         schema::BitcoinBlockHash, schema::BitcoinOutPoint,
         schema::UtreexoNodeHash, schema::UtreexoProof,
     ])]
@@ -992,6 +994,15 @@ pub mod wallet {
             &self,
             request: MarketSellRequest,
         ) -> RpcResult<MarketSellResponse>;
+
+        /// Move a market's share vector: buy and sell any of its outcomes in
+        /// one transaction (with dry_run support for the quote)
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "market_trade")]
+        async fn market_trade(
+            &self,
+            request: MarketTradeRequest,
+        ) -> RpcResult<MarketTradeResponse>;
 
         #[open_api_method(output_schema(ToSchema))]
         #[method(name = "market_amplify_beta")]

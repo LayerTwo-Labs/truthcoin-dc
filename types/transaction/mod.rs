@@ -58,6 +58,25 @@ pub enum InPoint {
     Redistribution,
 }
 
+/// One leg of a trade: shares of one tradeable outcome to buy (positive) or
+/// sell (negative)
+#[derive(
+    BorshSerialize,
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    PartialEq,
+    Serialize,
+    ToSchema,
+)]
+pub struct ShareDelta {
+    /// Position within the market's tradeable outcomes
+    pub outcome_index: u32,
+    pub shares: i64,
+}
+
 /// Struct representing a single vote in a batch vote transaction
 #[derive(
     BorshSerialize,
@@ -122,16 +141,14 @@ pub enum TransactionData {
         tx_pow_ordering: Option<u8>,
         tx_pow_difficulty: Option<u8>,
     },
-    /// Trade shares in a prediction market (buy or sell).
-    /// `outcome_index` is the position within the market's tradeable outcomes
-    /// (i.e. index into `Market::get_valid_state_combos()`), not a full-state
-    /// combo index. Abstain/invalid states are voter-only and never tradeable.
+    /// Move a market's share vector: buy and sell any of its tradeable
+    /// outcomes at once, at the LMSR cost of the whole move. `max_cost` bounds
+    /// the net cost; a negative value is the least the trader accepts.
     Trade {
         market_id: MarketId,
-        outcome_index: u32,
-        shares: i64,
+        deltas: Vec<ShareDelta>,
         trader: Address,
-        limit_sats: u64,
+        max_cost: i64,
         tx_pow_nonce: Option<u64>,
         prev_block_hash: hashes::BlockHash,
     },
@@ -210,36 +227,23 @@ pub struct MarketCreationView<'a> {
     pub new_claims: &'a [ClaimDecisionPayload],
 }
 
-/// Struct describing a trade operation (buy or sell shares).
-/// Sign of shares determines direction: positive = buy, negative = sell.
-/// `outcome_index` is the position within the market's tradeable outcomes
-/// (i.e. index into `Market::get_valid_state_combos()`), not a full-state
-/// combo index.
+/// Struct describing a trade: the share deltas it moves a market by, each at
+/// a position within the market's tradeable outcomes (an index into
+/// `Market::get_valid_state_combos()`), not a full-state combo index.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trade {
     pub market_id: MarketId,
-    pub outcome_index: u32,
-    pub shares: i64,
+    pub deltas: Vec<ShareDelta>,
     pub trader: Address,
-    pub limit_sats: u64,
+    pub max_cost: i64,
     pub tx_pow_nonce: Option<u64>,
     pub prev_block_hash: hashes::BlockHash,
 }
 
 impl Trade {
-    /// Returns true if this is a buy trade (positive shares)
-    pub fn is_buy(&self) -> bool {
-        self.shares > 0
-    }
-
-    /// Returns true if this is a sell trade (negative shares)
-    pub fn is_sell(&self) -> bool {
-        self.shares < 0
-    }
-
-    /// Returns the absolute number of shares
-    pub fn shares_abs(&self) -> u64 {
-        self.shares.unsigned_abs()
+    /// Whether any leg sells shares
+    pub fn sells(&self) -> bool {
+        self.deltas.iter().any(|delta| delta.shares < 0)
     }
 }
 
@@ -505,18 +509,16 @@ impl FilledTransaction {
         match &self.transaction.data {
             Some(TransactionData::Trade {
                 market_id,
-                outcome_index,
-                shares,
+                deltas,
                 trader,
-                limit_sats,
+                max_cost,
                 tx_pow_nonce,
                 prev_block_hash,
             }) => Some(Trade {
                 market_id: *market_id,
-                outcome_index: *outcome_index,
-                shares: *shares,
+                deltas: deltas.clone(),
                 trader: *trader,
-                limit_sats: *limit_sats,
+                max_cost: *max_cost,
                 tx_pow_nonce: *tx_pow_nonce,
                 prev_block_hash: *prev_block_hash,
             }),

@@ -391,10 +391,9 @@ impl MarketValidator {
 
             let pow_data = crate::types::tx_pow::serialize_trade_for_pow(
                 market.id.as_bytes(),
-                trade.outcome_index,
-                trade.shares,
+                &trade.deltas,
                 &trade.trader,
-                trade.limit_sats,
+                trade.max_cost,
                 &trade.prev_block_hash,
             );
 
@@ -407,26 +406,16 @@ impl MarketValidator {
             }
         }
 
-        // Outcome index must be a valid tradeable outcome. Abstain/invalid
-        // states (voter-only) are not part of the tradeable outcome space
-        // and will naturally fall outside `market.shares().len()`.
-        if trade.outcome_index as usize >= market.shares().len() {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Outcome index {} out of range (market has {} tradeable \
-                     outcomes)",
-                    trade.outcome_index,
-                    market.shares().len()
-                ),
-            });
-        }
-
-        // Shares must be non-zero
-        if trade.shares == 0 {
-            return Err(Error::InvalidTransaction {
-                reason: "Shares to trade must be non-zero".to_string(),
-            });
-        }
+        // Each leg must be a tradeable outcome. Abstain/invalid states
+        // (voter-only) are not part of the tradeable outcome space and fall
+        // outside `market.shares().len()`.
+        crate::math::trading::check_deltas(
+            &trade.deltas,
+            market.shares().len(),
+        )
+        .map_err(|e| Error::InvalidTransaction {
+            reason: format!("Invalid trade: {e}"),
+        })?;
 
         if !tx.transaction.outputs.is_empty() {
             return Err(Error::InvalidTransaction {
@@ -443,22 +432,23 @@ impl MarketValidator {
             })?
             .to_sat();
 
-        if trade.is_buy() {
-            if trade.limit_sats == 0 {
-                return Err(Error::InvalidTransaction {
-                    reason: "Buy limit (max_cost) must be positive".to_string(),
-                });
-            }
+        let required_input = u64::try_from(trade.max_cost.max(0))
+            .ok()
+            .and_then(|max_cost| max_cost.checked_add(TRADE_MINER_FEE_SATS))
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: "Trade max cost overflows".to_string(),
+            })?;
+        if input_value < required_input {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Input value {input_value} sats insufficient for max cost \
+                     {} sats plus miner fee {TRADE_MINER_FEE_SATS} sats",
+                    trade.max_cost.max(0)
+                ),
+            });
+        }
 
-            if input_value < trade.limit_sats {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Input value {} sats insufficient for limit_sats {} sats",
-                        input_value, trade.limit_sats
-                    ),
-                });
-            }
-        } else {
+        if trade.sells() {
             let has_trader_input = tx
                 .spent_utxos
                 .iter()
@@ -474,33 +464,27 @@ impl MarketValidator {
                 });
             }
 
-            let owned_shares = state
+            let account = state
                 .markets()
-                .get_user_share_account(rotxn, &trade.trader)?
-                .and_then(|acc| {
-                    acc.positions
-                        .get(&(trade.market_id, trade.outcome_index))
-                        .copied()
-                })
-                .unwrap_or(0);
-
-            if owned_shares < 0 || (owned_shares as u64) < trade.shares_abs() {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Insufficient shares: trying to sell {} but only own {} for outcome {}",
-                        trade.shares_abs(),
-                        owned_shares,
-                        trade.outcome_index
-                    ),
-                });
-            }
-
-            if input_value < TRADE_MINER_FEE_SATS {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Input value {input_value} sats insufficient for miner fee {TRADE_MINER_FEE_SATS} sats"
-                    ),
-                });
+                .get_user_share_account(rotxn, &trade.trader)?;
+            for delta in trade.deltas.iter().filter(|delta| delta.shares < 0) {
+                let owned_shares = account
+                    .as_ref()
+                    .and_then(|acc| {
+                        acc.positions
+                            .get(&(trade.market_id, delta.outcome_index))
+                            .copied()
+                    })
+                    .unwrap_or(0);
+                if owned_shares < -delta.shares {
+                    return Err(Error::InvalidTransaction {
+                        reason: format!(
+                            "Insufficient shares: trying to sell {} but only \
+                             own {owned_shares} for outcome {}",
+                            -delta.shares, delta.outcome_index
+                        ),
+                    });
+                }
             }
         }
 

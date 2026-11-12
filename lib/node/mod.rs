@@ -1602,37 +1602,19 @@ where
         transaction: &Transaction,
     ) -> Result<(), Error> {
         if let Some(crate::types::TxData::Trade {
-            market_id,
-            outcome_index,
-            shares,
-            ..
+            market_id, deltas, ..
         }) = transaction.data.as_ref()
         {
-            if *shares > 0 {
-                self.update_mempool_buy(
-                    rwtxn,
-                    *market_id,
-                    *outcome_index,
-                    *shares,
-                )?;
-            } else {
-                self.update_mempool_sell(
-                    rwtxn,
-                    *market_id,
-                    *outcome_index,
-                    shares.unsigned_abs() as i64,
-                )?;
-            }
+            self.update_mempool_trade(rwtxn, *market_id, deltas)?;
         }
         Ok(())
     }
 
-    fn update_mempool_buy(
+    fn update_mempool_trade(
         &self,
         rwtxn: &mut RwTxn,
         market_id: MarketId,
-        outcome_index: u32,
-        shares_to_buy: i64,
+        deltas: &[crate::types::ShareDelta],
     ) -> Result<(), Error> {
         use crate::state;
 
@@ -1650,32 +1632,27 @@ where
             return Ok(());
         }
 
-        if outcome_index as usize >= market.shares().len() {
-            return Err(Error::State(Box::new(
-                state::Error::InvalidDecisionId {
+        let mut new_shares =
+            match self.state.get_mempool_shares(rwtxn, &market_id)? {
+                Some(existing_mempool_shares) => existing_mempool_shares,
+                None => market.shares().clone(),
+            };
+        for delta in deltas {
+            let shares = new_shares
+                .get_mut(delta.outcome_index as usize)
+                .ok_or_else(|| state::Error::InvalidTransaction {
                     reason: format!(
                         "Outcome index {} exceeds market outcomes {}",
-                        outcome_index,
+                        delta.outcome_index,
                         market.shares().len()
                     ),
-                },
-            )));
-        }
-
-        let current_shares = if let Some(existing_mempool_shares) =
-            self.state.get_mempool_shares(rwtxn, &market_id)?
-        {
-            existing_mempool_shares
-        } else {
-            market.shares().clone()
-        };
-
-        let mut new_shares = current_shares.clone();
-        new_shares[outcome_index as usize] = new_shares[outcome_index as usize]
-            .checked_add(shares_to_buy)
-            .ok_or_else(|| state::Error::InvalidTransaction {
-                reason: "Mempool share count overflow".to_string(),
+                })?;
+            *shares = shares.checked_add(delta.shares).ok_or_else(|| {
+                state::Error::InvalidTransaction {
+                    reason: "Mempool share count overflow".to_string(),
+                }
             })?;
+        }
 
         let beta = self.derive_market_beta(&market)?;
         trading::validate_lmsr_parameters(beta, &new_shares).map_err(|e| {
@@ -1691,79 +1668,9 @@ where
             .map_err(|e| Error::State(Box::new(e)))?;
 
         tracing::debug!(
-            "Updated mempool shares for market {}: outcome {} increased by {} shares",
+            "Updated mempool shares for market {}: {} legs",
             const_hex::encode(market_id),
-            outcome_index,
-            shares_to_buy
-        );
-
-        Ok(())
-    }
-
-    fn update_mempool_sell(
-        &self,
-        rwtxn: &mut RwTxn,
-        market_id: MarketId,
-        outcome_index: u32,
-        shares_to_sell: i64,
-    ) -> Result<(), Error> {
-        use crate::state;
-
-        let market = self
-            .state
-            .markets()
-            .get_market(rwtxn, &market_id)?
-            .ok_or_else(|| {
-                Error::State(Box::new(state::Error::InvalidDecisionId {
-                    reason: format!("Market {market_id:?} does not exist"),
-                }))
-            })?;
-
-        if market.state() != crate::state::markets::MarketState::Trading {
-            return Ok(());
-        }
-
-        if outcome_index as usize >= market.shares().len() {
-            return Err(Error::State(Box::new(
-                state::Error::InvalidDecisionId {
-                    reason: format!(
-                        "Outcome index {} exceeds market outcomes {}",
-                        outcome_index,
-                        market.shares().len()
-                    ),
-                },
-            )));
-        }
-
-        let current_shares = if let Some(existing_mempool_shares) =
-            self.state.get_mempool_shares(rwtxn, &market_id)?
-        {
-            existing_mempool_shares
-        } else {
-            market.shares().clone()
-        };
-
-        let mut new_shares = current_shares.clone();
-        new_shares[outcome_index as usize] -= shares_to_sell;
-
-        let beta = self.derive_market_beta(&market)?;
-        trading::validate_lmsr_parameters(beta, &new_shares).map_err(|e| {
-            Error::State(Box::new(state::Error::InvalidDecisionId {
-                reason: format!(
-                    "Invalid LMSR state after mempool sell update: {e:?}"
-                ),
-            }))
-        })?;
-
-        self.state
-            .put_mempool_shares(rwtxn, &market_id, &new_shares)
-            .map_err(|e| Error::State(Box::new(e)))?;
-
-        tracing::debug!(
-            "Updated mempool shares for market {}: outcome {} decreased by {} shares (sell)",
-            const_hex::encode(market_id),
-            outcome_index,
-            shares_to_sell
+            deltas.len()
         );
 
         Ok(())

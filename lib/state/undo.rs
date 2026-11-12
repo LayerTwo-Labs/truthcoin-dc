@@ -75,8 +75,6 @@ pub struct ReputationTransferUndoEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsolidationUndoData {
     pub entries: Vec<ConsolidationUndoEntry>,
-    /// Sell input change UTXOs created (to delete on revert)
-    pub sell_input_change_utxos: Vec<OutPoint>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,8 +92,6 @@ pub struct ConsolidationUndoEntry {
     pub new_treasury_utxo: Option<OutPoint>,
     /// New fee UTXO created (to delete on revert)
     pub new_fee_utxo: Option<OutPoint>,
-    /// Sell payout UTXOs created (to delete on revert)
-    pub sell_payout_utxos: Vec<OutPoint>,
-    /// Buy change UTXOs created (to delete on revert)
-    pub buy_change_utxos: Vec<OutPoint>,
+    /// Trader change UTXOs created, one per trade (to delete on revert)
+    pub trade_change_utxos: Vec<OutPoint>,
 }

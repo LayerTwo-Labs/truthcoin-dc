@@ -180,27 +180,24 @@ pub const POW_BOUND_WINDOW_BLOCKS: u32 = 10;
 
 pub fn serialize_trade_for_pow(
     market_id: &[u8; 6],
-    outcome_index: u32,
-    shares: i64,
+    deltas: &[crate::ShareDelta],
     trader: &crate::Address,
-    limit_sats: u64,
+    max_cost: i64,
     prev_block_hash: &crate::BlockHash,
 ) -> Vec<u8> {
     #[derive(BorshSerialize)]
     struct TradePowInput<'a> {
         market_id: &'a [u8; 6],
-        outcome_index: u32,
-        shares: i64,
+        deltas: &'a [crate::ShareDelta],
         trader: &'a crate::Address,
-        limit_sats: u64,
+        max_cost: i64,
         prev_block_hash: &'a crate::BlockHash,
     }
     let input = TradePowInput {
         market_id,
-        outcome_index,
-        shares,
+        deltas,
         trader,
-        limit_sats,
+        max_cost,
         prev_block_hash,
     };
     borsh::to_vec(&input)
@@ -530,8 +527,10 @@ mod tests {
         let block = crate::BlockHash([7u8; 32]);
         let data = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block,
@@ -540,13 +539,44 @@ mod tests {
 
         let data2 = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            1,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 1,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block,
         );
         assert_ne!(data, data2);
+    }
+
+    #[test]
+    fn trade_pow_commits_to_every_leg() {
+        let addr = crate::Address([0u8; 20]);
+        let block = crate::BlockHash([7u8; 32]);
+        let legs = |second| {
+            [
+                crate::ShareDelta {
+                    outcome_index: 0,
+                    shares: 10,
+                },
+                crate::ShareDelta {
+                    outcome_index: 2,
+                    shares: second,
+                },
+            ]
+        };
+        let pow = |second| {
+            serialize_trade_for_pow(
+                &[1, 2, 3, 4, 5, 6],
+                &legs(second),
+                &addr,
+                50000,
+                &block,
+            )
+        };
+        assert_ne!(pow(10), pow(11));
+        assert_ne!(pow(10), pow(-10));
     }
 
     /// Trade PoW data changes with the previous block hash
@@ -557,16 +587,20 @@ mod tests {
         let block_b = crate::BlockHash([2u8; 32]);
         let data_a = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block_a,
         );
         let data_b = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block_b,
@@ -587,16 +621,20 @@ mod tests {
         let block_b = crate::BlockHash([2u8; 32]);
         let data_a = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block_a,
         );
         let data_b = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block_b,

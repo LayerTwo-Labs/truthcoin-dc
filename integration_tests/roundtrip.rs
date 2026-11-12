@@ -17,7 +17,7 @@ use futures::{
 use tokio::time::sleep;
 use tracing::Instrument as _;
 use truthcoin_dc::types::{
-    Address, GetAddress as _, GetValue as _, OutputContent, TxData,
+    Address, GetAddress as _, GetValue as _, OutputContent, ShareDelta, TxData,
     authorization::{Dst, Signature},
 };
 use truthcoin_dc_app_rpc_api::{
@@ -25,7 +25,7 @@ use truthcoin_dc_app_rpc_api::{
         BallotItem, CreateTradeRequest, DecisionClaimItem,
         DecisionClaimRequest, DecisionContentInfo, DecisionFilter,
         DecisionState, DimensionInput, MarketBuyRequest, MarketCreateRequest,
-        MarketSellRequest, MarketStatus, VoteFilter,
+        MarketSellRequest, MarketStatus, MarketTradeRequest, VoteFilter,
     },
     node::{PrivateRpcClient as _, RpcClient as _},
     wallet::RpcClient as _,
@@ -445,6 +445,26 @@ impl TruthcoinNodes {
         ]
     }
 
+    /// Mine until no node holds a pending transaction, so the next block
+    /// carries only what is sent after this
+    async fn settle_mempools(
+        &self,
+        enforcer_post_setup: &mut EnforcerPostSetup,
+    ) -> anyhow::Result<()> {
+        for _ in 0..10 {
+            let mut pending = 0;
+            for node in std::iter::once(&self.issuer).chain(self.voters()) {
+                pending += node.rpc_client.list_mempool().await?.len();
+            }
+            if pending == 0 {
+                return Ok(());
+            }
+            self.issuer.bmm_single(enforcer_post_setup).await?;
+            sleep(std::time::Duration::from_secs(1)).await;
+        }
+        anyhow::bail!("mempools never emptied")
+    }
+
     /// Wait until `node` has the issuer's tip
     async fn sync_to_issuer_tip(&self, node: &PostSetup) -> anyhow::Result<()> {
         let tip = self
@@ -507,6 +527,22 @@ impl TruthcoinNodes {
 // Increased 10x to match 10x increase in market liquidity (INITIAL_LIQUIDITY/BETA)
 const DEPOSIT_AMOUNT: bitcoin::Amount = bitcoin::Amount::from_sat(210_000_000);
 const DEPOSIT_FEE: bitcoin::Amount = bitcoin::Amount::from_sat(1_000_000);
+
+/// Shares an address holds in each outcome of a market
+async fn market_holdings(
+    node: &PostSetup,
+    address: Address,
+    market_id: &str,
+) -> anyhow::Result<HashMap<usize, i64>> {
+    Ok(node
+        .rpc_client
+        .market_positions(address, Some(market_id.to_owned()))
+        .await?
+        .positions
+        .into_iter()
+        .map(|position| (position.outcome_index, position.shares))
+        .collect())
+}
 
 async fn setup(
     bin_paths: &BinPaths,
@@ -3090,9 +3126,11 @@ async fn roundtrip_task_inner(
             .rpc_client
             .create_trade(CreateTradeRequest {
                 market_id: market_a_id.clone(),
-                outcome_index: 0,
-                shares_amount: 1000,
-                limit_sats: 10_000_000,
+                deltas: vec![ShareDelta {
+                    outcome_index: 0,
+                    shares: 1000,
+                }],
+                max_cost: 9_999_000,
                 trader_address: Some(trader_addr),
                 prev_block_hash: unknown_hex,
             })
@@ -3117,9 +3155,11 @@ async fn roundtrip_task_inner(
             .rpc_client
             .create_trade(CreateTradeRequest {
                 market_id: market_a_id.clone(),
-                outcome_index: 0,
-                shares_amount: 1000,
-                limit_sats: 10_000_000,
+                deltas: vec![ShareDelta {
+                    outcome_index: 0,
+                    shares: 1000,
+                }],
+                max_cost: 9_999_000,
                 trader_address: Some(trader_addr),
                 prev_block_hash: pre_trade_tip_hex.clone(),
             })
@@ -3801,6 +3841,107 @@ async fn roundtrip_task_inner(
         .bmm_single(&mut enforcer_post_setup)
         .await?;
     sleep(std::time::Duration::from_secs(1)).await;
+
+    // Vector trades on Market D move several outcomes in one transaction
+    let voter_3_rpc = &truthcoin_nodes.voter_3.rpc_client;
+    voter_3_rpc.refresh_wallet().await?;
+    let mut d_holder = None;
+    for address in voter_3_rpc.get_wallet_addresses().await? {
+        let holdings =
+            market_holdings(&truthcoin_nodes.issuer, address, &market_d_id)
+                .await?;
+        if holdings.get(&0).is_some_and(|shares| *shares >= 25_000) {
+            d_holder = Some(address);
+        }
+    }
+    let d_holder = d_holder
+        .ok_or_else(|| anyhow::anyhow!("voter_3 holds no Market D shares"))?;
+    let leg = |outcome_index, shares| ShareDelta {
+        outcome_index,
+        shares,
+    };
+    let d_trade = |deltas, max_cost, dry_run| MarketTradeRequest {
+        market_id: market_d_id.clone(),
+        deltas,
+        trader_address: Some(d_holder),
+        max_cost,
+        dry_run: Some(dry_run),
+    };
+    assert!(
+        voter_3_rpc
+            .market_trade(d_trade(
+                vec![leg(1, 100), leg(1, 100)],
+                Some(10_000_000),
+                false
+            ))
+            .await
+            .is_err()
+    );
+    assert!(
+        voter_3_rpc
+            .market_trade(d_trade(vec![leg(0, -25_001)], Some(0), false))
+            .await
+            .is_err()
+    );
+    for deltas in [
+        vec![leg(1, 5_000), leg(2, 5_000)],
+        vec![leg(0, -2_000), leg(3, 1_000)],
+    ] {
+        truthcoin_nodes
+            .settle_mempools(&mut enforcer_post_setup)
+            .await?;
+        let holdings_before =
+            market_holdings(&truthcoin_nodes.issuer, d_holder, &market_d_id)
+                .await?;
+        let treasury_before = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .market_get(market_d_id.clone())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Market D not found"))?
+            .treasury_sats;
+        let quote = voter_3_rpc
+            .market_trade(d_trade(deltas.clone(), None, true))
+            .await?;
+        let sent = voter_3_rpc
+            .market_trade(d_trade(
+                deltas.clone(),
+                Some(quote.net_cost_sats),
+                false,
+            ))
+            .await?;
+        anyhow::ensure!(
+            sent.txid.is_some() && sent.net_cost_sats == quote.net_cost_sats
+        );
+        sleep(std::time::Duration::from_millis(500)).await;
+        truthcoin_nodes
+            .settle_mempools(&mut enforcer_post_setup)
+            .await?;
+        let holdings_after =
+            market_holdings(&truthcoin_nodes.issuer, d_holder, &market_d_id)
+                .await?;
+        for delta in &deltas {
+            let outcome = delta.outcome_index as usize;
+            anyhow::ensure!(
+                holdings_after.get(&outcome).copied().unwrap_or(0)
+                    == holdings_before.get(&outcome).copied().unwrap_or(0)
+                        + delta.shares,
+                "Market D outcome {outcome} did not move by {}",
+                delta.shares
+            );
+        }
+        let treasury_after = truthcoin_nodes
+            .issuer
+            .rpc_client
+            .market_get(market_d_id.clone())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Market D not found"))?
+            .treasury_sats;
+        anyhow::ensure!(
+            treasury_after as i64 - treasury_before as i64
+                == quote.buy_cost_sats as i64 - quote.sell_gross_sats as i64
+        );
+    }
 
     // Trade on Market F (256 outcomes)
     truthcoin_nodes.refresh_all_wallets().await?;

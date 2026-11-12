@@ -26,8 +26,8 @@ use truthcoin_dc::{
     state::period_to_name,
     types::{
         Address, Authorization, AuthorizedTransaction, Block, BlockHash,
-        EncryptionPubKey, M6id, PointedOutput, SpentOutput, Txid, VerifyingKey,
-        WithdrawalBundle,
+        EncryptionPubKey, M6id, PointedOutput, ShareDelta, SpentOutput, Txid,
+        VerifyingKey, WithdrawalBundle,
         authorization::{self, Dst, Signature},
         net::{Peer, PeerAddress},
         state::TwoWayPegEvent,
@@ -43,8 +43,9 @@ use truthcoin_dc_app_rpc_api::{
         DecisionFilter, DecisionListItem, DecisionState, DecisionSummary,
         MarketAmplifyBetaRequest, MarketBuyRequest, MarketBuyResponse,
         MarketDimension, MarketDimensionKind, MarketOutcome, MarketSellRequest,
-        MarketSellResponse, MarketStatus, ParticipationStats, PeriodStats,
-        VoteFilter, VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
+        MarketSellResponse, MarketStatus, MarketTradeRequest,
+        MarketTradeResponse, ParticipationStats, PeriodStats, VoteFilter,
+        VoteInfo, VoterInfo, VoterInfoFull, VotingPeriodFull,
     },
     node::TxInfo,
     typewit::const_marker::Bool,
@@ -320,6 +321,73 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
     #[inline(always)]
     fn node(&self) -> &Node<MainchainTransport> {
         &self.app.node
+    }
+
+    /// Price a trade against the market's mempool shares, and the prices it
+    /// leaves
+    fn quote_market_trade(
+        &self,
+        market: &truthcoin_dc::state::Market,
+        deltas: &[ShareDelta],
+    ) -> RpcResult<(trading::TradeQuote, Vec<f64>)> {
+        let current_shares = self
+            .node()
+            .get_mempool_shares(&market.id)
+            .map_err(custom_err)?
+            .unwrap_or_else(|| market.shares().clone());
+        let beta = self.node().get_market_beta(market).map_err(custom_err)?;
+        let quote = trading::quote_trade(
+            &current_shares,
+            deltas,
+            beta,
+            market.trading_fee(),
+        )
+        .map_err(|e| custom_err_msg(format!("Invalid trade: {e}")))?;
+        let new_prices = trading::calculate_prices(&quote.new_shares, beta)
+            .map(|prices| prices.to_vec())
+            .unwrap_or_default();
+        Ok((quote, new_prices))
+    }
+
+    /// Build, sign and send a trade bound to the current tip
+    fn send_market_trade(
+        &self,
+        market: &truthcoin_dc::state::Market,
+        deltas: Vec<ShareDelta>,
+        trader: Address,
+        max_cost: i64,
+    ) -> RpcResult<Txid> {
+        let prev_block_hash = self
+            .node()
+            .try_get_tip()
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Chain has no tip"))?;
+        let tx = self
+            .app
+            .wallet
+            .trade(
+                self.app.spend_options().map_err(custom_err)?,
+                market.id,
+                deltas,
+                trader,
+                max_cost,
+                Some(market.tx_pow_config()),
+                prev_block_hash,
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    fn first_wallet_address(&self) -> RpcResult<Address> {
+        self.app
+            .wallet
+            .get_addresses()
+            .map_err(custom_err)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| custom_err_msg("Wallet has no addresses"))
     }
 
     async fn decisions_status(
@@ -664,14 +732,16 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
     }
 }
 
-fn check_buy_limit(
-    buy_cost: &trading::BuyCost,
-    max_cost: u64,
-) -> RpcResult<()> {
-    if buy_cost.exceeds_limit(max_cost) {
+/// Trade legs in the canonical order, ascending by outcome
+fn share_deltas(mut deltas: Vec<ShareDelta>) -> Vec<ShareDelta> {
+    deltas.sort_by_key(|delta| delta.outcome_index);
+    deltas
+}
+
+fn check_buy_limit(cost_sats: u64, max_cost: u64) -> RpcResult<()> {
+    if cost_sats.saturating_add(trading::TRADE_MINER_FEE_SATS) > max_cost {
         return Err(custom_err_msg(format!(
-            "Share cost {} sats + miner fee {} sats exceeds maximum cost {max_cost} sats (slippage protection)",
-            buy_cost.total_cost_sats,
+            "Share cost {cost_sats} sats + miner fee {} sats exceeds maximum cost {max_cost} sats (slippage protection)",
             trading::TRADE_MINER_FEE_SATS,
         )));
     }
@@ -2891,41 +2961,17 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .map_err(custom_err)?
             .ok_or_else(|| custom_err_msg("Market not found"))?;
 
-        // Use mempool shares and effective treasury (confirmed + pending
-        // amplify_beta deposits) for cost calculation. This ensures the tx
-        // is created with correct cost for its expected position in the
-        // mempool ordering.
-        let current_shares = self
-            .app
-            .node
-            .get_mempool_shares(&market_id_struct)
-            .map_err(custom_err)?
-            .unwrap_or_else(|| market.shares().clone());
-        let effective_b =
-            self.app.node.get_market_beta(&market).map_err(custom_err)?;
-
-        let mut new_shares = current_shares.clone();
-        new_shares[request.outcome_index] += request.shares_amount;
-        let trade_cost = trading::calculate_update_cost(
-            &current_shares,
-            &new_shares,
-            effective_b,
-        )
-        .map_err(|e| {
-            custom_err_msg(format!("LMSR cost calculation failed: {e:?}"))
-        })?;
-
-        let buy_cost =
-            trading::calculate_buy_cost(trade_cost, market.trading_fee())
-                .map_err(|e| {
-                    custom_err_msg(format!("Cost calculation failed: {e}"))
-                })?;
-        let trading_fee_sats = buy_cost.trading_fee_sats;
-        let cost_sats = buy_cost.total_cost_sats;
-
-        let new_price = trading::calculate_prices(&new_shares, effective_b)
-            .ok()
-            .and_then(|p| p.get(request.outcome_index).copied())
+        let deltas = vec![ShareDelta {
+            outcome_index: request.outcome_index as u32,
+            shares: request.shares_amount,
+        }];
+        let (quote, new_prices) = self.quote_market_trade(&market, &deltas)?;
+        let cost_sats = u64::try_from(quote.net_cost_sats)
+            .map_err(|_| custom_err_msg("A buy must cost something"))?;
+        let trading_fee_sats = quote.fee_sats;
+        let new_price = new_prices
+            .get(request.outcome_index)
+            .copied()
             .unwrap_or(0.0);
 
         if request.dry_run.unwrap_or(false) {
@@ -2941,41 +2987,17 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             custom_err_msg("max_cost is required when dry_run is false")
         })?;
 
-        check_buy_limit(&buy_cost, max_cost)?;
+        check_buy_limit(cost_sats, max_cost)?;
 
-        let trader = self
-            .app
-            .wallet
-            .get_addresses()
-            .map_err(custom_err)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| custom_err_msg("Wallet has no addresses"))?;
-
-        let prev_block_hash = self
-            .app
-            .node
-            .try_get_tip()
-            .map_err(custom_err)?
-            .ok_or_else(|| custom_err_msg("Chain has no tip"))?;
-
-        let tx = self
-            .app
-            .wallet
-            .trade(
-                self.app.spend_options().map_err(custom_err)?,
-                market_id_struct,
-                request.outcome_index,
-                request.shares_amount,
-                trader,
-                max_cost, // limit_sats = max_cost for buy
-                Some(market.tx_pow_config()),
-                prev_block_hash,
-            )
-            .map_err(custom_err)?;
-
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
+        let trade_max_cost =
+            i64::try_from(max_cost - trading::TRADE_MINER_FEE_SATS)
+                .map_err(|_| custom_err_msg("max_cost is too large"))?;
+        let txid = self.send_market_trade(
+            &market,
+            deltas,
+            self.first_wallet_address()?,
+            trade_max_cost,
+        )?;
 
         Ok(MarketBuyResponse {
             txid: Some(txid.to_string()),
@@ -3018,47 +3040,23 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             )));
         }
 
-        // Use mempool shares and effective treasury (confirmed + pending
-        // amplify_beta deposits) for proceeds calculation.
-        let current_shares = self
-            .app
-            .node
-            .get_mempool_shares(&market_id_struct)
-            .map_err(custom_err)?
-            .unwrap_or_else(|| market.shares().clone());
-        let effective_b =
-            self.app.node.get_market_beta(&market).map_err(custom_err)?;
-
-        // Calculate proceeds: C(current_shares) - C(new_shares)
-        let mut new_shares = current_shares.clone();
-        new_shares[request.outcome_index] -= request.shares_amount;
-
-        // Calculate cost difference: old_cost - new_cost = proceeds (positive when selling)
-        let old_cost =
-            trading::calculate_treasury(&current_shares, effective_b).map_err(
-                |e| custom_err_msg(format!("Cost calculation error: {e:?}")),
-            )?;
-        let new_cost = trading::calculate_treasury(&new_shares, effective_b)
-            .map_err(|e| {
-                custom_err_msg(format!("Cost calculation error: {e:?}"))
+        let deltas = vec![ShareDelta {
+            outcome_index: request.outcome_index as u32,
+            shares: -request.shares_amount,
+        }];
+        let (quote, new_prices) = self.quote_market_trade(&market, &deltas)?;
+        let proceeds_sats = quote.sell_gross_sats;
+        let trading_fee_sats = quote.fee_sats;
+        let net_proceeds_sats =
+            u64::try_from(-quote.net_cost_sats).map_err(|_| {
+                custom_err_msg(format!(
+                    "Trading fee {trading_fee_sats} sats exceeds proceeds \
+                     {proceeds_sats} sats"
+                ))
             })?;
-
-        let proceeds_btc = old_cost - new_cost;
-
-        let sell_proceeds = trading::calculate_sell_proceeds(
-            proceeds_btc,
-            market.trading_fee(),
-        )
-        .map_err(|e| {
-            custom_err_msg(format!("Proceeds calculation failed: {e}"))
-        })?;
-        let proceeds_sats = sell_proceeds.gross_proceeds_sats;
-        let trading_fee_sats = sell_proceeds.trading_fee_sats;
-        let net_proceeds_sats = sell_proceeds.net_proceeds_sats;
-
-        let new_price = trading::calculate_prices(&new_shares, effective_b)
-            .ok()
-            .and_then(|p| p.get(request.outcome_index).copied())
+        let new_price = new_prices
+            .get(request.outcome_index)
+            .copied()
             .unwrap_or(0.0);
 
         if request.dry_run.unwrap_or(false) {
@@ -3079,30 +3077,15 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             )));
         }
 
-        let prev_block_hash = self
-            .app
-            .node
-            .try_get_tip()
-            .map_err(custom_err)?
-            .ok_or_else(|| custom_err_msg("Chain has no tip"))?;
-
-        let tx = self
-            .app
-            .wallet
-            .trade(
-                self.app.spend_options().map_err(custom_err)?,
-                market_id_struct,
-                request.outcome_index,
-                -request.shares_amount, // Negative for sell
-                request.seller_address,
-                min_proceeds,
-                Some(market.tx_pow_config()),
-                prev_block_hash,
-            )
-            .map_err(custom_err)?;
-
-        let txid = tx.txid();
-        self.app.sign_and_send(tx).map_err(custom_err)?;
+        let max_cost = i64::try_from(min_proceeds)
+            .map(|min_proceeds| -min_proceeds)
+            .map_err(|_| custom_err_msg("min_proceeds is too large"))?;
+        let txid = self.send_market_trade(
+            &market,
+            deltas,
+            request.seller_address,
+            max_cost,
+        )?;
 
         Ok(MarketSellResponse {
             txid: Some(txid.to_string()),
@@ -3111,6 +3094,55 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             net_proceeds_sats,
             new_price,
         })
+    }
+
+    async fn market_trade(
+        &self,
+        request: MarketTradeRequest,
+    ) -> RpcResult<MarketTradeResponse> {
+        let market_id_struct = parse_market_id(&request.market_id)?;
+        let market = self
+            .node()
+            .get_market_by_id(&market_id_struct)
+            .map_err(custom_err)?
+            .ok_or_else(|| custom_err_msg("Market not found"))?;
+
+        let deltas = share_deltas(request.deltas);
+        let (quote, new_prices) = self.quote_market_trade(&market, &deltas)?;
+        let response = |txid: Option<String>| MarketTradeResponse {
+            txid,
+            buy_cost_sats: quote.buy_cost_sats,
+            sell_gross_sats: quote.sell_gross_sats,
+            trading_fee_sats: quote.fee_sats,
+            net_cost_sats: quote.net_cost_sats,
+            new_prices: new_prices.clone(),
+        };
+        if request.dry_run.unwrap_or(false) {
+            return Ok(response(None));
+        }
+
+        let max_cost = request.max_cost.ok_or_else(|| {
+            custom_err_msg("max_cost is required when dry_run is false")
+        })?;
+        if quote.net_cost_sats > max_cost {
+            return Err(custom_err_msg(format!(
+                "Trade net cost {} sats exceeds maximum cost {max_cost} sats (slippage protection)",
+                quote.net_cost_sats
+            )));
+        }
+        let trader = match request.trader_address {
+            Some(address) => address,
+            None if deltas.iter().all(|delta| delta.shares > 0) => {
+                self.first_wallet_address()?
+            }
+            None => {
+                return Err(custom_err_msg(
+                    "trader_address is required for a trade that sells",
+                ));
+            }
+        };
+        let txid = self.send_market_trade(&market, deltas, trader, max_cost)?;
+        Ok(response(Some(txid.to_string())))
     }
 
     async fn market_amplify_beta(
@@ -3305,26 +3337,19 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
 
         let trader = match request.trader_address {
             Some(addr) => addr,
-            None => self
-                .app
-                .wallet
-                .get_addresses()
-                .map_err(custom_err)?
-                .into_iter()
-                .next()
-                .ok_or_else(|| custom_err_msg("Wallet has no addresses"))?,
+            None => self.first_wallet_address()?,
         };
 
+        let deltas = share_deltas(request.deltas);
         let tx = self
             .app
             .wallet
             .trade(
                 self.app.spend_options().map_err(custom_err)?,
                 market_id_struct,
-                request.outcome_index,
-                request.shares_amount,
+                deltas,
                 trader,
-                request.limit_sats,
+                request.max_cost,
                 Some(market.tx_pow_config()),
                 prev_block_hash,
             )
@@ -3559,7 +3584,6 @@ mod tests {
     use jsonrpsee::{RpcModule, server::Server};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    use truthcoin_dc::math::trading::BuyCost;
     use truthcoin_dc::state::{
         MarketBuilder,
         decisions::{Decision, DecisionId, DecisionType},
@@ -3571,20 +3595,15 @@ mod tests {
     /// A market buy's cost limit counts the miner fee
     #[test]
     fn buy_limit_miner_fee() -> anyhow::Result<()> {
-        let buy_cost = BuyCost {
-            base_cost_sats: 1001,
-            trading_fee_sats: 10,
-            total_cost_sats: 1011,
-        };
-        let Err(err) = check_buy_limit(&buy_cost, 1100) else {
+        let Err(err) = check_buy_limit(1011, 1100) else {
             anyhow::bail!("max_cost 1100 sats passed the buy limit");
         };
         assert_eq!(
             err.message(),
             "Share cost 1011 sats + miner fee 1000 sats exceeds maximum cost 1100 sats (slippage protection)"
         );
-        assert!(check_buy_limit(&buy_cost, 2010).is_err());
-        assert!(check_buy_limit(&buy_cost, 2011).is_ok());
+        assert!(check_buy_limit(1011, 2010).is_err());
+        assert!(check_buy_limit(1011, 2011).is_ok());
         Ok(())
     }
 

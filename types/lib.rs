@@ -41,8 +41,8 @@ pub use transaction::{
     Authorized, AuthorizedTransaction, BallotItem, ClaimDecisionPayload,
     DecisionClaimEntry, FilledTransaction, GetAddress, GetValue, InPoint,
     MarketCreationView, OutPoint, OutPointKey, Output, OutputContent,
-    PointedOutput, PointedOutputRef, RevealBallot, SpentOutput, Transaction,
-    TransactionData, TxData,
+    PointedOutput, PointedOutputRef, RevealBallot, ShareDelta, SpentOutput,
+    Transaction, TransactionData, TxData,
 };
 pub mod tx_pow;
 mod util;

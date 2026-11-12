@@ -17,6 +17,32 @@ use truthcoin_dc_types::{
     net::PeerAddress,
 };
 
+/// Trade legs parsed from "outcome:shares,outcome:shares"
+#[derive(Clone, Debug)]
+pub struct ShareDeltas(Vec<truthcoin_dc_types::ShareDelta>);
+
+fn parse_share_deltas(s: &str) -> Result<ShareDeltas, String> {
+    s.split(',')
+        .map(|leg| {
+            let (outcome_index, shares) = leg
+                .trim()
+                .split_once(':')
+                .ok_or_else(|| format!("leg `{leg}` is not outcome:shares"))?;
+            Ok(truthcoin_dc_types::ShareDelta {
+                outcome_index: outcome_index
+                    .trim()
+                    .parse()
+                    .map_err(|err| format!("outcome in `{leg}`: {err}"))?,
+                shares: shares
+                    .trim()
+                    .parse()
+                    .map_err(|err| format!("shares in `{leg}`: {err}"))?,
+            })
+        })
+        .collect::<Result<_, _>>()
+        .map(ShareDeltas)
+}
+
 struct JsonParser<T>(PhantomData<T>);
 
 impl<T> JsonParser<T> {
@@ -474,6 +500,25 @@ pub enum Command {
         /// Minimum proceeds to accept (slippage protection)
         #[arg(long, default_value = "0")]
         min_proceeds: u64,
+    },
+    /// Buy and sell several outcomes of a market in one transaction
+    #[command(name = "market-trade", alias = "trade")]
+    MarketTrade {
+        #[arg(long)]
+        market_id: String,
+        /// Comma-separated "outcome:shares" legs, negative shares to sell,
+        /// e.g. "0:10,2:-5"
+        #[arg(long, value_parser = parse_share_deltas)]
+        deltas: ShareDeltas,
+        /// The most the trade may cost, without the miner fee; negative is
+        /// the least it must pay out
+        #[arg(long, allow_hyphen_values = true)]
+        max_cost: Option<i64>,
+        /// Address holding the shares, required when any leg sells
+        #[arg(long)]
+        trader_address: Option<Address>,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Amplify a market's LMSR beta by funding its treasury (market author only)
     #[command(name = "market-amplify-beta")]
@@ -1227,6 +1272,25 @@ where
                 result.net_proceeds_sats,
                 txid_display
             )
+        }
+        Command::MarketTrade {
+            market_id,
+            deltas,
+            max_cost,
+            trader_address,
+            dry_run,
+        } => {
+            use truthcoin_dc_app_rpc_api::markets::MarketTradeRequest;
+            let result = rpc_client
+                .market_trade(MarketTradeRequest {
+                    market_id,
+                    deltas: deltas.0,
+                    trader_address,
+                    max_cost,
+                    dry_run: Some(dry_run),
+                })
+                .await?;
+            serde_json::to_string_pretty(&result)?
         }
         Command::MarketAmplifyBeta {
             market_id,

@@ -1129,8 +1129,8 @@ impl Wallet {
         use crate::types::TransactionData;
 
         let actor_addr = match &transaction.data {
-            Some(TransactionData::Trade { trader, shares, .. })
-                if *shares < 0 =>
+            Some(TransactionData::Trade { trader, deltas, .. })
+                if deltas.iter().any(|delta| delta.shares < 0) =>
             {
                 if !input_addresses.contains(trader) {
                     Some(*trader)
@@ -1684,41 +1684,34 @@ impl Wallet {
         Ok((tx, market_id))
     }
 
+    /// Build a trade that moves `market_id`'s share vector by `deltas`. The
+    /// inputs cover `max_cost`, when positive, and the miner fee.
     #[allow(clippy::too_many_arguments)]
     pub fn trade(
         &self,
         options: SpendOptions,
         market_id: crate::state::markets::MarketId,
-        outcome_index: usize,
-        shares: i64,
+        deltas: Vec<crate::types::ShareDelta>,
         trader: Address,
-        limit_sats: u64,
+        max_cost: i64,
         tx_pow_config: Option<crate::types::tx_pow::TxPowConfig>,
         prev_block_hash: crate::types::BlockHash,
     ) -> Result<Transaction, Error> {
-        let is_buy = shares > 0;
-
-        let inputs = if is_buy {
-            let selected = self
-                .select_coins(bitcoin::Amount::from_sat(limit_sats), options)?;
-            spend_inputs(selected.coins)
-        } else {
-            let min_fee =
-                bitcoin::Amount::from_sat(trading::TRADE_MINER_FEE_SATS);
-            let selected = self.select_coins(min_fee, options)?;
-            spend_inputs(selected.coins)
-        };
-
-        let outputs = Vec::new();
+        let required = u64::try_from(max_cost.max(0))
+            .ok()
+            .and_then(|cost| cost.checked_add(trading::TRADE_MINER_FEE_SATS))
+            .ok_or(Error::NotEnoughFunds)?;
+        let selected =
+            self.select_coins(bitcoin::Amount::from_sat(required), options)?;
+        let inputs = spend_inputs(selected.coins);
 
         let tx_pow_nonce = match tx_pow_config {
             Some(config) if config.is_enabled() => {
                 let pow_data = crate::types::tx_pow::serialize_trade_for_pow(
                     market_id.as_bytes(),
-                    outcome_index as u32,
-                    shares,
+                    &deltas,
                     &trader,
-                    limit_sats,
+                    max_cost,
                     &prev_block_hash,
                 );
                 Some(config.mine(&pow_data))
@@ -1726,13 +1719,12 @@ impl Wallet {
             _ => None,
         };
 
-        let mut tx = new_tx(inputs, outputs);
+        let mut tx = new_tx(inputs, Vec::new());
         tx.data = Some(TxData::Trade {
             market_id: MarketId::new(*market_id.as_bytes()),
-            outcome_index: outcome_index as u32,
-            shares,
+            deltas,
             trader,
-            limit_sats,
+            max_cost,
             tx_pow_nonce,
             prev_block_hash,
         });

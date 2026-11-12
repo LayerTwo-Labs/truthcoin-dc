@@ -2268,10 +2268,16 @@ mod test {
                     inputs: vec![(pointed.outpoint, hash(&pointed))].into(),
                     data: Some(TxData::Trade {
                         market_id: market.id,
-                        outcome_index: u32::from(index == 0 && !cost_overflow),
-                        shares,
+                        deltas: vec![crate::types::ShareDelta {
+                            outcome_index: u32::from(
+                                index == 0 && !cost_overflow,
+                            ),
+                            shares,
+                        }],
                         trader,
-                        limit_sats: input_sats,
+                        max_cost: input_sats as i64
+                            - crate::math::trading::TRADE_MINER_FEE_SATS
+                                as i64,
                         tx_pow_nonce: None,
                         prev_block_hash: tip,
                     }),
@@ -2321,11 +2327,25 @@ mod test {
             assert_eq!(node.get_all_transactions()?.len(), 2);
             {
                 let mut rwtxn = node.env.write_txn()?;
+                let buy = |outcome_index, shares| {
+                    [crate::types::ShareDelta {
+                        outcome_index,
+                        shares,
+                    }]
+                };
                 let result = if cost_overflow {
-                    node.update_mempool_buy(&mut rwtxn, market.id, 0, i64::MAX)?;
-                    node.update_mempool_buy(&mut rwtxn, market.id, 0, 1)
+                    node.update_mempool_trade(
+                        &mut rwtxn,
+                        market.id,
+                        &buy(0, i64::MAX),
+                    )?;
+                    node.update_mempool_trade(&mut rwtxn, market.id, &buy(0, 1))
                 } else {
-                    node.update_mempool_buy(&mut rwtxn, market.id, 1, i64::MAX)
+                    node.update_mempool_trade(
+                        &mut rwtxn,
+                        market.id,
+                        &buy(1, i64::MAX),
+                    )
                 };
                 assert!(matches!(result, Err(crate::node::Error::State(error)) if matches!(*error, state::Error::InvalidTransaction { .. })));
             }

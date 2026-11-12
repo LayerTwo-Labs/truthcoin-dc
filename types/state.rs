@@ -44,12 +44,9 @@ pub enum MarketUtxoReason {
     Treasury,
     /// The fees of the market author
     AuthorFee,
-    /// The proceeds of a sell trade, to the seller
-    SellPayout,
-    /// The change of a buy trade, to the buyer
-    BuyChange,
-    /// The change of the inputs of a sell trade, to the seller
-    SellInputChange,
+    /// What a trade returns to its trader: the inputs and sell proceeds left
+    /// after the buy cost and fees
+    TradeChange,
     /// The payout of settled shares, to the shareholder
     SharePayout,
     /// A share of the author fees at settlement
