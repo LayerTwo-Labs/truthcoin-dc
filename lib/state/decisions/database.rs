@@ -473,8 +473,8 @@ impl Dbs {
         &self.config
     }
 
-    pub fn period_to_string(&self, period_idx: u32) -> String {
-        period_to_string(period_idx, &self.config)
+    pub fn period_to_string(&self, period_idx: u32, genesis_ts: u64) -> String {
+        period_to_string(period_idx, &self.config, genesis_ts)
     }
 
     pub fn is_period_settled(

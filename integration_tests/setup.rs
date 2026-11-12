@@ -46,6 +46,9 @@ pub struct Init {
     pub extra_args: Vec<String>,
     /// Reach the enforcer over TLS, instead of plain h2c
     pub mainchain_tls: Option<MainchainTls>,
+    /// Blocks per voting period, or `None` for the calendar quarters a
+    /// downloaded binary runs with
+    pub decision_config_testing: Option<u32>,
 }
 
 impl Init {
@@ -58,6 +61,7 @@ impl Init {
             data_dir_suffix: None,
             extra_args: Vec::new(),
             mainchain_tls: None,
+            decision_config_testing: Some(10),
         }
     }
 }
@@ -214,7 +218,7 @@ impl Sidechain for PostSetup {
             net_port: reserved_ports.net.port(),
             network: Network::Regtest,
             rpc_port: reserved_ports.rpc.port(),
-            decision_config_testing: Some(10),
+            decision_config_testing: init.decision_config_testing,
         };
         let truthcoin_dc_app_task = truthcoin_dc_app
             .spawn_command_with_args::<String, String, _, _, _>(

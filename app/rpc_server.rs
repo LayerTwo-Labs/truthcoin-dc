@@ -334,7 +334,12 @@ impl<const ENABLE_PRIVATE_API: bool> RpcServerImpl<ENABLE_PRIVATE_API> {
         let current_period =
             self.node().get_current_period().map_err(custom_err)?;
 
-        let current_period_name = period_to_name(current_period);
+        let genesis_ts = self
+            .node()
+            .get_genesis_timestamp()
+            .map_err(custom_err)?
+            .unwrap_or(0);
+        let current_period_name = period_to_name(current_period, genesis_ts);
 
         Ok(truthcoin_dc_app_rpc_api::markets::DecisionPeriodStatus {
             is_testing_mode,

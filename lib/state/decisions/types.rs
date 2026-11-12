@@ -432,14 +432,13 @@ pub struct DecisionConfig {
 
 impl Default for DecisionConfig {
     fn default() -> Self {
-        Self {
-            is_blocks: false,
-            quantity: 86400,
-        }
+        Self::production()
     }
 }
 
 impl DecisionConfig {
+    /// Calendar quarters. `quantity` is a quarter's nominal length, which
+    /// only sets the reprice interval; period boundaries follow the calendar.
     pub fn production() -> Self {
         Self {
             is_blocks: false,
@@ -473,32 +472,34 @@ impl DecisionConfig {
             None
         }
     }
-
-    pub fn seconds_per_period(&self) -> Option<u64> {
-        if !self.is_blocks {
-            Some(self.quantity as u64)
-        } else {
-            None
-        }
-    }
 }
 
 /// Convert period index to human-readable name (single source of truth).
-/// Returns "Genesis" for period 0, otherwise "Q{quarter} Y{year}".
+/// Returns "Genesis" for period 0, otherwise "Q{quarter} Y{year}" for the
+/// calendar quarter of the period, counting the quarter of `genesis_ts` as
+/// period 1.
 #[inline]
-pub fn period_to_name(period: u32) -> String {
+pub fn period_to_name(period: u32, genesis_ts: u64) -> String {
     if period == 0 {
         return "Genesis".to_string();
     }
-    let year = 2009 + (period - 1) / 4;
-    let quarter = ((period - 1) % 4) + 1;
-    format!("Q{quarter} Y{year}")
+    let quarter =
+        crate::state::voting::period_calculator::utc_quarter(genesis_ts)
+            + u64::from(period)
+            - 1;
+    let year = 1970 + quarter / 4;
+    let quarter_of_year = quarter % 4 + 1;
+    format!("Q{quarter_of_year} Y{year}")
 }
 
-pub fn period_to_string(period_idx: u32, config: &DecisionConfig) -> String {
+pub fn period_to_string(
+    period_idx: u32,
+    config: &DecisionConfig,
+    genesis_ts: u64,
+) -> String {
     if config.is_blocks {
         format!("Testing Period {period_idx}")
     } else {
-        period_to_name(period_idx)
+        period_to_name(period_idx, genesis_ts)
     }
 }

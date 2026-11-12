@@ -1086,8 +1086,9 @@ mod tests {
         tx
     }
 
+    /// New decision claims must fall in the current period's window
     #[test]
-    fn market_creation_new_claim_window_follows_current_period() {
+    fn new_claim_window() {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(64 * 1024 * 1024)
@@ -1095,14 +1096,16 @@ mod tests {
         let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
         let state = State::new(&env, None, true).unwrap();
 
+        use crate::state::voting::period_calculator::{
+            utc_quarter, utc_quarter_start,
+        };
+
         let genesis_ts = 1_700_000_000;
+        let tenth_period_ts =
+            utc_quarter_start(utc_quarter(genesis_ts) + 9) + 60;
         let mut rwtxn = env.write_txn().unwrap();
         state
-            .put_timestamps_for_test(
-                &mut rwtxn,
-                genesis_ts,
-                genesis_ts + 9 * 86_400 + 60,
-            )
+            .put_timestamps_for_test(&mut rwtxn, genesis_ts, tenth_period_ts)
             .unwrap();
         rwtxn.commit().unwrap();
         let rotxn = env.read_txn().unwrap();

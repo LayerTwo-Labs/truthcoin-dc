@@ -10,6 +10,7 @@ mod ibd;
 mod integration_test;
 mod list_mempool;
 mod mainchain_tls;
+mod production_periods;
 mod receive_address;
 mod roundtrip;
 mod setup;
