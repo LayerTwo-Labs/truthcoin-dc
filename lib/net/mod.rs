@@ -24,7 +24,7 @@ use crate::{
     mempool::MemPool,
     state::State,
     types::{
-        AuthorizedTransaction, Network, VERSION, Version,
+        AuthorizedTransaction, Network, SignedOffer, VERSION, Version,
         net::{
             DEFAULT_PORT, Peer, PeerAddress, PeerConnectionStatus,
             ResolvedPeerAddress,
@@ -839,6 +839,36 @@ impl Net {
                 {
                     let txid = tx.transaction.txid();
                     tracing::warn!("Failed to push tx {txid} to peer at {addr}")
+                }
+            })
+    }
+
+    pub fn push_offer(
+        &self,
+        exclude: HashSet<SocketAddr>,
+        offer: &SignedOffer,
+    ) {
+        self.active_peers
+            .read()
+            .iter()
+            .filter(|(addr, _)| !exclude.contains(addr))
+            .for_each(|(addr, peer_connection_handle)| {
+                match peer_connection_handle.connection_status() {
+                    PeerConnectionStatus::Connecting => return,
+                    PeerConnectionStatus::Connected => {}
+                }
+                let request: PeerRequest = peer::message::PushOfferRequest {
+                    offer: Box::new(offer.clone()),
+                }
+                .into();
+                if let Err(_send_err) = peer_connection_handle
+                    .internal_message_tx
+                    .unbounded_send(request.into())
+                {
+                    let offer_id = offer.id();
+                    tracing::warn!(
+                        "Failed to push offer {offer_id} to peer at {addr}"
+                    )
                 }
             })
     }

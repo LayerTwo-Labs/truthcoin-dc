@@ -1990,6 +1990,164 @@ mod conservation_tests {
         Ok(())
     }
 
+    fn take_offer_tx(
+        signed: &crate::types::SignedOffer,
+        buyer: Address,
+    ) -> crate::types::FilledTransaction {
+        let mut take = funded_tx(
+            crate::types::TransactionData::TakeOffer {
+                offer: Box::new(signed.clone()),
+                buyer,
+            },
+            buyer,
+            signed.offer.price.to_sat() + 1000,
+        );
+        take.transaction.outputs = vec![crate::types::Output {
+            address: signed.offer.pay_to,
+            content: crate::types::OutputContent::Value(signed.offer.price),
+        }]
+        .into();
+        take.actor_address = None;
+        take
+    }
+
+    fn offer_of(
+        key: &crate::types::authorization::SigningKey,
+        voting_period: u32,
+        nonce: u64,
+    ) -> crate::types::SignedOffer {
+        let seller = crate::types::authorization::get_address(&key.into());
+        crate::validation::offer::sign_test_offer(
+            key,
+            crate::types::VotecoinOffer {
+                seller,
+                amount: Votecoin(100_000),
+                price: bitcoin::Amount::from_sat(50_000),
+                pay_to: seller,
+                voting_period,
+                nonce,
+            },
+        )
+    }
+
+    /// A take moves votecoin and closes the offer; disconnect reverts both; cancel closes it
+    #[test]
+    fn take_offer_and_undo() -> anyhow::Result<()> {
+        use std::collections::HashSet;
+
+        use crate::{
+            state::markets::block,
+            types::{AccumulatorDiff, authorization::SigningKey},
+            validation::OfferValidator,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let key = SigningKey::new(&mut rand::rng());
+        let seller = crate::types::authorization::get_address(&(&key).into());
+        let buyer = addr(2);
+        let (env, state, _) =
+            sealed_ballot_state(&dir, &[(seller, 400_000), (buyer, 600_000)])?;
+        let mut rwtxn = env.write_txn()?;
+        let period = state.current_period(&rwtxn)?;
+        let signed = offer_of(&key, period, 0);
+        let take = take_offer_tx(&signed, buyer);
+        let reputation = |rwtxn: &sneed::RwTxn| -> anyhow::Result<(u64, u64)> {
+            Ok((
+                state.reputation().get_reputation(rwtxn, &seller)?.0,
+                state.reputation().get_reputation(rwtxn, &buyer)?.0,
+            ))
+        };
+
+        OfferValidator::validate_take_offer(&state, &rwtxn, &take)?;
+        connect_height(&state, &mut rwtxn, 10, std::slice::from_ref(&take))?;
+        assert_eq!(reputation(&rwtxn)?, (300_000, 700_000));
+        assert!(state.is_offer_closed(&rwtxn, &signed.id())?);
+        assert!(
+            OfferValidator::validate_take_offer(&state, &rwtxn, &take).is_err()
+        );
+
+        block::disconnect_tx(
+            &state,
+            &mut rwtxn,
+            &mut AccumulatorDiff::default(),
+            &without_inputs(&take),
+            &mut Vec::new(),
+        )?;
+        block::disconnect_end(
+            &state,
+            &mut rwtxn,
+            10,
+            &HashSet::new(),
+            Vec::new(),
+        )?;
+        assert_eq!(reputation(&rwtxn)?, (400_000, 600_000));
+        assert!(!state.is_offer_closed(&rwtxn, &signed.id())?);
+        OfferValidator::validate_take_offer(&state, &rwtxn, &take)?;
+
+        let cancel = funded_tx(
+            crate::types::TransactionData::CancelOffer {
+                offer: signed.offer,
+            },
+            seller,
+            1000,
+        );
+        OfferValidator::validate_cancel_offer(&state, &rwtxn, &cancel)?;
+        connect_height(&state, &mut rwtxn, 10, &[cancel])?;
+        assert_eq!(reputation(&rwtxn)?, (400_000, 600_000));
+        assert!(
+            OfferValidator::validate_take_offer(&state, &rwtxn, &take).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ballot_locks_offers() -> anyhow::Result<()> {
+        use crate::{
+            types::authorization::SigningKey, validation::OfferValidator,
+        };
+
+        let dir = tempfile::tempdir()?;
+        let voter_key = SigningKey::new(&mut rand::rng());
+        let voter =
+            crate::types::authorization::get_address(&(&voter_key).into());
+        let outsider_key = SigningKey::new(&mut rand::rng());
+        let outsider =
+            crate::types::authorization::get_address(&(&outsider_key).into());
+        let (env, state, decision_id) = sealed_ballot_state(
+            &dir,
+            &[(voter, 600_000), (outsider, 400_000)],
+        )?;
+        let mut rwtxn = env.write_txn()?;
+        connect_height(&state, &mut rwtxn, 10, &[])?;
+        connect_height(
+            &state,
+            &mut rwtxn,
+            11,
+            &[sealed_ballot_tx(&binary_ballot(voter, decision_id, 1.0, 1))],
+        )?;
+        let period = state.current_period(&rwtxn)?;
+
+        assert!(
+            OfferValidator::validate_open_offer(
+                &state,
+                &rwtxn,
+                &offer_of(&voter_key, period, 0),
+            )
+            .is_err()
+        );
+        let outsider_offer = offer_of(&outsider_key, period, 0);
+        OfferValidator::validate_open_offer(&state, &rwtxn, &outsider_offer)?;
+        assert!(
+            OfferValidator::validate_take_offer(
+                &state,
+                &rwtxn,
+                &take_offer_tx(&outsider_offer, voter),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
     /// Zero and overdraft are refused; a full-balance transfer removes the sender
     #[test]
     fn transfer_moves_balance() -> anyhow::Result<()> {
@@ -2045,6 +2203,42 @@ mod conservation_tests {
             .map(|units| units.0)
             .sum();
         assert_eq!(total, Votecoin::TOTAL.0);
+        Ok(())
+    }
+
+    /// A transfer funded by another address is authorized by the sender actor proof
+    #[test]
+    fn actor_proof_transfer() -> anyhow::Result<()> {
+        use crate::validation::VoteValidator;
+
+        let dir = tempfile::tempdir()?;
+        let sender = addr(1);
+        let (env, state, _) = sealed_ballot_state(
+            &dir,
+            &[(sender, 500_000), (addr(2), 500_000)],
+        )?;
+        let rwtxn = env.write_txn()?;
+        let mut transfer = funded_tx(
+            crate::types::TransactionData::TransferReputation {
+                sender,
+                dest: addr(3),
+                amount: Votecoin(100_000),
+            },
+            addr(4),
+            1000,
+        );
+
+        transfer.actor_address = Some(sender);
+        VoteValidator::validate_reputation_transfer(
+            &state, &rwtxn, &transfer, None,
+        )?;
+        transfer.actor_address = None;
+        assert!(
+            VoteValidator::validate_reputation_transfer(
+                &state, &rwtxn, &transfer, None,
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

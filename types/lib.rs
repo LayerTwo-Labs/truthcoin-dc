@@ -28,12 +28,14 @@ pub use error::{
 pub mod hashes;
 pub use hashes::{
     BlockHash, CoinbaseTxid, Hash, M6id, MerkleRoot, NonZeroBitcoinBlockHash,
-    Txid, UtreexoNodeHash, hash, hash_with_scratch_buffer,
+    OfferId, Txid, UtreexoNodeHash, hash, hash_with_scratch_buffer,
 };
 pub mod keys;
 pub use keys::{EncryptionPubKey, VerifyingKey};
 pub mod market;
 pub mod net;
+pub mod offer;
+pub use offer::{SignedOffer, VotecoinOffer};
 pub mod schema;
 pub mod state;
 pub mod transaction;

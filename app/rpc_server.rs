@@ -26,8 +26,9 @@ use truthcoin_dc::{
     state::period_to_name,
     types::{
         Address, Authorization, AuthorizedTransaction, Block, BlockHash,
-        EncryptionPubKey, M6id, PointedOutput, ShareDelta, SpentOutput, Txid,
-        VerifyingKey, Votecoin, WithdrawalBundle,
+        EncryptionPubKey, M6id, OfferId, PointedOutput, ShareDelta,
+        SpentOutput, Txid, VerifyingKey, Votecoin, VotecoinOffer,
+        WithdrawalBundle,
         authorization::{self, Dst, Signature},
         net::{Peer, PeerAddress},
         state::TwoWayPegEvent,
@@ -1145,6 +1146,32 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                 })
             })
             .collect()
+    }
+
+    async fn list_offers(&self) -> RpcResult<Vec<rpc_api::node::OfferInfo>> {
+        let mut offers: Vec<_> = self
+            .app
+            .node
+            .get_offers()
+            .map_err(custom_err)?
+            .into_iter()
+            .map(|signed_offer| {
+                let offer = signed_offer.offer;
+                rpc_api::node::OfferInfo {
+                    offer_id: offer.id(),
+                    seller: offer.seller,
+                    amount: offer.amount,
+                    price_sats: offer.price.to_sat(),
+                    pay_to: offer.pay_to,
+                    voting_period: offer.voting_period,
+                }
+            })
+            .collect();
+        offers.sort_by(|a, b| {
+            (u128::from(a.price_sats) * u128::from(b.amount.0))
+                .cmp(&(u128::from(b.price_sats) * u128::from(a.amount.0)))
+        });
+        Ok(offers)
     }
 
     async fn list_utxos(&self) -> RpcResult<Vec<PointedOutput>> {
@@ -2588,6 +2615,101 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 dest,
                 amount,
                 Amount::from_sat(fee_sats),
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    async fn create_offer(
+        &self,
+        amount: Votecoin,
+        price_sats: u64,
+        seller: Option<Address>,
+        pay_to: Option<Address>,
+    ) -> RpcResult<OfferId> {
+        let seller = self.app.resolve_voter(seller).map_err(custom_err)?;
+        let voting_period =
+            self.app.node.get_current_period().map_err(custom_err)?;
+        let offer = VotecoinOffer {
+            seller,
+            amount,
+            price: Amount::from_sat(price_sats),
+            pay_to: pay_to.unwrap_or(seller),
+            voting_period,
+            nonce: rand::random(),
+        };
+        let signed_offer = self
+            .app
+            .wallet
+            .sign_offer(rand::rng(), offer)
+            .map_err(custom_err)?;
+        self.app
+            .node
+            .submit_offer(&signed_offer)
+            .map_err(custom_err)?;
+        Ok(signed_offer.id())
+    }
+
+    async fn take_offer(
+        &self,
+        offer_id: OfferId,
+        fee_sats: u64,
+        buyer: Option<Address>,
+    ) -> RpcResult<Txid> {
+        let offer = self
+            .app
+            .node
+            .get_offer(&offer_id)
+            .map_err(custom_err)?
+            .ok_or_else(|| {
+                custom_err_msg(format!("offer {offer_id} is not on the board"))
+            })?;
+        let buyer = match buyer {
+            Some(buyer) => buyer,
+            None => self.app.wallet.get_new_address().map_err(custom_err)?,
+        };
+        let tx = self
+            .app
+            .wallet
+            .take_offer(
+                offer,
+                buyer,
+                Amount::from_sat(fee_sats),
+                self.app.spend_options().map_err(custom_err)?,
+            )
+            .map_err(custom_err)?;
+        let txid = tx.txid();
+        let () = self.app.sign_and_send(tx).map_err(custom_err)?;
+        Ok(txid)
+    }
+
+    async fn cancel_offer(
+        &self,
+        offer_id: OfferId,
+        fee_sats: u64,
+    ) -> RpcResult<Txid> {
+        let offer = self
+            .app
+            .node
+            .get_offer(&offer_id)
+            .map_err(custom_err)?
+            .ok_or_else(|| {
+                custom_err_msg(format!("offer {offer_id} is not on the board"))
+            })?
+            .offer;
+        let _: Address = self
+            .app
+            .resolve_voter(Some(offer.seller))
+            .map_err(custom_err)?;
+        let tx = self
+            .app
+            .wallet
+            .cancel_offer(
+                offer,
+                Amount::from_sat(fee_sats),
+                self.app.spend_options().map_err(custom_err)?,
             )
             .map_err(custom_err)?;
         let txid = tx.txid();

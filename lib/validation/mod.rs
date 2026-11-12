@@ -1,5 +1,6 @@
 pub mod decision;
 pub mod market;
+pub mod offer;
 pub mod vote;
 
 use std::collections::HashSet;
@@ -20,6 +21,7 @@ use crate::{
 
 pub use decision::DecisionValidator;
 pub use market::{MarketStateValidator, MarketValidator};
+pub use offer::OfferValidator;
 pub use vote::{PeriodValidator, VoteValidator};
 
 pub trait DecisionValidationInterface {
@@ -150,7 +152,30 @@ pub(crate) fn validate_market_transaction(
             override_height,
         )?;
     }
+    if tx.is_take_offer() {
+        OfferValidator::validate_take_offer(state, rotxn, tx)?;
+    }
+    if tx.is_cancel_offer() {
+        OfferValidator::validate_cancel_offer(state, rotxn, tx)?;
+    }
     Ok(None)
+}
+
+pub fn check_duplicate_offer_closes(
+    transactions: &[Transaction],
+) -> Result<(), Error> {
+    let mut closed = HashSet::new();
+    for offer_id in transactions
+        .iter()
+        .filter_map(|tx| tx.data.as_ref()?.closed_offer_id())
+    {
+        if !closed.insert(offer_id) {
+            return Err(Error::InvalidTransaction {
+                reason: format!("Block closes offer {offer_id} more than once"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Reject a block claiming the same decision id more than once, across both
@@ -287,6 +312,46 @@ mod tests {
             })),
             ..Transaction::default()
         }
+    }
+
+    #[test]
+    fn block_closes_offer_once() {
+        use crate::types::{TxData, VotecoinOffer, authorization::SigningKey};
+
+        let key = SigningKey::new(&mut rand::rng());
+        let offer = |nonce| VotecoinOffer {
+            seller: Address([1; 20]),
+            amount: crate::types::Votecoin(100_000),
+            price: bitcoin::Amount::from_sat(1000),
+            pay_to: Address([1; 20]),
+            voting_period: 1,
+            nonce,
+        };
+        let take = |nonce| Transaction {
+            data: Some(TxData::TakeOffer {
+                offer: Box::new(super::offer::sign_test_offer(
+                    &key,
+                    offer(nonce),
+                )),
+                buyer: Address([2; 20]),
+            }),
+            ..Transaction::default()
+        };
+        let cancel = |nonce| Transaction {
+            data: Some(TxData::CancelOffer {
+                offer: offer(nonce),
+            }),
+            ..Transaction::default()
+        };
+
+        assert!(
+            super::check_duplicate_offer_closes(&[take(1), take(1)]).is_err()
+        );
+        assert!(
+            super::check_duplicate_offer_closes(&[take(1), cancel(1)]).is_err()
+        );
+        super::check_duplicate_offer_closes(&[take(1), take(2), cancel(3)])
+            .unwrap();
     }
 
     /// The miner fee excludes an amplify-beta deposit

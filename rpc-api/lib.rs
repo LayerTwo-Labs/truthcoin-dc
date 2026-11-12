@@ -91,9 +91,9 @@ pub mod node {
         BlockIndexDeposit, BlockIndexReturn, BlockIndexSpend, BlockIndexTx,
         Body, ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
         Header, InPoint, M6id, MainchainSyncPhase, MainchainSyncProgress,
-        MerkleRoot, OutPoint, Output, OutputContent, PointedOutput, ShareDelta,
-        SpentOutput, Transaction, TxData, TxIn, Txid, Votecoin,
-        WithdrawalBundle, WithdrawalBundleStatus,
+        MerkleRoot, OfferId, OutPoint, Output, OutputContent, PointedOutput,
+        ShareDelta, SignedOffer, SpentOutput, Transaction, TxData, TxIn, Txid,
+        Votecoin, VotecoinOffer, WithdrawalBundle, WithdrawalBundleStatus,
         authorization::Signature,
         decision::DecisionType,
         market::MarketId,
@@ -255,9 +255,9 @@ pub mod node {
                 Address, Authorization, Block, BlockHash, Body,
                 ClaimDecisionPayload, Coinbase, CoinbaseTxid,
                 DecisionClaimEntry, Header, M6id, MerkleRoot, Output,
-                OutputContent, ShareDelta, Transaction, TxData, Txid, Votecoin,
-                authorization::Signature, market::MarketId,
-                transaction::Outputs,
+                OutputContent, ShareDelta, SignedOffer, Transaction, TxData,
+                Txid, Votecoin, VotecoinOffer, authorization::Signature,
+                market::MarketId, transaction::Outputs,
             };
             use typewit::const_marker::Bool;
             use utoipa::ToSchema;
@@ -296,8 +296,8 @@ pub mod node {
                 BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, Coinbase,
                 CoinbaseTxid, DecisionClaimEntry, Header, M6id, MarketId, MerkleRoot,
                 Output, OutputContent, Outputs, Signature, Transaction,
-                ShareDelta, TransactionVerbose, TxData, Txid, Votecoin,
-                schema::BitcoinAddr,
+                ShareDelta, SignedOffer, TransactionVerbose, TxData, Txid,
+                Votecoin, VotecoinOffer, schema::BitcoinAddr,
                 schema::BitcoinBlockHash, schema::BitcoinOutPoint,
                 schema::UtreexoNodeHash, schema::UtreexoProof,
             ])]
@@ -368,6 +368,16 @@ pub mod node {
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+    pub struct OfferInfo {
+        pub offer_id: OfferId,
+        pub seller: Address,
+        pub amount: Votecoin,
+        pub price_sats: u64,
+        pub pay_to: Address,
+        pub voting_period: u32,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
     pub struct GetWithdrawalBundleResponse {
         pub info: WithdrawalBundleInfo,
         pub status: WithdrawalBundleStatus,
@@ -384,11 +394,11 @@ pub mod node {
             DecisionType, Header, InPoint, M6id, MainchainSyncPhase,
             MarketDimension, MarketDimensionKind, MarketId, MarketOutcome,
             MarketResolution, MarketStatus, MarketUtxo, MarketUtxoReason,
-            MerkleRoot, OutPoint, Output,
+            MerkleRoot, OfferId, OutPoint, Output,
             OutputContent, Outputs, ParticipationStats, PeerConnectionStatus,
             PeriodStats, ScoreChange, SharePosition, Signature, SpentOutput,
-            ShareDelta, Transaction, TxData, TxIn, Txid, Votecoin,
-            WinningOutcome, WithdrawalBundle,
+            ShareDelta, SignedOffer, Transaction, TxData, TxIn, Txid,
+            Votecoin, VotecoinOffer, WinningOutcome, WithdrawalBundle,
             WithdrawalBundleInfo, WithdrawalBundleStatus, schema::BitcoinAddr,
             schema::BitcoinBlockHash, schema::BitcoinOutPoint,
             schema::BitcoinTransaction, schema::SocketAddr,
@@ -522,6 +532,11 @@ pub mod node {
         /// List the transactions the mempool holds, in no particular order.
         #[method(name = "list_mempool")]
         async fn list_mempool(&self) -> RpcResult<Vec<MempoolTx>>;
+
+        /// List the votecoin sell offers on the board, cheapest price per
+        /// votecoin first
+        #[method(name = "list_offers")]
+        async fn list_offers(&self) -> RpcResult<Vec<OfferInfo>>;
 
         /// List peers
         #[method(name = "list_peers")]
@@ -724,9 +739,9 @@ pub mod wallet {
     use truthcoin_dc_types::{
         Address, Authorization, Authorized, Block, BlockHash, Body,
         ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
-        EncryptionPubKey, Header, M6id, MerkleRoot, OutPoint, Output,
-        OutputContent, PointedOutput, ShareDelta, Transaction, TxData, Txid,
-        VerifyingKey, Votecoin,
+        EncryptionPubKey, Header, M6id, MerkleRoot, OfferId, OutPoint, Output,
+        OutputContent, PointedOutput, ShareDelta, SignedOffer, Transaction,
+        TxData, Txid, VerifyingKey, Votecoin, VotecoinOffer,
         authorization::{Dst, Signature},
         market::MarketId,
         transaction::Outputs,
@@ -762,7 +777,8 @@ pub mod wallet {
         ClaimDecisionPayload, ClaimedDecisionInfo, Coinbase, CoinbaseTxid,
         DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, M6id, MarketId,
         MerkleRoot, OutPoint, Output, OutputContent, Outputs, Signature,
-        ShareDelta, Transaction, TxData, Txid, Votecoin, schema::BitcoinAddr,
+        ShareDelta, SignedOffer, Transaction, TxData, Txid, Votecoin,
+        VotecoinOffer, schema::BitcoinAddr,
         schema::BitcoinBlockHash, schema::BitcoinOutPoint,
         schema::UtreexoNodeHash, schema::UtreexoProof,
     ])]
@@ -952,7 +968,8 @@ pub mod wallet {
         async fn get_voter_address(&self) -> RpcResult<Address>;
 
         /// Transfer votecoin to the specified address, from `sender` or else
-        /// the one wallet address that holds votecoin.
+        /// the one wallet address that holds votecoin. The sender pays the
+        /// fee from its own coins, or from any wallet coin if it has none.
         #[method(name = "transfer_votecoin")]
         async fn transfer_votecoin(
             &self,
@@ -960,6 +977,37 @@ pub mod wallet {
             amount: Votecoin,
             fee_sats: u64,
             sender: Option<Address>,
+        ) -> RpcResult<Txid>;
+
+        /// Sign an offer to sell `amount` votecoin for `price_sats`, paid to
+        /// `pay_to` or else the seller, and post it to the offer board. The
+        /// seller is `seller` or else the one wallet address that holds
+        /// votecoin. The offer expires when the current voting period ends.
+        #[method(name = "create_offer")]
+        async fn create_offer(
+            &self,
+            amount: Votecoin,
+            price_sats: u64,
+            seller: Option<Address>,
+            pay_to: Option<Address>,
+        ) -> RpcResult<OfferId>;
+
+        /// Take an offer from the board: pay its price and receive its
+        /// votecoin at `buyer`, or else at a new wallet address
+        #[method(name = "take_offer")]
+        async fn take_offer(
+            &self,
+            offer_id: OfferId,
+            fee_sats: u64,
+            buyer: Option<Address>,
+        ) -> RpcResult<Txid>;
+
+        /// Cancel an offer of a wallet address before it expires
+        #[method(name = "cancel_offer")]
+        async fn cancel_offer(
+            &self,
+            offer_id: OfferId,
+            fee_sats: u64,
         ) -> RpcResult<Txid>;
 
         /// Claim one or more decisions.

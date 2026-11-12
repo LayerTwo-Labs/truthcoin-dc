@@ -465,6 +465,31 @@ where
         Ok(())
     }
 
+    pub fn submit_offer(
+        &self,
+        offer: &crate::types::SignedOffer,
+    ) -> Result<(), Error> {
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        let _: bool =
+            self.mempool.offers.admit(&mut rwtxn, &self.state, offer)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        self.net.push_offer(Default::default(), offer);
+        Ok(())
+    }
+
+    pub fn get_offers(&self) -> Result<Vec<crate::types::SignedOffer>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.mempool.offers.all(&rotxn)?)
+    }
+
+    pub fn get_offer(
+        &self,
+        offer_id: &crate::types::OfferId,
+    ) -> Result<Option<crate::types::SignedOffer>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.mempool.offers.get(&rotxn, offer_id)?)
+    }
+
     pub fn get_all_utxos(&self) -> Result<HashMap<OutPoint, Output>, Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         self.state
@@ -879,17 +904,13 @@ where
                 Some((_, voter, false)) => Some(voter),
                 Some((_, _, true)) | None => None,
             };
+            let reputation_move = transaction
+                .transaction
+                .data
+                .as_ref()
+                .and_then(crate::types::TxData::reputation_move);
             let transfer =
-                if let Some(crate::types::TxData::TransferReputation {
-                    sender,
-                    dest,
-                    ..
-                }) = &transaction.transaction.data
-                {
-                    Some([*sender, *dest])
-                } else {
-                    None
-                };
+                reputation_move.map(|(sender, dest, _)| [sender, dest]);
             if sealing_voter
                 .is_some_and(|voter| transfer_parties.contains(&voter))
                 || transfer.is_some_and(|parties| {
@@ -961,34 +982,31 @@ where
                     continue;
                 }
             }
-            if let Some(transfer) =
-                filled_transaction.transaction.transfer_reputation()
-            {
-                let sender_rep = match reputation.get(&transfer.sender) {
+            if let Some((sender, dest, amount)) = reputation_move {
+                let sender_rep = match reputation.get(&sender) {
                     Some(&value) => value,
                     None => self
                         .state
                         .reputation()
-                        .get_reputation(&rwtxn, &transfer.sender)?,
+                        .get_reputation(&rwtxn, &sender)?,
                 };
-                let receiver_rep = match reputation.get(&transfer.dest) {
+                let receiver_rep = match reputation.get(&dest) {
                     Some(&value) => value,
-                    None => self
-                        .state
-                        .reputation()
-                        .get_reputation(&rwtxn, &transfer.dest)?,
+                    None => {
+                        self.state.reputation().get_reputation(&rwtxn, &dest)?
+                    }
                 };
                 let Ok((sender_after, receiver_after)) =
                     crate::validation::VoteValidator::balances_after_transfer(
                         sender_rep,
                         receiver_rep,
-                        transfer.amount,
+                        amount,
                     )
                 else {
                     continue;
                 };
-                reputation.insert(transfer.sender, sender_after);
-                reputation.insert(transfer.dest, receiver_after);
+                reputation.insert(sender, sender_after);
+                reputation.insert(dest, receiver_after);
             }
             block_outputs.extend(
                 filled_transaction
@@ -1952,16 +1970,7 @@ where
 
     pub fn get_current_period(&self) -> Result<u32, Error> {
         let rotxn = self.env.read_txn()?;
-        let block_height = self.state.try_get_height(&rotxn)?;
-        let genesis_ts =
-            self.state.try_get_genesis_timestamp(&rotxn)?.unwrap_or(0);
-        let mainchain_ts =
-            self.state.try_get_mainchain_timestamp(&rotxn)?.unwrap_or(0);
-        Ok(self.state.decisions().get_current_period(
-            mainchain_ts,
-            block_height,
-            genesis_ts,
-        )?)
+        Ok(self.state.current_period(&rotxn)?)
     }
 
     pub fn get_decisions_db(&self) -> &crate::state::decisions::Dbs {

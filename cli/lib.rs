@@ -12,7 +12,7 @@ use truthcoin_dc_app_rpc_api::{
 };
 use truthcoin_dc_types::wallet::TransferDests;
 use truthcoin_dc_types::{
-    Address, EncryptionPubKey, M6id, Txid, VerifyingKey, Votecoin,
+    Address, EncryptionPubKey, M6id, OfferId, Txid, VerifyingKey, Votecoin,
     authorization::{Dst, Signature},
     net::PeerAddress,
 };
@@ -634,6 +634,41 @@ pub enum Command {
     VotecoinBalance {
         /// Address to check
         address: Address,
+    },
+    /// Offer votecoin for sale on the offer board, until the current voting
+    /// period ends
+    #[command(name = "create-offer")]
+    CreateOffer {
+        #[arg(long)]
+        amount: Votecoin,
+        #[arg(long)]
+        price_sats: u64,
+        /// Defaults to the one wallet address that holds votecoin
+        #[arg(long)]
+        seller: Option<Address>,
+        /// Defaults to the seller
+        #[arg(long)]
+        pay_to: Option<Address>,
+    },
+    /// List the votecoin offers on the board, cheapest first
+    #[command(name = "list-offers")]
+    ListOffers,
+    /// Take an offer: pay its price and receive its votecoin
+    #[command(name = "take-offer")]
+    TakeOffer {
+        offer_id: OfferId,
+        #[arg(long, default_value = "1000")]
+        fee_sats: u64,
+        /// Defaults to a new wallet address
+        #[arg(long)]
+        buyer: Option<Address>,
+    },
+    /// Cancel an offer of this wallet
+    #[command(name = "cancel-offer")]
+    CancelOffer {
+        offer_id: OfferId,
+        #[arg(long, default_value = "1000")]
+        fee_sats: u64,
     },
 }
 
@@ -1479,6 +1514,33 @@ where
         Command::VotecoinBalance { address } => {
             let balance = rpc_client.votecoin_balance(address).await?;
             format!("{balance}")
+        }
+        Command::CreateOffer {
+            amount,
+            price_sats,
+            seller,
+            pay_to,
+        } => {
+            let offer_id = rpc_client
+                .create_offer(amount, price_sats, seller, pay_to)
+                .await?;
+            format!("{offer_id}")
+        }
+        Command::ListOffers => {
+            let offers = rpc_client.list_offers().await?;
+            json_response(&offers)?
+        }
+        Command::TakeOffer {
+            offer_id,
+            fee_sats,
+            buyer,
+        } => {
+            let txid = rpc_client.take_offer(offer_id, fee_sats, buyer).await?;
+            format!("Offer taken: {txid}")
+        }
+        Command::CancelOffer { offer_id, fee_sats } => {
+            let txid = rpc_client.cancel_offer(offer_id, fee_sats).await?;
+            format!("Offer cancelled: {txid}")
         }
     })
 }

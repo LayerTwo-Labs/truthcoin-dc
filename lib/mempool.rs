@@ -12,8 +12,9 @@ use sneed::{
 use tokio_stream::{StreamMap, wrappers::WatchStream};
 
 use crate::{
+    offers::OfferBoard,
     types::{
-        Accumulator, Address, AuthorizedTransaction, OutPoint, Output,
+        Accumulator, Address, AuthorizedTransaction, OfferId, OutPoint, Output,
         Transaction, Txid, UtreexoError, VERSION, Version,
     },
     util::Watchable,
@@ -53,6 +54,8 @@ pub enum Error {
          period {voting_period} in mempool"
     )]
     BallotAlreadyInMempool { voter: Address, voting_period: u32 },
+    #[error("can't add transaction, offer {0} is already closed in mempool")]
+    OfferAlreadyClosedInMempool(OfferId),
     #[error("Missing transaction {0}")]
     MissingTransaction(Txid),
     #[error(transparent)]
@@ -84,12 +87,15 @@ pub struct MemPool {
     /// Pending ballots: voting period, voter and reveal flag to the txid
     pending_ballots:
         DatabaseUnique<SerdeBincode<BallotKey>, SerdeBincode<Txid>>,
+    pending_offer_closes:
+        DatabaseUnique<SerdeBincode<OfferId>, SerdeBincode<Txid>>,
+    pub offers: OfferBoard,
 }
 
 type BallotKey = (u32, Address, bool);
 
 impl MemPool {
-    pub const NUM_DBS: u32 = 8;
+    pub const NUM_DBS: u32 = 9 + OfferBoard::NUM_DBS;
 
     pub fn new<Tls>(env: &sneed::Env<Tls>) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
@@ -136,6 +142,11 @@ impl MemPool {
         let pending_ballots =
             DatabaseUnique::create(env, &mut rwtxn, "pending_ballots")
                 .map_err(EnvError::from)?;
+        let pending_offer_closes =
+            DatabaseUnique::create(env, &mut rwtxn, "pending_offer_closes")
+                .map_err(EnvError::from)?;
+        let offers =
+            OfferBoard::new(env, &mut rwtxn).map_err(EnvError::from)?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
             transactions,
@@ -146,6 +157,8 @@ impl MemPool {
             trade_insertion_order,
             trade_order_counter,
             pending_ballots,
+            pending_offer_closes,
+            offers,
         })
     }
 
@@ -383,6 +396,69 @@ impl MemPool {
             .map_err(Error::from)
     }
 
+    fn put_offer_close(
+        &self,
+        rwtxn: &mut RwTxn,
+        transaction: &Transaction,
+    ) -> Result<(), Error> {
+        let Some(offer_id) = transaction
+            .data
+            .as_ref()
+            .and_then(|data| data.closed_offer_id())
+        else {
+            return Ok(());
+        };
+        let txid = transaction.txid();
+        if let Some(existing_txid) =
+            self.pending_offer_closes.try_get(rwtxn, &offer_id)?
+            && existing_txid != txid
+        {
+            return Err(Error::OfferAlreadyClosedInMempool(offer_id));
+        }
+        self.pending_offer_closes.put(rwtxn, &offer_id, &txid)?;
+        Ok(())
+    }
+
+    fn delete_offer_close(
+        &self,
+        rwtxn: &mut RwTxn,
+        transaction: &Transaction,
+    ) -> Result<(), Error> {
+        let Some(offer_id) = transaction
+            .data
+            .as_ref()
+            .and_then(|data| data.closed_offer_id())
+        else {
+            return Ok(());
+        };
+        if self.pending_offer_closes.try_get(rwtxn, &offer_id)?
+            == Some(transaction.txid())
+        {
+            self.pending_offer_closes.delete(rwtxn, &offer_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn evict_offer_close_conflicts(
+        &self,
+        rwtxn: &mut RwTxn,
+        confirmed_tx: &Transaction,
+    ) -> Result<(), Error> {
+        let Some(offer_id) = confirmed_tx
+            .data
+            .as_ref()
+            .and_then(|data| data.closed_offer_id())
+        else {
+            return Ok(());
+        };
+        match self.pending_offer_closes.try_get(rwtxn, &offer_id)? {
+            Some(txid) if txid != confirmed_tx.txid() => {
+                self.delete(rwtxn, txid)
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+
     /// Evict the mempool ballot that `confirmed_tx` takes the place of
     pub fn evict_ballot_conflicts(
         &self,
@@ -438,6 +514,7 @@ impl MemPool {
             self.put_decision_claims(txn, txid, &claimed_decisions)?;
         }
         let () = self.put_ballot(txn, &transaction.transaction)?;
+        let () = self.put_offer_close(txn, &transaction.transaction)?;
         for (outpoint, _) in &transaction.transaction.inputs {
             if self
                 .spent_utxos
@@ -481,6 +558,7 @@ impl MemPool {
                 let () = self.unindex_tx_addresses(rwtxn, &tx)?;
                 let () = self.delete_decision_claims(rwtxn, &tx)?;
                 let () = self.delete_ballot(rwtxn, &tx.transaction)?;
+                let () = self.delete_offer_close(rwtxn, &tx.transaction)?;
                 if Self::is_trade_tx(&tx) {
                     self.delete_trade_order(rwtxn, &txid)?;
                 }
@@ -585,6 +663,7 @@ impl MemPool {
         let () = self.unindex_tx_addresses(rwtxn, &tx)?;
         let () = self.delete_decision_claims(rwtxn, &tx)?;
         let () = self.delete_ballot(rwtxn, &tx.transaction)?;
+        let () = self.delete_offer_close(rwtxn, &tx.transaction)?;
         if Self::is_trade_tx(&tx) {
             self.delete_trade_order(rwtxn, &txid)?;
         }
@@ -976,6 +1055,7 @@ impl Watchable<()> for MemPool {
             self.spent_utxos.watch().clone(),
             self.pending_decision_claims.watch().clone(),
             self.pending_ballots.watch().clone(),
+            self.pending_offer_closes.watch().clone(),
         ];
         let streams = StreamMap::from_iter(
             watchables.into_iter().map(WatchStream::new).enumerate(),
@@ -1140,6 +1220,80 @@ mod tests {
             .delete_confirmed(&mut rwtxn, second.transaction.txid())
             .unwrap();
         assert_eq!(mempool.pending_ballot(&rwtxn, &key).unwrap(), None);
+        rwtxn.commit().unwrap();
+    }
+
+    fn offer_close_tx(
+        input_seed: u8,
+        data: TransactionData,
+    ) -> AuthorizedTransaction {
+        Authorized {
+            transaction: Transaction {
+                inputs: vec![(input_outpoint(input_seed), [0; 32])].into(),
+                proof: Default::default(),
+                outputs: vec![].into(),
+                data: Some(data),
+            },
+            authorizations: vec![],
+            actor_proof: None,
+        }
+    }
+
+    #[test]
+    fn one_pending_close_per_offer() {
+        use crate::types::{VotecoinOffer, authorization::SigningKey};
+
+        let (env, _dir) = make_env();
+        let mempool = MemPool::new(&env).unwrap();
+        let offer = VotecoinOffer {
+            seller: Address([1; 20]),
+            amount: crate::types::Votecoin(100_000),
+            price: bitcoin::Amount::from_sat(1000),
+            pay_to: Address([1; 20]),
+            voting_period: 1,
+            nonce: 0,
+        };
+        let signed = crate::validation::offer::sign_test_offer(
+            &SigningKey::new(&mut rand::rng()),
+            offer,
+        );
+        let take = |input_seed| {
+            offer_close_tx(
+                input_seed,
+                TransactionData::TakeOffer {
+                    offer: Box::new(signed.clone()),
+                    buyer: Address([2; 20]),
+                },
+            )
+        };
+        let first = take(1);
+        let mined = take(4);
+
+        let mut rwtxn = env.write_txn().unwrap();
+        mempool.put(&mut rwtxn, &first).unwrap();
+        assert!(matches!(
+            mempool.put(&mut rwtxn, &take(2)),
+            Err(Error::OfferAlreadyClosedInMempool(_))
+        ));
+        assert!(matches!(
+            mempool.put(
+                &mut rwtxn,
+                &offer_close_tx(3, TransactionData::CancelOffer { offer }),
+            ),
+            Err(Error::OfferAlreadyClosedInMempool(_))
+        ));
+
+        mempool
+            .evict_offer_close_conflicts(&mut rwtxn, &mined.transaction)
+            .unwrap();
+        assert!(
+            mempool
+                .transactions
+                .try_get(&rwtxn, &first.transaction.txid())
+                .unwrap()
+                .is_none()
+        );
+        mempool.put(&mut rwtxn, &take(2)).unwrap();
         rwtxn.commit().unwrap();
     }
 

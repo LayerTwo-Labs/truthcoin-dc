@@ -27,7 +27,8 @@ use crate::{
         request_queue,
     },
     types::{
-        AuthorizedTransaction, BlockHash, BmmResult, Header, Tip, VERSION,
+        AuthorizedTransaction, BlockHash, BmmResult, Header, SignedOffer, Tip,
+        VERSION,
     },
     util::{ErrorChain, join_set},
 };
@@ -773,6 +774,57 @@ impl ConnectionTask {
         }
     }
 
+    async fn handle_push_offer(
+        ctxt: &ConnectionContext,
+        info_tx: &mpsc::UnboundedSender<Info>,
+        response_tx: SendStream,
+        offer: Box<SignedOffer>,
+    ) -> Result<(), Error> {
+        let offer_id = offer.id();
+        let validate_result = {
+            let rotxn = ctxt.env.read_txn().map_err(EnvError::from)?;
+            crate::validation::OfferValidator::validate_open_offer(
+                &ctxt.state,
+                &rotxn,
+                &offer,
+            )
+        };
+        let response = match validate_result {
+            Ok(()) => ResponseMessage::OfferAccepted(offer_id),
+            Err(_) => ResponseMessage::OfferRejected(offer_id),
+        };
+        Connection::send_response(ctxt.magic_bytes, response_tx, response)
+            .await?;
+        if !offer.is_signed_by_seller() {
+            return Err(Error::from(
+                crate::state::Error::WrongPubKeyForAddress,
+            ));
+        }
+        if validate_result.is_ok() {
+            info_tx
+                .unbounded_send(Info::NewOffer(offer))
+                .map_err(|_| Error::SendInfo)?;
+        }
+        Ok(())
+    }
+
+    async fn handle_get_offers(
+        ctxt: &ConnectionContext,
+        response_tx: SendStream,
+    ) -> Result<(), Error> {
+        let offers = {
+            let rotxn = ctxt.env.read_txn().map_err(EnvError::from)?;
+            ctxt.mempool.offers.all(&rotxn)?
+        };
+        Connection::send_response(
+            ctxt.magic_bytes,
+            response_tx,
+            ResponseMessage::Offers(offers),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Record a peer state, evicting the least recently received states if the
     /// cache is full. Returns the ID of the recorded peer state.
     fn insert_peer_state(
@@ -804,6 +856,11 @@ impl ConnectionTask {
                 let new_peer_state = heartbeat.0;
                 let new_peer_state_id =
                     Self::insert_peer_state(peer_states, new_peer_state);
+                if peer_state.is_none() {
+                    let _: bool = mailbox_sender
+                        .request_tx
+                        .send_request(message::GetOffersRequest.into())?;
+                }
                 if *peer_state != Some(new_peer_state_id) {
                     let ctxt = Arc::clone(ctxt);
                     let info_tx = info_tx.clone();
@@ -855,6 +912,14 @@ impl ConnectionTask {
                 Self::handle_push_tx(ctxt, info_tx, response_tx, transaction)
                     .await
             }
+            RequestMessage::Request(Request::PushOffer(
+                message::PushOfferRequest { offer },
+            )) => {
+                Self::handle_push_offer(ctxt, info_tx, response_tx, offer).await
+            }
+            RequestMessage::Request(Request::GetOffers(
+                message::GetOffersRequest,
+            )) => Self::handle_get_offers(ctxt, response_tx).await,
         }
     }
 

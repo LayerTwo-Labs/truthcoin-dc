@@ -24,7 +24,9 @@ pub(crate) fn ballot_key(
             | TxData::CreateMarket { .. }
             | TxData::Trade { .. }
             | TxData::TransferReputation { .. }
-            | TxData::AmplifyBeta { .. },
+            | TxData::AmplifyBeta { .. }
+            | TxData::TakeOffer { .. }
+            | TxData::CancelOffer { .. },
         )
         | None => None,
     }
@@ -53,11 +55,11 @@ pub(crate) fn check_ballot_conflicts(
                 sealing_voters.insert(voter);
             }
         }
-        if let Some(TxData::TransferReputation { sender, dest, .. }) =
-            &transaction.data
+        if let Some((sender, dest, _)) =
+            transaction.data.as_ref().and_then(TxData::reputation_move)
         {
-            transfer_parties.insert(*sender);
-            transfer_parties.insert(*dest);
+            transfer_parties.insert(sender);
+            transfer_parties.insert(dest);
         }
     }
     match sealing_voters.intersection(&transfer_parties).next() {
@@ -265,18 +267,7 @@ impl VoteValidator {
 
         let sender_address = transfer_data.sender;
 
-        let has_sender_input = filled_tx
-            .spent_utxos
-            .iter()
-            .any(|utxo| utxo.address == sender_address);
-        if !has_sender_input {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Reputation transfer from {sender_address} must spend \
-                     a Bitcoin UTXO owned by the sender (replay protection)"
-                ),
-            });
-        }
+        Self::validate_actor_identity(filled_tx, sender_address)?;
 
         if transfer_data.amount.is_zero() {
             return Err(Error::InvalidTransaction {

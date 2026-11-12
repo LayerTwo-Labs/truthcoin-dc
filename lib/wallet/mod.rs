@@ -29,10 +29,11 @@ use crate::{
         Accumulator, Address, AmountOverflowError, AmountUnderflowError,
         AuthorizedTransaction, CoinbaseTxid, EncryptionPubKey, GetValue, Hash,
         InPoint, OutPoint, OutPointKey, Output, OutputContent, PointedOutput,
-        RevealBallot, SpentOutput, THIS_SIDECHAIN, Transaction, TxData,
-        UtreexoError, UtreexoNodeHash, VERSION, VerifyingKey, Version,
+        RevealBallot, SignedOffer, SpentOutput, THIS_SIDECHAIN, Transaction,
+        TxData, UtreexoError, UtreexoNodeHash, VERSION, VerifyingKey, Version,
+        VotecoinOffer,
         authorization::{
-            self, Authorization, Signature, SigningKey, get_address,
+            self, Authorization, Dst, Signature, SigningKey, get_address,
             rand_core::CryptoRng,
         },
         hash,
@@ -1145,6 +1146,13 @@ impl Wallet {
                     None
                 }
             }
+            Some(TransactionData::CancelOffer { offer }) => {
+                if !input_addresses.contains(&offer.seller) {
+                    Some(offer.seller)
+                } else {
+                    None
+                }
+            }
             Some(TransactionData::SubmitBallot { voter, .. })
             | Some(TransactionData::RevealBallot { voter, .. }) => {
                 if !input_addresses.contains(voter) {
@@ -1897,8 +1905,15 @@ impl Wallet {
             amount,
         };
 
-        let (total_bitcoin, bitcoin_utxos) =
-            self.select_bitcoins_from_address(fee, voter_addr, options)?;
+        let (total_bitcoin, bitcoin_utxos) = match self
+            .select_bitcoins_from_address(fee, voter_addr, options)
+        {
+            Ok(selected) => selected,
+            Err(Error::NotEnoughFunds) => {
+                return self.fund_actor_tx(tx_data, voter_addr, fee, options);
+            }
+            Err(err) => return Err(err),
+        };
         let change_bitcoin = total_bitcoin - fee;
 
         let inputs = spend_inputs(bitcoin_utxos);
@@ -1914,6 +1929,91 @@ impl Wallet {
         tx.data = Some(tx_data);
 
         Ok(tx)
+    }
+
+    fn fund_actor_tx(
+        &self,
+        data: TxData,
+        change_address: Address,
+        fee: bitcoin::Amount,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let selected = self.select_coins(fee, options)?;
+        let change = selected.total - fee;
+        let outputs = if change > bitcoin::Amount::ZERO {
+            vec![Output {
+                address: change_address,
+                content: OutputContent::Value(change),
+            }]
+        } else {
+            Vec::new()
+        };
+        let mut tx = new_tx(spend_inputs(selected.coins), outputs);
+        tx.data = Some(data);
+        Ok(tx)
+    }
+
+    pub fn sign_offer<R>(
+        &self,
+        rng: R,
+        offer: VotecoinOffer,
+    ) -> Result<SignedOffer, Error>
+    where
+        R: CryptoRng,
+    {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let signing_key =
+            self.get_signing_key_for_addr(&rotxn, &offer.seller)?;
+        let msg = offer.signing_message()?;
+        let signature =
+            authorization::sign(rng, &signing_key, Dst::VotecoinOffer, &msg);
+        Ok(SignedOffer {
+            offer,
+            authorization: Authorization {
+                verifying_key: (&signing_key).into(),
+                signature,
+            },
+        })
+    }
+
+    pub fn take_offer(
+        &self,
+        offer: SignedOffer,
+        buyer: Address,
+        fee: bitcoin::Amount,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let price = offer.offer.price;
+        let pay_to = offer.offer.pay_to;
+        let cost = price.checked_add(fee).ok_or(AmountOverflowError)?;
+        let selected = self.select_coins(cost, options)?;
+        let change = selected.total - cost;
+        let mut outputs = vec![Output {
+            address: pay_to,
+            content: OutputContent::Value(price),
+        }];
+        if change > bitcoin::Amount::ZERO {
+            outputs.push(Output {
+                address: self.get_new_address()?,
+                content: OutputContent::Value(change),
+            });
+        }
+        let mut tx = new_tx(spend_inputs(selected.coins), outputs);
+        tx.data = Some(TxData::TakeOffer {
+            offer: Box::new(offer),
+            buyer,
+        });
+        Ok(tx)
+    }
+
+    pub fn cancel_offer(
+        &self,
+        offer: VotecoinOffer,
+        fee: bitcoin::Amount,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let seller = offer.seller;
+        self.fund_actor_tx(TxData::CancelOffer { offer }, seller, fee, options)
     }
 
     /// Pick coins of `address` worth at least `value`. A confirmed coin comes

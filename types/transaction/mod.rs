@@ -12,10 +12,11 @@ use crate::{
     decision::DecisionType,
     error,
     hashes::{
-        self, Hash, InputsMerkleRoot, M6id, OutputsMerkleRoot, TxMerkleRoot,
-        Txid, hash_with_scratch_buffer,
+        self, Hash, InputsMerkleRoot, M6id, OfferId, OutputsMerkleRoot,
+        TxMerkleRoot, Txid, hash_with_scratch_buffer,
     },
     market::{DimensionSpec, MarketId},
+    offer::{SignedOffer, VotecoinOffer},
     schema,
     votecoin::Votecoin,
 };
@@ -180,6 +181,13 @@ pub enum TransactionData {
         amount: u64,
         market_author: Address,
     },
+    TakeOffer {
+        offer: Box<SignedOffer>,
+        buyer: Address,
+    },
+    CancelOffer {
+        offer: VotecoinOffer,
+    },
 }
 
 pub type TxData = TransactionData;
@@ -211,6 +219,48 @@ impl TxData {
 
     pub fn is_amplify_beta(&self) -> bool {
         matches!(self, Self::AmplifyBeta { .. })
+    }
+
+    pub fn is_take_offer(&self) -> bool {
+        matches!(self, Self::TakeOffer { .. })
+    }
+
+    pub fn is_cancel_offer(&self) -> bool {
+        matches!(self, Self::CancelOffer { .. })
+    }
+
+    pub fn reputation_move(&self) -> Option<(Address, Address, Votecoin)> {
+        match self {
+            Self::TransferReputation {
+                sender,
+                dest,
+                amount,
+            } => Some((*sender, *dest, *amount)),
+            Self::TakeOffer { offer, buyer } => {
+                Some((offer.offer.seller, *buyer, offer.offer.amount))
+            }
+            Self::ClaimDecision(_)
+            | Self::CreateMarket { .. }
+            | Self::Trade { .. }
+            | Self::SubmitBallot { .. }
+            | Self::RevealBallot { .. }
+            | Self::AmplifyBeta { .. }
+            | Self::CancelOffer { .. } => None,
+        }
+    }
+
+    pub fn closed_offer_id(&self) -> Option<OfferId> {
+        match self {
+            Self::TakeOffer { offer, .. } => Some(offer.id()),
+            Self::CancelOffer { offer } => Some(offer.id()),
+            Self::ClaimDecision(_)
+            | Self::CreateMarket { .. }
+            | Self::Trade { .. }
+            | Self::SubmitBallot { .. }
+            | Self::RevealBallot { .. }
+            | Self::TransferReputation { .. }
+            | Self::AmplifyBeta { .. } => None,
+        }
     }
 }
 
@@ -469,6 +519,30 @@ impl FilledTransaction {
 
     pub fn is_amplify_beta(&self) -> bool {
         self.data().as_ref().is_some_and(TxData::is_amplify_beta)
+    }
+
+    pub fn is_take_offer(&self) -> bool {
+        self.data().as_ref().is_some_and(TxData::is_take_offer)
+    }
+
+    pub fn is_cancel_offer(&self) -> bool {
+        self.data().as_ref().is_some_and(TxData::is_cancel_offer)
+    }
+
+    pub fn take_offer(&self) -> Option<(&SignedOffer, Address)> {
+        match &self.transaction.data {
+            Some(TransactionData::TakeOffer { offer, buyer }) => {
+                Some((offer.as_ref(), *buyer))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn cancel_offer(&self) -> Option<&VotecoinOffer> {
+        match &self.transaction.data {
+            Some(TransactionData::CancelOffer { offer }) => Some(offer),
+            _ => None,
+        }
     }
 
     pub fn claim_decision(&self) -> Option<&ClaimDecisionPayload> {

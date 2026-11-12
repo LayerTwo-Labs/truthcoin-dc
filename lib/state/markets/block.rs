@@ -13,6 +13,7 @@ use crate::{
     types::{
         AccumulatorDiff, Address, Body, FilledTransaction, GetValue as _,
         MerkleRoot, OutPoint, OutPointKey, OutputContent, Transaction, TxData,
+        Votecoin,
         state::{MarketUtxo, MarketUtxoChanges, MarketUtxoReason},
     },
 };
@@ -724,6 +725,20 @@ pub(in crate::state) fn connect_txs(
             Some(TxData::AmplifyBeta { .. }) => {
                 apply_amplify_beta(filled_tx, &mut state_update)?;
             }
+            Some(TxData::TakeOffer { offer, buyer }) => {
+                move_reputation(
+                    state,
+                    rwtxn,
+                    offer.offer.seller,
+                    *buyer,
+                    offer.offer.amount,
+                    height,
+                )?;
+                state.closed_offers.put(rwtxn, &offer.id(), &height)?;
+            }
+            Some(TxData::CancelOffer { offer }) => {
+                state.closed_offers.put(rwtxn, &offer.id(), &height)?;
+            }
             None => {}
         }
     }
@@ -1014,6 +1029,12 @@ pub(in crate::state) fn disconnect_tx(
         TxData::TransferReputation { .. } => {}
         TxData::AmplifyBeta { .. } => {
             let () = revert_amplify_beta(state, rwtxn, &filled_tx)?;
+        }
+        TxData::TakeOffer { offer, .. } => {
+            state.closed_offers.delete(rwtxn, &offer.id())?;
+        }
+        TxData::CancelOffer { offer } => {
+            state.closed_offers.delete(rwtxn, &offer.id())?;
         }
     }
     Ok(())
@@ -2160,24 +2181,38 @@ fn apply_transfer_reputation(
             reason: "Not a reputation transfer transaction".to_string(),
         }
     })?;
+    move_reputation(
+        state,
+        rwtxn,
+        transfer.sender,
+        transfer.dest,
+        transfer.amount,
+        height,
+    )
+}
 
-    let sender_address = transfer.sender;
-
+fn move_reputation(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    sender_address: Address,
+    dest: Address,
+    amount: Votecoin,
+    height: u32,
+) -> Result<(), Error> {
     let sender_rep =
         state.reputation().get_reputation(rwtxn, &sender_address)?;
-    let receiver_rep =
-        state.reputation().get_reputation(rwtxn, &transfer.dest)?;
+    let receiver_rep = state.reputation().get_reputation(rwtxn, &dest)?;
     let (sender_after, receiver_after) =
         crate::validation::VoteValidator::balances_after_transfer(
             sender_rep,
             receiver_rep,
-            transfer.amount,
+            amount,
         )?;
 
     let undo_entry = crate::state::undo::ReputationTransferUndoEntry {
         sender: sender_address,
         sender_pre_reputation: sender_rep,
-        receiver: transfer.dest,
+        receiver: dest,
         receiver_pre_reputation: receiver_rep,
     };
 
@@ -2197,7 +2232,7 @@ fn apply_transfer_reputation(
         .set_reputation(rwtxn, &sender_address, sender_after)?;
     state
         .reputation()
-        .set_reputation(rwtxn, &transfer.dest, receiver_after)?;
+        .set_reputation(rwtxn, &dest, receiver_after)?;
 
     Ok(())
 }

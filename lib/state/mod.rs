@@ -19,8 +19,8 @@ use crate::{
         Accumulator, AccumulatorDiff, Address, AmountOverflowError,
         AmountUnderflowError, Authorized, AuthorizedTransaction, BlockHash,
         Body, Coinbase, CoinbaseTxid, FilledTransaction, GetAddress, GetValue,
-        Header, InPoint, M6id, MerkleRoot, OutPoint, OutPointKey, Output,
-        PointedOutput, PointedOutputRef, SpentOutput, Transaction,
+        Header, InPoint, M6id, MerkleRoot, OfferId, OutPoint, OutPointKey,
+        Output, PointedOutput, PointedOutputRef, SpentOutput, Transaction,
         UtreexoNodeHash, UtreexoProof, VERSION, Version, WithdrawalBundle,
         WithdrawalBundleStatus,
         authorization::{self, BatchVerificationContext},
@@ -152,10 +152,11 @@ pub struct State {
     /// height that applied them
     market_utxos:
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<MarketUtxoChanges>>,
+    closed_offers: DatabaseUnique<SerdeBincode<OfferId>, SerdeBincode<u32>>,
 }
 
 impl State {
-    pub const NUM_DBS: u32 = 25
+    pub const NUM_DBS: u32 = 26
         + reputation::ReputationDbs::NUM_DBS
         + decisions::Dbs::NUM_DBS
         + MarketsDatabase::NUM_DBS
@@ -282,6 +283,8 @@ impl State {
             DatabaseUnique::create(env, &mut rwtxn, "skipped_tx_indices_undo")?;
         let market_utxos =
             DatabaseUnique::create(env, &mut rwtxn, "market_utxos")?;
+        let closed_offers =
+            DatabaseUnique::create(env, &mut rwtxn, "closed_offers")?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
             genesis_reputation_to_miner,
@@ -314,6 +317,7 @@ impl State {
             reputation_transfer_undo,
             skipped_tx_indices_undo,
             market_utxos,
+            closed_offers,
         })
     }
 
@@ -347,6 +351,26 @@ impl State {
     ) -> Result<Option<u64>, Error> {
         let timestamp = self.genesis_timestamp.try_get(rotxn, &())?;
         Ok(timestamp)
+    }
+
+    pub fn current_period(&self, rotxn: &RoTxn) -> Result<u32, Error> {
+        let block_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        let mainchain_ts =
+            self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
+        self.decisions().get_current_period(
+            mainchain_ts,
+            block_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn is_offer_closed(
+        &self,
+        rotxn: &RoTxn,
+        offer_id: &OfferId,
+    ) -> Result<bool, Error> {
+        Ok(self.closed_offers.try_get(rotxn, offer_id)?.is_some())
     }
 
     #[cfg(test)]

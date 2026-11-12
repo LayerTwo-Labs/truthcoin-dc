@@ -164,6 +164,7 @@ fn connect_tip_(
         let _evicted: Vec<_> =
             mempool.evict_decision_claim_conflicts(rwtxn, transaction)?;
         let () = mempool.evict_ballot_conflicts(rwtxn, transaction)?;
+        let () = mempool.evict_offer_close_conflicts(rwtxn, transaction)?;
         let txid = transaction.txid();
         for (outpoint, _) in &transaction.inputs {
             match mempool.spender(rwtxn, outpoint)? {
@@ -179,6 +180,7 @@ fn connect_tip_(
     }
     let () = evict_stale_ballots(rwtxn, mempool, state)?;
     let () = mempool.regenerate_proofs(rwtxn, &accumulator)?;
+    let () = mempool.offers.prune(rwtxn, state)?;
     Ok(())
 }
 
@@ -359,11 +361,46 @@ pub(in crate::node) fn disconnect_tip_(
                     .evict_ballot_conflicts(rwtxn, &transaction.transaction)?;
                 mempool.put_disconnected(rwtxn, transaction)?;
             }
+            Err(mempool::Error::OfferAlreadyClosedInMempool(_)) => {
+                let () = mempool.evict_offer_close_conflicts(
+                    rwtxn,
+                    &transaction.transaction,
+                )?;
+                mempool.put_disconnected(rwtxn, transaction)?;
+            }
             Err(err) => return Err(err.into()),
         }
     }
     let accumulator = state.get_accumulator(rwtxn)?;
     mempool.regenerate_proofs(rwtxn, &accumulator)?;
+    let () = mempool.offers.prune(rwtxn, state)?;
+    Ok(())
+}
+
+fn admit_peer_offers(
+    ctxt: &NetTaskContext,
+    addr: SocketAddr,
+    offers: Vec<crate::types::SignedOffer>,
+) -> Result<(), Error> {
+    let mut rwtxn = ctxt.env.write_txn().map_err(EnvError::from)?;
+    let mut admitted = Vec::new();
+    for offer in offers {
+        match ctxt.mempool.offers.admit(&mut rwtxn, &ctxt.state, &offer) {
+            Ok(true) => admitted.push(offer),
+            Ok(false) => {}
+            Err(
+                err @ (crate::offers::Error::Invalid(_)
+                | crate::offers::Error::SellerLimit { .. }),
+            ) => {
+                tracing::debug!(%addr, "this node refuses a peer's offer: {err}");
+            }
+            Err(err @ crate::offers::Error::Db(_)) => return Err(err.into()),
+        }
+    }
+    rwtxn.commit().map_err(RwTxnError::from)?;
+    for offer in &admitted {
+        let () = ctxt.net.push_offer(HashSet::from_iter([addr]), offer);
+    }
     Ok(())
 }
 
@@ -384,6 +421,7 @@ fn is_fatal_peer_tx_error(err: &Error) -> bool {
             mempool::Error::DecisionAlreadyClaimedInMempool(_)
             | mempool::Error::NonstandardCapInMempool { .. }
             | mempool::Error::BallotAlreadyInMempool { .. }
+            | mempool::Error::OfferAlreadyClosedInMempool(_)
             | mempool::Error::MissingTransaction(_)
             | mempool::Error::Utreexo(_)
             | mempool::Error::UtxoDoubleSpent
@@ -1052,9 +1090,19 @@ impl NetTask {
                 PeerResponse::TransactionRejected(_),
             ) => Ok(()),
             (
+                PeerRequest::PushOffer(_),
+                PeerResponse::OfferAccepted(_) | PeerResponse::OfferRejected(_),
+            ) => Ok(()),
+            (
+                PeerRequest::GetOffers(peer_message::GetOffersRequest),
+                PeerResponse::Offers(offers),
+            ) => admit_peer_offers(ctxt, addr, offers),
+            (
                 req @ (PeerRequest::GetBlock { .. }
                 | PeerRequest::GetHeaders { .. }
-                | PeerRequest::PushTransaction { .. }),
+                | PeerRequest::PushTransaction { .. }
+                | PeerRequest::PushOffer { .. }
+                | PeerRequest::GetOffers { .. }),
                 resp,
             ) => {
                 // Invalid response
@@ -1718,6 +1766,9 @@ impl NetTask {
                                 }
                                 Err(err) => return Err(err),
                             }
+                        }
+                        PeerConnectionInfo::NewOffer(offer) => {
+                            admit_peer_offers(&self.ctxt, addr, vec![*offer])?;
                         }
                         PeerConnectionInfo::Response(boxed) => {
                             let (resp, req) = *boxed;

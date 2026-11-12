@@ -1596,6 +1596,111 @@ async fn roundtrip_task_inner(
         }
     }
 
+    const OFFER_AMOUNT: Votecoin = Votecoin(10_000);
+    const OFFER_PRICE_SATS: u64 = 100_000;
+    const OFFER_FEE_SATS: u64 = 1000;
+    for (seller, seller_addr, buyer, buyer_addr) in [
+        (
+            &truthcoin_nodes.voter_0,
+            voter_addr_0,
+            &truthcoin_nodes.voter_1,
+            voter_addr_1,
+        ),
+        (
+            &truthcoin_nodes.voter_1,
+            voter_addr_1,
+            &truthcoin_nodes.voter_0,
+            voter_addr_0,
+        ),
+    ] {
+        let seller_votecoin_before =
+            seller.rpc_client.votecoin_balance(seller_addr).await?;
+        let buyer_votecoin_before =
+            buyer.rpc_client.votecoin_balance(buyer_addr).await?;
+        let offer_id = seller
+            .rpc_client
+            .create_offer(
+                OFFER_AMOUNT,
+                OFFER_PRICE_SATS,
+                Some(seller_addr),
+                None,
+            )
+            .await?;
+        let mut on_buyer_board = false;
+        for _ in 0..20 {
+            if buyer
+                .rpc_client
+                .list_offers()
+                .await?
+                .iter()
+                .any(|offer| offer.offer_id == offer_id)
+            {
+                on_buyer_board = true;
+                break;
+            }
+            sleep(std::time::Duration::from_millis(500)).await;
+        }
+        anyhow::ensure!(
+            on_buyer_board,
+            "offer {offer_id} did not reach the buyer"
+        );
+        let take_txid = buyer
+            .rpc_client
+            .take_offer(offer_id, OFFER_FEE_SATS, Some(buyer_addr))
+            .await?;
+        sleep(std::time::Duration::from_secs(1)).await;
+        truthcoin_nodes
+            .issuer
+            .bmm_single(&mut enforcer_post_setup)
+            .await?;
+        truthcoin_nodes.sync_to_issuer_tip(seller).await?;
+        truthcoin_nodes.sync_to_issuer_tip(buyer).await?;
+        seller.rpc_client.refresh_wallet().await?;
+
+        anyhow::ensure!(
+            seller.rpc_client.votecoin_balance(seller_addr).await?
+                == Votecoin(seller_votecoin_before.0 - OFFER_AMOUNT.0)
+        );
+        anyhow::ensure!(
+            buyer.rpc_client.votecoin_balance(buyer_addr).await?
+                == Votecoin(buyer_votecoin_before.0 + OFFER_AMOUNT.0)
+        );
+        anyhow::ensure!(
+            seller
+                .rpc_client
+                .get_wallet_utxos()
+                .await?
+                .iter()
+                .any(|utxo| {
+                    matches!(
+                        utxo.outpoint,
+                        truthcoin_dc::types::OutPoint::Regular { txid, .. }
+                            if txid == take_txid
+                    ) && utxo.output.address == seller_addr
+                        && utxo.output.get_value()
+                            == bitcoin::Amount::from_sat(OFFER_PRICE_SATS)
+                }),
+            "the seller did not receive the price of offer {offer_id}"
+        );
+        for node in [seller, buyer] {
+            anyhow::ensure!(
+                node.rpc_client
+                    .list_offers()
+                    .await?
+                    .iter()
+                    .all(|offer| offer.offer_id != offer_id)
+            );
+        }
+        assert!(
+            buyer
+                .rpc_client
+                .take_offer(offer_id, OFFER_FEE_SATS, Some(buyer_addr))
+                .await
+                .is_err()
+        );
+    }
+    tracing::info!("✓ Votecoin offers taken between voters");
+
     let current_height =
         truthcoin_nodes.issuer.rpc_client.getblockcount().await?;
 

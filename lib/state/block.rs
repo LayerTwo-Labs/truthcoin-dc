@@ -157,6 +157,8 @@ pub fn prevalidate(
     }
     let () =
         crate::validation::check_duplicate_decision_claims(&body.transactions)?;
+    let () =
+        crate::validation::check_duplicate_offer_closes(&body.transactions)?;
     {
         use rayon::prelude::ParallelSliceMut;
         all_input_keys.par_sort_unstable();
@@ -527,6 +529,8 @@ pub fn validate(
     }
     let () =
         crate::validation::check_duplicate_decision_claims(&body.transactions)?;
+    let () =
+        crate::validation::check_duplicate_offer_closes(&body.transactions)?;
     if coinbase_value > total_fees {
         return Err(Error::NotEnoughFees);
     }

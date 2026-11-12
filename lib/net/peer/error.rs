@@ -594,6 +594,8 @@ pub enum Error {
     SendBlockingTask,
     #[error("mempool error")]
     MemPool(#[from] crate::mempool::Error),
+    #[error("offer board error")]
+    Offers(#[from] crate::offers::Error),
     #[error(transparent)]
     SendHeartbeat(#[from] request_queue::SendHeartbeat),
     #[error("Failed to push info message")]
@@ -613,6 +615,7 @@ impl Recoverable for Error {
             | Self::DbEnv(_)
             | Self::MemPool(_)
             | Self::MissingPeerState(_)
+            | Self::Offers(_)
             | Self::SendBlockingTask
             | Self::SendInfo
             | Self::State(_) => true,
@@ -667,6 +670,7 @@ impl Error {
             | Self::DbEnv(_)
             | Self::MemPool(_)
             | Self::MissingPeerState(_)
+            | Self::Offers(_)
             | Self::PeerBan(_)
             | Self::SendBlockingTask
             | Self::SendHeartbeat(_)

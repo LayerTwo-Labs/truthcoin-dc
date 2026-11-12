@@ -109,6 +109,7 @@ impl Serialize for Signature {
 #[serde(rename_all = "lowercase")]
 pub enum Dst {
     Transaction = 0,
+    VotecoinOffer = 1,
     /// Arbitrary, non-protocol messages
     Arbitrary = u8::MAX,
 }

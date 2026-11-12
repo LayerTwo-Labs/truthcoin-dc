@@ -21,7 +21,7 @@ use crate::{
     mempool::MemPool,
     state::State,
     types::{
-        AuthorizedTransaction, Hash, Tip, Version, hash,
+        AuthorizedTransaction, Hash, SignedOffer, Tip, Version, hash,
         net::{PeerConnectionStatus, ResolvedPeerAddress},
     },
     util::ErrorChain,
@@ -133,6 +133,7 @@ pub enum Info {
     /// New tip ready (body and header exist in archive, BMM verified)
     NewTipReady(Tip),
     NewTransaction(AuthorizedTransaction),
+    NewOffer(Box<SignedOffer>),
     Response(Box<(ResponseMessage, Request)>),
 }
 
