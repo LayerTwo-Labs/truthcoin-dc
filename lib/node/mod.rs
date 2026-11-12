@@ -971,9 +971,6 @@ where
                         .reputation()
                         .get_reputation(&rwtxn, &transfer.sender)?,
                 };
-                if sender_rep < transfer.amount {
-                    continue;
-                }
                 let receiver_rep = match reputation.get(&transfer.dest) {
                     Some(&value) => value,
                     None => self
@@ -981,10 +978,17 @@ where
                         .reputation()
                         .get_reputation(&rwtxn, &transfer.dest)?,
                 };
-                reputation
-                    .insert(transfer.sender, sender_rep - transfer.amount);
-                reputation
-                    .insert(transfer.dest, receiver_rep + transfer.amount);
+                let Ok((sender_after, receiver_after)) =
+                    crate::validation::VoteValidator::balances_after_transfer(
+                        sender_rep,
+                        receiver_rep,
+                        transfer.amount,
+                    )
+                else {
+                    continue;
+                };
+                reputation.insert(transfer.sender, sender_after);
+                reputation.insert(transfer.dest, receiver_after);
             }
             block_outputs.extend(
                 filled_transaction

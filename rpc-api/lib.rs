@@ -92,8 +92,8 @@ pub mod node {
         Body, ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
         Header, InPoint, M6id, MainchainSyncPhase, MainchainSyncProgress,
         MerkleRoot, OutPoint, Output, OutputContent, PointedOutput, ShareDelta,
-        SpentOutput, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
-        WithdrawalBundleStatus,
+        SpentOutput, Transaction, TxData, TxIn, Txid, Votecoin,
+        WithdrawalBundle, WithdrawalBundleStatus,
         authorization::Signature,
         decision::DecisionType,
         market::MarketId,
@@ -255,7 +255,7 @@ pub mod node {
                 Address, Authorization, Block, BlockHash, Body,
                 ClaimDecisionPayload, Coinbase, CoinbaseTxid,
                 DecisionClaimEntry, Header, M6id, MerkleRoot, Output,
-                OutputContent, ShareDelta, Transaction, TxData, Txid,
+                OutputContent, ShareDelta, Transaction, TxData, Txid, Votecoin,
                 authorization::Signature, market::MarketId,
                 transaction::Outputs,
             };
@@ -296,7 +296,8 @@ pub mod node {
                 BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, Coinbase,
                 CoinbaseTxid, DecisionClaimEntry, Header, M6id, MarketId, MerkleRoot,
                 Output, OutputContent, Outputs, Signature, Transaction,
-                ShareDelta, TransactionVerbose, TxData, Txid, schema::BitcoinAddr,
+                ShareDelta, TransactionVerbose, TxData, Txid, Votecoin,
+                schema::BitcoinAddr,
                 schema::BitcoinBlockHash, schema::BitcoinOutPoint,
                 schema::UtreexoNodeHash, schema::UtreexoProof,
             ])]
@@ -386,8 +387,8 @@ pub mod node {
             MerkleRoot, OutPoint, Output,
             OutputContent, Outputs, ParticipationStats, PeerConnectionStatus,
             PeriodStats, ScoreChange, SharePosition, Signature, SpentOutput,
-            ShareDelta, Transaction, TxData, TxIn, Txid, WinningOutcome,
-            WithdrawalBundle,
+            ShareDelta, Transaction, TxData, TxIn, Txid, Votecoin,
+            WinningOutcome, WithdrawalBundle,
             WithdrawalBundleInfo, WithdrawalBundleStatus, schema::BitcoinAddr,
             schema::BitcoinBlockHash, schema::BitcoinOutPoint,
             schema::BitcoinTransaction, schema::SocketAddr,
@@ -707,9 +708,12 @@ pub mod node {
         async fn voter_addresses(&self) -> RpcResult<Vec<VoterInfo>>;
 
         /// Get votecoin balance for an address
-        #[open_api_method(output_schema(ToSchema = "f64"))]
+        #[open_api_method(output_schema(ToSchema = "Votecoin"))]
         #[method(name = "votecoin_balance")]
-        async fn votecoin_balance(&self, address: Address) -> RpcResult<f64>;
+        async fn votecoin_balance(
+            &self,
+            address: Address,
+        ) -> RpcResult<Votecoin>;
     }
 }
 
@@ -722,7 +726,7 @@ pub mod wallet {
         ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
         EncryptionPubKey, Header, M6id, MerkleRoot, OutPoint, Output,
         OutputContent, PointedOutput, ShareDelta, Transaction, TxData, Txid,
-        VerifyingKey,
+        VerifyingKey, Votecoin,
         authorization::{Dst, Signature},
         market::MarketId,
         transaction::Outputs,
@@ -758,7 +762,7 @@ pub mod wallet {
         ClaimDecisionPayload, ClaimedDecisionInfo, Coinbase, CoinbaseTxid,
         DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, M6id, MarketId,
         MerkleRoot, OutPoint, Output, OutputContent, Outputs, Signature,
-        ShareDelta, Transaction, TxData, Txid, schema::BitcoinAddr,
+        ShareDelta, Transaction, TxData, Txid, Votecoin, schema::BitcoinAddr,
         schema::BitcoinBlockHash, schema::BitcoinOutPoint,
         schema::UtreexoNodeHash, schema::UtreexoProof,
     ])]
@@ -953,7 +957,7 @@ pub mod wallet {
         async fn transfer_votecoin(
             &self,
             dest: Address,
-            amount: f64,
+            amount: Votecoin,
             fee_sats: u64,
             sender: Option<Address>,
         ) -> RpcResult<Txid>;

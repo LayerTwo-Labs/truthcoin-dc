@@ -18,7 +18,7 @@ pub(super) struct Ballot {
     current_period: u32,
     node_updated: Option<NodeUpdates>,
     needs_initial_load: bool,
-    holders: Vec<(Address, f64)>,
+    holders: Vec<(Address, truthcoin_dc::types::Votecoin)>,
     voter: Option<Address>,
 }
 
@@ -160,7 +160,7 @@ impl Ballot {
         app: &App,
         ui: &mut egui::Ui,
         current_period: u32,
-        total_reputation: f64,
+        total_reputation: truthcoin_dc::types::Votecoin,
     ) {
         self.refresh(app, current_period);
 
@@ -200,7 +200,7 @@ impl Ballot {
                     ui.add_space(8.0);
                 }
 
-                let has_reputation = total_reputation > 0.0;
+                let has_reputation = !total_reputation.is_zero();
                 if !has_reputation {
                     egui::Frame::new()
                         .fill(ui.visuals().widgets.noninteractive.bg_fill)
@@ -293,8 +293,11 @@ impl Ballot {
             });
     }
 
-    fn submit_gate(&self, total_reputation: f64) -> (bool, Option<String>) {
-        if total_reputation <= 0.0 {
+    fn submit_gate(
+        &self,
+        total_reputation: truthcoin_dc::types::Votecoin,
+    ) -> (bool, Option<String>) {
+        if total_reputation.is_zero() {
             return (false, Some("No voting reputation".to_string()));
         }
         let non_abstain: Vec<&BallotRow> =

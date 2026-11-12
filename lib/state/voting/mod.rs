@@ -8,7 +8,11 @@ pub mod database;
 pub mod period_calculator;
 pub mod types;
 
-use crate::state::{Error, decisions::DecisionId};
+use crate::{
+    math::voting::constants::VOTECOIN_UNITS_PER_REPUTATION,
+    state::{Error, decisions::DecisionId},
+    types::Votecoin,
+};
 use database::VotingDatabases;
 use sneed::{Env, RoTxn, RwTxn};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -53,6 +57,58 @@ pub(in crate::state) fn reanchor_to_initial_total(
     if let Some(rep) = post.get_mut(&addr) {
         *rep += residual;
     }
+}
+
+pub(in crate::state) fn to_consensus_scale(
+    reputations: &BTreeMap<crate::types::Address, Votecoin>,
+) -> BTreeMap<crate::types::Address, f64> {
+    reputations
+        .iter()
+        .map(|(&address, units)| {
+            (address, units.0 as f64 / VOTECOIN_UNITS_PER_REPUTATION)
+        })
+        .collect()
+}
+
+pub(in crate::state) fn from_consensus_scale(
+    mut reputations: BTreeMap<crate::types::Address, f64>,
+) -> Result<BTreeMap<crate::types::Address, Votecoin>, Error> {
+    use crate::math::voting::constants::{
+        MIN_REPUTATION_BALANCE, round_reputation,
+    };
+
+    if let Some((&address, &reputation)) = reputations
+        .iter()
+        .find(|(_, reputation)| !reputation.is_finite() || **reputation < 0.0)
+    {
+        return Err(Error::InvalidConsensusReputation {
+            address,
+            reputation,
+        });
+    }
+    reputations
+        .values_mut()
+        .for_each(|reputation| *reputation = round_reputation(*reputation));
+    reputations.retain(|_, reputation| *reputation >= MIN_REPUTATION_BALANCE);
+    reanchor_to_initial_total(&mut reputations);
+    let mut units = BTreeMap::new();
+    for (address, reputation) in reputations {
+        let scaled = (reputation * VOTECOIN_UNITS_PER_REPUTATION).round();
+        if !scaled.is_finite() || scaled < 0.0 {
+            return Err(Error::InvalidConsensusReputation {
+                address,
+                reputation,
+            });
+        }
+        if scaled >= 1.0 {
+            units.insert(address, Votecoin(scaled as u64));
+        }
+    }
+    let total: u64 = units.values().map(|units| units.0).sum();
+    if total != Votecoin::TOTAL.0 {
+        return Err(Error::VotecoinTotalViolation { total });
+    }
+    Ok(units)
 }
 
 fn verify_reputation_conservation(
@@ -177,7 +233,7 @@ impl VotingSystem {
                     1.0,
                     0.0,
                     0,
-                    0.0,
+                    Votecoin::ZERO,
                     0,
                     0,
                     true,
@@ -199,12 +255,14 @@ impl VotingSystem {
             return Ok(Some(result));
         }
 
-        let reputations = state.reputation().get_all_reputations(rotxn)?;
-        let total_weight: f64 = reputations.values().sum();
+        let unit_reputations = state.reputation().get_all_reputations(rotxn)?;
+        let total_weight =
+            Votecoin(unit_reputations.values().map(|units| units.0).sum());
 
-        if reputations.is_empty() || total_weight <= 0.0 {
+        if total_weight.is_zero() {
             return Ok(None);
         }
+        let reputations = to_consensus_scale(&unit_reputations);
 
         let mut voters: Vec<_> = reputations.keys().copied().collect();
         voters.sort();
@@ -292,17 +350,6 @@ impl VotingSystem {
             period_stats.first_loading =
                 Some(math_result.first_loading.clone());
             period_stats.certainty = Some(math_result.certainty);
-
-            let mut score_changes: BTreeMap<crate::types::Address, (f64, f64)> =
-                BTreeMap::new();
-            for (&voter_id, &new_score) in &math_result.updated_reputations {
-                let old_rep =
-                    reputations.get(&voter_id).copied().unwrap_or(0.0);
-                score_changes.insert(voter_id, (old_rep, new_score));
-            }
-            if !score_changes.is_empty() {
-                period_stats.reputation_changes = Some(score_changes);
-            }
 
             resolved.extend(math_result.outcomes.iter().map(
                 |(decision_id, outcome_value)| {
@@ -413,7 +460,7 @@ impl VotingSystem {
                     1.0,
                     0.0,
                     0,
-                    0.0,
+                    Votecoin::ZERO,
                     0,
                     0,
                     true,
@@ -471,7 +518,7 @@ impl VotingSystem {
     fn commit_consensus_result(
         &self,
         rwtxn: &mut RwTxn,
-        result: ConsensusResult,
+        mut result: ConsensusResult,
         state: &crate::state::State,
         decisions_db: &crate::state::decisions::Dbs,
     ) -> Result<crate::state::undo::ConsensusUndoEntry, Error> {
@@ -505,19 +552,44 @@ impl VotingSystem {
 
         let pre_consensus_reputation =
             state.reputation().get_all_reputations(rwtxn)?;
+        let pre_consensus_scale = to_consensus_scale(&pre_consensus_reputation);
 
-        let mut post_consensus_reputation = compute_post_consensus_reputation(
-            &pre_consensus_reputation,
+        let post_consensus_scale = compute_post_consensus_reputation(
+            &pre_consensus_scale,
             &result.updated_reputations,
         );
 
         let (pre_sum, post_sum, block_drift, anchor_drift) =
             verify_reputation_conservation(
-                &pre_consensus_reputation,
-                &post_consensus_reputation,
+                &pre_consensus_scale,
+                &post_consensus_scale,
             )?;
 
-        reanchor_to_initial_total(&mut post_consensus_reputation);
+        let post_consensus_reputation =
+            from_consensus_scale(post_consensus_scale)?;
+
+        let reputation_changes: BTreeMap<_, _> = result
+            .updated_reputations
+            .keys()
+            .map(|address| {
+                (
+                    *address,
+                    (
+                        pre_consensus_reputation
+                            .get(address)
+                            .copied()
+                            .unwrap_or_default(),
+                        post_consensus_reputation
+                            .get(address)
+                            .copied()
+                            .unwrap_or_default(),
+                    ),
+                )
+            })
+            .collect();
+        if !reputation_changes.is_empty() {
+            result.period_stats.reputation_changes = Some(reputation_changes);
+        }
 
         self.databases
             .put_period_stats(rwtxn, &result.period_stats)?;
@@ -828,10 +900,13 @@ impl VotingSystem {
         let voter_addrs: HashSet<crate::types::Address> =
             votes.keys().map(|k| k.voter_address).collect();
         let all_reputations = state.reputation().get_all_reputations(rotxn)?;
-        let total_reputation_weight: f64 = voter_addrs
-            .iter()
-            .filter_map(|addr| all_reputations.get(addr))
-            .sum();
+        let total_reputation_weight = Votecoin(
+            voter_addrs
+                .iter()
+                .filter_map(|addr| all_reputations.get(addr))
+                .map(|units| units.0)
+                .sum(),
+        );
 
         let outcomes =
             self.databases.get_outcomes_for_period(rotxn, period_id)?;
@@ -1029,6 +1104,218 @@ mod conservation_tests {
         );
     }
 
+    fn holder(index: usize) -> Address {
+        let mut bytes = [0; 20];
+        bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        Address(bytes)
+    }
+
+    fn total_units(units: &BTreeMap<Address, Votecoin>) -> u64 {
+        units.values().map(|units| units.0).sum()
+    }
+
+    fn next_value(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    /// 10^6 units per 1.0 of reputation, and the dust floor is one unit
+    #[test]
+    fn units_match_precision() {
+        use crate::math::voting::constants::{
+            INITIAL_REPUTATION_TOTAL, MIN_REPUTATION_BALANCE,
+            REPUTATION_PRECISION_DECIMALS, VOTECOIN_UNITS_PER_REPUTATION,
+        };
+
+        assert_eq!(10u64.pow(REPUTATION_PRECISION_DECIMALS), Votecoin::TOTAL.0);
+        assert_eq!(
+            INITIAL_REPUTATION_TOTAL * VOTECOIN_UNITS_PER_REPUTATION,
+            Votecoin::TOTAL.0 as f64
+        );
+        assert_eq!(MIN_REPUTATION_BALANCE * VOTECOIN_UNITS_PER_REPUTATION, 1.0);
+    }
+
+    #[test]
+    fn even_split() {
+        let shares = (0..50).map(|index| (holder(index), 0.02)).collect();
+
+        let units = from_consensus_scale(shares).unwrap();
+
+        assert_eq!(units.len(), 50);
+        assert!(units.values().all(|&share| share == Votecoin(20_000)));
+    }
+
+    /// 1/n shares total exactly 1,000,000 units; the last address absorbs the leftover
+    #[test]
+    fn uneven_splits_reanchor() {
+        for count in [3, 7, 49, 51, 97] {
+            let shares = (0..count)
+                .map(|index| (holder(index), 1.0 / count as f64))
+                .collect();
+
+            let units = from_consensus_scale(shares).unwrap();
+
+            assert_eq!(total_units(&units), Votecoin::TOTAL.0, "{count}");
+            let last = holder(count - 1);
+            let rounded = units[&holder(0)];
+            assert!(
+                units
+                    .iter()
+                    .filter(|(address, _)| **address != last)
+                    .all(|(_, share)| *share == rounded),
+                "{count}: {units:?}"
+            );
+            assert!(
+                rounded.0.abs_diff(Votecoin::TOTAL.0 / count as u64) <= 1,
+                "{count}"
+            );
+            assert_eq!(
+                units[&last].0,
+                Votecoin::TOTAL.0 - rounded.0 * (count as u64 - 1),
+                "{count}"
+            );
+        }
+    }
+
+    /// 1,000 shares that all round up stay at exactly 1,000,000 units
+    #[test]
+    fn rounding_drift_reanchors() {
+        let count = 1_000;
+        let shares: BTreeMap<_, _> = (0..count)
+            .map(|index| (holder(index), 999.5000001e-6))
+            .collect();
+        let drifted: f64 = shares.values().sum();
+        assert!((drifted - 1.0).abs() > 4e-4);
+        let mut balanced = shares;
+        let first = holder(0);
+        let spare = 1.0 - balanced.values().sum::<f64>();
+        *balanced.get_mut(&first).unwrap() += spare;
+
+        let units = from_consensus_scale(balanced).unwrap();
+
+        assert_eq!(total_units(&units), Votecoin::TOTAL.0);
+        assert!(
+            units
+                .iter()
+                .filter(|(address, _)| **address != first)
+                .all(|(_, share)| *share == Votecoin(1_000))
+        );
+    }
+
+    /// Under half a unit is dropped and reanchored; 0.9 of a unit rounds up to 1
+    #[test]
+    fn dust_rounds_away() {
+        let mut shares = BTreeMap::new();
+        shares.insert(addr(1), 0.6);
+        shares.insert(addr(2), 0.4 - 1.2e-6);
+        shares.insert(addr(3), 3e-7);
+        shares.insert(addr(4), 9e-7);
+
+        let units = from_consensus_scale(shares).unwrap();
+
+        assert_eq!(units.get(&addr(3)), None);
+        assert_eq!(units.get(&addr(4)), Some(&Votecoin(1)));
+        assert_eq!(units.get(&addr(2)), Some(&Votecoin(399_999)));
+        assert_eq!(units.get(&addr(1)), Some(&Votecoin(600_000)));
+        assert_eq!(total_units(&units), Votecoin::TOTAL.0);
+        assert!(units.values().all(|share| !share.is_zero()));
+    }
+
+    #[test]
+    fn lone_holder_takes_all() {
+        let mut shares = BTreeMap::new();
+        shares.insert(addr(1), 1.0 - 8e-7);
+        for index in 2..10 {
+            shares.insert(addr(index), 1e-7);
+        }
+
+        let units = from_consensus_scale(shares).unwrap();
+
+        assert_eq!(units.len(), 1);
+        assert_eq!(units.get(&addr(1)), Some(&Votecoin::TOTAL));
+    }
+
+    /// Shares built by repeated f64 addition still land on whole units
+    #[test]
+    fn float_noise_rounds_away() {
+        let mut share = 0.0;
+        for _ in 0..100 {
+            share += 1e-6;
+        }
+        assert_ne!(share, 1e-4);
+        let shares = (0..10_000).map(|index| (holder(index), share)).collect();
+
+        let units = from_consensus_scale(shares).unwrap();
+
+        assert_eq!(units.len(), 10_000);
+        assert!(units.values().all(|&share| share == Votecoin(100)));
+        assert_eq!(total_units(&units), Votecoin::TOTAL.0);
+    }
+
+    /// NaN, infinite or negative output, or an empty result, is an error
+    #[test]
+    fn invalid_output_errors() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1e-6] {
+            let mut shares = BTreeMap::new();
+            shares.insert(addr(1), 1.0);
+            shares.insert(addr(2), bad);
+            assert!(
+                matches!(
+                    from_consensus_scale(shares),
+                    Err(Error::InvalidConsensusReputation { .. })
+                ),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            from_consensus_scale(BTreeMap::new()),
+            Err(Error::VotecoinTotalViolation { total: 0 })
+        ));
+    }
+
+    /// Random unit distributions survive units -> f64 -> units unchanged
+    #[test]
+    fn units_round_trip() {
+        let mut seed = 7;
+        for _ in 0..500 {
+            let count = 1 + (next_value(&mut seed) % 60) as usize;
+            let mut remaining = Votecoin::TOTAL.0;
+            let mut units = BTreeMap::new();
+            for index in 0..count {
+                let share = if index + 1 == count {
+                    remaining
+                } else {
+                    next_value(&mut seed) % (remaining + 1)
+                };
+                remaining -= share;
+                if share > 0 {
+                    units.insert(holder(index), Votecoin(share));
+                }
+            }
+
+            let round_trip =
+                from_consensus_scale(to_consensus_scale(&units)).unwrap();
+
+            assert_eq!(round_trip, units);
+        }
+    }
+
+    #[test]
+    fn exit_is_deterministic() {
+        let forward: Vec<_> = (0..7)
+            .map(|index| (holder(index), 1.0 / 7.0 + index as f64 * 1e-9))
+            .collect();
+        let backward: BTreeMap<_, _> = forward.iter().rev().copied().collect();
+        let forward: BTreeMap<_, _> = forward.into_iter().collect();
+
+        let first = from_consensus_scale(forward.clone()).unwrap();
+
+        assert_eq!(from_consensus_scale(forward).unwrap(), first);
+        assert_eq!(from_consensus_scale(backward).unwrap(), first);
+    }
+
     /// A transaction that spends one coin of `payer` worth `value_sats` and
     /// pays all of it as fee
     fn funded_tx(
@@ -1106,13 +1393,13 @@ mod conservation_tests {
     fn transfer_tx(
         sender: Address,
         dest: Address,
-        amount: f64,
+        amount: u64,
     ) -> crate::types::FilledTransaction {
         let mut transfer = funded_tx(
             crate::types::TransactionData::TransferReputation {
                 sender,
                 dest,
-                amount,
+                amount: Votecoin(amount),
             },
             sender,
             1000,
@@ -1177,7 +1464,7 @@ mod conservation_tests {
 
     fn sealed_ballot_state(
         dir: &tempfile::TempDir,
-        reputations: &[(Address, f64)],
+        reputations: &[(Address, u64)],
     ) -> anyhow::Result<(
         sneed::Env,
         crate::state::State,
@@ -1200,7 +1487,7 @@ mod conservation_tests {
             state.reputation().set_reputation(
                 &mut rwtxn,
                 voter,
-                *reputation,
+                Votecoin(*reputation),
             )?;
         }
         state.genesis_timestamp.put(&mut rwtxn, &(), &1000)?;
@@ -1239,7 +1526,7 @@ mod conservation_tests {
         let outsider = addr(3);
         let (env, state, decision_id) = sealed_ballot_state(
             &dir,
-            &[(sender, 0.4), (receiver, 0.5), (outsider, 0.1)],
+            &[(sender, 400_000), (receiver, 500_000), (outsider, 100_000)],
         )?;
         let mut rwtxn = env.write_txn()?;
         let ballots = [(sender, 0.0, 1), (receiver, 1.0, 2)].map(
@@ -1250,8 +1537,8 @@ mod conservation_tests {
         let seals = ballots.each_ref().map(sealed_ballot_tx);
         let reveals = ballots.each_ref().map(reveal_ballot_tx);
         let locked_transfers = [
-            transfer_tx(sender, outsider, 0.01),
-            transfer_tx(outsider, receiver, 0.01),
+            transfer_tx(sender, outsider, 10_000),
+            transfer_tx(outsider, receiver, 10_000),
         ];
         let is_locked = |rwtxn: &sneed::RwTxn| -> anyhow::Result<bool> {
             let mut locked = true;
@@ -1271,7 +1558,7 @@ mod conservation_tests {
         VoteValidator::validate_reputation_transfer(
             &state,
             &rwtxn,
-            &transfer_tx(outsider, addr(4), 0.01),
+            &transfer_tx(outsider, addr(4), 10_000),
             None,
         )?;
         connect_height(&state, &mut rwtxn, 20, &[])?;
@@ -1311,7 +1598,8 @@ mod conservation_tests {
         };
 
         let dir = tempfile::tempdir()?;
-        let (env, state, early) = sealed_ballot_state(&dir, &[(addr(1), 1.0)])?;
+        let (env, state, early) =
+            sealed_ballot_state(&dir, &[(addr(1), 1_000_000)])?;
         let mut rwtxn = env.write_txn()?;
         let late = DecisionId::new(true, 1, 1)?;
         let height = 10;
@@ -1377,7 +1665,7 @@ mod conservation_tests {
         let [late, early, silent] = [addr(1), addr(2), addr(3)];
         let (env, state, decision_id) = sealed_ballot_state(
             &dir,
-            &[(late, 0.5), (early, 0.3), (silent, 0.2)],
+            &[(late, 500_000), (early, 300_000), (silent, 200_000)],
         )?;
         let mut rwtxn = env.write_txn()?;
         let period_id = VotingPeriodId::new(decision_id.voting_period());
@@ -1429,7 +1717,10 @@ mod conservation_tests {
                 .databases()
                 .has_consensus(&rwtxn, period_id)?
         );
-        assert_eq!(state.reputation().get_reputation(&rwtxn, &late)?, 0.5);
+        assert_eq!(
+            state.reputation().get_reputation(&rwtxn, &late)?,
+            Votecoin(500_000)
+        );
         assert!(
             VoteValidator::validate_reveal(
                 &state,
@@ -1463,7 +1754,10 @@ mod conservation_tests {
                 .map(|entry| entry.value),
             Some(types::VoteValue::Binary(true)),
         );
-        assert!(state.reputation().get_reputation(&rwtxn, &silent)? < 0.2);
+        assert!(
+            state.reputation().get_reputation(&rwtxn, &silent)?
+                < Votecoin(200_000)
+        );
         assert!(sealed(&rwtxn, early)?.is_some_and(|ballot| ballot.revealed));
         assert!(sealed(&rwtxn, silent)?.is_some_and(|ballot| !ballot.revealed));
 
@@ -1566,7 +1860,8 @@ mod conservation_tests {
     #[test]
     fn nonstandard_skips_svd() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let voters = [(addr(1), 0.5), (addr(2), 0.3), (addr(3), 0.2)];
+        let voters =
+            [(addr(1), 500_000), (addr(2), 300_000), (addr(3), 200_000)];
         let (env, state, standard) = sealed_ballot_state(&dir, &voters)?;
         let mut rwtxn = env.write_txn()?;
         let optional = claim_nonstandard(&state, &mut rwtxn, 1)?;
@@ -1596,7 +1891,7 @@ mod conservation_tests {
         assert_eq!(outcome_of(&state, &rwtxn, optional)?, Some(0.0));
         for (voter, reputation) in voters {
             let after = state.reputation().get_reputation(&rwtxn, &voter)?;
-            assert!((after - reputation).abs() < 1e-9);
+            assert_eq!(after, Votecoin(reputation));
         }
         Ok(())
     }
@@ -1606,7 +1901,8 @@ mod conservation_tests {
     #[test]
     fn nonstandard_only_period() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let voters = [(addr(1), 0.5), (addr(2), 0.3), (addr(3), 0.2)];
+        let voters =
+            [(addr(1), 500_000), (addr(2), 300_000), (addr(3), 200_000)];
         let (env, state, _) = sealed_ballot_state(&dir, &voters)?;
         let mut rwtxn = env.write_txn()?;
         let optional = claim_nonstandard(&state, &mut rwtxn, 2)?;
@@ -1629,8 +1925,126 @@ mod conservation_tests {
         let after = state.reputation().get_all_reputations(&rwtxn)?;
         assert_eq!(after.len(), before.len());
         for (voter, reputation) in &before {
-            assert!((after[voter] - reputation).abs() < 1e-9);
+            assert_eq!(after[voter], Votecoin(*reputation));
         }
+        Ok(())
+    }
+
+    /// Resolution keeps 1,000,000 units, records real before/after balances, and undoes exactly
+    #[test]
+    fn consensus_conserves_total() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let voters = [(addr(1), 600_000), (addr(2), 399_999), (addr(3), 1)];
+        let (env, state, decision_id) = sealed_ballot_state(&dir, &voters)?;
+        let mut rwtxn = env.write_txn()?;
+        let ballots: Vec<_> = voters[..2]
+            .iter()
+            .enumerate()
+            .map(|(salt, (voter, _))| {
+                binary_ballot(*voter, decision_id, 1.0, salt as u8)
+            })
+            .collect();
+
+        connect_height(&state, &mut rwtxn, 10, &[])?;
+        let seals: Vec<_> = ballots.iter().map(sealed_ballot_tx).collect();
+        connect_height(&state, &mut rwtxn, 11, &seals)?;
+        connect_height(&state, &mut rwtxn, 20, &[])?;
+        let reveals: Vec<_> = ballots.iter().map(reveal_ballot_tx).collect();
+        connect_height(&state, &mut rwtxn, 21, &reveals)?;
+
+        let after = state.reputation().get_all_reputations(&rwtxn)?;
+        let total: u64 = after.values().map(|units| units.0).sum();
+        assert_eq!(total, Votecoin::TOTAL.0);
+        assert!(after.values().all(|units| !units.is_zero()));
+        let changes = state
+            .voting()
+            .databases()
+            .get_period_stats(
+                &rwtxn,
+                VotingPeriodId::new(decision_id.voting_period()),
+            )?
+            .and_then(|stats| stats.reputation_changes)
+            .unwrap_or_default();
+        assert!(!changes.is_empty());
+        for (voter, (old, new)) in &changes {
+            let before = voters
+                .iter()
+                .find(|(address, _)| address == voter)
+                .map_or(Votecoin::ZERO, |(_, units)| Votecoin(*units));
+            assert_eq!(*old, before);
+            assert_eq!(*new, after.get(voter).copied().unwrap_or_default());
+        }
+
+        crate::state::markets::block::disconnect_begin(
+            &state,
+            &mut rwtxn,
+            &mut crate::types::AccumulatorDiff::default(),
+            21,
+        )?;
+        let restored = state.reputation().get_all_reputations(&rwtxn)?;
+        let expected: BTreeMap<_, _> = voters
+            .iter()
+            .map(|(address, units)| (*address, Votecoin(*units)))
+            .collect();
+        assert_eq!(restored, expected);
+        Ok(())
+    }
+
+    /// Zero and overdraft are refused; a full-balance transfer removes the sender
+    #[test]
+    fn transfer_moves_balance() -> anyhow::Result<()> {
+        use crate::validation::VoteValidator;
+
+        let dir = tempfile::tempdir()?;
+        let [sender, other, fresh] = [addr(1), addr(2), addr(9)];
+        let (env, state, _) =
+            sealed_ballot_state(&dir, &[(sender, 500_000), (other, 500_000)])?;
+        let mut rwtxn = env.write_txn()?;
+        let validate = |rwtxn: &sneed::RwTxn,
+                        tx: &crate::types::FilledTransaction|
+         -> Result<(), Error> {
+            VoteValidator::validate_reputation_transfer(&state, rwtxn, tx, None)
+        };
+
+        assert!(validate(&rwtxn, &transfer_tx(sender, fresh, 0)).is_err());
+        assert!(
+            validate(&rwtxn, &transfer_tx(sender, fresh, 500_001)).is_err()
+        );
+        let full_balance = transfer_tx(sender, fresh, 500_000);
+        validate(&rwtxn, &full_balance)?;
+        connect_height(
+            &state,
+            &mut rwtxn,
+            1,
+            std::slice::from_ref(&full_balance),
+        )?;
+
+        let after = state.reputation().get_all_reputations(&rwtxn)?;
+        assert!(!after.contains_key(&sender));
+        assert_eq!(after.get(&fresh), Some(&Votecoin(500_000)));
+        let single_unit = transfer_tx(fresh, other, 1);
+        validate(&rwtxn, &single_unit)?;
+        connect_height(
+            &state,
+            &mut rwtxn,
+            2,
+            std::slice::from_ref(&single_unit),
+        )?;
+        assert_eq!(
+            state.reputation().get_reputation(&rwtxn, &fresh)?,
+            Votecoin(499_999)
+        );
+        assert_eq!(
+            state.reputation().get_reputation(&rwtxn, &other)?,
+            Votecoin(500_001)
+        );
+        let total: u64 = state
+            .reputation()
+            .get_all_reputations(&rwtxn)?
+            .values()
+            .map(|units| units.0)
+            .sum();
+        assert_eq!(total, Votecoin::TOTAL.0);
         Ok(())
     }
 }

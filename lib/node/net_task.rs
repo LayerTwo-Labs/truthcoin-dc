@@ -2019,12 +2019,12 @@ mod test {
     }
 
     fn check_reputation_selection(
-        start_reputation: f64,
-        amounts: &[f64],
+        start_reputation: u64,
+        amounts: &[u64],
         expected_count: usize,
     ) -> anyhow::Result<()> {
         use crate::types::{
-            Address, Body, Coinbase, Header, TransactionData,
+            Address, Body, Coinbase, Header, TransactionData, Votecoin,
             authorization::{SigningKey, authorize, get_address},
         };
         use bitcoin::hashes::Hash as _;
@@ -2047,7 +2047,7 @@ mod test {
             node.state.reputation().set_reputation(
                 &mut rwtxn,
                 &sender,
-                start_reputation,
+                Votecoin(start_reputation),
             )?;
             for index in 0..amounts.len() {
                 let pointed = PointedOutput {
@@ -2091,7 +2091,7 @@ mod test {
                     data: Some(TransactionData::TransferReputation {
                         sender,
                         dest: receiver,
-                        amount,
+                        amount: Votecoin(amount),
                     }),
                     ..Default::default()
                 };
@@ -2101,9 +2101,11 @@ mod test {
 
             let (selected, fee) = node.get_transactions(100)?;
             let selected_count = selected.len();
-            let transferred: f64 = selected
+            let transferred: u64 = selected
                 .iter()
-                .map(|tx| tx.transaction.transfer_reputation().unwrap().amount)
+                .map(|tx| {
+                    tx.transaction.transfer_reputation().unwrap().amount.0
+                })
                 .sum();
             let body = Body::new(
                 selected.iter().cloned().map(Into::into).collect(),
@@ -2142,11 +2144,11 @@ mod test {
             assert_eq!(fee.to_sat(), 100 * expected_count as u64);
             assert_eq!(
                 node.state.reputation().get_reputation(&rwtxn, &sender)?,
-                start_reputation - transferred
+                Votecoin(start_reputation - transferred)
             );
             assert_eq!(
                 node.state.reputation().get_reputation(&rwtxn, &receiver)?,
-                transferred
+                Votecoin(transferred)
             );
             Ok(())
         })
@@ -2155,18 +2157,19 @@ mod test {
     /// Block selection never spends more reputation than the balance holds.
     #[test]
     fn block_selection_caps_reputation() -> anyhow::Result<()> {
-        check_reputation_selection(1.0, &[0.75, 0.75], 1)
+        check_reputation_selection(1_000_000, &[750_000, 750_000], 1)
     }
 
     /// Block selection keeps every reputation transfer the balance funds.
     #[test]
     fn block_selection_keeps_funded() -> anyhow::Result<()> {
-        check_reputation_selection(1.0, &[0.25, 0.25], 2)
+        check_reputation_selection(1_000_000, &[250_000, 250_000], 2)
     }
 
+    /// 300,000 units fund 100,000 and 200,000; the extra unit is left out
     #[test]
-    fn block_selection_matches_decimal_reputation() -> anyhow::Result<()> {
-        check_reputation_selection(0.3, &[0.1, 0.2], 1)
+    fn block_selection_drops_overdraft() -> anyhow::Result<()> {
+        check_reputation_selection(300_000, &[100_000, 200_000, 1], 2)
     }
 
     #[test]
@@ -2442,7 +2445,7 @@ mod test {
                     TxData::TransferReputation {
                         sender: other,
                         dest: Address([9; 20]),
-                        amount: 0.1,
+                        amount: crate::types::Votecoin(100_000),
                     },
                 ),
             ];
@@ -2462,9 +2465,11 @@ mod test {
             node.archive.put_header(&mut rwtxn, &header)?;
             node.state.connect_block(&mut rwtxn, &header, &body, 0)?;
             for address in [voter, other] {
-                node.state
-                    .reputation()
-                    .set_reputation(&mut rwtxn, &address, 1.0)?;
+                node.state.reputation().set_reputation(
+                    &mut rwtxn,
+                    &address,
+                    crate::types::Votecoin::TOTAL,
+                )?;
             }
             for decision_id in revealing.into_iter().chain([voting]) {
                 let decision = Decision::new(

@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use crate::{
     math::voting::constants::INITIAL_REPUTATION_TOTAL,
-    state::{error::Error, voting::reanchor_to_initial_total},
-    types::{Address, Body},
+    state::{error::Error, voting::from_consensus_scale},
+    types::{Address, Body, Votecoin},
 };
 
 pub const GENESIS_VOTERS: &[&str] = &[
@@ -62,12 +62,14 @@ pub const GENESIS_VOTERS: &[&str] = &[
     "2gXSyzL2WefMQ2SEPwv672MgvCoC",
 ];
 
-fn split_equally(voters: &[&str]) -> Result<BTreeMap<Address, f64>, Error> {
+fn split_equally(
+    voters: &[&str],
+) -> Result<BTreeMap<Address, Votecoin>, Error> {
     if voters.is_empty() {
         return Err(Error::EmptyGenesisVoters);
     }
     let share = INITIAL_REPUTATION_TOTAL / voters.len() as f64;
-    let mut shares = voters
+    let shares = voters
         .iter()
         .map(|&address| {
             address
@@ -79,14 +81,13 @@ fn split_equally(voters: &[&str]) -> Result<BTreeMap<Address, f64>, Error> {
                 })
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    reanchor_to_initial_total(&mut shares);
-    Ok(shares)
+    from_consensus_scale(shares)
 }
 
 pub(in crate::state) fn genesis_allocation(
     genesis_reputation_to_miner: bool,
     body: &Body,
-) -> Result<BTreeMap<Address, f64>, Error> {
+) -> Result<BTreeMap<Address, Votecoin>, Error> {
     if !genesis_reputation_to_miner {
         return split_equally(GENESIS_VOTERS);
     }
@@ -95,14 +96,14 @@ pub(in crate::state) fn genesis_allocation(
         .outputs
         .iter()
         .next()
-        .map(|output| (output.address, INITIAL_REPUTATION_TOTAL))
+        .map(|output| (output.address, Votecoin::TOTAL))
         .into_iter()
         .collect())
 }
 
 #[derive(Clone)]
 pub struct ReputationDbs {
-    reputation: DatabaseUnique<SerdeBincode<Address>, SerdeBincode<f64>>,
+    reputation: DatabaseUnique<SerdeBincode<Address>, SerdeBincode<Votecoin>>,
 }
 
 impl ReputationDbs {
@@ -120,18 +121,18 @@ impl ReputationDbs {
         &self,
         rotxn: &RoTxn,
         address: &Address,
-    ) -> Result<f64, Error> {
-        Ok(self.reputation.try_get(rotxn, address)?.unwrap_or(0.0))
+    ) -> Result<Votecoin, Error> {
+        Ok(self.reputation.try_get(rotxn, address)?.unwrap_or_default())
     }
 
     pub fn get_all_reputations(
         &self,
         rotxn: &RoTxn,
-    ) -> Result<BTreeMap<Address, f64>, Error> {
+    ) -> Result<BTreeMap<Address, Votecoin>, Error> {
         let mut reputations = BTreeMap::new();
         let mut iter = self.reputation.iter(rotxn)?;
         while let Some((address, reputation)) = iter.next()? {
-            if reputation > 0.0 {
+            if !reputation.is_zero() {
                 reputations.insert(address, reputation);
             }
         }
@@ -142,9 +143,9 @@ impl ReputationDbs {
         &self,
         rwtxn: &mut RwTxn,
         address: &Address,
-        reputation: f64,
+        reputation: Votecoin,
     ) -> Result<(), Error> {
-        if reputation <= 0.0 {
+        if reputation.is_zero() {
             self.reputation.delete(rwtxn, address)?;
         } else {
             self.reputation.put(rwtxn, address, &reputation)?;
@@ -164,11 +165,11 @@ impl ReputationDbs {
     pub fn clear_and_restore(
         &self,
         rwtxn: &mut RwTxn,
-        snapshot: &BTreeMap<Address, f64>,
+        snapshot: &BTreeMap<Address, Votecoin>,
     ) -> Result<(), Error> {
         self.reputation.clear(rwtxn)?;
         for (&address, &rep) in snapshot {
-            if rep > 0.0 {
+            if !rep.is_zero() {
                 self.reputation.put(rwtxn, &address, &rep)?;
             }
         }
@@ -179,7 +180,7 @@ impl ReputationDbs {
         let mut iter = self.reputation.iter(rotxn)?;
         let mut count = 0u64;
         while let Some((_, reputation)) = iter.next()? {
-            if reputation > 0.0 {
+            if !reputation.is_zero() {
                 count += 1;
             }
         }
@@ -192,7 +193,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{GENESIS_VOTERS, split_equally};
-    use crate::types::Address;
+    use crate::types::{Address, Votecoin};
 
     /// The genesis whitelist holds fifty distinct valid addresses
     #[test]
@@ -216,21 +217,16 @@ mod tests {
         let allocation = split_equally(&voters).unwrap();
 
         assert_eq!(allocation.len(), 50);
-        assert!(
-            allocation
-                .values()
-                .all(|&share| (share - 0.02).abs() < 1e-12)
-        );
+        assert!(allocation.values().all(|&share| share == Votecoin(20_000)));
         let seven: Vec<String> =
             (1..=7).map(|i| Address([i; 20]).as_base58()).collect();
         let seven: Vec<&str> = seven.iter().map(String::as_str).collect();
         let uneven = split_equally(&seven).unwrap();
-        assert!((uneven.values().sum::<f64>() - 1.0).abs() < 1e-15);
-        assert!(
-            uneven
-                .values()
-                .all(|&share| (share - 1.0 / 7.0).abs() < 1e-12)
+        assert_eq!(
+            uneven.values().map(|units| units.0).sum::<u64>(),
+            1_000_000
         );
+        assert!(uneven.values().all(|units| units.0.abs_diff(142_857) <= 1));
         assert!(split_equally(&[]).is_err());
         assert!(split_equally(&["not an address"]).is_err());
     }

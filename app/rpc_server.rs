@@ -27,7 +27,7 @@ use truthcoin_dc::{
     types::{
         Address, Authorization, AuthorizedTransaction, Block, BlockHash,
         EncryptionPubKey, M6id, PointedOutput, ShareDelta, SpentOutput, Txid,
-        VerifyingKey, WithdrawalBundle,
+        VerifyingKey, Votecoin, WithdrawalBundle,
         authorization::{self, Dst, Signature},
         net::{Peer, PeerAddress},
         state::TwoWayPegEvent,
@@ -2220,7 +2220,7 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
             .collect()
     }
 
-    async fn votecoin_balance(&self, address: Address) -> RpcResult<f64> {
+    async fn votecoin_balance(&self, address: Address) -> RpcResult<Votecoin> {
         let rotxn = self.node().read_txn().map_err(custom_err)?;
 
         let votecoin_balance = self
@@ -2574,7 +2574,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
     async fn transfer_votecoin(
         &self,
         dest: Address,
-        amount: f64,
+        amount: Votecoin,
         fee_sats: u64,
         sender: Option<Address>,
     ) -> RpcResult<Txid> {

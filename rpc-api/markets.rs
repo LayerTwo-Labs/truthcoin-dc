@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use truthcoin_dc_types::{
-    Address, BlockHash, ShareDelta, Txid, decision::DecisionType,
+    Address, BlockHash, ShareDelta, Txid, Votecoin, decision::DecisionType,
     market::MarketState,
 };
 use utoipa::ToSchema;
@@ -224,7 +224,7 @@ pub struct ConsensusResults {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VoterInfoFull {
     pub address: String,
-    pub votecoin_balance: f64,
+    pub votecoin_balance: Votecoin,
     pub total_votes: u64,
     pub periods_active: u32,
     pub is_active: bool,
@@ -569,7 +569,7 @@ pub struct BallotItem {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VoterInfo {
     pub address: String,
-    pub votecoin_balance: f64,
+    pub votecoin_balance: Votecoin,
     pub total_votes: u64,
     pub is_active: bool,
 }
@@ -591,6 +591,6 @@ pub struct VoteInfo {
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ScoreChange {
-    pub old_score: f64,
-    pub new_score: f64,
+    pub old_score: Votecoin,
+    pub new_score: Votecoin,
 }

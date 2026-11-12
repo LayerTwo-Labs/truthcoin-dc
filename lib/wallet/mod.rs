@@ -1888,7 +1888,7 @@ impl Wallet {
         options: SpendOptions,
         voter_addr: Address,
         dest: Address,
-        amount: f64,
+        amount: crate::types::Votecoin,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
         let tx_data = crate::types::TransactionData::TransferReputation {
@@ -2559,13 +2559,23 @@ mod tests {
         let dest = Address([5u8; 20]);
         let fee = bitcoin::Amount::from_sat(1_000);
 
-        let first =
-            wallet.transfer_reputation(options(true), voter, dest, 0.1, fee)?;
+        let first = wallet.transfer_reputation(
+            options(true),
+            voter,
+            dest,
+            crate::types::Votecoin(100_000),
+            fee,
+        )?;
         let first_inputs: HashSet<OutPoint> =
             first.inputs.iter().map(|(outpoint, _)| *outpoint).collect();
         wallet.set_mempool_view(&HashMap::new(), &first_inputs)?;
-        let second =
-            wallet.transfer_reputation(options(true), voter, dest, 0.1, fee)?;
+        let second = wallet.transfer_reputation(
+            options(true),
+            voter,
+            dest,
+            crate::types::Votecoin(100_000),
+            fee,
+        )?;
         let second_inputs: HashSet<OutPoint> = second
             .inputs
             .iter()
@@ -2731,7 +2741,7 @@ mod tests {
             options(true),
             address,
             Address([5u8; 20]),
-            0.1,
+            crate::types::Votecoin(100_000),
             bitcoin::Amount::from_sat(1_000),
         )?;
         let authorized = wallet.authorize(rand::rng(), tx)?;

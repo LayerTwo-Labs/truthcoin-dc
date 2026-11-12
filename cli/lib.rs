@@ -12,7 +12,7 @@ use truthcoin_dc_app_rpc_api::{
 };
 use truthcoin_dc_types::wallet::TransferDests;
 use truthcoin_dc_types::{
-    Address, EncryptionPubKey, M6id, Txid, VerifyingKey,
+    Address, EncryptionPubKey, M6id, Txid, VerifyingKey, Votecoin,
     authorization::{Dst, Signature},
     net::PeerAddress,
 };
@@ -622,7 +622,7 @@ pub enum Command {
     VotecoinTransfer {
         dest: Address,
         #[arg(long)]
-        amount: f64,
+        amount: Votecoin,
         #[arg(long, default_value = "1000")]
         fee_sats: u64,
         /// Defaults to the one wallet address that holds votecoin

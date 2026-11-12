@@ -99,8 +99,8 @@ fn find_correct_voters(
             }
             let reputation =
                 state.reputation().get_reputation(txn, &key.voter_address)?;
-            if reputation > 0.0 {
-                correct_voters.push((key.voter_address, reputation));
+            if !reputation.is_zero() {
+                correct_voters.push((key.voter_address, reputation.0 as f64));
             }
         }
 

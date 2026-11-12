@@ -670,7 +670,9 @@ impl App {
     }
 
     /// The wallet's addresses that hold votecoin, with their votecoin
-    pub fn voter_addresses(&self) -> Result<Vec<(Address, f64)>, Error> {
+    pub fn voter_addresses(
+        &self,
+    ) -> Result<Vec<(Address, truthcoin_dc::types::Votecoin)>, Error> {
         let rotxn = self.node.read_txn()?;
         let mut holders = Vec::new();
         for address in self.wallet_addresses()? {
@@ -679,7 +681,7 @@ impl App {
                 .reputation()
                 .get_reputation(&rotxn, &address)
                 .map_err(node::Error::from)?;
-            if votecoin > 0.0 {
+            if !votecoin.is_zero() {
                 holders.push((address, votecoin));
             }
         }

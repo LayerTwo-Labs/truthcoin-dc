@@ -1,5 +1,5 @@
 use crate::state::decisions::DecisionId;
-use crate::types::Address;
+use crate::types::{Address, Votecoin};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -274,7 +274,7 @@ pub struct DecisionOutcome {
     pub max: f64,
     pub confidence: f64,
     pub total_votes: u64,
-    pub total_reputation_weight: f64,
+    pub total_reputation_weight: Votecoin,
     pub finalized_at: u64,
     pub block_height: u32,
     pub is_consensus: bool,
@@ -292,7 +292,7 @@ impl DecisionOutcome {
         max: f64,
         confidence: f64,
         total_votes: u64,
-        total_reputation_weight: f64,
+        total_reputation_weight: Votecoin,
         finalized_at: u64,
         block_height: u32,
         is_consensus: bool,
@@ -420,12 +420,12 @@ pub struct VotingPeriodStats {
     pub total_votes: u64,
     pub total_decisions: u64,
     pub avg_participation_rate: f64,
-    pub total_reputation_weight: f64,
+    pub total_reputation_weight: Votecoin,
     pub consensus_decisions: u64,
     pub calculated_at: u64,
     pub first_loading: Option<Vec<f64>>,
     pub certainty: Option<f64>,
-    pub reputation_changes: Option<BTreeMap<Address, (f64, f64)>>,
+    pub reputation_changes: Option<BTreeMap<Address, (Votecoin, Votecoin)>>,
 }
 
 impl VotingPeriodStats {
@@ -444,7 +444,7 @@ impl VotingPeriodStats {
             total_votes: 0,
             total_decisions: 0,
             avg_participation_rate: 0.0,
-            total_reputation_weight: 0.0,
+            total_reputation_weight: Votecoin::ZERO,
             consensus_decisions: 0,
             calculated_at,
             first_loading: None,

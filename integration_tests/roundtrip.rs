@@ -18,6 +18,7 @@ use tokio::time::sleep;
 use tracing::Instrument as _;
 use truthcoin_dc::types::{
     Address, GetAddress as _, GetValue as _, OutputContent, ShareDelta, TxData,
+    Votecoin,
     authorization::{Dst, Signature},
 };
 use truthcoin_dc_app_rpc_api::{
@@ -52,7 +53,7 @@ mod expected {
     pub const PRICE_SUM_TOLERANCE: f64 = 1e-6;
 
     /// Reputation change tolerance for comparisons
-    pub const REPUTATION_TOLERANCE: f64 = 0.0001;
+    pub const REPUTATION_TOLERANCE: i64 = 100;
 
     /// Outcome value tolerance for consensus verification
     pub const OUTCOME_TOLERANCE: f64 = 0.01;
@@ -649,7 +650,7 @@ async fn roundtrip_task_inner(
 
     truthcoin_nodes.issuer.rpc_client.refresh_wallet().await?;
 
-    const VOTER_ALLOCATION: f64 = 0.142857;
+    const VOTER_ALLOCATION: Votecoin = Votecoin(142_857);
     for &voter_addr in &voter_addresses {
         truthcoin_nodes
             .issuer
@@ -693,7 +694,7 @@ async fn roundtrip_task_inner(
         )
     }
 
-    let vote_weights: HashMap<Address, f64> = {
+    let vote_weights: HashMap<Address, Votecoin> = {
         let mut weights = HashMap::new();
         for &voter_addr in &voter_addresses {
             let balance = truthcoin_nodes
@@ -701,7 +702,7 @@ async fn roundtrip_task_inner(
                 .rpc_client
                 .votecoin_balance(voter_addr)
                 .await?;
-            if balance > 0.0 {
+            if !balance.is_zero() {
                 weights.insert(voter_addr, balance);
             }
         }
@@ -714,7 +715,7 @@ async fn roundtrip_task_inner(
     );
     for (&addr, &weight) in &vote_weights {
         anyhow::ensure!(
-            (weight - VOTER_ALLOCATION).abs() < 0.001,
+            weight == VOTER_ALLOCATION,
             "Voter {} has weight {}, expected {}",
             addr.as_base58(),
             weight,
@@ -733,7 +734,7 @@ async fn roundtrip_task_inner(
         .sign_arbitrary_msg_as_addr(voter_addr_1, VOTE_NO_MSG.to_owned())
         .await?;
     let (total_yes, total_no) = {
-        let (mut total_yes, mut total_no) = (0.0_f64, 0.0_f64);
+        let (mut total_yes, mut total_no) = (0_u64, 0_u64);
         let mut vote_weights = vote_weights;
         for vote_auth in [vote_auth_0, vote_auth_1] {
             let voter_addr = vote_auth.get_address();
@@ -749,7 +750,7 @@ async fn roundtrip_task_inner(
                 .await?
             {
                 if let Some(weight) = vote_weights.remove(&voter_addr) {
-                    total_yes += weight;
+                    total_yes += weight.0;
                 }
             } else if truthcoin_nodes
                 .issuer
@@ -763,17 +764,17 @@ async fn roundtrip_task_inner(
                 .await?
                 && let Some(weight) = vote_weights.remove(&voter_addr)
             {
-                total_no += weight;
+                total_no += weight.0;
             }
         }
         (total_yes, total_no)
     };
     anyhow::ensure!(
-        total_yes > 0.0,
+        total_yes > 0,
         "Expected voter_0 YES vote weight > 0, got {total_yes}"
     );
     anyhow::ensure!(
-        total_no > 0.0,
+        total_no > 0,
         "Expected voter_1 NO vote weight > 0, got {total_no}"
     );
 
@@ -1879,7 +1880,7 @@ async fn roundtrip_task_inner(
     // Capture pre-consensus reputation BEFORE the period closes. Consensus
     // runs after the reveal window closes, so reputation must not move
     // before then.
-    let mut pre_consensus_rep: HashMap<Address, f64> = HashMap::new();
+    let mut pre_consensus_rep: HashMap<Address, Votecoin> = HashMap::new();
     for &voter_addr in &voter_addresses {
         let rep = truthcoin_nodes
             .issuer
@@ -1940,7 +1941,7 @@ async fn roundtrip_task_inner(
     ] {
         let result = sender
             .rpc_client
-            .transfer_votecoin(dest, 0.000001, 1000, None)
+            .transfer_votecoin(dest, Votecoin(1), 1000, None)
             .await;
         anyhow::ensure!(
             matches!(&result, Err(err) if err.to_string().contains("locked")),
@@ -2110,7 +2111,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_millis(100)).await;
 
-    let mut post_consensus_rep: HashMap<Address, f64> = HashMap::new();
+    let mut post_consensus_rep: HashMap<Address, Votecoin> = HashMap::new();
     for &voter_addr in &voter_addresses {
         let rep = truthcoin_nodes
             .issuer
@@ -2143,25 +2144,25 @@ async fn roundtrip_task_inner(
     let dissenter_addr = voter_addresses[expected::DISSENTER_INDEX];
     let dissenter_pre = pre_consensus_rep[&dissenter_addr];
     let dissenter_post = post_consensus_rep[&dissenter_addr];
-    let dissenter_delta = dissenter_post - dissenter_pre;
+    let dissenter_delta = dissenter_post.0 as i64 - dissenter_pre.0 as i64;
 
     anyhow::ensure!(
-        dissenter_delta < 0.0,
+        dissenter_delta < 0,
         "Dissenter should have lost reputation: \
-         pre={dissenter_pre:.6}, post={dissenter_post:.6}, \
-         delta={dissenter_delta:+.6}",
+         pre={dissenter_pre}, post={dissenter_post}, \
+         delta={dissenter_delta:+}",
     );
 
     for (i, &voter_addr) in voter_addresses.iter().enumerate() {
         if i != expected::DISSENTER_INDEX {
             let pre = pre_consensus_rep[&voter_addr];
             let post = post_consensus_rep[&voter_addr];
-            let delta = post - pre;
+            let delta = post.0 as i64 - pre.0 as i64;
             anyhow::ensure!(
                 delta >= -expected::REPUTATION_TOLERANCE,
                 "Conformer V{} lost too much reputation: \
-                 pre={pre:.6}, post={post:.6}, \
-                 delta={delta:+.6}",
+                 pre={pre}, post={post}, \
+                 delta={delta:+}",
                 i + 1,
             );
         }
@@ -2171,8 +2172,8 @@ async fn roundtrip_task_inner(
         if i != expected::DISSENTER_INDEX {
             let conformer_post = post_consensus_rep[&voter_addr];
             anyhow::ensure!(
-                dissenter_post
-                    <= conformer_post + expected::REPUTATION_TOLERANCE,
+                dissenter_post.0 as i64
+                    <= conformer_post.0 as i64 + expected::REPUTATION_TOLERANCE,
                 "Dissenter should have lower or equal \
                  reputation than conformer V{}",
                 i + 1
@@ -2180,13 +2181,17 @@ async fn roundtrip_task_inner(
         }
     }
 
-    let total_pre: f64 = pre_consensus_rep.values().sum();
-    let total_post: f64 = post_consensus_rep.values().sum();
+    let total_pre: i64 =
+        pre_consensus_rep.values().map(|units| units.0 as i64).sum();
+    let total_post: i64 = post_consensus_rep
+        .values()
+        .map(|units| units.0 as i64)
+        .sum();
     anyhow::ensure!(
         (total_pre - total_post).abs() < expected::REPUTATION_TOLERANCE,
         "Reputation conservation violated: \
-         pre={total_pre:.6}, post={total_post:.6}, \
-         diff={:.6}",
+         pre={total_pre}, post={total_post}, \
+         diff={}",
         (total_pre - total_post).abs()
     );
 
@@ -2369,9 +2374,9 @@ async fn roundtrip_task_inner(
             .await?;
         let expected_rep = post_consensus_rep[&voter_addr];
         anyhow::ensure!(
-            (rep - expected_rep).abs() < expected::REPUTATION_TOLERANCE,
+            rep == expected_rep,
             "Reputation mutated by market payouts for {voter_addr}: \
-             consensus_post={expected_rep:.6}, post_payout={rep:.6}",
+             consensus_post={expected_rep}, post_payout={rep}",
         );
     }
 
@@ -4635,7 +4640,7 @@ async fn roundtrip_task_inner(
     tracing::info!("✓ Phase 13: Period resolution completed");
 
     // Verify reputation conservation across Phase 2 consensus
-    let mut phase2_post_rep: HashMap<Address, f64> = HashMap::new();
+    let mut phase2_post_rep: HashMap<Address, Votecoin> = HashMap::new();
     for &voter_addr in &voter_addresses {
         let rep = truthcoin_nodes
             .issuer
@@ -4644,12 +4649,13 @@ async fn roundtrip_task_inner(
             .await?;
         phase2_post_rep.insert(voter_addr, rep);
     }
-    let phase2_total: f64 = phase2_post_rep.values().sum();
+    let phase2_total: i64 =
+        phase2_post_rep.values().map(|units| units.0 as i64).sum();
     anyhow::ensure!(
         (phase2_total - total_pre).abs() < expected::REPUTATION_TOLERANCE,
         "Reputation conservation violated across Phase 2 consensus: \
-         initial={total_pre:.6}, phase2_post={phase2_total:.6}, \
-         diff={:.6}",
+         initial={total_pre}, phase2_post={phase2_total}, \
+         diff={}",
         (phase2_total - total_pre).abs()
     );
 

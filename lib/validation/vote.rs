@@ -140,7 +140,7 @@ impl VoteValidator {
     ) -> Result<(), Error> {
         let reputation =
             state.reputation().get_reputation(rotxn, voter_address)?;
-        if reputation <= 0.0 {
+        if reputation.is_zero() {
             return Err(Error::InvalidTransaction {
                 reason: "Voter has no reputation (voting rights)".to_string(),
             });
@@ -278,30 +278,9 @@ impl VoteValidator {
             });
         }
 
-        if transfer_data.amount <= 0.0 {
+        if transfer_data.amount.is_zero() {
             return Err(Error::InvalidTransaction {
                 reason: "Transfer amount must be positive".to_string(),
-            });
-        }
-
-        if !transfer_data.amount.is_finite() {
-            return Err(Error::InvalidTransaction {
-                reason: "Transfer amount must be a finite number".to_string(),
-            });
-        }
-
-        if transfer_data.amount
-            != crate::math::voting::constants::round_reputation(
-                transfer_data.amount,
-            )
-        {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Transfer amount {} exceeds reputation precision \
-                     (max {} decimal digits)",
-                    transfer_data.amount,
-                    crate::math::voting::constants::REPUTATION_PRECISION_DECIMALS,
-                ),
             });
         }
 
@@ -319,15 +298,14 @@ impl VoteValidator {
 
         let sender_reputation =
             state.reputation().get_reputation(rotxn, &sender_address)?;
-        if sender_reputation < transfer_data.amount {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Insufficient reputation: have \
-                     {sender_reputation}, need {}",
-                    transfer_data.amount
-                ),
-            });
-        }
+        let receiver_reputation = state
+            .reputation()
+            .get_reputation(rotxn, &transfer_data.dest)?;
+        Self::balances_after_transfer(
+            sender_reputation,
+            receiver_reputation,
+            transfer_data.amount,
+        )?;
 
         Ok(())
     }
@@ -357,6 +335,31 @@ impl VoteValidator {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn balances_after_transfer(
+        sender_reputation: crate::types::Votecoin,
+        receiver_reputation: crate::types::Votecoin,
+        amount: crate::types::Votecoin,
+    ) -> Result<(crate::types::Votecoin, crate::types::Votecoin), Error> {
+        let sender_after =
+            sender_reputation.checked_sub(amount).ok_or_else(|| {
+                Error::InvalidTransaction {
+                    reason: format!(
+                        "Insufficient votecoin: have {sender_reputation}, \
+                         need {amount}"
+                    ),
+                }
+            })?;
+        let receiver_after = receiver_reputation
+            .checked_add(amount)
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: format!(
+                    "Votecoin balance overflow: {receiver_reputation} + \
+                         {amount}"
+                ),
+            })?;
+        Ok((sender_after, receiver_after))
     }
 
     pub fn validate_ballot(
@@ -781,32 +784,29 @@ mod tests {
         assert!(VoteValidator::validate_vote_value(&d, 1.5).is_err());
     }
 
+    /// Debits the sender, credits the receiver, refuses overdraft and overflow
     #[test]
-    fn transfer_amount_at_precision_is_accepted() {
-        use crate::math::voting::constants::round_reputation;
-        let amount = 0.000_000_000_1_f64;
-        assert_eq!(amount, round_reputation(amount));
-    }
+    fn transfer_balances() {
+        use crate::types::Votecoin;
 
-    #[test]
-    fn transfer_amount_above_precision_is_rejected() {
-        use crate::math::voting::constants::round_reputation;
-        let amount = 0.000_000_000_01_f64;
-        assert_ne!(amount, round_reputation(amount));
-    }
+        let after = VoteValidator::balances_after_transfer;
 
-    #[test]
-    fn transfer_amount_subprecision_is_rejected() {
-        use crate::math::voting::constants::round_reputation;
-        let amount = 1e-15_f64;
-        assert_ne!(amount, round_reputation(amount));
-    }
-
-    #[test]
-    fn transfer_amount_whole_value_is_accepted() {
-        use crate::math::voting::constants::round_reputation;
-        let amount = 0.5_f64;
-        assert_eq!(amount, round_reputation(amount));
+        assert_eq!(
+            after(Votecoin(300_000), Votecoin::ZERO, Votecoin(100_000))
+                .unwrap(),
+            (Votecoin(200_000), Votecoin(100_000))
+        );
+        assert_eq!(
+            after(Votecoin(250_000), Votecoin(500_000), Votecoin(250_000))
+                .unwrap(),
+            (Votecoin::ZERO, Votecoin(750_000))
+        );
+        assert_eq!(
+            after(Votecoin(1), Votecoin::ZERO, Votecoin(1)).unwrap(),
+            (Votecoin::ZERO, Votecoin(1))
+        );
+        assert!(after(Votecoin(1), Votecoin::ZERO, Votecoin(2)).is_err());
+        assert!(after(Votecoin(1), Votecoin(u64::MAX), Votecoin(1)).is_err());
     }
 
     struct VotingFixture {
@@ -845,7 +845,7 @@ mod tests {
             .unwrap();
         state
             .reputation()
-            .set_reputation(&mut rwtxn, &voter, 1.0)
+            .set_reputation(&mut rwtxn, &voter, crate::types::Votecoin::TOTAL)
             .unwrap();
         for decision_id in decision_ids {
             let decision = Decision::new(
@@ -1275,7 +1275,7 @@ mod tests {
             data: Some(TxData::TransferReputation {
                 sender,
                 dest,
-                amount: 0.1,
+                amount: crate::types::Votecoin(100_000),
             }),
             ..Default::default()
         };

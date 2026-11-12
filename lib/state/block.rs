@@ -1039,7 +1039,7 @@ mod test {
             )?;
             assert_eq!(
                 state.reputation().get_reputation(&rwtxn, &address)?,
-                1.0
+                crate::types::Votecoin::TOTAL
             );
             if address == first_address {
                 state.disconnect_withdrawal_bundle_creation(&mut rwtxn)?;
@@ -1054,7 +1054,7 @@ mod test {
 
         assert_eq!(
             state.reputation().get_reputation(&rwtxn, &first_address)?,
-            0.0
+            crate::types::Votecoin::ZERO
         );
         assert_eq!(state.reputation().count_holders(&rwtxn)?, 1);
         Ok(())
@@ -1292,7 +1292,11 @@ mod test {
             reputations.keys().copied().collect::<BTreeSet<_>>(),
             whitelist
         );
-        assert!(reputations.values().all(|&rep| (rep - 0.02).abs() < 1e-12));
+        assert!(
+            reputations
+                .values()
+                .all(|&rep| rep == crate::types::Votecoin(20_000))
+        );
 
         state.disconnect_tip_body(&mut rwtxn, &header, &body)?;
         state.disconnect_tip_header(&mut rwtxn, &header)?;
@@ -1763,7 +1767,11 @@ mod test {
         state.genesis_timestamp.put(&mut txn, &(), &1000)?;
         state.mainchain_timestamp.put(&mut txn, &(), &timestamp)?;
         state.height.put(&mut txn, &(), &10)?;
-        state.reputation().set_reputation(&mut txn, &voter, 1.0)?;
+        state.reputation().set_reputation(
+            &mut txn,
+            &voter,
+            crate::types::Votecoin::TOTAL,
+        )?;
         state
             .decisions()
             .mint_genesis(&mut txn, timestamp, 10, 1000)?;

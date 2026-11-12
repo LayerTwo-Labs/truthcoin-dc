@@ -2165,17 +2165,14 @@ fn apply_transfer_reputation(
 
     let sender_rep =
         state.reputation().get_reputation(rwtxn, &sender_address)?;
-    if sender_rep < transfer.amount {
-        return Err(Error::InvalidTransaction {
-            reason: format!(
-                "Insufficient reputation at apply: have {sender_rep}, \
-                 need {}",
-                transfer.amount
-            ),
-        });
-    }
     let receiver_rep =
         state.reputation().get_reputation(rwtxn, &transfer.dest)?;
+    let (sender_after, receiver_after) =
+        crate::validation::VoteValidator::balances_after_transfer(
+            sender_rep,
+            receiver_rep,
+            transfer.amount,
+        )?;
 
     let undo_entry = crate::state::undo::ReputationTransferUndoEntry {
         sender: sender_address,
@@ -2195,16 +2192,12 @@ fn apply_transfer_reputation(
         .reputation_transfer_undo
         .put(rwtxn, &height, &undo_data)?;
 
-    state.reputation().set_reputation(
-        rwtxn,
-        &sender_address,
-        sender_rep - transfer.amount,
-    )?;
-    state.reputation().set_reputation(
-        rwtxn,
-        &transfer.dest,
-        receiver_rep + transfer.amount,
-    )?;
+    state
+        .reputation()
+        .set_reputation(rwtxn, &sender_address, sender_after)?;
+    state
+        .reputation()
+        .set_reputation(rwtxn, &transfer.dest, receiver_after)?;
 
     Ok(())
 }

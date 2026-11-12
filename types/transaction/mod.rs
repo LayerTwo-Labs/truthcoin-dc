@@ -17,6 +17,7 @@ use crate::{
     },
     market::{DimensionSpec, MarketId},
     schema,
+    votecoin::Votecoin,
 };
 
 pub mod inputs;
@@ -170,8 +171,7 @@ pub enum TransactionData {
     TransferReputation {
         sender: Address,
         dest: Address,
-        #[borsh(serialize_with = "crate::util::borsh::serialize::f64")]
-        amount: f64,
+        amount: Votecoin,
     },
     /// Amplify a market's LMSR beta by funding its treasury.
     /// Only the market author may submit this transaction.
@@ -288,7 +288,7 @@ pub fn ballot_commitment(
 pub struct TransferReputation {
     pub sender: Address,
     pub dest: Address,
-    pub amount: f64,
+    pub amount: Votecoin,
 }
 
 #[derive(Clone, Debug, PartialEq)]

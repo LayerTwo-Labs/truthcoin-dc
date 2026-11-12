@@ -46,6 +46,8 @@ pub use transaction::{
 };
 pub mod tx_pow;
 mod util;
+pub mod votecoin;
+pub use votecoin::Votecoin;
 pub mod wallet;
 
 pub const THIS_SIDECHAIN: u8 = 13;
