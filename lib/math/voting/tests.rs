@@ -806,3 +806,355 @@ fn test_unguaranteed_categorical() {
         Some((1.0, Some(1)))
     );
 }
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Binary,
+    Scaled,
+    Categorical(u16),
+}
+
+type Column = (Kind, &'static [Option<f64>]);
+
+struct CampResult {
+    outcomes: Vec<Option<f64>>,
+    reputations: Vec<Vec<f64>>,
+}
+
+impl CampResult {
+    fn total(&self, camp: usize) -> f64 {
+        self.reputations[camp].iter().sum()
+    }
+}
+
+fn camp_consensus(camps: &[&[f64]], columns: &[Column]) -> CampResult {
+    let num_voters = camps.iter().map(|camp| camp.len()).sum();
+    let voters = create_test_voter_ids(num_voters);
+    let decisions = create_test_decision_ids(columns.len());
+    let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
+    let mut reputation = VotingWeightVector::new();
+    let mut scaled = HashSet::new();
+    let mut categorical = HashMap::new();
+    for (decision, (kind, _)) in decisions.iter().zip(columns) {
+        match kind {
+            Kind::Binary => {}
+            Kind::Scaled => {
+                scaled.insert(*decision);
+            }
+            Kind::Categorical(option_count) => {
+                categorical.insert(*decision, *option_count);
+            }
+        }
+    }
+    let mut camp_voters = Vec::new();
+    let mut next = voters.iter();
+    for (camp_idx, camp) in camps.iter().enumerate() {
+        let members: Vec<Address> =
+            next.by_ref().take(camp.len()).copied().collect();
+        for (voter, rep) in members.iter().zip(camp.iter()) {
+            reputation.set_reputation(*voter, *rep);
+            for (decision, (_, votes)) in decisions.iter().zip(columns) {
+                if let Some(vote) = votes[camp_idx] {
+                    matrix.set_vote(*voter, *decision, vote).unwrap();
+                }
+            }
+        }
+        camp_voters.push(members);
+    }
+    let result =
+        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
+            .unwrap();
+    CampResult {
+        outcomes: decisions.iter().map(|d| result.outcomes[d]).collect(),
+        reputations: camp_voters
+            .iter()
+            .map(|members| {
+                members
+                    .iter()
+                    .map(|voter| result.updated_reputations[voter])
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
+fn assert_split_invariant(
+    unsplit: &[&[f64]],
+    split: &[&[f64]],
+    columns: &[Column],
+) {
+    let whole = camp_consensus(unsplit, columns);
+    let pieces = camp_consensus(split, columns);
+    for (a, b) in whole.outcomes.iter().zip(&pieces.outcomes) {
+        match (a, b) {
+            (Some(a), Some(b)) => assert!((a - b).abs() < 1e-8, "{a} vs {b}"),
+            (a, b) => assert_eq!(a, b),
+        }
+    }
+    for camp in 0..unsplit.len() {
+        let (a, b) = (whole.total(camp), pieces.total(camp));
+        assert!((a - b).abs() < 1e-5, "camp {camp}: {a} vs {b}");
+    }
+}
+
+fn assert_reputation_unchanged(camps: &[&[f64]], result: &CampResult) {
+    for (inputs, updated) in camps.iter().zip(&result.reputations) {
+        for (input, output) in inputs.iter().zip(updated) {
+            assert!((input - output).abs() < 1e-6, "{input} vs {output}");
+        }
+    }
+}
+
+const BINARY_STRAGGLER: [Column; 3] = [
+    (Kind::Binary, &[Some(0.0), Some(1.0), Some(0.75)]),
+    (Kind::Binary, &[Some(0.0), Some(1.0), Some(0.75)]),
+    (Kind::Binary, &[Some(0.0), Some(1.0), Some(0.0)]),
+];
+
+/// 50/45/5 binary camps: splitting the 45% camp 5 ways changes nothing.
+#[test]
+fn split_minority_binary() {
+    assert_split_invariant(
+        &[&[0.5], &[0.45], &[0.05]],
+        &[&[0.5], &[0.09; 5], &[0.05]],
+        &BINARY_STRAGGLER,
+    );
+}
+
+/// 50/45/5 binary camps: splitting the 50% camp 5 ways changes nothing.
+#[test]
+fn split_majority_binary() {
+    assert_split_invariant(
+        &[&[0.5], &[0.45], &[0.05]],
+        &[&[0.1; 5], &[0.45], &[0.05]],
+        &BINARY_STRAGGLER,
+    );
+}
+
+/// Both camps split 3 and 7 ways match the unsplit result.
+#[test]
+fn split_both_camps() {
+    assert_split_invariant(
+        &[&[0.51], &[0.42], &[0.07]],
+        &[&[0.17; 3], &[0.06; 7], &[0.07]],
+        &BINARY_STRAGGLER,
+    );
+}
+
+/// The 45% camp split into unequal pieces changes nothing.
+#[test]
+fn split_uneven_pieces() {
+    assert_split_invariant(
+        &[&[0.5], &[0.45], &[0.05]],
+        &[&[0.5], &[0.2, 0.15, 0.1], &[0.05]],
+        &BINARY_STRAGGLER,
+    );
+}
+
+/// A 20-way split of the 40% camp changes nothing.
+#[test]
+fn split_twenty_ways() {
+    assert_split_invariant(
+        &[&[0.5], &[0.4], &[0.1]],
+        &[&[0.5], &[0.02; 20], &[0.1]],
+        &BINARY_STRAGGLER,
+    );
+}
+
+/// Scaled 0.2 vs 0.8 at 50/45/5: splitting the 45% camp changes nothing.
+#[test]
+fn split_scaled_votes() {
+    assert_split_invariant(
+        &[&[0.5], &[0.45], &[0.05]],
+        &[&[0.5], &[0.09; 5], &[0.05]],
+        &[
+            (Kind::Scaled, &[Some(0.2), Some(0.8), Some(0.65)]),
+            (Kind::Scaled, &[Some(0.2), Some(0.8), Some(0.65)]),
+            (Kind::Scaled, &[Some(0.2), Some(0.8), Some(0.2)]),
+        ],
+    );
+}
+
+/// Scaled 0.0 vs 1.0 at 50/45/5: splitting the 45% camp changes nothing.
+#[test]
+fn split_scaled_extremes() {
+    assert_split_invariant(
+        &[&[0.5], &[0.45], &[0.05]],
+        &[&[0.5], &[0.09; 5], &[0.05]],
+        &[
+            (Kind::Scaled, &[Some(0.0), Some(1.0), Some(0.75)]),
+            (Kind::Scaled, &[Some(0.0), Some(1.0), Some(0.75)]),
+            (Kind::Scaled, &[Some(0.0), Some(1.0), Some(0.0)]),
+        ],
+    );
+}
+
+/// Binary, scaled and a decided categorical in one period: splitting
+/// changes nothing.
+#[test]
+fn split_mixed_period() {
+    assert_split_invariant(
+        &[&[0.5], &[0.45], &[0.05]],
+        &[&[0.5], &[0.09; 5], &[0.05]],
+        &[
+            (Kind::Binary, &[Some(0.0), Some(1.0), Some(0.75)]),
+            (Kind::Scaled, &[Some(0.2), Some(0.8), Some(0.65)]),
+            (Kind::Categorical(2), &[Some(0.0), Some(1.0), Some(0.0)]),
+        ],
+    );
+}
+
+/// Camp B abstains on one contested decision: splitting B changes nothing.
+#[test]
+fn split_with_abstentions() {
+    assert_split_invariant(
+        &[&[0.5], &[0.45], &[0.05]],
+        &[&[0.5], &[0.09; 5], &[0.05]],
+        &[
+            (Kind::Binary, &[Some(0.0), Some(1.0), Some(0.75)]),
+            (Kind::Binary, &[Some(0.0), None, Some(0.75)]),
+            (Kind::Binary, &[Some(0.0), Some(1.0), Some(0.0)]),
+        ],
+    );
+}
+
+/// 70/30 with the minority split 10 ways: the majority still gains
+/// reputation and wins every contested decision.
+#[test]
+fn majority_still_rewarded() {
+    let result = camp_consensus(
+        &[&[0.7], &[0.03; 10]],
+        &[
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Scaled, &[Some(0.2), Some(0.8)]),
+        ],
+    );
+    assert!(result.total(0) > 0.7);
+    assert_eq!(result.outcomes, vec![Some(0.0), Some(0.0), Some(0.2)]);
+}
+
+/// 50/50 binary camps with B split 5 ways: no reputation moves and the
+/// contested decisions resolve 0.5.
+#[test]
+fn deadlock_binary_only() {
+    let camps: [&[f64]; 2] = [&[0.5], &[0.1; 5]];
+    let result = camp_consensus(
+        &camps,
+        &[
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+        ],
+    );
+    assert_reputation_unchanged(&camps, &result);
+    assert_eq!(result.outcomes, vec![Some(0.5), Some(0.5)]);
+}
+
+/// 50/50 at scaled 0.25 vs 0.75 with B split 5 ways: no reputation moves
+/// and the outcome is the old-reputation median midpoint.
+#[test]
+fn deadlock_scaled_exact() {
+    let camps: [&[f64]; 2] = [&[0.5], &[0.1; 5]];
+    let result = camp_consensus(
+        &camps,
+        &[
+            (Kind::Scaled, &[Some(0.25), Some(0.75)]),
+            (Kind::Scaled, &[Some(0.25), Some(0.75)]),
+        ],
+    );
+    assert_reputation_unchanged(&camps, &result);
+    assert_eq!(result.outcomes, vec![Some(0.5), Some(0.5)]);
+}
+
+/// Binary plus scaled 0.2 vs 0.8, whose distances differ by one ULP, with
+/// A split 5 ways: still a deadlock.
+#[test]
+fn deadlock_rounding_noise() {
+    let camps: [&[f64]; 2] = [&[0.1; 5], &[0.5]];
+    let result = camp_consensus(
+        &camps,
+        &[
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Scaled, &[Some(0.2), Some(0.8)]),
+            (Kind::Scaled, &[Some(0.2), Some(0.8)]),
+        ],
+    );
+    assert_reputation_unchanged(&camps, &result);
+    assert_eq!(result.outcomes, vec![Some(0.5), Some(0.5), Some(0.5)]);
+}
+
+/// 55/45 binary camps: the reference still catches to 0.5, so no
+/// reputation moves and the decisions resolve 0.5.
+#[test]
+fn deadlock_unequal_reps() {
+    let camps: [&[f64]; 2] = [&[0.55], &[0.45]];
+    let result = camp_consensus(
+        &camps,
+        &[
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+        ],
+    );
+    assert_reputation_unchanged(&camps, &result);
+    assert_eq!(result.outcomes, vec![Some(0.5), Some(0.5)]);
+}
+
+/// A binary deadlock plus a tied categorical: the categorical is skipped
+/// and nothing moves.
+#[test]
+fn deadlock_categorical_tie() {
+    let camps: [&[f64]; 2] = [&[0.5], &[0.1; 5]];
+    let result = camp_consensus(
+        &camps,
+        &[
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Categorical(2), &[Some(0.0), Some(1.0)]),
+        ],
+    );
+    assert_reputation_unchanged(&camps, &result);
+    assert_eq!(result.outcomes, vec![Some(0.5), Some(0.5), Some(0.5)]);
+}
+
+/// A binary deadlock gives the same result with B in 1 or 9 addresses.
+#[test]
+fn deadlock_split_irrelevant() {
+    let columns: [Column; 2] = [
+        (Kind::Binary, &[Some(0.0), Some(1.0)]),
+        (Kind::Binary, &[Some(0.0), Some(1.0)]),
+    ];
+    assert_split_invariant(
+        &[&[0.5], &[0.5]],
+        &[&[0.5], &[0.5 / 9.0; 9]],
+        &columns,
+    );
+}
+
+/// 65/35 binary camps sit outside the catch band, so A is rewarded.
+#[test]
+fn no_deadlock_outside_band() {
+    let result = camp_consensus(
+        &[&[0.65], &[0.35]],
+        &[
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+        ],
+    );
+    assert!(result.total(0) > 0.65);
+}
+
+/// A 51/49 binary deadlock plus a categorical A wins: the pinned column
+/// breaks the deadlock and A is rewarded.
+#[test]
+fn decided_categorical_anchors() {
+    let result = camp_consensus(
+        &[&[0.51], &[0.049; 10]],
+        &[
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Binary, &[Some(0.0), Some(1.0)]),
+            (Kind::Categorical(2), &[Some(0.0), Some(1.0)]),
+        ],
+    );
+    assert!(result.total(0) > 0.51);
+    assert_eq!(result.outcomes, vec![Some(0.0), Some(0.0), Some(0.0)]);
+}
