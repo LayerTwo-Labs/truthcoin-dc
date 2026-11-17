@@ -1,5 +1,6 @@
 pub mod decision;
 pub mod market;
+pub mod offer;
 pub mod vote;
 
 use std::collections::HashSet;
@@ -20,6 +21,7 @@ use crate::{
 
 pub use decision::DecisionValidator;
 pub use market::{MarketStateValidator, MarketValidator};
+pub use offer::OfferValidator;
 pub use vote::{PeriodValidator, VoteValidator};
 
 pub trait DecisionValidationInterface {
@@ -46,6 +48,12 @@ pub trait DecisionValidationInterface {
     ) -> Result<Option<u64>, Error>;
 
     fn get_standard_claimed_count_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<u64, Error>;
+
+    fn get_nonstandard_claimed_count_in_period(
         &self,
         rotxn: &RoTxn,
         period_index: u32,
@@ -130,16 +138,11 @@ pub(crate) fn validate_market_transaction(
         )?;
         return Ok(Some(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)));
     }
-    if tx.is_submit_vote() {
-        VoteValidator::validate_vote_submission(
-            state,
-            rotxn,
-            tx,
-            override_height,
-        )?;
-    }
     if tx.is_submit_ballot() {
         VoteValidator::validate_ballot(state, rotxn, tx, override_height)?;
+    }
+    if tx.is_reveal_ballot() {
+        VoteValidator::validate_reveal(state, rotxn, tx, override_height)?;
     }
     if tx.is_transfer_reputation() {
         VoteValidator::validate_reputation_transfer(
@@ -149,7 +152,30 @@ pub(crate) fn validate_market_transaction(
             override_height,
         )?;
     }
+    if tx.is_take_offer() {
+        OfferValidator::validate_take_offer(state, rotxn, tx)?;
+    }
+    if tx.is_cancel_offer() {
+        OfferValidator::validate_cancel_offer(state, rotxn, tx)?;
+    }
     Ok(None)
+}
+
+pub fn check_duplicate_offer_closes(
+    transactions: &[Transaction],
+) -> Result<(), Error> {
+    let mut closed = HashSet::new();
+    for offer_id in transactions
+        .iter()
+        .filter_map(|tx| tx.data.as_ref()?.closed_offer_id())
+    {
+        if !closed.insert(offer_id) {
+            return Err(Error::InvalidTransaction {
+                reason: format!("Block closes offer {offer_id} more than once"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Reject a block claiming the same decision id more than once, across both
@@ -232,14 +258,16 @@ mod tests {
         }
     }
 
+    /// A coinbase may always pay a bitcoin output
     #[test]
-    fn coinbase_bitcoin_output_always_valid() {
+    fn coinbase_bitcoin_output() {
         let outputs = vec![bitcoin_output(5000)];
         assert!(super::validate_coinbase_outputs(&outputs).is_ok());
     }
 
+    /// A coinbase may never pay market funds
     #[test]
-    fn coinbase_market_funds_always_rejected() {
+    fn coinbase_market_funds() {
         let outputs = vec![Output {
             address: Address::ALL_ZEROS,
             content: OutputContent::MarketFunds {
@@ -258,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_fees_coinbase_exceeds_fees_rejected() {
+    fn coinbase_exceeds_fees() {
         let coinbase = bitcoin::Amount::from_sat(1000);
         assert!(super::validate_fees(coinbase, &[], &HashSet::new()).is_err());
     }
@@ -287,7 +315,48 @@ mod tests {
     }
 
     #[test]
-    fn miner_fee_excludes_amplify_beta_deposit() {
+    fn block_closes_offer_once() {
+        use crate::types::{TxData, VotecoinOffer, authorization::SigningKey};
+
+        let key = SigningKey::new(&mut rand::rng());
+        let offer = |nonce| VotecoinOffer {
+            seller: Address([1; 20]),
+            amount: crate::types::Votecoin(100_000),
+            price: bitcoin::Amount::from_sat(1000),
+            pay_to: Address([1; 20]),
+            voting_period: 1,
+            nonce,
+        };
+        let take = |nonce| Transaction {
+            data: Some(TxData::TakeOffer {
+                offer: Box::new(super::offer::sign_test_offer(
+                    &key,
+                    offer(nonce),
+                )),
+                buyer: Address([2; 20]),
+            }),
+            ..Transaction::default()
+        };
+        let cancel = |nonce| Transaction {
+            data: Some(TxData::CancelOffer {
+                offer: offer(nonce),
+            }),
+            ..Transaction::default()
+        };
+
+        assert!(
+            super::check_duplicate_offer_closes(&[take(1), take(1)]).is_err()
+        );
+        assert!(
+            super::check_duplicate_offer_closes(&[take(1), cancel(1)]).is_err()
+        );
+        super::check_duplicate_offer_closes(&[take(1), take(2), cancel(3)])
+            .unwrap();
+    }
+
+    /// The miner fee excludes an amplify-beta deposit
+    #[test]
+    fn miner_fee_beta_deposit() {
         use crate::{
             math::trading::TRADE_MINER_FEE_SATS,
             state::markets::MarketId,
@@ -314,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_decision_claim_across_txs_rejected() {
+    fn duplicate_claim_across_txs() {
         let txs = vec![claim_tx(&[[1, 2, 3, 4]]), claim_tx(&[[1, 2, 3, 4]])];
         assert!(super::check_duplicate_decision_claims(&txs).is_err());
     }

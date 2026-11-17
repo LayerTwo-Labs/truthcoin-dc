@@ -57,12 +57,18 @@ impl Periods {
         )
     }
 
-    fn period_start_ts(&self, seconds_per_period: u64) -> Option<u64> {
+    /// Start and end timestamps of the current time-based period
+    fn period_bounds(&self, config: &DecisionConfig) -> Option<(u64, u64)> {
+        if config.is_blocks_mode() || self.current_period == 0 {
+            return None;
+        }
         let genesis_ts = self.genesis_timestamp?;
-        let period = self.current_period.checked_sub(1)? as u64;
         Some(
-            genesis_ts
-                .saturating_add(period.saturating_mul(seconds_per_period)),
+            truthcoin_dc::state::voting::period_calculator::calculate_period_boundaries(
+                self.current_period,
+                config,
+                genesis_ts,
+            ),
         )
     }
 
@@ -245,15 +251,12 @@ impl Periods {
                             ui.label(RichText::new("Period Length:").strong());
                             if let Some(blocks) = config.blocks_per_period() {
                                 ui.label(format!("{blocks} blocks"));
-                            } else if let Some(secs) =
-                                config.seconds_per_period()
-                            {
-                                ui.label(format_duration(secs));
+                            } else {
+                                ui.label("Calendar quarter (UTC)");
                             }
                             ui.end_row();
 
-                            if let Some(secs) = config.seconds_per_period()
-                                && let Some(start) = self.period_start_ts(secs)
+                            if let Some((start, _)) = self.period_bounds(config)
                             {
                                 ui.label(
                                     RichText::new("Period Started:").strong(),
@@ -305,14 +308,11 @@ impl Periods {
             return;
         }
 
-        let Some(seconds_per_period) = config.seconds_per_period() else {
-            return;
-        };
-
-        let Some(period_start_ts) = self.period_start_ts(seconds_per_period)
+        let Some((period_start_ts, period_end_ts)) = self.period_bounds(config)
         else {
             return;
         };
+        let seconds_per_period = period_end_ts - period_start_ts;
         let Some(estimated_now) = self.estimated_mainchain_ts() else {
             return;
         };

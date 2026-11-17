@@ -8,8 +8,8 @@
 use crate::state::{
     Error,
     voting::types::{
-        Ballot, DecisionOutcome, Vote, VoteMatrixEntry, VoteMatrixKey,
-        VotingPeriodId, VotingPeriodStats,
+        Ballot, DecisionOutcome, SealedBallot, Vote, VoteMatrixEntry,
+        VoteMatrixKey, VotingPeriodId, VotingPeriodStats,
     },
 };
 use fallible_iterator::FallibleIterator;
@@ -39,10 +39,15 @@ pub struct VotingDatabases {
         SerdeBincode<VotingPeriodId>,
         SerdeBincode<VotingPeriodStats>,
     >,
+
+    sealed_ballots: DatabaseUnique<
+        SerdeBincode<(VotingPeriodId, crate::types::Address)>,
+        SerdeBincode<SealedBallot>,
+    >,
 }
 
 impl VotingDatabases {
-    pub const NUM_DBS: u32 = 4;
+    pub const NUM_DBS: u32 = 5;
 
     pub fn new<Tls>(
         env: &Env<Tls>,
@@ -57,7 +62,49 @@ impl VotingDatabases {
                 "decision_outcomes",
             )?,
             period_stats: DatabaseUnique::create(env, rwtxn, "period_stats")?,
+            sealed_ballots: DatabaseUnique::create(
+                env,
+                rwtxn,
+                "sealed_ballots",
+            )?,
         })
+    }
+
+    pub fn get_sealed_ballot(
+        &self,
+        rotxn: &RoTxn,
+        period_id: VotingPeriodId,
+        voter_address: crate::types::Address,
+    ) -> Result<Option<SealedBallot>, Error> {
+        Ok(self
+            .sealed_ballots
+            .try_get(rotxn, &(period_id, voter_address))?)
+    }
+
+    pub fn put_sealed_ballot(
+        &self,
+        rwtxn: &mut RwTxn,
+        period_id: VotingPeriodId,
+        voter_address: crate::types::Address,
+        sealed_ballot: &SealedBallot,
+    ) -> Result<(), Error> {
+        self.sealed_ballots.put(
+            rwtxn,
+            &(period_id, voter_address),
+            sealed_ballot,
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_sealed_ballot(
+        &self,
+        rwtxn: &mut RwTxn,
+        period_id: VotingPeriodId,
+        voter_address: crate::types::Address,
+    ) -> Result<(), Error> {
+        self.sealed_ballots
+            .delete(rwtxn, &(period_id, voter_address))?;
+        Ok(())
     }
 
     pub fn put_vote(

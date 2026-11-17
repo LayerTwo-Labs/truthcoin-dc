@@ -19,8 +19,8 @@ use crate::{
         Accumulator, AccumulatorDiff, Address, AmountOverflowError,
         AmountUnderflowError, Authorized, AuthorizedTransaction, BlockHash,
         Body, Coinbase, CoinbaseTxid, FilledTransaction, GetAddress, GetValue,
-        Header, InPoint, M6id, MerkleRoot, OutPoint, OutPointKey, Output,
-        PointedOutput, PointedOutputRef, SpentOutput, Transaction,
+        Header, InPoint, M6id, MerkleRoot, OfferId, OutPoint, OutPointKey,
+        Output, PointedOutput, PointedOutputRef, SpentOutput, Transaction,
         UtreexoNodeHash, UtreexoProof, VERSION, Version, WithdrawalBundle,
         WithdrawalBundleStatus,
         authorization::{self, BatchVerificationContext},
@@ -73,6 +73,7 @@ pub struct PrevalidatedBlock {
 
 #[derive(Clone)]
 pub struct State {
+    genesis_reputation_to_miner: bool,
     /// Sidechain heights for each coinbase txid
     pub coinbase_height:
         DatabaseUnique<SerdeBincode<CoinbaseTxid>, SerdeBincode<u32>>,
@@ -118,6 +119,10 @@ pub struct State {
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Vec<TwoWayPegEvent>>>,
     /// Timestamp of the mainchain block that the tip names
     mainchain_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
+    /// Mainchain timestamp before each height connected, restored when that
+    /// height disconnects
+    mainchain_timestamp_undo:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<u64>>,
     /// Timestamp of the mainchain block that the genesis block names
     genesis_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
     reputation: reputation::ReputationDbs,
@@ -147,10 +152,11 @@ pub struct State {
     /// height that applied them
     market_utxos:
         DatabaseUnique<SerdeBincode<u32>, SerdeBincode<MarketUtxoChanges>>,
+    closed_offers: DatabaseUnique<SerdeBincode<OfferId>, SerdeBincode<u32>>,
 }
 
 impl State {
-    pub const NUM_DBS: u32 = 24
+    pub const NUM_DBS: u32 = 26
         + reputation::ReputationDbs::NUM_DBS
         + decisions::Dbs::NUM_DBS
         + MarketsDatabase::NUM_DBS
@@ -159,6 +165,7 @@ impl State {
     pub fn new<Tls>(
         env: &sneed::Env<Tls>,
         decision_config_testing: Option<u32>,
+        genesis_reputation_to_miner: bool,
     ) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
         let coinbase_height =
@@ -232,6 +239,11 @@ impl State {
                 .map_err(EnvError::from)?;
         let mainchain_timestamp =
             DatabaseUnique::create(env, &mut rwtxn, "mainchain_timestamp")?;
+        let mainchain_timestamp_undo = DatabaseUnique::create(
+            env,
+            &mut rwtxn,
+            "mainchain_timestamp_undo",
+        )?;
         let genesis_timestamp =
             DatabaseUnique::create(env, &mut rwtxn, "genesis_timestamp")?;
         let reputation = reputation::ReputationDbs::new(env, &mut rwtxn)?;
@@ -271,8 +283,11 @@ impl State {
             DatabaseUnique::create(env, &mut rwtxn, "skipped_tx_indices_undo")?;
         let market_utxos =
             DatabaseUnique::create(env, &mut rwtxn, "market_utxos")?;
+        let closed_offers =
+            DatabaseUnique::create(env, &mut rwtxn, "closed_offers")?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
+            genesis_reputation_to_miner,
             coinbase_height,
             deposit_blocks,
             deposit_mainchain_height,
@@ -289,6 +304,7 @@ impl State {
             withdrawal_bundle_event_blocks,
             withdrawal_bundles,
             mainchain_timestamp,
+            mainchain_timestamp_undo,
             genesis_timestamp,
             reputation,
             decisions,
@@ -301,6 +317,7 @@ impl State {
             reputation_transfer_undo,
             skipped_tx_indices_undo,
             market_utxos,
+            closed_offers,
         })
     }
 
@@ -334,6 +351,26 @@ impl State {
     ) -> Result<Option<u64>, Error> {
         let timestamp = self.genesis_timestamp.try_get(rotxn, &())?;
         Ok(timestamp)
+    }
+
+    pub fn current_period(&self, rotxn: &RoTxn) -> Result<u32, Error> {
+        let block_height = self.try_get_height(rotxn)?;
+        let genesis_ts = self.try_get_genesis_timestamp(rotxn)?.unwrap_or(0);
+        let mainchain_ts =
+            self.try_get_mainchain_timestamp(rotxn)?.unwrap_or(0);
+        self.decisions().get_current_period(
+            mainchain_ts,
+            block_height,
+            genesis_ts,
+        )
+    }
+
+    pub fn is_offer_closed(
+        &self,
+        rotxn: &RoTxn,
+        offer_id: &OfferId,
+    ) -> Result<bool, Error> {
+        Ok(self.closed_offers.try_get(rotxn, offer_id)?.is_some())
     }
 
     #[cfg(test)]
@@ -1337,6 +1374,15 @@ impl DecisionValidationInterface for State {
             .get_standard_claimed_count_in_period(rotxn, period_index)
     }
 
+    fn get_nonstandard_claimed_count_in_period(
+        &self,
+        rotxn: &RoTxn,
+        period_index: u32,
+    ) -> Result<u64, Error> {
+        self.decisions()
+            .get_nonstandard_claimed_count_in_period(rotxn, period_index)
+    }
+
     fn get_available_decisions(
         &self,
         rotxn: &RoTxn,
@@ -1417,7 +1463,7 @@ mod test {
         test_name: &str,
     ) -> anyhow::Result<(temp_dir::TempDir, sneed::Env, State)> {
         let (temp_dir, env) = temp_env(test_name)?;
-        let state = State::new(&env, None)?;
+        let state = State::new(&env, None, true)?;
         Ok((temp_dir, env, state))
     }
 
@@ -1429,8 +1475,9 @@ mod test {
         }
     }
 
+    /// A body's size is the sum of its transactions' sizes.
     #[test]
-    fn body_size_is_the_sum_of_its_transactions() -> anyhow::Result<()> {
+    fn body_size_sums_txs() -> anyhow::Result<()> {
         use crate::types::{
             Authorization, AuthorizedTransaction, Body, Coinbase, Transaction,
             UtreexoNodeHash, UtreexoProof,
@@ -1479,8 +1526,9 @@ mod test {
         Ok(())
     }
 
+    /// Filling an authorized transaction sets its actor address.
     #[test]
-    fn fill_authorized_transaction_sets_actor_address() -> anyhow::Result<()> {
+    fn fill_sets_actor_address() -> anyhow::Result<()> {
         use crate::types::authorization::{SigningKey, authorize, get_address};
 
         let (_temp_dir, env, state) =
@@ -1578,10 +1626,10 @@ mod test {
     }
 
     #[test]
-    fn state_opens_a_database_it_created() -> anyhow::Result<()> {
+    fn state_reopens_database() -> anyhow::Result<()> {
         let (_temp_dir, env, state) = fresh_state("state-reopen")?;
         drop(state);
-        State::new(&env, None)?;
+        State::new(&env, None, true)?;
         Ok(())
     }
 

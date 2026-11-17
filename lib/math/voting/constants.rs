@@ -10,8 +10,11 @@ pub const REPUTATION_MAX: f64 = 1.0;
 pub const PRODUCTION_PERIOD_DURATION_SECONDS: u64 = SECONDS_PER_QUARTER;
 pub const VOTING_STALENESS_BLOCKS: u64 = 10;
 pub const CONSENSUS_PRECISION_DECIMALS: u32 = 8;
-pub const REPUTATION_PRECISION_DECIMALS: u32 = 10;
+pub const REPUTATION_PRECISION_DECIMALS: u32 = 6;
 pub const INITIAL_REPUTATION_TOTAL: f64 = 1.0;
+pub const VOTECOIN_UNITS_PER_REPUTATION: f64 = 1_000_000.0;
+/// Smallest nonzero reputation balance a holder may keep
+pub const MIN_REPUTATION_BALANCE: f64 = 1e-6;
 pub const CONSENSUS_CONSERVATION_EPSILON: f64 = 1e-9;
 pub const REPUTATION_ANCHOR_EPSILON: f64 = 1e-6;
 
@@ -118,7 +121,7 @@ mod tests {
 
     #[test]
     fn test_round_reputation() {
-        assert_eq!(round_reputation(0.12345678901234), 0.1234567890);
+        assert_eq!(round_reputation(0.12345678901234), 0.123457);
     }
 
     #[test]

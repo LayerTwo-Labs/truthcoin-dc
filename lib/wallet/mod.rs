@@ -29,10 +29,11 @@ use crate::{
         Accumulator, Address, AmountOverflowError, AmountUnderflowError,
         AuthorizedTransaction, CoinbaseTxid, EncryptionPubKey, GetValue, Hash,
         InPoint, OutPoint, OutPointKey, Output, OutputContent, PointedOutput,
-        SpentOutput, THIS_SIDECHAIN, Transaction, TxData, UtreexoError,
-        UtreexoNodeHash, VERSION, VerifyingKey, Version,
+        RevealBallot, SignedOffer, SpentOutput, THIS_SIDECHAIN, Transaction,
+        TxData, UtreexoError, UtreexoNodeHash, VERSION, VerifyingKey, Version,
+        VotecoinOffer,
         authorization::{
-            self, Authorization, Signature, SigningKey, get_address,
+            self, Authorization, Dst, Signature, SigningKey, get_address,
             rand_core::CryptoRng,
         },
         hash,
@@ -140,6 +141,11 @@ pub enum Error {
     AmountUnderflow(#[from] AmountUnderflowError),
     #[error("authorization error")]
     Authorization(#[from] crate::types::error::Authorization),
+    #[error("ballot fee {fee} is below the minimum {min_fee}")]
+    BallotFeeBelowMinimum {
+        fee: bitcoin::Amount,
+        min_fee: bitcoin::Amount,
+    },
     #[error("bip32 error")]
     Bip32(#[from] bip32::Error),
     #[error(transparent)]
@@ -158,10 +164,12 @@ pub enum Error {
         .db_path.display()
     )]
     IncompatibleVersion { version: Version, db_path: PathBuf },
+    #[error("invalid private key")]
+    InvalidPrivateKey(#[source] authorization::SignatureError),
     #[error("io error")]
     Io(#[from] std::io::Error),
-    #[error("no index for address {address}")]
-    NoIndex { address: Address },
+    #[error("failed to measure the ballot transaction")]
+    MeasureBallot(#[source] bincode::Error),
     #[error(
         "wallet does not have a seed (set with RPC `set-seed-from-mnemonic`)"
     )]
@@ -250,10 +258,17 @@ pub struct Wallet {
     /// Map each message signing key index to a verifying key
     index_to_vk:
         DatabaseUnique<SerdeBincode<[u8; 4]>, SerdeBincode<VerifyingKey>>,
+    /// Sealed ballots this wallet committed to, keyed by commitment, kept
+    /// until they are revealed
+    sealed_ballots:
+        DatabaseUnique<SerdeBincode<Hash>, SerdeBincode<RevealBallot>>,
+    /// Private keys imported from outside the seed, keyed by their address
+    imported_keys:
+        DatabaseUnique<SerdeBincode<Address>, SerdeBincode<[u8; 32]>>,
 }
 
 impl Wallet {
-    pub const NUM_DBS: u32 = 14;
+    pub const NUM_DBS: u32 = 16;
 
     pub fn new(path: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(path)?;
@@ -337,6 +352,12 @@ impl Wallet {
         let index_to_vk =
             DatabaseUnique::create(&env, &mut rwtxn, "index_to_vk")
                 .map_err(EnvError::from)?;
+        let sealed_ballots =
+            DatabaseUnique::create(&env, &mut rwtxn, "sealed_ballots")
+                .map_err(EnvError::from)?;
+        let imported_keys =
+            DatabaseUnique::create(&env, &mut rwtxn, "imported_keys")
+                .map_err(EnvError::from)?;
         match version.try_get(&rwtxn, &()).map_err(DbError::from)? {
             Some(db_version)
                 if db_version
@@ -373,6 +394,8 @@ impl Wallet {
             index_to_epk,
             vk_to_index,
             index_to_vk,
+            sealed_ballots,
+            imported_keys,
         })
     }
 
@@ -392,6 +415,9 @@ impl Wallet {
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
         self.mempool_spent_utxos
+            .clear(&mut rwtxn)
+            .map_err(DbError::from)?;
+        self.sealed_ballots
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
         rwtxn.commit().map_err(RwTxnError::from)?;
@@ -993,14 +1019,57 @@ impl Wallet {
 
     pub fn get_addresses(&self) -> Result<HashSet<Address>, Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
-        let addresses: HashSet<_> = self
+        let mut addresses: HashSet<_> = self
             .index_to_address
             .iter(&rotxn)
             .map_err(DbError::from)?
             .map(|(_, address)| Ok(address))
             .collect()
             .map_err(DbError::from)?;
+        let imported: Vec<_> = self
+            .imported_keys
+            .iter_keys(&rotxn)
+            .map_err(DbError::from)?
+            .collect()
+            .map_err(DbError::from)?;
+        addresses.extend(imported);
         Ok(addresses)
+    }
+
+    /// Import a private key from outside the seed, and return its address.
+    /// The seed does not back it up: restoring the seed elsewhere does not
+    /// restore it.
+    pub fn import_private_key(
+        &self,
+        secret: [u8; 32],
+    ) -> Result<Address, Error> {
+        if !self.has_seed()? {
+            return Err(Error::NoSeed);
+        }
+        let signing_key = SigningKey::deserialize(&secret)
+            .map_err(Error::InvalidPrivateKey)?;
+        let address = get_address(&(&signing_key).into());
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        self.imported_keys
+            .put(&mut rwtxn, &address, &secret)
+            .map_err(DbError::from)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        Ok(address)
+    }
+
+    fn get_imported_signing_key(
+        &self,
+        rotxn: &RoTxn,
+        address: &Address,
+    ) -> Result<Option<SigningKey>, Error> {
+        self.imported_keys
+            .try_get(rotxn, address)
+            .map_err(DbError::from)?
+            .map(|secret| {
+                SigningKey::deserialize(&secret)
+                    .map_err(Error::InvalidPrivateKey)
+            })
+            .transpose()
     }
 
     pub fn authorize<R>(
@@ -1026,15 +1095,8 @@ impl Wallet {
                         .ok_or(Error::NoUtxo)?,
                 };
             input_addresses.insert(spent_utxo.address);
-            let index = self
-                .address_to_index
-                .try_get(&txn, &spent_utxo.address)
-                .map_err(DbError::from)?
-                .ok_or(Error::NoIndex {
-                    address: spent_utxo.address,
-                })?;
-            let index = BigEndian::read_u32(&index);
-            let signing_key = self.get_signing_key(&txn, index)?;
+            let signing_key =
+                self.get_signing_key_for_addr(&txn, &spent_utxo.address)?;
             let signature = crate::types::authorization::sign_tx(
                 &mut rng,
                 &signing_key,
@@ -1068,8 +1130,8 @@ impl Wallet {
         use crate::types::TransactionData;
 
         let actor_addr = match &transaction.data {
-            Some(TransactionData::Trade { trader, shares, .. })
-                if *shares < 0 =>
+            Some(TransactionData::Trade { trader, deltas, .. })
+                if deltas.iter().any(|delta| delta.shares < 0) =>
             {
                 if !input_addresses.contains(trader) {
                     Some(*trader)
@@ -1084,8 +1146,15 @@ impl Wallet {
                     None
                 }
             }
-            Some(TransactionData::SubmitVote { voter, .. })
-            | Some(TransactionData::SubmitBallot { voter, .. }) => {
+            Some(TransactionData::CancelOffer { offer }) => {
+                if !input_addresses.contains(&offer.seller) {
+                    Some(offer.seller)
+                } else {
+                    None
+                }
+            }
+            Some(TransactionData::SubmitBallot { voter, .. })
+            | Some(TransactionData::RevealBallot { voter, .. }) => {
                 if !input_addresses.contains(voter) {
                     Some(*voter)
                 } else {
@@ -1245,11 +1314,15 @@ impl Wallet {
         rotxn: &RoTxn,
         address: &Address,
     ) -> Result<SigningKey, Error> {
-        let index = self
+        let Some(index) = self
             .address_to_index
             .try_get(rotxn, address)
             .map_err(DbError::from)?
-            .ok_or(Error::AddressDoesNotExist { address: *address })?;
+        else {
+            return self
+                .get_imported_signing_key(rotxn, address)?
+                .ok_or(Error::AddressDoesNotExist { address: *address });
+        };
         let signing_key =
             self.get_signing_key(rotxn, BigEndian::read_u32(&index))?;
         // sanity check that signing key corresponds to address
@@ -1304,11 +1377,16 @@ impl Wallet {
         rotxn: &RoTxn,
         vk: &VerifyingKey,
     ) -> Result<SigningKey, Error> {
-        let vk_idx = self
-            .vk_to_index
-            .try_get(rotxn, vk)
-            .map_err(DbError::from)?
-            .ok_or_else(|| Box::new(VkDoesNotExistError { vk: *vk }))?;
+        let Some(vk_idx) =
+            self.vk_to_index.try_get(rotxn, vk).map_err(DbError::from)?
+        else {
+            return self
+                .get_imported_signing_key(rotxn, &get_address(vk))?
+                .filter(|signing_key| VerifyingKey::from(signing_key) == *vk)
+                .ok_or_else(|| {
+                    Box::new(VkDoesNotExistError { vk: *vk }).into()
+                });
+        };
         let signing_key =
             self.get_message_signing_key(rotxn, BigEndian::read_u32(&vk_idx))?;
         // sanity check that signing key corresponds to vk
@@ -1614,41 +1692,34 @@ impl Wallet {
         Ok((tx, market_id))
     }
 
+    /// Build a trade that moves `market_id`'s share vector by `deltas`. The
+    /// inputs cover `max_cost`, when positive, and the miner fee.
     #[allow(clippy::too_many_arguments)]
     pub fn trade(
         &self,
         options: SpendOptions,
         market_id: crate::state::markets::MarketId,
-        outcome_index: usize,
-        shares: i64,
+        deltas: Vec<crate::types::ShareDelta>,
         trader: Address,
-        limit_sats: u64,
+        max_cost: i64,
         tx_pow_config: Option<crate::types::tx_pow::TxPowConfig>,
         prev_block_hash: crate::types::BlockHash,
     ) -> Result<Transaction, Error> {
-        let is_buy = shares > 0;
-
-        let inputs = if is_buy {
-            let selected = self
-                .select_coins(bitcoin::Amount::from_sat(limit_sats), options)?;
-            spend_inputs(selected.coins)
-        } else {
-            let min_fee =
-                bitcoin::Amount::from_sat(trading::TRADE_MINER_FEE_SATS);
-            let selected = self.select_coins(min_fee, options)?;
-            spend_inputs(selected.coins)
-        };
-
-        let outputs = Vec::new();
+        let required = u64::try_from(max_cost.max(0))
+            .ok()
+            .and_then(|cost| cost.checked_add(trading::TRADE_MINER_FEE_SATS))
+            .ok_or(Error::NotEnoughFunds)?;
+        let selected =
+            self.select_coins(bitcoin::Amount::from_sat(required), options)?;
+        let inputs = spend_inputs(selected.coins);
 
         let tx_pow_nonce = match tx_pow_config {
             Some(config) if config.is_enabled() => {
                 let pow_data = crate::types::tx_pow::serialize_trade_for_pow(
                     market_id.as_bytes(),
-                    outcome_index as u32,
-                    shares,
+                    &deltas,
                     &trader,
-                    limit_sats,
+                    max_cost,
                     &prev_block_hash,
                 );
                 Some(config.mine(&pow_data))
@@ -1656,13 +1727,12 @@ impl Wallet {
             _ => None,
         };
 
-        let mut tx = new_tx(inputs, outputs);
+        let mut tx = new_tx(inputs, Vec::new());
         tx.data = Some(TxData::Trade {
             market_id: MarketId::new(*market_id.as_bytes()),
-            outcome_index: outcome_index as u32,
-            shares,
+            deltas,
             trader,
-            limit_sats,
+            max_cost,
             tx_pow_nonce,
             prev_block_hash,
         });
@@ -1714,49 +1784,136 @@ impl Wallet {
         Ok(tx)
     }
 
-    pub fn submit_ballot(
+    /// Fund a ballot commit or reveal with at least the minimum ballot fee
+    /// for its size, or with `fee` when it covers that minimum. The change
+    /// goes back to the voter address, which a ballot already names, so it
+    /// can pay for the voter's reputation transfers.
+    fn fund_ballot_tx(
         &self,
+        data: TxData,
+        voter: Address,
+        fee: Option<bitcoin::Amount>,
         options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let mut paid = bitcoin::Amount::ZERO;
+        loop {
+            let selected = self.select_coins(paid, options)?;
+            let change = selected.total - paid;
+            let outputs = if change > bitcoin::Amount::ZERO {
+                vec![Output {
+                    address: voter,
+                    content: OutputContent::Value(change),
+                }]
+            } else {
+                Vec::new()
+            };
+            let mut tx = new_tx(spend_inputs(selected.coins), outputs);
+            tx.data = Some(data.clone());
+            let min_fee = crate::validation::vote::min_ballot_fee(&tx)
+                .map_err(Error::MeasureBallot)?;
+            let required = match fee {
+                Some(fee) if fee < min_fee => {
+                    return Err(Error::BallotFeeBelowMinimum { fee, min_fee });
+                }
+                Some(fee) => fee,
+                None => min_fee,
+            };
+            if paid >= required {
+                return Ok(tx);
+            }
+            paid = required;
+        }
+    }
+
+    /// Seal a ballot. The ballot is stored before the commitment transaction
+    /// is returned, so a broadcast commitment can always be revealed.
+    pub fn submit_ballot<R>(
+        &self,
+        mut rng: R,
+        voter: Address,
         votes: Vec<crate::types::BallotItem>,
         voting_period: u32,
-        fee: bitcoin::Amount,
-    ) -> Result<Transaction, Error> {
-        let voter = self.voter_address()?;
-        let tx_data = crate::types::TransactionData::SubmitBallot {
+        fee: Option<bitcoin::Amount>,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error>
+    where
+        R: CryptoRng,
+    {
+        let mut salt = [0; 32];
+        rng.fill_bytes(&mut salt);
+        let ballot = RevealBallot {
             voter,
-            votes,
             voting_period,
+            votes,
+            salt,
         };
-
-        let selected = self.select_coins(fee, options)?;
-        let change_bitcoin = selected.total - fee;
-
-        let inputs = spend_inputs(selected.coins);
-        let mut outputs = Vec::new();
-        self.push_bitcoin_change(&mut outputs, change_bitcoin)?;
-
-        let mut tx = new_tx(inputs, outputs);
-        tx.data = Some(tx_data);
-
+        let commitment = ballot.commitment();
+        let data = TxData::SubmitBallot {
+            voter: ballot.voter,
+            voting_period,
+            commitment,
+        };
+        let tx = self.fund_ballot_tx(data, voter, fee, options)?;
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        self.sealed_ballots
+            .put(&mut rwtxn, &commitment, &ballot)
+            .map_err(DbError::from)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(tx)
+    }
+
+    /// Open a sealed ballot, funding its fee
+    pub fn reveal_ballot(
+        &self,
+        ballot: RevealBallot,
+        fee: Option<bitcoin::Amount>,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let voter = ballot.voter;
+        let data = TxData::RevealBallot {
+            voter,
+            voting_period: ballot.voting_period,
+            votes: ballot.votes,
+            salt: ballot.salt,
+        };
+        self.fund_ballot_tx(data, voter, fee, options)
+    }
+
+    /// The sealed ballot with this commitment
+    pub fn sealed_ballot(
+        &self,
+        commitment: &Hash,
+    ) -> Result<Option<RevealBallot>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self
+            .sealed_ballots
+            .try_get(&rotxn, commitment)
+            .map_err(DbError::from)?)
     }
 
     pub fn transfer_reputation(
         &self,
         options: SpendOptions,
+        voter_addr: Address,
         dest: Address,
-        amount: f64,
+        amount: crate::types::Votecoin,
         fee: bitcoin::Amount,
     ) -> Result<Transaction, Error> {
-        let voter_addr = self.voter_address()?;
         let tx_data = crate::types::TransactionData::TransferReputation {
             sender: voter_addr,
             dest,
             amount,
         };
 
-        let (total_bitcoin, bitcoin_utxos) =
-            self.select_bitcoins_from_address(fee, voter_addr, options)?;
+        let (total_bitcoin, bitcoin_utxos) = match self
+            .select_bitcoins_from_address(fee, voter_addr, options)
+        {
+            Ok(selected) => selected,
+            Err(Error::NotEnoughFunds) => {
+                return self.fund_actor_tx(tx_data, voter_addr, fee, options);
+            }
+            Err(err) => return Err(err),
+        };
         let change_bitcoin = total_bitcoin - fee;
 
         let inputs = spend_inputs(bitcoin_utxos);
@@ -1772,6 +1929,91 @@ impl Wallet {
         tx.data = Some(tx_data);
 
         Ok(tx)
+    }
+
+    fn fund_actor_tx(
+        &self,
+        data: TxData,
+        change_address: Address,
+        fee: bitcoin::Amount,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let selected = self.select_coins(fee, options)?;
+        let change = selected.total - fee;
+        let outputs = if change > bitcoin::Amount::ZERO {
+            vec![Output {
+                address: change_address,
+                content: OutputContent::Value(change),
+            }]
+        } else {
+            Vec::new()
+        };
+        let mut tx = new_tx(spend_inputs(selected.coins), outputs);
+        tx.data = Some(data);
+        Ok(tx)
+    }
+
+    pub fn sign_offer<R>(
+        &self,
+        rng: R,
+        offer: VotecoinOffer,
+    ) -> Result<SignedOffer, Error>
+    where
+        R: CryptoRng,
+    {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let signing_key =
+            self.get_signing_key_for_addr(&rotxn, &offer.seller)?;
+        let msg = offer.signing_message()?;
+        let signature =
+            authorization::sign(rng, &signing_key, Dst::VotecoinOffer, &msg);
+        Ok(SignedOffer {
+            offer,
+            authorization: Authorization {
+                verifying_key: (&signing_key).into(),
+                signature,
+            },
+        })
+    }
+
+    pub fn take_offer(
+        &self,
+        offer: SignedOffer,
+        buyer: Address,
+        fee: bitcoin::Amount,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let price = offer.offer.price;
+        let pay_to = offer.offer.pay_to;
+        let cost = price.checked_add(fee).ok_or(AmountOverflowError)?;
+        let selected = self.select_coins(cost, options)?;
+        let change = selected.total - cost;
+        let mut outputs = vec![Output {
+            address: pay_to,
+            content: OutputContent::Value(price),
+        }];
+        if change > bitcoin::Amount::ZERO {
+            outputs.push(Output {
+                address: self.get_new_address()?,
+                content: OutputContent::Value(change),
+            });
+        }
+        let mut tx = new_tx(spend_inputs(selected.coins), outputs);
+        tx.data = Some(TxData::TakeOffer {
+            offer: Box::new(offer),
+            buyer,
+        });
+        Ok(tx)
+    }
+
+    pub fn cancel_offer(
+        &self,
+        offer: VotecoinOffer,
+        fee: bitcoin::Amount,
+        options: SpendOptions,
+    ) -> Result<Transaction, Error> {
+        let seller = offer.seller;
+        self.fund_actor_tx(TxData::CancelOffer { offer }, seller, fee, options)
     }
 
     /// Pick coins of `address` worth at least `value`. A confirmed coin comes
@@ -1870,6 +2112,8 @@ impl Watchable<()> for Wallet {
             index_to_epk,
             vk_to_index,
             index_to_vk,
+            sealed_ballots,
+            imported_keys,
         } = self;
         let watchables = [
             seed.watch().clone(),
@@ -1883,6 +2127,8 @@ impl Watchable<()> for Wallet {
             index_to_epk.watch().clone(),
             vk_to_index.watch().clone(),
             index_to_vk.watch().clone(),
+            sealed_ballots.watch().clone(),
+            imported_keys.watch().clone(),
         ];
         let streams = StreamMap::from_iter(
             watchables.into_iter().map(WatchStream::new).enumerate(),
@@ -1908,8 +2154,88 @@ mod tests {
         }
     }
 
+    /// Ballot and reveal txs each pay their minimum fee; the ballot is stored.
     #[test]
-    fn wallet_opens_a_database_it_created() -> anyhow::Result<()> {
+    fn ballot_txs_pay_min_fee() -> anyhow::Result<()> {
+        use crate::{types::BallotItem, validation::vote::min_ballot_fee};
+
+        let temp_dir = temp_dir::TempDir::with_prefix(format!(
+            "wallet-ballot-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            std::process::id()
+        ))?;
+        let wallet = Wallet::new(temp_dir.path())?;
+        wallet.set_seed(&[0x42; 64])?;
+        let coin = Output {
+            address: wallet.get_new_address()?,
+            content: OutputContent::Value(bitcoin::Amount::from_sat(100_000)),
+        };
+        let outpoint = OutPoint::Regular {
+            txid: crate::types::Txid([5; 32]),
+            vout: 0,
+        };
+        wallet.put_utxos(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::from([(outpoint, coin.clone())]),
+        )?;
+        let fee_of = |tx: &Transaction| -> anyhow::Result<bitcoin::Amount> {
+            anyhow::ensure!(tx.inputs.iter().map(|(op, _)| *op).eq([outpoint]));
+            let value_out = tx
+                .outputs
+                .iter()
+                .map(Output::get_value)
+                .sum::<bitcoin::Amount>();
+            Ok(coin.get_value() - value_out)
+        };
+        let votes = vec![BallotItem {
+            decision_id_bytes: [0, 0, 0, 1],
+            vote_value: None,
+        }];
+
+        let voter_address = wallet.voter_address()?;
+        anyhow::ensure!(matches!(
+            wallet.submit_ballot(
+                rand::rng(),
+                voter_address,
+                votes.clone(),
+                2,
+                Some(bitcoin::Amount::from_sat(1)),
+                options(false),
+            ),
+            Err(Error::BallotFeeBelowMinimum { .. })
+        ));
+        let tx = wallet.submit_ballot(
+            rand::rng(),
+            voter_address,
+            votes.clone(),
+            2,
+            None,
+            options(false),
+        )?;
+        anyhow::ensure!(fee_of(&tx)? == min_ballot_fee(&tx)?);
+        anyhow::ensure!(
+            tx.outputs
+                .iter()
+                .all(|output| output.address == voter_address)
+        );
+        let Some(TxData::SubmitBallot { commitment, .. }) = tx.data else {
+            anyhow::bail!("expected a sealed ballot, got {:?}", tx.data);
+        };
+        let ballot = wallet
+            .sealed_ballot(&commitment)?
+            .ok_or_else(|| anyhow::anyhow!("the sealed ballot is stored"))?;
+        anyhow::ensure!(ballot.votes == votes);
+
+        let reveal = wallet.reveal_ballot(ballot, None, options(false))?;
+        anyhow::ensure!(fee_of(&reveal)? == min_ballot_fee(&reveal)?);
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_reopens_its_db() -> anyhow::Result<()> {
         let temp_dir = temp_dir::TempDir::with_prefix(format!(
             "wallet-reopen-{}-{}",
             std::time::SystemTime::now()
@@ -1927,8 +2253,7 @@ mod tests {
     /// too, so the output moves to the unconfirmed side, where the proof code
     /// leaves it out.
     #[test]
-    fn a_disconnected_output_leaves_the_confirmed_table() -> anyhow::Result<()>
-    {
+    fn disconnect_unconfirms_output() -> anyhow::Result<()> {
         use crate::types::OutputContent;
 
         let temp_dir = temp_dir::TempDir::with_prefix(format!(
@@ -2152,7 +2477,7 @@ mod tests {
     }
 
     #[test]
-    fn coin_selection_stops_at_the_requested_value() -> anyhow::Result<()> {
+    fn coin_selection_stops_at_value() -> anyhow::Result<()> {
         for (values, value, total, count, takes_unconfirmed) in [
             (vec![1_000], 1_000, 1_000, 1, false),
             (vec![1_000], 1_001, 3_000, 2, true),
@@ -2211,6 +2536,7 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction_many` pays each destination, then wallet change.
     #[test]
     fn coin_selection_waits_for_maturity() -> anyhow::Result<()> {
         let temp_dir = temp_dir::TempDir::new()?;
@@ -2269,7 +2595,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_transaction_many_pays_each_address() -> anyhow::Result<()> {
+    fn test_many_pays_each_address() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_many", &[10_000])?;
 
@@ -2303,8 +2629,7 @@ mod tests {
     /// The node marks the inputs of a mempool transaction as mempool-spent.
     /// A second reputation transfer before a block must take another coin.
     #[test]
-    fn a_second_reputation_transfer_skips_mempool_spent_coins()
-    -> anyhow::Result<()> {
+    fn reputation_transfer_skips_spent() -> anyhow::Result<()> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
@@ -2334,13 +2659,23 @@ mod tests {
         let dest = Address([5u8; 20]);
         let fee = bitcoin::Amount::from_sat(1_000);
 
-        let first =
-            wallet.transfer_reputation(options(true), dest, 0.1, fee)?;
+        let first = wallet.transfer_reputation(
+            options(true),
+            voter,
+            dest,
+            crate::types::Votecoin(100_000),
+            fee,
+        )?;
         let first_inputs: HashSet<OutPoint> =
             first.inputs.iter().map(|(outpoint, _)| *outpoint).collect();
         wallet.set_mempool_view(&HashMap::new(), &first_inputs)?;
-        let second =
-            wallet.transfer_reputation(options(true), dest, 0.1, fee)?;
+        let second = wallet.transfer_reputation(
+            options(true),
+            voter,
+            dest,
+            crate::types::Votecoin(100_000),
+            fee,
+        )?;
         let second_inputs: HashSet<OutPoint> = second
             .inputs
             .iter()
@@ -2358,9 +2693,9 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction` yields one payment output plus wallet change.
     #[test]
-    fn test_create_transaction_keeps_one_payment_and_change()
-    -> anyhow::Result<()> {
+    fn test_one_payment_and_change() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_one", &[10_000])?;
 
@@ -2384,9 +2719,9 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction_many` rejects destinations whose sum overflows.
     #[test]
-    fn test_create_transaction_many_rejects_an_overflow() -> anyhow::Result<()>
-    {
+    fn test_many_rejects_overflow() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_overflow", &[10_000])?;
 
@@ -2407,9 +2742,9 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction_many` rejects an empty destination map.
     #[test]
-    fn test_create_transaction_many_needs_a_destination() -> anyhow::Result<()>
-    {
+    fn test_many_needs_destination() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_none", &[10_000])?;
 
@@ -2425,8 +2760,9 @@ mod tests {
         Ok(())
     }
 
+    /// `create_transaction_many` selects coins by the summed destination value.
     #[test]
-    fn test_create_transaction_many_totals_the_values() -> anyhow::Result<()> {
+    fn test_many_totals_values() -> anyhow::Result<()> {
         let (test_dir, wallet, accumulator) =
             funded_wallet("transfer_total", &[1000, 1000])?;
 
@@ -2451,6 +2787,84 @@ mod tests {
             bitcoin::Amount::from_sat(1000),
         );
         assert!(matches!(result, Err(Error::NotEnoughFunds)));
+
+        let _unused = std::fs::remove_dir_all(&test_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn imported_key_signs_like_a_seed_key() -> anyhow::Result<()> {
+        use authorization::{BatchVerificationContext, Dst};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let test_dir = std::env::temp_dir()
+            .join(format!("truthcoin_dc_test_imported_key_{nanos}"));
+        let wallet = Wallet::new(&test_dir)?;
+        let signing_key = SigningKey::new(&mut rand::rng());
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let secret: [u8; 32] = signing_key.serialize().try_into().unwrap();
+
+        assert!(matches!(
+            wallet.import_private_key(secret),
+            Err(Error::NoSeed)
+        ));
+        wallet.set_seed(&[4u8; 64])?;
+        assert!(matches!(
+            wallet.import_private_key([0xff; 32]),
+            Err(Error::InvalidPrivateKey(_))
+        ));
+        let address = wallet.import_private_key(secret)?;
+        assert_eq!(address, get_address(&verifying_key));
+        assert_eq!(wallet.import_private_key(secret)?, address);
+        assert!(wallet.get_addresses()?.contains(&address));
+
+        let outpoint = OutPoint::Regular {
+            txid: [9; 32].into(),
+            vout: 0,
+        };
+        wallet.put_utxos(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::from([(
+                outpoint,
+                Output {
+                    address,
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        5_000,
+                    )),
+                },
+            )]),
+        )?;
+        let tx = wallet.transfer_reputation(
+            options(true),
+            address,
+            Address([5u8; 20]),
+            crate::types::Votecoin(100_000),
+            bitcoin::Amount::from_sat(1_000),
+        )?;
+        let authorized = wallet.authorize(rand::rng(), tx)?;
+        assert!(
+            authorized
+                .authorizations
+                .iter()
+                .map(|authorization| authorization.verifying_key)
+                .eq([verifying_key])
+        );
+        authorization::verify_transaction(
+            &BatchVerificationContext::new(&mut rand::rng()),
+            &authorized,
+        )?;
+
+        let signature =
+            wallet.sign_arbitrary_msg(rand::rng(), &verifying_key, "msg")?;
+        assert!(authorization::verify(
+            signature,
+            &verifying_key,
+            Dst::Arbitrary,
+            b"msg"
+        ));
 
         let _unused = std::fs::remove_dir_all(&test_dir);
         Ok(())

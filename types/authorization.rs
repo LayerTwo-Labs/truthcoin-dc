@@ -109,6 +109,7 @@ impl Serialize for Signature {
 #[serde(rename_all = "lowercase")]
 pub enum Dst {
     Transaction = 0,
+    VotecoinOffer = 1,
     /// Arbitrary, non-protocol messages
     Arbitrary = u8::MAX,
 }
@@ -472,8 +473,9 @@ mod tests {
         }
     }
 
+    /// An address hashes the compressed ristretto point
     #[test]
-    fn an_address_comes_from_the_compressed_ristretto_point() {
+    fn address_from_point() {
         let key = signing_key(1);
         let verifying_key = VerifyingKey::from(&key);
         let expected = {
@@ -487,23 +489,25 @@ mod tests {
         assert_eq!(get_address(&verifying_key), expected);
     }
 
+    /// A verifying key round-trips through bech32m
     #[test]
-    fn a_verifying_key_round_trips_through_bech32m() {
+    fn verifying_key_bech32m() {
         let key = VerifyingKey::from(&signing_key(2));
         let encoded = key.bech32m_encode();
         assert_eq!(VerifyingKey::bech32m_decode(&encoded).unwrap(), key);
     }
 
     #[test]
-    fn a_signature_round_trips_through_hex() {
+    fn signature_hex_round_trip() {
         let signature =
             sign(rand::rng(), &signing_key(3), Dst::Arbitrary, b"hello");
         let encoded = signature.to_string();
         assert_eq!(Signature::from_hex(&encoded).unwrap(), signature);
     }
 
+    /// authorize puts the signer's address on the authorization
     #[test]
-    fn authorize_puts_the_address_of_the_signer_on_the_authorization() {
+    fn authorize_sets_address() {
         let key = signing_key(4);
         let address = get_address(&VerifyingKey::from(&key));
         let authorized =
@@ -512,8 +516,9 @@ mod tests {
         assert_eq!(authorized.authorizations[0].get_address(), address);
     }
 
+    /// authorize rejects a key that does not match the address
     #[test]
-    fn authorize_rejects_a_key_that_does_not_match_the_address() {
+    fn authorize_wrong_key() {
         let key = signing_key(5);
         let other = get_address(&VerifyingKey::from(&signing_key(6)));
         let err = authorize(rand::rng(), &[(other, &key)], one_input_tx())
@@ -535,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn a_signature_from_another_key_fails() {
+    fn forged_signature_fails() {
         let mut rng = rand::rng();
         let victim = signing_key(8);
         let attacker = signing_key(9);
@@ -572,8 +577,9 @@ mod tests {
         ));
     }
 
+    /// A signature under one domain tag fails under another
     #[test]
-    fn a_domain_tag_separates_two_messages() {
+    fn domain_tag_separation() {
         let key = signing_key(10);
         let verifying_key = VerifyingKey::from(&key);
         let signature =

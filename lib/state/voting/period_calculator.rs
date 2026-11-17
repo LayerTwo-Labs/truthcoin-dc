@@ -6,11 +6,48 @@ use crate::state::{
 use sneed::RoTxn;
 use std::collections::HashMap;
 
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Calendar quarters since 1970 Q1 of a unix timestamp, in UTC
+pub(crate) fn utc_quarter(timestamp: u64) -> u64 {
+    let days = timestamp / SECONDS_PER_DAY + 719_468;
+    let era = days / 146_097;
+    let day_of_era = days % 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
+        - day_of_era / 146_096)
+        / 365;
+    let day_of_year =
+        day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = era * 400 + year_of_era + u64::from(month <= 2);
+    (year - 1970) * 4 + (month - 1) / 3
+}
+
+/// Unix timestamp of 00:00 UTC on the first day of a quarter counted as in
+/// [`utc_quarter`]
+pub(crate) fn utc_quarter_start(quarter: u64) -> u64 {
+    let month = (quarter % 4) * 3 + 1;
+    let year = 1970 + quarter / 4 - u64::from(month <= 2);
+    let era = year / 400;
+    let year_of_era = year % 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5;
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    (era * 146_097 + day_of_era - 719_468) * SECONDS_PER_DAY
+}
+
 /// Returns the 1-based period number for a given timestamp/block_height.
 ///
 /// This is the **single source of truth** for "what period are we in".
 /// In blocks mode: `height / quantity + 1`.
-/// In time mode: `(timestamp - genesis_ts) / quantity + 1`.
+/// In time mode: the calendar quarter (UTC) of `timestamp`, counting the
+/// quarter of `genesis_ts` as period 1.
 pub fn get_current_period(
     timestamp: u64,
     block_height: Option<u32>,
@@ -24,39 +61,56 @@ pub fn get_current_period(
             .map(|v| v + 1)
             .unwrap_or(0))
     } else {
-        if genesis_ts == 0 || timestamp < genesis_ts {
+        if genesis_ts == 0 {
             return Ok(0);
         }
-        Ok(((timestamp - genesis_ts) / config.quantity as u64) as u32 + 1)
+        Ok(utc_quarter(timestamp)
+            .checked_sub(utc_quarter(genesis_ts))
+            .map_or(0, |quarters| quarters as u32 + 1))
     }
 }
 
 /// Display/consensus: returns (start, end) boundaries for a period.
 /// Used by GUI timers, RPC, and VotingPeriod construction for consensus.
+/// In time mode a period is a calendar quarter, from 00:00 UTC on its first
+/// day to 00:00 UTC on the first day of the next quarter.
 pub fn calculate_period_boundaries(
     period_index: u32,
     config: &DecisionConfig,
     genesis_ts: u64,
 ) -> (u64, u64) {
-    if config.is_blocks {
-        if period_index == 0 {
-            (0, 0)
-        } else {
-            let start_block = (period_index - 1) * config.quantity;
-            let end_block = period_index * config.quantity;
-            (start_block as u64, end_block as u64)
-        }
-    } else {
-        let period_duration = config.quantity as u64;
-        if period_index == 0 {
-            (0, 0)
-        } else {
-            let start =
-                genesis_ts + (period_index - 1) as u64 * period_duration;
-            let end = start + period_duration;
-            (start, end)
-        }
+    if period_index == 0 {
+        return (0, 0);
     }
+    if config.is_blocks {
+        let start_block = (period_index - 1) * config.quantity;
+        let end_block = period_index * config.quantity;
+        (start_block as u64, end_block as u64)
+    } else {
+        let quarter = utc_quarter(genesis_ts) + u64::from(period_index) - 1;
+        (utc_quarter_start(quarter), utc_quarter_start(quarter + 1))
+    }
+}
+
+/// Whether the reveal window following `voting_period` has elapsed, using the
+/// same clock as [`get_current_period`].
+pub fn reveal_window_closed(
+    voting_period: u32,
+    timestamp: u64,
+    block_height: Option<u32>,
+    genesis_ts: u64,
+    config: &DecisionConfig,
+) -> bool {
+    let (_, end) =
+        calculate_period_boundaries(voting_period, config, genesis_ts);
+    let now = if config.is_blocks {
+        u64::from(block_height.unwrap_or(0))
+    } else if genesis_ts == 0 {
+        return false;
+    } else {
+        timestamp
+    };
+    now >= end + u64::from(config.reveal_window())
 }
 
 /// Display only: determines period status from boundary timestamps.
@@ -91,17 +145,11 @@ pub fn get_decision_ids_for_period(
         });
     }
 
-    let claim_period = voting_period - 1;
-    let all_decisions = decisions_db.get_all_claimed_decisions(rotxn)?;
-
-    let mut decision_ids = Vec::new();
-    for entry in all_decisions {
-        if entry.decision_id.period_index() == claim_period {
-            decision_ids.push(entry.decision_id);
-        }
-    }
-
-    Ok(decision_ids)
+    Ok(decisions_db
+        .get_claimed_decisions_in_period(rotxn, voting_period - 1)?
+        .into_iter()
+        .map(|entry| entry.decision_id)
+        .collect())
 }
 
 /// Vote validation / RPC / statistics: constructs a full VotingPeriod struct.
@@ -411,7 +459,7 @@ mod tests {
     // --- get_current_period tests ---
 
     #[test]
-    fn test_get_current_period_blocks_mode() {
+    fn test_current_period_blocks() {
         let config = DecisionConfig::testing(TEN);
 
         // Block 0-9 → period 1
@@ -427,39 +475,79 @@ mod tests {
         assert_eq!(get_current_period(0, Some(20), 0, &config).unwrap(), 3);
     }
 
+    const OCT_1_2026: u64 = 1_790_812_800;
+    const JAN_1_2027: u64 = 1_798_761_600;
+    const APR_1_2027: u64 = 1_806_537_600;
+    const JUL_1_2027: u64 = 1_814_400_000;
+    const OCT_1_2027: u64 = 1_822_348_800;
+    const OCT_29_2026: u64 = 1_793_232_000;
+
     #[test]
-    fn test_get_current_period_time_mode() {
-        let config = DecisionConfig {
-            is_blocks: false,
-            quantity: 600,
+    fn test_current_period_time() {
+        let config = DecisionConfig::production();
+        let genesis_ts = OCT_29_2026 + 12 * 3600;
+        let period = |timestamp| {
+            get_current_period(timestamp, None, genesis_ts, &config).unwrap()
         };
-        let genesis_ts = 1000;
 
-        // Before genesis
-        assert_eq!(
-            get_current_period(999, None, genesis_ts, &config).unwrap(),
-            0
-        );
+        assert_eq!(period(OCT_1_2026 - 1), 0);
+        assert_eq!(period(OCT_1_2026), 1);
+        assert_eq!(period(genesis_ts), 1);
+        assert_eq!(period(JAN_1_2027 - 1), 1);
+        assert_eq!(period(JAN_1_2027), 2);
+        assert_eq!(period(APR_1_2027 - 1), 2);
+        assert_eq!(period(APR_1_2027), 3);
+        assert_eq!(period(JUL_1_2027), 4);
+        assert_eq!(period(OCT_1_2027 - 1), 4);
+        assert_eq!(period(OCT_1_2027), 5);
+    }
 
-        // Genesis to genesis+599 → period 1
+    /// Production periods are UTC calendar quarters from the genesis quarter
+    #[test]
+    fn periods_are_utc_quarters() {
+        let config = DecisionConfig::production();
+        let genesis_ts = OCT_29_2026 + 12 * 3600;
+        let starts = [OCT_1_2026, JAN_1_2027, APR_1_2027, JUL_1_2027];
+        for (period, bounds) in (1..).zip(starts.windows(2)) {
+            assert_eq!(
+                calculate_period_boundaries(period, &config, genesis_ts),
+                (bounds[0], bounds[1]),
+            );
+        }
         assert_eq!(
-            get_current_period(1000, None, genesis_ts, &config).unwrap(),
-            1
+            crate::state::decisions::period_to_name(1, genesis_ts),
+            "Q4 Y2026"
         );
         assert_eq!(
-            get_current_period(1599, None, genesis_ts, &config).unwrap(),
-            1
-        );
-
-        // genesis+600 to genesis+1199 → period 2
-        assert_eq!(
-            get_current_period(1600, None, genesis_ts, &config).unwrap(),
-            2
+            crate::state::decisions::period_to_name(2, genesis_ts),
+            "Q1 Y2027"
         );
     }
 
+    /// Quarter start and index conversions round-trip through leap years
     #[test]
-    fn test_get_current_period_zero_genesis() {
+    fn quarter_math_leap_years() {
+        const APR_1_2028: u64 = 1_838_160_000;
+        const MAR_1_2100: u64 = 4_107_542_400;
+        const APR_1_2100: u64 = 4_110_220_800;
+
+        assert_eq!(utc_quarter_start(utc_quarter(APR_1_2028)), APR_1_2028);
+        assert_eq!(utc_quarter(APR_1_2028 - 1), utc_quarter(APR_1_2028) - 1);
+        assert_eq!(utc_quarter(MAR_1_2100), utc_quarter(APR_1_2100) - 1);
+        assert_eq!(utc_quarter_start(utc_quarter(MAR_1_2100) + 1), APR_1_2100);
+        for quarter in 0..(4 * 400) {
+            let start = utc_quarter_start(quarter);
+            assert_eq!(start % 86_400, 0);
+            assert_eq!(utc_quarter(start), quarter);
+            assert_eq!(
+                utc_quarter(utc_quarter_start(quarter + 1) - 1),
+                quarter
+            );
+        }
+    }
+
+    #[test]
+    fn test_zero_genesis_period() {
         let config = DecisionConfig::default();
         // genesis_ts == 0 → period 0
         assert_eq!(get_current_period(500, None, 0, &config).unwrap(), 0);
@@ -468,7 +556,7 @@ mod tests {
     // --- Transition rule tests ---
 
     #[test]
-    fn test_claimed_to_voting_transition_rule() {
+    fn test_claimed_to_voting() {
         // With DecisionConfig::testing(TEN), a decision claimed in period 1 (period_index=1)
         // should transition to Voting when current_period > 1.
         let config = DecisionConfig::testing(TEN);
@@ -485,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn test_voting_to_resolved_transition_rule() {
+    fn test_voting_to_resolved() {
         // With DecisionConfig::testing(TEN), a decision with period_index=1 has voting_period=2.
         // It should resolve when current_period > 2.
         let config = DecisionConfig::testing(TEN);
@@ -545,9 +633,47 @@ mod tests {
             assert!(cp <= 2, "should NOT resolve at block {h}");
         }
 
-        // Resolve at block 20 (current_period=3, 3 > 2 is true)
+        // Reveal at block 20 (current_period=3, 3 > 2 is true)
         let cp = get_current_period(0, Some(20), 0, &config).unwrap();
         assert_eq!(cp, 3);
-        assert!(cp > 2, "should resolve at block 20");
+        assert!(cp > 2, "should reveal at block 20");
+        assert!(!reveal_window_closed(2, 0, Some(20), 0, &config));
+
+        // Resolve at block 21, one block after the period ends
+        assert!(reveal_window_closed(2, 0, Some(21), 0, &config));
+    }
+
+    /// In time mode the reveal window closes one week after the period ends
+    #[test]
+    fn reveal_window_one_week() {
+        let config = DecisionConfig::default();
+        let genesis_ts = 1_000;
+        let (_, end) = calculate_period_boundaries(2, &config, genesis_ts);
+        let week = 7 * 24 * 3600;
+
+        assert!(!reveal_window_closed(2, end, None, genesis_ts, &config));
+        assert!(!reveal_window_closed(
+            2,
+            end + week - 1,
+            None,
+            genesis_ts,
+            &config
+        ));
+        assert!(reveal_window_closed(
+            2,
+            end + week,
+            None,
+            genesis_ts,
+            &config
+        ));
+        assert!(!reveal_window_closed(2, end + week, None, 0, &config));
+    }
+
+    #[test]
+    fn catch_up_closes_reveal() {
+        let config = DecisionConfig::testing(TEN);
+        let cp = get_current_period(0, Some(40), 0, &config).unwrap();
+        assert!(cp > 2);
+        assert!(reveal_window_closed(2, 0, Some(40), 0, &config));
     }
 }

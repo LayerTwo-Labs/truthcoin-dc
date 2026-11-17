@@ -42,7 +42,7 @@ fn test_sparse_vote_matrix_creation() {
 }
 
 #[test]
-fn test_sparse_vote_matrix_vote_operations() {
+fn test_sparse_matrix_votes() {
     let voters = create_test_voter_ids(3);
     let decisions = create_test_decision_ids(2);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
@@ -136,8 +136,37 @@ fn test_reputation_vector_clamping() {
     assert_eq!(reputation.get_reputation(voter), 1.0);
 }
 
+fn uniform_rep(num_voters: usize) -> nalgebra::DVector<f64> {
+    nalgebra::DVector::from_element(num_voters, 1.0)
+}
+
+/// A high-reputation minority beats a low-reputation headcount majority.
 #[test]
-fn test_resolve_categorical_plurality_clear_winner() {
+fn test_plurality_rep_over_headcount() {
+    let mut matrix = nalgebra::DMatrix::from_element(6, 1, f64::NAN);
+    matrix[(0, 0)] = 0.0;
+    for row in 1..6 {
+        matrix[(row, 0)] = 1.0;
+    }
+    let rep =
+        nalgebra::DVector::from_vec(vec![0.9, 0.02, 0.02, 0.02, 0.02, 0.02]);
+
+    let mut categorical_columns = std::collections::HashMap::new();
+    categorical_columns.insert(0_usize, 3_u16);
+
+    let results = super::oracle::resolve_categorical_plurality(
+        &mut matrix,
+        &categorical_columns,
+        &rep,
+    );
+
+    assert_eq!(results[&0].winning_option, Some(0));
+    assert_eq!(matrix[(0, 0)], 1.0);
+    assert_eq!(matrix[(1, 0)], 0.0);
+}
+
+#[test]
+fn test_plurality_clear_winner() {
     let mut matrix = nalgebra::DMatrix::from_element(3, 1, f64::NAN);
     matrix[(0, 0)] = 1.0;
     matrix[(1, 0)] = 1.0;
@@ -149,6 +178,7 @@ fn test_resolve_categorical_plurality_clear_winner() {
     let results = super::oracle::resolve_categorical_plurality(
         &mut matrix,
         &categorical_columns,
+        &uniform_rep(3),
     );
 
     assert_eq!(results[&0].winning_option, Some(1));
@@ -158,7 +188,7 @@ fn test_resolve_categorical_plurality_clear_winner() {
 }
 
 #[test]
-fn test_resolve_categorical_plurality_three_way_tie() {
+fn test_plurality_three_way_tie() {
     let mut matrix = nalgebra::DMatrix::from_element(3, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 1.0;
@@ -170,16 +200,18 @@ fn test_resolve_categorical_plurality_three_way_tie() {
     let results = super::oracle::resolve_categorical_plurality(
         &mut matrix,
         &categorical_columns,
+        &uniform_rep(3),
     );
 
-    assert_eq!(results[&0].winning_option, Some(3));
+    assert_eq!(results[&0].winning_option, None);
+    assert!(results[&0].tied);
     assert_eq!(matrix[(0, 0)], 0.0);
-    assert_eq!(matrix[(1, 0)], 0.0);
-    assert_eq!(matrix[(2, 0)], 0.0);
+    assert_eq!(matrix[(1, 0)], 1.0);
+    assert_eq!(matrix[(2, 0)], 2.0);
 }
 
 #[test]
-fn test_resolve_categorical_plurality_two_way_tie() {
+fn test_plurality_two_way_tie() {
     let mut matrix = nalgebra::DMatrix::from_element(4, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 1.0;
@@ -192,16 +224,15 @@ fn test_resolve_categorical_plurality_two_way_tie() {
     let results = super::oracle::resolve_categorical_plurality(
         &mut matrix,
         &categorical_columns,
+        &uniform_rep(4),
     );
 
-    assert_eq!(results[&0].winning_option, Some(4));
-    for row in 0..4 {
-        assert_eq!(matrix[(row, 0)], 0.0);
-    }
+    assert_eq!(results[&0].winning_option, None);
+    assert!(results[&0].tied);
 }
 
 #[test]
-fn test_resolve_categorical_inconclusive_wins_outright() {
+fn test_plurality_inconclusive_wins() {
     let mut matrix = nalgebra::DMatrix::from_element(5, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 1.0;
@@ -215,6 +246,7 @@ fn test_resolve_categorical_inconclusive_wins_outright() {
     let results = super::oracle::resolve_categorical_plurality(
         &mut matrix,
         &categorical_columns,
+        &uniform_rep(5),
     );
 
     assert_eq!(results[&0].winning_option, Some(3));
@@ -226,7 +258,7 @@ fn test_resolve_categorical_inconclusive_wins_outright() {
 }
 
 #[test]
-fn test_resolve_categorical_tie_with_inconclusive_voters() {
+fn test_plurality_tie_with_inconclusive() {
     let mut matrix = nalgebra::DMatrix::from_element(5, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 0.0;
@@ -240,18 +272,16 @@ fn test_resolve_categorical_tie_with_inconclusive_voters() {
     let results = super::oracle::resolve_categorical_plurality(
         &mut matrix,
         &categorical_columns,
+        &uniform_rep(5),
     );
 
-    assert_eq!(results[&0].winning_option, Some(3));
-    assert_eq!(matrix[(0, 0)], 0.0);
-    assert_eq!(matrix[(1, 0)], 0.0);
-    assert_eq!(matrix[(2, 0)], 0.0);
-    assert_eq!(matrix[(3, 0)], 0.0);
-    assert_eq!(matrix[(4, 0)], 1.0);
+    assert_eq!(results[&0].winning_option, None);
+    assert!(results[&0].tied);
 }
 
+/// An inconclusive categorical winner resolves to the neutral value 0.5.
 #[test]
-fn test_resolve_categorical_inconclusive_outcome_is_neutral_value() {
+fn test_inconclusive_outcome_neutral() {
     let voters = create_test_voter_ids(4);
     let decisions = create_test_decision_ids(1);
 
@@ -280,7 +310,7 @@ fn test_resolve_categorical_inconclusive_outcome_is_neutral_value() {
 }
 
 #[test]
-fn test_resolve_categorical_plurality_all_abstain() {
+fn test_plurality_all_abstain() {
     let mut matrix = nalgebra::DMatrix::from_element(3, 1, f64::NAN);
 
     let mut categorical_columns = std::collections::HashMap::new();
@@ -289,6 +319,7 @@ fn test_resolve_categorical_plurality_all_abstain() {
     let results = super::oracle::resolve_categorical_plurality(
         &mut matrix,
         &categorical_columns,
+        &uniform_rep(3),
     );
 
     assert_eq!(results[&0].winning_option, None);
@@ -298,7 +329,7 @@ fn test_resolve_categorical_plurality_all_abstain() {
 }
 
 #[test]
-fn test_resolve_categorical_plurality_single_voter() {
+fn test_plurality_single_voter() {
     let mut matrix = nalgebra::DMatrix::from_element(1, 1, f64::NAN);
     matrix[(0, 0)] = 2.0;
 
@@ -308,6 +339,7 @@ fn test_resolve_categorical_plurality_single_voter() {
     let results = super::oracle::resolve_categorical_plurality(
         &mut matrix,
         &categorical_columns,
+        &uniform_rep(1),
     );
 
     assert_eq!(results[&0].winning_option, Some(2));
@@ -315,7 +347,7 @@ fn test_resolve_categorical_plurality_single_voter() {
 }
 
 #[test]
-fn test_resolve_categorical_with_nan_entries() {
+fn test_plurality_nan_entries() {
     let mut matrix = nalgebra::DMatrix::from_element(4, 1, f64::NAN);
     matrix[(0, 0)] = 0.0;
     matrix[(1, 0)] = 0.0;
@@ -327,6 +359,7 @@ fn test_resolve_categorical_with_nan_entries() {
     let results = super::oracle::resolve_categorical_plurality(
         &mut matrix,
         &categorical_columns,
+        &uniform_rep(4),
     );
 
     assert_eq!(results[&0].winning_option, Some(0));
@@ -337,7 +370,7 @@ fn test_resolve_categorical_with_nan_entries() {
 }
 
 #[test]
-fn test_mixed_binary_and_categorical_columns() {
+fn test_mixed_binary_categorical() {
     let voters = create_test_voter_ids(3);
     let decisions = create_test_decision_ids(2);
 
@@ -372,7 +405,7 @@ fn test_mixed_binary_and_categorical_columns() {
 }
 
 #[test]
-fn test_consensus_categorical_clear_winner() {
+fn test_categorical_clear_winner() {
     let voters = create_test_voter_ids(5);
     let decisions = create_test_decision_ids(1);
 
@@ -403,8 +436,9 @@ fn test_consensus_categorical_clear_winner() {
     assert!((outcome - 1.0).abs() < 0.01);
 }
 
+/// Whitepaper figure 5: reputation is conserved and the dissenter loses.
 #[test]
-fn test_reputation_conservation_whitepaper_figure5() {
+fn test_figure5_conservation() {
     let voters = create_test_voter_ids(7);
     let decisions = create_test_decision_ids(4);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
@@ -456,8 +490,9 @@ fn test_reputation_conservation_whitepaper_figure5() {
     );
 }
 
+/// Reputation ranks full > partial > absent, absent below its start.
 #[test]
-fn test_absent_voter_penalized_relative_to_attendance() {
+fn test_absence_penalized() {
     let voters = create_test_voter_ids(3);
     let decisions = create_test_decision_ids(4);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
@@ -500,8 +535,9 @@ fn test_absent_voter_penalized_relative_to_attendance() {
     );
 }
 
+/// Full participation: only compliance moves reputation, total conserved.
 #[test]
-fn test_full_participation_leaves_compliance_only() {
+fn test_full_participation() {
     let voters = create_test_voter_ids(5);
     let decisions = create_test_decision_ids(3);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
@@ -549,8 +585,9 @@ fn test_full_participation_leaves_compliance_only() {
     );
 }
 
+/// Under heavy absence a dissenting voter still outranks a fully absent one.
 #[test]
-fn test_high_absence_dominates_consensus() {
+fn test_high_absence() {
     let voters = create_test_voter_ids(4);
     let decisions = create_test_decision_ids(4);
     let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
@@ -580,5 +617,192 @@ fn test_high_absence_dominates_consensus() {
          a voter who showed up and disagreed ({rep_voted_wrong:.10}) \
          should still outrank a fully-absent voter \
          ({rep_fully_absent:.10})"
+    );
+}
+
+/// Dust addresses gain no participation share over an equal honest voter.
+#[test]
+fn test_dust_no_participation_gain() {
+    let voters = create_test_voter_ids(12);
+    let decisions = create_test_decision_ids(4);
+    let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
+    let honest = voters[0];
+    let dust = &voters[2..];
+    for voter in std::iter::once(&honest).chain(dust) {
+        for (j, decision) in decisions.iter().enumerate() {
+            matrix.set_vote(*voter, *decision, (j % 2) as f64).unwrap();
+        }
+    }
+
+    let mut reputation = VotingWeightVector::new();
+    reputation.set_reputation(honest, 0.5);
+    reputation.set_reputation(voters[1], 0.4);
+    for voter in dust {
+        reputation.set_reputation(*voter, 0.01);
+    }
+
+    let scaled = std::collections::HashSet::new();
+    let categorical = std::collections::HashMap::new();
+    let result =
+        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
+            .unwrap();
+
+    let dust_total: f64 =
+        dust.iter().map(|v| result.updated_reputations[v]).sum();
+    let ratio = dust_total / result.updated_reputations[&honest];
+    assert!(
+        ratio <= 0.1 / 0.5 + 1e-6,
+        "dust grew relative to an identical honest voter: {ratio:.10}"
+    );
+}
+
+/// When every voter abstains, reputation is unchanged.
+#[test]
+fn test_all_abstain_unchanged() {
+    let voters = create_test_voter_ids(3);
+    let decisions = create_test_decision_ids(2);
+    let matrix = SparseVoteMatrix::new(voters.clone(), decisions);
+
+    let mut reputation = VotingWeightVector::new();
+    for (voter, rep) in voters.iter().zip([0.6, 0.3, 0.1]) {
+        reputation.set_reputation(*voter, rep);
+    }
+
+    let scaled = std::collections::HashSet::new();
+    let categorical = std::collections::HashMap::new();
+    let result =
+        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
+            .unwrap();
+
+    for voter in &voters {
+        assert!(
+            (result.updated_reputations[voter]
+                - reputation.get_reputation(*voter))
+            .abs()
+                < 1e-9
+        );
+    }
+}
+
+/// Non-voting dust addresses do not shield a dissenter from its penalty.
+#[test]
+fn test_dust_keeps_dissent_penalty() {
+    let voters = create_test_voter_ids(203);
+    let decisions = create_test_decision_ids(4);
+    let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
+    let dissenter = voters[2];
+    for decision in &decisions {
+        matrix.set_vote(voters[0], *decision, 1.0).unwrap();
+        matrix.set_vote(voters[1], *decision, 1.0).unwrap();
+        matrix.set_vote(dissenter, *decision, 0.0).unwrap();
+    }
+
+    let mut reputation = VotingWeightVector::new();
+    reputation.set_reputation(voters[0], 0.45);
+    reputation.set_reputation(voters[1], 0.45);
+    reputation.set_reputation(dissenter, 0.08);
+    for voter in &voters[3..] {
+        reputation.set_reputation(*voter, 0.0001);
+    }
+
+    let scaled = std::collections::HashSet::new();
+    let categorical = std::collections::HashMap::new();
+    let result =
+        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
+            .unwrap();
+
+    let after = result.updated_reputations[&dissenter];
+    assert!(
+        after < 0.07,
+        "non-voting dust shielded the dissenter: {after:.10}"
+    );
+}
+
+fn categorical_consensus(
+    votes_and_reps: &[(f64, f64)],
+) -> (Vec<Address>, VotingWeightVector, DetailedConsensusResult) {
+    let voters = create_test_voter_ids(votes_and_reps.len());
+    let decisions = create_test_decision_ids(1);
+    let mut matrix = SparseVoteMatrix::new(voters.clone(), decisions.clone());
+    let mut reputation = VotingWeightVector::new();
+    for (voter, &(vote, rep)) in voters.iter().zip(votes_and_reps) {
+        matrix.set_vote(*voter, decisions[0], vote).unwrap();
+        reputation.set_reputation(*voter, rep);
+    }
+    let scaled = std::collections::HashSet::new();
+    let mut categorical = std::collections::HashMap::new();
+    categorical.insert(decisions[0], 3_u16);
+    let result =
+        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
+            .unwrap();
+    (voters, reputation, result)
+}
+
+/// A plurality winner without a majority keeps reputation; losers drop.
+#[test]
+fn test_categorical_no_majority() {
+    let (voters, reputation, result) =
+        categorical_consensus(&[(0.0, 0.35), (1.0, 0.33), (2.0, 0.32)]);
+
+    assert_eq!(result.categorical_winners.values().next(), Some(&Some(0)));
+    let winner_after = result.updated_reputations[&voters[0]];
+    assert!(
+        winner_after >= reputation.get_reputation(voters[0]),
+        "the plurality winner lost reputation: {winner_after:.10}"
+    );
+    assert!(
+        result.updated_reputations[&voters[1]]
+            < reputation.get_reputation(voters[1])
+    );
+}
+
+/// An outright inconclusive win does not cost its voters reputation.
+#[test]
+fn test_inconclusive_win_rewards() {
+    let (voters, reputation, result) =
+        categorical_consensus(&[(3.0, 0.4), (0.0, 0.3), (1.0, 0.3)]);
+
+    assert_eq!(result.categorical_winners.values().next(), Some(&Some(3)));
+    assert!(
+        result.updated_reputations[&voters[0]]
+            >= reputation.get_reputation(voters[0])
+    );
+}
+
+/// A categorical tie resolves to 0.5 and changes no reputation.
+#[test]
+fn test_categorical_tie_no_change() {
+    let (voters, reputation, result) =
+        categorical_consensus(&[(0.0, 0.5), (1.0, 0.5)]);
+
+    assert_eq!(result.categorical_winners.values().next(), Some(&None));
+    assert_eq!(result.outcomes.values().next(), Some(&Some(0.5)));
+    for voter in &voters {
+        assert_eq!(
+            result.updated_reputations[voter],
+            reputation.get_reputation(*voter)
+        );
+    }
+}
+
+/// resolve_unguaranteed handles a tie, an inconclusive win and a plain winner.
+#[test]
+fn test_unguaranteed_categorical() {
+    use super::oracle::resolve_unguaranteed;
+
+    assert_eq!(
+        resolve_unguaranteed(&[(0.0, 0.5), (1.0, 0.5)], false, Some(3))
+            .unwrap(),
+        Some((0.5, None))
+    );
+    assert_eq!(
+        resolve_unguaranteed(&[(3.0, 0.6), (1.0, 0.4)], false, Some(3))
+            .unwrap(),
+        Some((0.5, Some(3)))
+    );
+    assert_eq!(
+        resolve_unguaranteed(&[(1.0, 0.6), (0.0, 0.4)], false, Some(3))
+            .unwrap(),
+        Some((1.0, Some(1)))
     );
 }

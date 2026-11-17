@@ -9,10 +9,13 @@ use crate::types::{Address, MerkleRoot, OutPoint};
 use super::market::Market;
 use super::types::{FeePayoutRecord, FeeRole, MarketId};
 
+/// Whether a vote matches the consensus. `inconclusive_won` is true only
+/// when "Inconclusive" won a categorical decision's plurality, not on a tie.
 fn is_vote_correct(
     vote: &crate::state::voting::types::VoteValue,
     consensus: f64,
     decision: &Decision,
+    inconclusive_won: bool,
 ) -> bool {
     use crate::state::voting::types::VoteValue;
     match vote {
@@ -33,7 +36,9 @@ fn is_vote_correct(
             if *idx as f64 == consensus {
                 return true;
             }
-            consensus == 0.5 && decision.inconclusive_index() == Some(*idx)
+            inconclusive_won
+                && consensus == 0.5
+                && decision.inconclusive_index() == Some(*idx)
         }
     }
 }
@@ -70,19 +75,32 @@ fn find_correct_voters(
             .voting()
             .databases()
             .get_votes_for_period(txn, period_id)?;
+        let inconclusive_won = decision.inconclusive_index().is_some()
+            && state
+                .voting()
+                .databases()
+                .get_decision_outcome(txn, *decision_id)?
+                .and_then(|outcome| outcome.categorical_winner)
+                .flatten()
+                == decision.inconclusive_index();
 
         let mut correct_voters: Vec<(Address, f64)> = Vec::new();
         for (key, entry) in &votes {
             if key.decision_id != *decision_id {
                 continue;
             }
-            if !is_vote_correct(&entry.value, consensus, decision) {
+            if !is_vote_correct(
+                &entry.value,
+                consensus,
+                decision,
+                inconclusive_won,
+            ) {
                 continue;
             }
             let reputation =
                 state.reputation().get_reputation(txn, &key.voter_address)?;
-            if reputation > 0.0 {
-                correct_voters.push((key.voter_address, reputation));
+            if !reputation.is_zero() {
+                correct_voters.push((key.voter_address, reputation.0 as f64));
             }
         }
 
@@ -297,20 +315,51 @@ mod payout_tests {
         )
         .unwrap();
 
-        assert!(is_vote_correct(&VoteValue::Binary(true), 1.0, &decision));
-        assert!(!is_vote_correct(&VoteValue::Binary(false), 1.0, &decision));
+        assert!(is_vote_correct(
+            &VoteValue::Binary(true),
+            1.0,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Binary(false),
+            1.0,
+            &decision,
+            false
+        ));
 
-        assert!(is_vote_correct(&VoteValue::Binary(false), 0.0, &decision));
-        assert!(!is_vote_correct(&VoteValue::Binary(true), 0.0, &decision));
+        assert!(is_vote_correct(
+            &VoteValue::Binary(false),
+            0.0,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Binary(true),
+            0.0,
+            &decision,
+            false
+        ));
 
-        assert!(!is_vote_correct(&VoteValue::Binary(true), 0.5, &decision));
-        assert!(!is_vote_correct(&VoteValue::Binary(false), 0.5, &decision));
+        assert!(!is_vote_correct(
+            &VoteValue::Binary(true),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Binary(false),
+            0.5,
+            &decision,
+            false
+        ));
 
-        assert!(!is_vote_correct(&VoteValue::Abstain, 1.0, &decision));
+        assert!(!is_vote_correct(&VoteValue::Abstain, 1.0, &decision, false));
     }
 
+    /// is_vote_correct on a categorical decision with a real winning option.
     #[test]
-    fn test_is_vote_correct_categorical_real_winner() {
+    fn test_categorical_winner() {
         use crate::state::decisions::{Decision, DecisionType};
         use crate::state::voting::types::VoteValue;
 
@@ -327,13 +376,29 @@ mod payout_tests {
         )
         .unwrap();
 
-        assert!(is_vote_correct(&VoteValue::Categorical(1), 1.0, &decision));
-        assert!(!is_vote_correct(&VoteValue::Categorical(0), 1.0, &decision));
-        assert!(!is_vote_correct(&VoteValue::Categorical(3), 1.0, &decision));
+        assert!(is_vote_correct(
+            &VoteValue::Categorical(1),
+            1.0,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Categorical(0),
+            1.0,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Categorical(3),
+            1.0,
+            &decision,
+            false
+        ));
     }
 
+    /// is_vote_correct on a categorical decision with an inconclusive outcome.
     #[test]
-    fn test_is_vote_correct_categorical_inconclusive() {
+    fn test_categorical_inconclusive() {
         use crate::state::decisions::{Decision, DecisionType};
         use crate::state::voting::types::VoteValue;
 
@@ -350,10 +415,31 @@ mod payout_tests {
         )
         .unwrap();
 
-        assert!(is_vote_correct(&VoteValue::Categorical(3), 0.5, &decision));
-        assert!(!is_vote_correct(&VoteValue::Categorical(0), 0.5, &decision));
-        assert!(!is_vote_correct(&VoteValue::Categorical(2), 0.5, &decision));
-        assert!(!is_vote_correct(&VoteValue::Abstain, 0.5, &decision));
+        assert!(is_vote_correct(
+            &VoteValue::Categorical(3),
+            0.5,
+            &decision,
+            true
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Categorical(3),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Categorical(0),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Categorical(2),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(&VoteValue::Abstain, 0.5, &decision, false));
     }
 
     #[test]
@@ -376,10 +462,30 @@ mod payout_tests {
         )
         .unwrap();
 
-        assert!(is_vote_correct(&VoteValue::Scalar(0.5), 0.5, &decision));
-        assert!(is_vote_correct(&VoteValue::Scalar(0.55), 0.5, &decision));
-        assert!(is_vote_correct(&VoteValue::Scalar(0.45), 0.5, &decision));
-        assert!(!is_vote_correct(&VoteValue::Scalar(0.56), 0.5, &decision));
-        assert!(!is_vote_correct(&VoteValue::Abstain, 0.5, &decision));
+        assert!(is_vote_correct(
+            &VoteValue::Scalar(0.5),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(is_vote_correct(
+            &VoteValue::Scalar(0.55),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(is_vote_correct(
+            &VoteValue::Scalar(0.45),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Scalar(0.56),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(&VoteValue::Abstain, 0.5, &decision, false));
     }
 }

@@ -91,9 +91,9 @@ pub mod node {
         BlockIndexDeposit, BlockIndexReturn, BlockIndexSpend, BlockIndexTx,
         Body, ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
         Header, InPoint, M6id, MainchainSyncPhase, MainchainSyncProgress,
-        MerkleRoot, OutPoint, Output, OutputContent, PointedOutput,
-        SpentOutput, Transaction, TxData, TxIn, Txid, WithdrawalBundle,
-        WithdrawalBundleStatus,
+        MerkleRoot, OfferId, OutPoint, Output, OutputContent, PointedOutput,
+        ShareDelta, SignedOffer, SpentOutput, Transaction, TxData, TxIn, Txid,
+        Votecoin, VotecoinOffer, WithdrawalBundle, WithdrawalBundleStatus,
         authorization::Signature,
         decision::DecisionType,
         market::MarketId,
@@ -255,9 +255,9 @@ pub mod node {
                 Address, Authorization, Block, BlockHash, Body,
                 ClaimDecisionPayload, Coinbase, CoinbaseTxid,
                 DecisionClaimEntry, Header, M6id, MerkleRoot, Output,
-                OutputContent, Transaction, TxData, Txid,
-                authorization::Signature, market::MarketId,
-                transaction::Outputs,
+                OutputContent, ShareDelta, SignedOffer, Transaction, TxData,
+                Txid, Votecoin, VotecoinOffer, authorization::Signature,
+                market::MarketId, transaction::Outputs,
             };
             use typewit::const_marker::Bool;
             use utoipa::ToSchema;
@@ -294,10 +294,10 @@ pub mod node {
             #[open_api(ref_schemas[
                 Address, Authorization, BallotItem, Block, BlockHash,
                 BlockVerbose, Body, BodyVerbose, ClaimDecisionPayload, Coinbase,
-                CoinbaseTxid, DecisionClaimEntry, Header, M6id, MarketId,
-                MerkleRoot, Output, OutputContent, Outputs, Signature,
-                Transaction, TransactionVerbose, TxData, Txid,
-                schema::BitcoinAddr,
+                CoinbaseTxid, DecisionClaimEntry, Header, M6id, MarketId, MerkleRoot,
+                Output, OutputContent, Outputs, Signature, Transaction,
+                ShareDelta, SignedOffer, TransactionVerbose, TxData, Txid,
+                Votecoin, VotecoinOffer, schema::BitcoinAddr,
                 schema::BitcoinBlockHash, schema::BitcoinOutPoint,
                 schema::UtreexoNodeHash, schema::UtreexoProof,
             ])]
@@ -368,6 +368,16 @@ pub mod node {
     }
 
     #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+    pub struct OfferInfo {
+        pub offer_id: OfferId,
+        pub seller: Address,
+        pub amount: Votecoin,
+        pub price_sats: u64,
+        pub pay_to: Address,
+        pub voting_period: u32,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
     pub struct GetWithdrawalBundleResponse {
         pub info: WithdrawalBundleInfo,
         pub status: WithdrawalBundleStatus,
@@ -384,10 +394,11 @@ pub mod node {
             DecisionType, Header, InPoint, M6id, MainchainSyncPhase,
             MarketDimension, MarketDimensionKind, MarketId, MarketOutcome,
             MarketResolution, MarketStatus, MarketUtxo, MarketUtxoReason,
-            MerkleRoot, OutPoint, Output,
+            MerkleRoot, OfferId, OutPoint, Output,
             OutputContent, Outputs, ParticipationStats, PeerConnectionStatus,
             PeriodStats, ScoreChange, SharePosition, Signature, SpentOutput,
-            Transaction, TxData, TxIn, Txid, WinningOutcome, WithdrawalBundle,
+            ShareDelta, SignedOffer, Transaction, TxData, TxIn, Txid,
+            Votecoin, VotecoinOffer, WinningOutcome, WithdrawalBundle,
             WithdrawalBundleInfo, WithdrawalBundleStatus, schema::BitcoinAddr,
             schema::BitcoinBlockHash, schema::BitcoinOutPoint,
             schema::BitcoinTransaction, schema::SocketAddr,
@@ -521,6 +532,11 @@ pub mod node {
         /// List the transactions the mempool holds, in no particular order.
         #[method(name = "list_mempool")]
         async fn list_mempool(&self) -> RpcResult<Vec<MempoolTx>>;
+
+        /// List the votecoin sell offers on the board, cheapest price per
+        /// votecoin first
+        #[method(name = "list_offers")]
+        async fn list_offers(&self) -> RpcResult<Vec<OfferInfo>>;
 
         /// List peers
         #[method(name = "list_peers")]
@@ -701,10 +717,18 @@ pub mod node {
         #[method(name = "vote_voters")]
         async fn vote_voters(&self) -> RpcResult<Vec<VoterInfo>>;
 
+        /// List this wallet's addresses that hold votecoin
+        #[open_api_method(output_schema(ToSchema = "Vec<VoterInfo>"))]
+        #[method(name = "voter_addresses")]
+        async fn voter_addresses(&self) -> RpcResult<Vec<VoterInfo>>;
+
         /// Get votecoin balance for an address
-        #[open_api_method(output_schema(ToSchema = "f64"))]
+        #[open_api_method(output_schema(ToSchema = "Votecoin"))]
         #[method(name = "votecoin_balance")]
-        async fn votecoin_balance(&self, address: Address) -> RpcResult<f64>;
+        async fn votecoin_balance(
+            &self,
+            address: Address,
+        ) -> RpcResult<Votecoin>;
     }
 }
 
@@ -715,8 +739,9 @@ pub mod wallet {
     use truthcoin_dc_types::{
         Address, Authorization, Authorized, Block, BlockHash, Body,
         ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
-        EncryptionPubKey, Header, M6id, MerkleRoot, OutPoint, Output,
-        OutputContent, PointedOutput, Transaction, TxData, Txid, VerifyingKey,
+        EncryptionPubKey, Header, M6id, MerkleRoot, OfferId, OutPoint, Output,
+        OutputContent, PointedOutput, ShareDelta, SignedOffer, Transaction,
+        TxData, Txid, VerifyingKey, Votecoin, VotecoinOffer,
         authorization::{Dst, Signature},
         market::MarketId,
         transaction::Outputs,
@@ -731,6 +756,7 @@ pub mod wallet {
             DecisionClaimResponse, DimensionInput, MarketAmplifyBetaRequest,
             MarketBuyRequest, MarketBuyResponse, MarketCreateRequest,
             MarketCreateResponse, MarketSellRequest, MarketSellResponse,
+            MarketTradeRequest, MarketTradeResponse,
         },
         open_api, schema,
     };
@@ -749,9 +775,10 @@ pub mod wallet {
     #[open_api(ref_schemas[
         Address, Authorization, BallotItem, Block, BlockHash, Body,
         ClaimDecisionPayload, ClaimedDecisionInfo, Coinbase, CoinbaseTxid,
-        DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, M6id,
-        MarketId, MerkleRoot, OutPoint, Output, OutputContent, Outputs,
-        Signature, Transaction, TxData, Txid, schema::BitcoinAddr,
+        DecisionClaimEntry, DecisionClaimItem, DimensionInput, Header, M6id, MarketId,
+        MerkleRoot, OutPoint, Output, OutputContent, Outputs, Signature,
+        ShareDelta, SignedOffer, Transaction, TxData, Txid, Votecoin,
+        VotecoinOffer, schema::BitcoinAddr,
         schema::BitcoinBlockHash, schema::BitcoinOutPoint,
         schema::UtreexoNodeHash, schema::UtreexoProof,
     ])]
@@ -853,6 +880,15 @@ pub mod wallet {
         #[method(name = "mine")]
         async fn mine(&self, fee: Option<u64>) -> RpcResult<()>;
 
+        /// Import a ristretto255 private key (a 32-byte FROST-serialized
+        /// scalar, hex) into the wallet, and return its address. The wallet
+        /// must have a seed. The seed does not back up an imported key.
+        #[method(name = "import_private_key")]
+        async fn import_private_key(
+            &self,
+            private_key: String,
+        ) -> RpcResult<Address>;
+
         /// Set the wallet seed from a mnemonic seed phrase
         #[open_api_method(output_schema(ToSchema))]
         #[method(name = "set_seed_from_mnemonic")]
@@ -931,12 +967,46 @@ pub mod wallet {
         #[method(name = "get_voter_address")]
         async fn get_voter_address(&self) -> RpcResult<Address>;
 
-        /// Transfer votecoin to the specified address
+        /// Transfer votecoin to the specified address, from `sender` or else
+        /// the one wallet address that holds votecoin. The sender pays the
+        /// fee from its own coins, or from any wallet coin if it has none.
         #[method(name = "transfer_votecoin")]
         async fn transfer_votecoin(
             &self,
             dest: Address,
-            amount: f64,
+            amount: Votecoin,
+            fee_sats: u64,
+            sender: Option<Address>,
+        ) -> RpcResult<Txid>;
+
+        /// Sign an offer to sell `amount` votecoin for `price_sats`, paid to
+        /// `pay_to` or else the seller, and post it to the offer board. The
+        /// seller is `seller` or else the one wallet address that holds
+        /// votecoin. The offer expires when the current voting period ends.
+        #[method(name = "create_offer")]
+        async fn create_offer(
+            &self,
+            amount: Votecoin,
+            price_sats: u64,
+            seller: Option<Address>,
+            pay_to: Option<Address>,
+        ) -> RpcResult<OfferId>;
+
+        /// Take an offer from the board: pay its price and receive its
+        /// votecoin at `buyer`, or else at a new wallet address
+        #[method(name = "take_offer")]
+        async fn take_offer(
+            &self,
+            offer_id: OfferId,
+            fee_sats: u64,
+            buyer: Option<Address>,
+        ) -> RpcResult<Txid>;
+
+        /// Cancel an offer of a wallet address before it expires
+        #[method(name = "cancel_offer")]
+        async fn cancel_offer(
+            &self,
+            offer_id: OfferId,
             fee_sats: u64,
         ) -> RpcResult<Txid>;
 
@@ -977,6 +1047,15 @@ pub mod wallet {
             request: MarketSellRequest,
         ) -> RpcResult<MarketSellResponse>;
 
+        /// Move a market's share vector: buy and sell any of its outcomes in
+        /// one transaction (with dry_run support for the quote)
+        #[open_api_method(output_schema(ToSchema))]
+        #[method(name = "market_trade")]
+        async fn market_trade(
+            &self,
+            request: MarketTradeRequest,
+        ) -> RpcResult<MarketTradeResponse>;
+
         #[open_api_method(output_schema(ToSchema))]
         #[method(name = "market_amplify_beta")]
         async fn market_amplify_beta(
@@ -984,13 +1063,28 @@ pub mod wallet {
             request: MarketAmplifyBetaRequest,
         ) -> RpcResult<String>;
 
-        /// Submit one or more votes (batch)
+        /// Seal the voter's one ballot for a period, voting on every
+        /// decision in it. The fee defaults to the minimum for its size.
+        /// The voter is `voter`, or else the one wallet address that holds
+        /// votecoin.
         #[open_api_method(output_schema(ToSchema = "String"))]
         #[method(name = "vote_submit")]
         async fn vote_submit(
             &self,
             votes: Vec<BallotItem>,
-            fee_sats: u64,
+            fee_sats: Option<u64>,
+            voter: Option<Address>,
+        ) -> RpcResult<String>;
+
+        /// Reveal the voter's sealed ballot for a period once its voting
+        /// closes. The fee defaults to the minimum for its size.
+        #[open_api_method(output_schema(ToSchema = "String"))]
+        #[method(name = "vote_reveal")]
+        async fn vote_reveal(
+            &self,
+            voting_period: u32,
+            fee_sats: Option<u64>,
+            voter: Option<Address>,
         ) -> RpcResult<String>;
 
         /// Build and sign a Trade transaction with a caller-supplied

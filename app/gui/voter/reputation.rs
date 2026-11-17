@@ -31,7 +31,7 @@ impl Reputation {
             }
         };
 
-        let mut total_reputation: f64 = 0.0;
+        let mut total_reputation = truthcoin_dc::types::Votecoin::ZERO;
         let mut addr_weights: Vec<_> = Vec::new();
 
         for addr in &addresses {
@@ -39,10 +39,10 @@ impl Reputation {
                 .node
                 .reputation()
                 .get_reputation(&rotxn, addr)
-                .unwrap_or(0.0);
-            if weight > 0.0 {
+                .unwrap_or_default();
+            if !weight.is_zero() {
                 addr_weights.push((*addr, weight));
-                total_reputation += weight;
+                total_reputation.0 += weight.0;
             }
         }
 
@@ -50,7 +50,7 @@ impl Reputation {
             ui.monospace("Total Reputation Weight: ");
             ui.monospace_selectable_singleline(
                 false,
-                format!("{total_reputation:.6}"),
+                format!("{total_reputation}"),
             );
         });
 
@@ -62,7 +62,7 @@ impl Reputation {
             return;
         }
 
-        addr_weights.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
+        addr_weights.sort_by(|(_, a), (_, b)| b.cmp(a));
 
         egui::Grid::new("voter_reputation_by_address")
             .striped(true)
@@ -76,7 +76,7 @@ impl Reputation {
                     ui.monospace_selectable_singleline(true, format!("{addr}"));
                     ui.monospace_selectable_singleline(
                         false,
-                        format!("{weight:.6}"),
+                        format!("{weight}"),
                     );
                     ui.end_row();
                 }

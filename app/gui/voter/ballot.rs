@@ -4,7 +4,7 @@ use std::task::Poll;
 use eframe::egui::{self, Color32, RichText, ScrollArea};
 use futures::Stream;
 use truthcoin_dc::state::decisions::{Decision, DecisionId, DecisionType};
-use truthcoin_dc::types::BallotItem;
+use truthcoin_dc::types::{Address, BallotItem};
 
 use crate::util::PromiseStream;
 use crate::{app::App, gui::util::UiExt};
@@ -13,12 +13,13 @@ type NodeUpdates = PromiseStream<Pin<Box<dyn Stream<Item = ()> + Send>>>;
 
 pub(super) struct Ballot {
     rows: Vec<BallotRow>,
-    fee_sats: String,
     error: Option<String>,
     last_submit: Option<SubmitResult>,
     current_period: u32,
     node_updated: Option<NodeUpdates>,
     needs_initial_load: bool,
+    holders: Vec<(Address, truthcoin_dc::types::Votecoin)>,
+    voter: Option<Address>,
 }
 
 struct BallotRow {
@@ -44,12 +45,13 @@ impl Default for Ballot {
     fn default() -> Self {
         Self {
             rows: Vec::new(),
-            fee_sats: String::from("1000"),
             error: None,
             last_submit: None,
             current_period: 0,
             node_updated: None,
             needs_initial_load: true,
+            holders: Vec::new(),
+            voter: None,
         }
     }
 }
@@ -83,6 +85,17 @@ impl Ballot {
             return;
         }
         self.needs_initial_load = false;
+
+        self.holders = match app.voter_addresses() {
+            Ok(holders) => holders,
+            Err(err) => {
+                self.error = Some(format!("Failed to load voters: {err:#}"));
+                return;
+            }
+        };
+        self.voter = self.voter.filter(|voter| {
+            self.holders.iter().any(|(address, _)| address == voter)
+        });
 
         let rotxn = match app.node.read_txn() {
             Ok(t) => t,
@@ -147,7 +160,7 @@ impl Ballot {
         app: &App,
         ui: &mut egui::Ui,
         current_period: u32,
-        total_reputation: f64,
+        total_reputation: truthcoin_dc::types::Votecoin,
     ) {
         self.refresh(app, current_period);
 
@@ -187,7 +200,7 @@ impl Ballot {
                     ui.add_space(8.0);
                 }
 
-                let has_reputation = total_reputation > 0.0;
+                let has_reputation = !total_reputation.is_zero();
                 if !has_reputation {
                     egui::Frame::new()
                         .fill(ui.visuals().widgets.noninteractive.bg_fill)
@@ -234,6 +247,28 @@ impl Ballot {
                     ui.separator();
                     ui.add_space(8.0);
 
+                    if self.holders.len() > 1 {
+                        ui.horizontal(|ui| {
+                            ui.label("Vote as:");
+                            let selected = self.voter.map_or(
+                                "Choose a voter".to_string(),
+                                |voter| voter.to_string(),
+                            );
+                            egui::ComboBox::from_id_salt("ballot_voter")
+                                .selected_text(selected)
+                                .show_ui(ui, |ui| {
+                                    for (address, votecoin) in &self.holders {
+                                        ui.selectable_value(
+                                            &mut self.voter,
+                                            Some(*address),
+                                            format!("{address} ({votecoin})"),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.add_space(8.0);
+                    }
+
                     let (enabled, disabled_reason) =
                         self.submit_gate(total_reputation);
 
@@ -258,12 +293,12 @@ impl Ballot {
             });
     }
 
-    fn submit_gate(&self, total_reputation: f64) -> (bool, Option<String>) {
-        if total_reputation <= 0.0 {
+    fn submit_gate(
+        &self,
+        total_reputation: truthcoin_dc::types::Votecoin,
+    ) -> (bool, Option<String>) {
+        if total_reputation.is_zero() {
             return (false, Some("No voting reputation".to_string()));
-        }
-        if self.fee_sats.parse::<u64>().is_err() {
-            return (false, Some("Fee must be an integer in sats".to_string()));
         }
         let non_abstain: Vec<&BallotRow> =
             self.rows.iter().filter(|r| !r.abstain).collect();
@@ -287,16 +322,15 @@ impl Ballot {
         self.last_submit = None;
         self.error = None;
 
-        let fee_sats = match self.fee_sats.parse::<u64>() {
-            Ok(f) => f,
-            Err(_) => {
-                self.error = Some("Invalid fee".to_string());
-                return;
-            }
-        };
-
         let mut items: Vec<BallotItem> = Vec::new();
-        for row in self.rows.iter().filter(|r| !r.abstain) {
+        for row in &self.rows {
+            if row.abstain {
+                items.push(BallotItem {
+                    decision_id_bytes: row.decision_id.as_bytes(),
+                    vote_value: None,
+                });
+                continue;
+            }
             let user_value = match row_user_value(row) {
                 Ok(v) => v,
                 Err(reason) => {
@@ -314,18 +348,24 @@ impl Ballot {
                 };
             items.push(BallotItem {
                 decision_id_bytes: row.decision_id.as_bytes(),
-                vote_value: normalized,
+                vote_value: Some(normalized),
             });
         }
 
-        if items.is_empty() {
-            self.error = Some("No non-abstain votes to submit".to_string());
+        let vote_count = items.len();
+        let period = self.current_period;
+
+        let voter = match app.resolve_voter(self.voter) {
+            Ok(voter) => voter,
+            Err(err) => {
+                self.error = Some(format!("Invalid voter: {err:#}"));
+                return;
+            }
+        };
+        if let Err(err) = app.node.prepare_ballot(period, voter, &items) {
+            self.error = Some(format!("Invalid ballot: {err:#}"));
             return;
         }
-
-        let vote_count = items.len();
-        let fee = bitcoin::Amount::from_sat(fee_sats);
-        let period = self.current_period;
 
         let options = match app.spend_options() {
             Ok(options) => options,
@@ -335,7 +375,14 @@ impl Ballot {
                 return;
             }
         };
-        let tx = match app.wallet.submit_ballot(options, items, period, fee) {
+        let tx = match app.wallet.submit_ballot(
+            rand::rng(),
+            voter,
+            items,
+            period,
+            None,
+            options,
+        ) {
             Ok(tx) => tx,
             Err(err) => {
                 self.error = Some(format!("Failed to build ballot: {err:#}"));
@@ -354,7 +401,6 @@ impl Ballot {
             vote_count,
         });
         self.rows.clear();
-        self.fee_sats.clear();
         self.current_period = 0;
     }
 }

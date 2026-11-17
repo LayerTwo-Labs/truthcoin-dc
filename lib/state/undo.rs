@@ -6,7 +6,7 @@
 
 use crate::state::markets::{Market, MarketId, MarketPayoutSummary};
 use crate::state::voting::types::VotingPeriodId;
-use crate::types::{Address, OutPoint, Output};
+use crate::types::{Address, OutPoint, Output, Votecoin};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -47,7 +47,7 @@ pub struct ConsensusUndoEntry {
     pub decision_outcome_ids: Vec<crate::state::decisions::DecisionId>,
     pub had_period_stats: bool,
     pub resolved_decision_ids: Vec<crate::state::decisions::DecisionId>,
-    pub pre_consensus_reputation: BTreeMap<Address, f64>,
+    pub pre_consensus_reputation: BTreeMap<Address, Votecoin>,
 }
 
 /// Undo data for reputation transfers within a block.
@@ -63,9 +63,9 @@ pub struct ReputationTransferUndoData {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReputationTransferUndoEntry {
     pub sender: Address,
-    pub sender_pre_reputation: f64,
+    pub sender_pre_reputation: Votecoin,
     pub receiver: Address,
-    pub receiver_pre_reputation: f64,
+    pub receiver_pre_reputation: Votecoin,
 }
 
 /// Undo data for market treasury UTXO consolidation (C3).
@@ -75,8 +75,6 @@ pub struct ReputationTransferUndoEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsolidationUndoData {
     pub entries: Vec<ConsolidationUndoEntry>,
-    /// Sell input change UTXOs created (to delete on revert)
-    pub sell_input_change_utxos: Vec<OutPoint>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,8 +92,6 @@ pub struct ConsolidationUndoEntry {
     pub new_treasury_utxo: Option<OutPoint>,
     /// New fee UTXO created (to delete on revert)
     pub new_fee_utxo: Option<OutPoint>,
-    /// Sell payout UTXOs created (to delete on revert)
-    pub sell_payout_utxos: Vec<OutPoint>,
-    /// Buy change UTXOs created (to delete on revert)
-    pub buy_change_utxos: Vec<OutPoint>,
+    /// Trader change UTXOs created, one per trade (to delete on revert)
+    pub trade_change_utxos: Vec<OutPoint>,
 }

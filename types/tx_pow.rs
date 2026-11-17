@@ -180,27 +180,24 @@ pub const POW_BOUND_WINDOW_BLOCKS: u32 = 10;
 
 pub fn serialize_trade_for_pow(
     market_id: &[u8; 6],
-    outcome_index: u32,
-    shares: i64,
+    deltas: &[crate::ShareDelta],
     trader: &crate::Address,
-    limit_sats: u64,
+    max_cost: i64,
     prev_block_hash: &crate::BlockHash,
 ) -> Vec<u8> {
     #[derive(BorshSerialize)]
     struct TradePowInput<'a> {
         market_id: &'a [u8; 6],
-        outcome_index: u32,
-        shares: i64,
+        deltas: &'a [crate::ShareDelta],
         trader: &'a crate::Address,
-        limit_sats: u64,
+        max_cost: i64,
         prev_block_hash: &'a crate::BlockHash,
     }
     let input = TradePowInput {
         market_id,
-        outcome_index,
-        shares,
+        deltas,
         trader,
-        limit_sats,
+        max_cost,
         prev_block_hash,
     };
     borsh::to_vec(&input)
@@ -244,7 +241,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sha256_produces_correct_output() {
+    fn test_sha256_output() {
         use sha2::Digest as _;
         let data = b"hello world";
         let expected = sha2::Sha256::digest(data);
@@ -253,15 +250,16 @@ mod tests {
     }
 
     #[test]
-    fn test_blake3_produces_correct_output() {
+    fn test_blake3_output() {
         let data = b"hello world";
         let expected = blake3::hash(data);
         let result = HashFunction::Blake3.hash(data);
         assert_eq!(result, *expected.as_bytes());
     }
 
+    /// Every hash function produces a 32-byte digest
     #[test]
-    fn test_each_hash_function_produces_32_bytes() {
+    fn test_hash_lengths() {
         let data = b"test data for hashing";
         for func in &ALL_HASH_FUNCTIONS {
             let result = func.hash(data);
@@ -269,8 +267,9 @@ mod tests {
         }
     }
 
+    /// Different hash functions give different digests of the same data
     #[test]
-    fn test_different_hash_functions_produce_different_output() {
+    fn test_hashes_differ() {
         let data = b"unique test data";
         let sha256 = HashFunction::Sha256.hash(data);
         let sha3_256 = HashFunction::Sha3_256.hash(data);
@@ -332,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lehmer_identity_permutation() {
+    fn test_lehmer_identity() {
         let config = TxPowConfig {
             hash_selector: 0b0000_0111,
             ordering: 0,
@@ -350,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lehmer_reverse_permutation() {
+    fn test_lehmer_reverse() {
         let config = TxPowConfig {
             hash_selector: 0b0000_0111,
             ordering: 5,
@@ -422,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_rejects_invalid_nonce() {
+    fn test_verify_bad_nonce() {
         let config = TxPowConfig {
             hash_selector: 0b0000_0001,
             ordering: 0,
@@ -434,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_pow_always_passes() {
+    fn test_disabled_pow_passes() {
         let config = TxPowConfig {
             hash_selector: 0,
             ordering: 0,
@@ -444,8 +443,9 @@ mod tests {
         assert!(config.verify(b"anything", 42));
     }
 
+    /// Mining with PoW disabled returns nonce zero
     #[test]
-    fn test_mine_disabled_returns_zero() {
+    fn test_mine_disabled() {
         let config = TxPowConfig {
             hash_selector: 0,
             ordering: 0,
@@ -527,8 +527,10 @@ mod tests {
         let block = crate::BlockHash([7u8; 32]);
         let data = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block,
@@ -537,8 +539,10 @@ mod tests {
 
         let data2 = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            1,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 1,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block,
@@ -547,22 +551,56 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_trade_for_pow_different_prev_block() {
+    fn trade_pow_commits_to_every_leg() {
+        let addr = crate::Address([0u8; 20]);
+        let block = crate::BlockHash([7u8; 32]);
+        let legs = |second| {
+            [
+                crate::ShareDelta {
+                    outcome_index: 0,
+                    shares: 10,
+                },
+                crate::ShareDelta {
+                    outcome_index: 2,
+                    shares: second,
+                },
+            ]
+        };
+        let pow = |second| {
+            serialize_trade_for_pow(
+                &[1, 2, 3, 4, 5, 6],
+                &legs(second),
+                &addr,
+                50000,
+                &block,
+            )
+        };
+        assert_ne!(pow(10), pow(11));
+        assert_ne!(pow(10), pow(-10));
+    }
+
+    /// Trade PoW data changes with the previous block hash
+    #[test]
+    fn test_trade_pow_prev_block() {
         let addr = crate::Address([0u8; 20]);
         let block_a = crate::BlockHash([1u8; 32]);
         let block_b = crate::BlockHash([2u8; 32]);
         let data_a = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block_a,
         );
         let data_b = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block_b,
@@ -570,8 +608,9 @@ mod tests {
         assert_ne!(data_a, data_b);
     }
 
+    /// A nonce mined against one previous block fails against another
     #[test]
-    fn test_pow_nonce_bound_to_prev_block() {
+    fn test_nonce_bound_to_block() {
         let config = TxPowConfig {
             hash_selector: 0b0000_0001,
             ordering: 0,
@@ -582,16 +621,20 @@ mod tests {
         let block_b = crate::BlockHash([2u8; 32]);
         let data_a = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block_a,
         );
         let data_b = serialize_trade_for_pow(
             &[1, 2, 3, 4, 5, 6],
-            0,
-            100,
+            &[crate::ShareDelta {
+                outcome_index: 0,
+                shares: 100,
+            }],
             &addr,
             50000,
             &block_b,
@@ -601,8 +644,9 @@ mod tests {
         assert!(!config.verify(&data_b, nonce_for_a));
     }
 
+    /// A single selected function hashes without chaining
     #[test]
-    fn test_single_function_no_chaining() {
+    fn test_single_function() {
         let data = b"single function test";
         let config = TxPowConfig {
             hash_selector: 0b0000_0001,

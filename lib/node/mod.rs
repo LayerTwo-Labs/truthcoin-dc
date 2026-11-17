@@ -76,6 +76,8 @@ pub struct Config {
     pub server_names: HashSet<String>,
     /// Blocks per voting period, for a test network
     pub decision_config_testing: Option<u32>,
+    /// Credit the genesis votecoin to the genesis miner, for testing
+    pub genesis_reputation_to_miner: bool,
 }
 
 /// A long-running task that stopped with an error
@@ -103,6 +105,49 @@ impl TaskError {
 /// its net or mainchain task has ended, while its RPC server keeps answering,
 /// so the owner of the process should exit on the first one.
 pub type FatalErrorTx = futures::channel::mpsc::UnboundedSender<TaskError>;
+
+/// Refuse a transaction whose non-standard decision claims, with those
+/// already claimed and those pending in the mempool, would exceed a period's
+/// cap
+pub(crate) fn check_pending_nonstandard_cap<E>(
+    state: &State,
+    mempool: &MemPool,
+    rotxn: &RoTxn,
+    transaction: &Transaction,
+) -> Result<(), E>
+where
+    E: From<mempool::Error> + From<state::Error>,
+{
+    use crate::{
+        math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX,
+        state::decisions::DecisionId,
+    };
+
+    let mut claims_per_period = std::collections::BTreeMap::new();
+    for decision_id_bytes in MemPool::get_claimed_decision_ids(transaction) {
+        if let Ok(decision_id) = DecisionId::from_bytes(decision_id_bytes)
+            && !decision_id.is_standard()
+        {
+            *claims_per_period
+                .entry(decision_id.period_index())
+                .or_insert(0u64) += 1;
+        }
+    }
+    for (period, claims) in claims_per_period {
+        let claimed = state
+            .decisions()
+            .get_nonstandard_claimed_count_in_period(rotxn, period)?;
+        let pending = mempool.pending_nonstandard_claims(rotxn, period)?;
+        if claimed.saturating_add(pending).saturating_add(claims)
+            > NONSTANDARD_SLOTS_PER_PERIOD_MAX
+        {
+            return Err(
+                mempool::Error::NonstandardCapInMempool { period }.into()
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Wrap a task that must run for the life of the node, reporting on
 /// `fatal_error_tx` however it ends: an error, a panic, or returning at all.
@@ -195,6 +240,7 @@ where
             add_peers,
             server_names,
             decision_config_testing,
+            genesis_reputation_to_miner,
         } = config;
         let env_path = datadir.join("data.mdb");
         // let _ = std::fs::remove_dir_all(&env_path);
@@ -241,7 +287,11 @@ where
             unsafe { Env::open(&env_open_opts, &env_path) }
                 .map_err(EnvError::from)?
         };
-        let state = State::new(&env, decision_config_testing)?;
+        let state = State::new(
+            &env,
+            decision_config_testing,
+            genesis_reputation_to_miner,
+        )?;
         let archive = Archive::new(&env)?;
         let mempool = MemPool::new(&env)?;
         let (mainchain_task_handle, mainchain_task_event_rx) =
@@ -398,6 +448,12 @@ where
                 transaction.borrow(),
                 &self.archive,
             )?;
+            check_pending_nonstandard_cap::<Error>(
+                &self.state,
+                &self.mempool,
+                &rotxn,
+                &transaction.borrow().transaction,
+            )?;
             self.mempool.put(&mut rotxn, transaction.borrow())?;
             let () = self.update_mempool_market(
                 &mut rotxn,
@@ -407,6 +463,31 @@ where
         }
         self.net.push_tx(Default::default(), transaction.borrow());
         Ok(())
+    }
+
+    pub fn submit_offer(
+        &self,
+        offer: &crate::types::SignedOffer,
+    ) -> Result<(), Error> {
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        let _: bool =
+            self.mempool.offers.admit(&mut rwtxn, &self.state, offer)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        self.net.push_offer(Default::default(), offer);
+        Ok(())
+    }
+
+    pub fn get_offers(&self) -> Result<Vec<crate::types::SignedOffer>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.mempool.offers.all(&rotxn)?)
+    }
+
+    pub fn get_offer(
+        &self,
+        offer_id: &crate::types::OfferId,
+    ) -> Result<Option<crate::types::SignedOffer>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        Ok(self.mempool.offers.get(&rotxn, offer_id)?)
     }
 
     pub fn get_all_utxos(&self) -> Result<HashMap<OutPoint, Output>, Error> {
@@ -743,15 +824,27 @@ where
     ) -> Result<(Vec<Authorized<FilledTransaction>>, bitcoin::Amount), Error>
     {
         let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
-        // Take non-trade txs first, a parent before its child, then trade txs
-        // in insertion order
-        let transactions = self.mempool.topological(&rwtxn, Some(number))?;
+        // Take ballot reveals first, then non-trade txs, a parent before its
+        // child, then trade txs in insertion order. Order the whole mempool,
+        // so a reveal is never cut before it moves to the front.
+        let transactions = self.mempool.topological(&rwtxn, None)?;
+        let (reveals, transactions): (Vec<_>, Vec<_>) =
+            transactions.into_iter().partition(|tx| {
+                tx.transaction
+                    .data
+                    .as_ref()
+                    .is_some_and(crate::types::TxData::is_reveal_ballot)
+            });
         let trade_txs = self.mempool.take_trades_ordered(&rwtxn)?;
         let trade_txids: HashSet<_> =
             trade_txs.iter().map(|tx| tx.transaction.txid()).collect();
-        let transactions: Vec<_> = transactions
+        let transactions: Vec<_> = reveals
             .into_iter()
-            .filter(|tx| !trade_txids.contains(&tx.transaction.txid()))
+            .chain(
+                transactions
+                    .into_iter()
+                    .filter(|tx| !trade_txids.contains(&tx.transaction.txid())),
+            )
             .chain(trade_txs)
             .take(number)
             .collect();
@@ -775,6 +868,8 @@ where
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
         let mut selected_votes = HashSet::new();
+        let mut sealing_voters = HashSet::new();
+        let mut transfer_parties = HashSet::new();
         let mut trades = TradeSimulation::default();
         let mut reputation = HashMap::new();
         // Outputs the transactions already taken for this block make.
@@ -800,8 +895,27 @@ where
             if body_size + transaction_size > size_limit {
                 continue;
             }
-            if crate::validation::vote::vote_keys(&transaction.transaction)
-                .any(|key| selected_votes.contains(&key))
+            let ballot_key =
+                crate::validation::vote::ballot_key(&transaction.transaction);
+            if ballot_key.is_some_and(|key| selected_votes.contains(&key)) {
+                continue;
+            }
+            let sealing_voter = match ballot_key {
+                Some((_, voter, false)) => Some(voter),
+                Some((_, _, true)) | None => None,
+            };
+            let reputation_move = transaction
+                .transaction
+                .data
+                .as_ref()
+                .and_then(crate::types::TxData::reputation_move);
+            let transfer =
+                reputation_move.map(|(sender, dest, _)| [sender, dest]);
+            if sealing_voter
+                .is_some_and(|voter| transfer_parties.contains(&voter))
+                || transfer.is_some_and(|parties| {
+                    parties.iter().any(|party| sealing_voters.contains(party))
+                })
             {
                 continue;
             }
@@ -868,30 +982,31 @@ where
                     continue;
                 }
             }
-            if let Some(transfer) =
-                filled_transaction.transaction.transfer_reputation()
-            {
-                let sender_rep = match reputation.get(&transfer.sender) {
+            if let Some((sender, dest, amount)) = reputation_move {
+                let sender_rep = match reputation.get(&sender) {
                     Some(&value) => value,
                     None => self
                         .state
                         .reputation()
-                        .get_reputation(&rwtxn, &transfer.sender)?,
+                        .get_reputation(&rwtxn, &sender)?,
                 };
-                if sender_rep < transfer.amount {
+                let receiver_rep = match reputation.get(&dest) {
+                    Some(&value) => value,
+                    None => {
+                        self.state.reputation().get_reputation(&rwtxn, &dest)?
+                    }
+                };
+                let Ok((sender_after, receiver_after)) =
+                    crate::validation::VoteValidator::balances_after_transfer(
+                        sender_rep,
+                        receiver_rep,
+                        amount,
+                    )
+                else {
                     continue;
-                }
-                let receiver_rep = match reputation.get(&transfer.dest) {
-                    Some(&value) => value,
-                    None => self
-                        .state
-                        .reputation()
-                        .get_reputation(&rwtxn, &transfer.dest)?,
                 };
-                reputation
-                    .insert(transfer.sender, sender_rep - transfer.amount);
-                reputation
-                    .insert(transfer.dest, receiver_rep + transfer.amount);
+                reputation.insert(sender, sender_after);
+                reputation.insert(dest, receiver_after);
             }
             block_outputs.extend(
                 filled_transaction
@@ -907,33 +1022,42 @@ where
                     .iter()
                     .cloned(),
             );
-            selected_votes.extend(crate::validation::vote::vote_keys(
-                &filled_transaction.transaction.transaction,
-            ));
+            selected_votes.extend(ballot_key);
+            sealing_voters.extend(sealing_voter);
+            transfer_parties.extend(transfer.into_iter().flatten());
             returned_transactions.push(filled_transaction);
             sigops += transaction_sigops;
             body_size += transaction_size;
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
-        let returned_transactions =
+        let (returned_transactions, dropped_txids) =
             self.drop_unconnectable_transactions(returned_transactions)?;
+        if !dropped_txids.is_empty() {
+            let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+            for txid in dropped_txids {
+                self.mempool.delete(&mut rwtxn, txid)?;
+            }
+            rwtxn.commit().map_err(RwTxnError::from)?;
+        }
         let fee = template_fee(&returned_transactions)?;
         Ok((returned_transactions, fee))
     }
 
     /// Remove each transaction that block connect rejects after the
     /// transactions before it. Also remove each transaction that spends an
-    /// output of a removed transaction.
+    /// output of a removed transaction. Returns the kept transactions and
+    /// the txids of the removed ones.
     fn drop_unconnectable_transactions(
         &self,
         mut transactions: Vec<Authorized<FilledTransaction>>,
-    ) -> Result<Vec<Authorized<FilledTransaction>>, Error> {
+    ) -> Result<(Vec<Authorized<FilledTransaction>>, Vec<Txid>), Error> {
         // The first `connects` transactions connect as one block.
         let mut connects = 0;
         let mut empty_connects = false;
+        let mut all_dropped = Vec::new();
         loop {
             let Err(err) = self.connect_template(&transactions)? else {
-                return Ok(transactions);
+                return Ok((transactions, all_dropped));
             };
             if !empty_connects {
                 if let Err(err) = self.connect_template(&[])? {
@@ -973,6 +1097,7 @@ where
                 }
                 !spends_dropped
             });
+            all_dropped.extend(dropped_txids);
         }
     }
 
@@ -1016,11 +1141,9 @@ where
             }
             .into(),
         };
-        let main_tip_hash = self
-            .archive
-            .side_tips()
-            .get_mainchain_tip(rwtxn)?
-            .block_hash();
+        let mainchain_tip =
+            self.archive.side_tips().get_mainchain_tip(rwtxn)?;
+        let main_tip_hash = mainchain_tip.block_hash();
         let main_tip_height =
             self.archive.get_main_height(rwtxn, main_tip_hash)?;
         // A block connects the 2WPD of its mainchain parent before its
@@ -1085,9 +1208,12 @@ where
             )?;
         let () = accumulator.apply_diff(construction_diff)?;
         header.roots = accumulator.get_roots();
-        // Before the first block, no mainchain timestamp exists yet.
-        let mainchain_timestamp =
-            self.state.try_get_mainchain_timestamp(rwtxn)?.unwrap_or(0);
+        // The template builds on the mainchain tip. Without one, as before the
+        // first block, fall back to the stored mainchain timestamp.
+        let mainchain_timestamp = match mainchain_tip.tip_info {
+            Some(tip) => tip.timestamp,
+            None => self.state.try_get_mainchain_timestamp(rwtxn)?.unwrap_or(0),
+        };
         self.state.apply_block(
             rwtxn,
             &self.batch_verification_ctxt,
@@ -1557,37 +1683,19 @@ where
         transaction: &Transaction,
     ) -> Result<(), Error> {
         if let Some(crate::types::TxData::Trade {
-            market_id,
-            outcome_index,
-            shares,
-            ..
+            market_id, deltas, ..
         }) = transaction.data.as_ref()
         {
-            if *shares > 0 {
-                self.update_mempool_buy(
-                    rwtxn,
-                    *market_id,
-                    *outcome_index,
-                    *shares,
-                )?;
-            } else {
-                self.update_mempool_sell(
-                    rwtxn,
-                    *market_id,
-                    *outcome_index,
-                    shares.unsigned_abs() as i64,
-                )?;
-            }
+            self.update_mempool_trade(rwtxn, *market_id, deltas)?;
         }
         Ok(())
     }
 
-    fn update_mempool_buy(
+    fn update_mempool_trade(
         &self,
         rwtxn: &mut RwTxn,
         market_id: MarketId,
-        outcome_index: u32,
-        shares_to_buy: i64,
+        deltas: &[crate::types::ShareDelta],
     ) -> Result<(), Error> {
         use crate::state;
 
@@ -1605,32 +1713,27 @@ where
             return Ok(());
         }
 
-        if outcome_index as usize >= market.shares().len() {
-            return Err(Error::State(Box::new(
-                state::Error::InvalidDecisionId {
+        let mut new_shares =
+            match self.state.get_mempool_shares(rwtxn, &market_id)? {
+                Some(existing_mempool_shares) => existing_mempool_shares,
+                None => market.shares().clone(),
+            };
+        for delta in deltas {
+            let shares = new_shares
+                .get_mut(delta.outcome_index as usize)
+                .ok_or_else(|| state::Error::InvalidTransaction {
                     reason: format!(
                         "Outcome index {} exceeds market outcomes {}",
-                        outcome_index,
+                        delta.outcome_index,
                         market.shares().len()
                     ),
-                },
-            )));
-        }
-
-        let current_shares = if let Some(existing_mempool_shares) =
-            self.state.get_mempool_shares(rwtxn, &market_id)?
-        {
-            existing_mempool_shares
-        } else {
-            market.shares().clone()
-        };
-
-        let mut new_shares = current_shares.clone();
-        new_shares[outcome_index as usize] = new_shares[outcome_index as usize]
-            .checked_add(shares_to_buy)
-            .ok_or_else(|| state::Error::InvalidTransaction {
-                reason: "Mempool share count overflow".to_string(),
+                })?;
+            *shares = shares.checked_add(delta.shares).ok_or_else(|| {
+                state::Error::InvalidTransaction {
+                    reason: "Mempool share count overflow".to_string(),
+                }
             })?;
+        }
 
         let beta = self.derive_market_beta(&market)?;
         trading::validate_lmsr_parameters(beta, &new_shares).map_err(|e| {
@@ -1646,79 +1749,9 @@ where
             .map_err(|e| Error::State(Box::new(e)))?;
 
         tracing::debug!(
-            "Updated mempool shares for market {}: outcome {} increased by {} shares",
+            "Updated mempool shares for market {}: {} legs",
             const_hex::encode(market_id),
-            outcome_index,
-            shares_to_buy
-        );
-
-        Ok(())
-    }
-
-    fn update_mempool_sell(
-        &self,
-        rwtxn: &mut RwTxn,
-        market_id: MarketId,
-        outcome_index: u32,
-        shares_to_sell: i64,
-    ) -> Result<(), Error> {
-        use crate::state;
-
-        let market = self
-            .state
-            .markets()
-            .get_market(rwtxn, &market_id)?
-            .ok_or_else(|| {
-                Error::State(Box::new(state::Error::InvalidDecisionId {
-                    reason: format!("Market {market_id:?} does not exist"),
-                }))
-            })?;
-
-        if market.state() != crate::state::markets::MarketState::Trading {
-            return Ok(());
-        }
-
-        if outcome_index as usize >= market.shares().len() {
-            return Err(Error::State(Box::new(
-                state::Error::InvalidDecisionId {
-                    reason: format!(
-                        "Outcome index {} exceeds market outcomes {}",
-                        outcome_index,
-                        market.shares().len()
-                    ),
-                },
-            )));
-        }
-
-        let current_shares = if let Some(existing_mempool_shares) =
-            self.state.get_mempool_shares(rwtxn, &market_id)?
-        {
-            existing_mempool_shares
-        } else {
-            market.shares().clone()
-        };
-
-        let mut new_shares = current_shares.clone();
-        new_shares[outcome_index as usize] -= shares_to_sell;
-
-        let beta = self.derive_market_beta(&market)?;
-        trading::validate_lmsr_parameters(beta, &new_shares).map_err(|e| {
-            Error::State(Box::new(state::Error::InvalidDecisionId {
-                reason: format!(
-                    "Invalid LMSR state after mempool sell update: {e:?}"
-                ),
-            }))
-        })?;
-
-        self.state
-            .put_mempool_shares(rwtxn, &market_id, &new_shares)
-            .map_err(|e| Error::State(Box::new(e)))?;
-
-        tracing::debug!(
-            "Updated mempool shares for market {}: outcome {} decreased by {} shares (sell)",
-            const_hex::encode(market_id),
-            outcome_index,
-            shares_to_sell
+            deltas.len()
         );
 
         Ok(())
@@ -1809,6 +1842,59 @@ where
             .get_claimed_decisions_in_period(&rotxn, period_id.as_u32())?)
     }
 
+    pub fn get_decision_state(
+        &self,
+        decision_id: crate::state::decisions::DecisionId,
+    ) -> Result<crate::state::decisions::DecisionState, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self
+            .state
+            .decisions()
+            .get_decision_current_state(&rotxn, decision_id)?)
+    }
+
+    pub fn get_sealed_ballot(
+        &self,
+        voting_period: u32,
+        voter: Address,
+    ) -> Result<Option<crate::state::voting::types::SealedBallot>, Error> {
+        let rotxn = self.env.read_txn()?;
+        Ok(self.state.voting().databases().get_sealed_ballot(
+            &rotxn,
+            crate::state::voting::types::VotingPeriodId::new(voting_period),
+            voter,
+        )?)
+    }
+
+    /// Check a ballot before sealing it. A voter seals one ballot per
+    /// period, so one waiting in the mempool counts.
+    pub fn prepare_ballot(
+        &self,
+        voting_period: u32,
+        voter: Address,
+        votes: &[crate::types::BallotItem],
+    ) -> Result<(), Error> {
+        let rotxn = self.env.read_txn()?;
+        if self
+            .mempool
+            .pending_ballot(&rotxn, &(voting_period, voter, false))?
+            .is_some()
+        {
+            return Err(mempool::Error::BallotAlreadyInMempool {
+                voter,
+                voting_period,
+            }
+            .into());
+        }
+        Ok(crate::validation::VoteValidator::prepare_ballot(
+            &self.state,
+            &rotxn,
+            voter,
+            voting_period,
+            votes,
+        )?)
+    }
+
     pub fn is_decision_in_voting(
         &self,
         decision_id: crate::state::decisions::DecisionId,
@@ -1884,16 +1970,7 @@ where
 
     pub fn get_current_period(&self) -> Result<u32, Error> {
         let rotxn = self.env.read_txn()?;
-        let block_height = self.state.try_get_height(&rotxn)?;
-        let genesis_ts =
-            self.state.try_get_genesis_timestamp(&rotxn)?.unwrap_or(0);
-        let mainchain_ts =
-            self.state.try_get_mainchain_timestamp(&rotxn)?.unwrap_or(0);
-        Ok(self.state.decisions().get_current_period(
-            mainchain_ts,
-            block_height,
-            genesis_ts,
-        )?)
+        Ok(self.state.current_period(&rotxn)?)
     }
 
     pub fn get_decisions_db(&self) -> &crate::state::decisions::Dbs {

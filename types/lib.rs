@@ -28,12 +28,14 @@ pub use error::{
 pub mod hashes;
 pub use hashes::{
     BlockHash, CoinbaseTxid, Hash, M6id, MerkleRoot, NonZeroBitcoinBlockHash,
-    Txid, UtreexoNodeHash, hash, hash_with_scratch_buffer,
+    OfferId, Txid, UtreexoNodeHash, hash, hash_with_scratch_buffer,
 };
 pub mod keys;
 pub use keys::{EncryptionPubKey, VerifyingKey};
 pub mod market;
 pub mod net;
+pub mod offer;
+pub use offer::{SignedOffer, VotecoinOffer};
 pub mod schema;
 pub mod state;
 pub mod transaction;
@@ -41,11 +43,13 @@ pub use transaction::{
     Authorized, AuthorizedTransaction, BallotItem, ClaimDecisionPayload,
     DecisionClaimEntry, FilledTransaction, GetAddress, GetValue, InPoint,
     MarketCreationView, OutPoint, OutPointKey, Output, OutputContent,
-    PointedOutput, PointedOutputRef, SpentOutput, Transaction, TransactionData,
-    TxData,
+    PointedOutput, PointedOutputRef, RevealBallot, ShareDelta, SpentOutput,
+    Transaction, TransactionData, TxData,
 };
 pub mod tx_pow;
 mod util;
+pub mod votecoin;
+pub use votecoin::Votecoin;
 pub mod wallet;
 
 pub const THIS_SIDECHAIN: u8 = 13;
@@ -767,7 +771,7 @@ mod withdrawal_bundle_order_regression {
     // were aggregated (HashMap iteration order is randomized per process). Before the
     // total-order fix, the comparator was non-transitive and this failed.
     #[test]
-    fn m6id_is_independent_of_aggregation_order() {
+    fn m6id_order_independent() {
         let a = aw(1, 3);
         let b = aw(3, 2);
         let c = aw(2, 1);
@@ -802,7 +806,7 @@ mod same_block_chain {
     /// `modify_memforest`; validation walks `AccumulatorDiff`. A leaf the
     /// block makes and spends reaches neither.
     #[test]
-    fn the_template_and_validation_agree() -> anyhow::Result<()> {
+    fn template_matches_validation() -> anyhow::Result<()> {
         let address = get_address(&(&SigningKey::new(&mut rand::rng())).into());
         let value_output = |sats: u64| Output {
             address,

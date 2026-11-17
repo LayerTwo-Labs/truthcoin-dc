@@ -99,6 +99,11 @@ impl MarketValidator {
                     .insert(decision_id, payload.decision_type.clone());
             }
         }
+        DecisionValidator::validate_nonstandard_cap(
+            state,
+            rotxn,
+            pending_claims.keys().copied(),
+        )?;
 
         let dimension_specs = view.dimension_specs;
 
@@ -326,6 +331,21 @@ impl MarketValidator {
             });
         }
 
+        for decision_id in &market.decision_ids {
+            if state
+                .decisions()
+                .get_decision_current_state(rotxn, *decision_id)?
+                .allows_reveal()
+            {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "Trading halted: decision {} is revealing votes",
+                        decision_id.to_hex()
+                    ),
+                });
+            }
+        }
+
         let tip = state.try_get_tip(rotxn)?.ok_or_else(|| {
             Error::InvalidTransaction {
                 reason: "No chain tip when validating trade".to_string(),
@@ -376,10 +396,9 @@ impl MarketValidator {
 
             let pow_data = crate::types::tx_pow::serialize_trade_for_pow(
                 market.id.as_bytes(),
-                trade.outcome_index,
-                trade.shares,
+                &trade.deltas,
                 &trade.trader,
-                trade.limit_sats,
+                trade.max_cost,
                 &trade.prev_block_hash,
             );
 
@@ -392,26 +411,16 @@ impl MarketValidator {
             }
         }
 
-        // Outcome index must be a valid tradeable outcome. Abstain/invalid
-        // states (voter-only) are not part of the tradeable outcome space
-        // and will naturally fall outside `market.shares().len()`.
-        if trade.outcome_index as usize >= market.shares().len() {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Outcome index {} out of range (market has {} tradeable \
-                     outcomes)",
-                    trade.outcome_index,
-                    market.shares().len()
-                ),
-            });
-        }
-
-        // Shares must be non-zero
-        if trade.shares == 0 {
-            return Err(Error::InvalidTransaction {
-                reason: "Shares to trade must be non-zero".to_string(),
-            });
-        }
+        // Each leg must be a tradeable outcome. Abstain/invalid states
+        // (voter-only) are not part of the tradeable outcome space and fall
+        // outside `market.shares().len()`.
+        crate::math::trading::check_deltas(
+            &trade.deltas,
+            market.shares().len(),
+        )
+        .map_err(|e| Error::InvalidTransaction {
+            reason: format!("Invalid trade: {e}"),
+        })?;
 
         if !tx.transaction.outputs.is_empty() {
             return Err(Error::InvalidTransaction {
@@ -428,22 +437,23 @@ impl MarketValidator {
             })?
             .to_sat();
 
-        if trade.is_buy() {
-            if trade.limit_sats == 0 {
-                return Err(Error::InvalidTransaction {
-                    reason: "Buy limit (max_cost) must be positive".to_string(),
-                });
-            }
+        let required_input = u64::try_from(trade.max_cost.max(0))
+            .ok()
+            .and_then(|max_cost| max_cost.checked_add(TRADE_MINER_FEE_SATS))
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: "Trade max cost overflows".to_string(),
+            })?;
+        if input_value < required_input {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Input value {input_value} sats insufficient for max cost \
+                     {} sats plus miner fee {TRADE_MINER_FEE_SATS} sats",
+                    trade.max_cost.max(0)
+                ),
+            });
+        }
 
-            if input_value < trade.limit_sats {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Input value {} sats insufficient for limit_sats {} sats",
-                        input_value, trade.limit_sats
-                    ),
-                });
-            }
-        } else {
+        if trade.sells() {
             let has_trader_input = tx
                 .spent_utxos
                 .iter()
@@ -459,33 +469,27 @@ impl MarketValidator {
                 });
             }
 
-            let owned_shares = state
+            let account = state
                 .markets()
-                .get_user_share_account(rotxn, &trade.trader)?
-                .and_then(|acc| {
-                    acc.positions
-                        .get(&(trade.market_id, trade.outcome_index))
-                        .copied()
-                })
-                .unwrap_or(0);
-
-            if owned_shares < 0 || (owned_shares as u64) < trade.shares_abs() {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Insufficient shares: trying to sell {} but only own {} for outcome {}",
-                        trade.shares_abs(),
-                        owned_shares,
-                        trade.outcome_index
-                    ),
-                });
-            }
-
-            if input_value < TRADE_MINER_FEE_SATS {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Input value {input_value} sats insufficient for miner fee {TRADE_MINER_FEE_SATS} sats"
-                    ),
-                });
+                .get_user_share_account(rotxn, &trade.trader)?;
+            for delta in trade.deltas.iter().filter(|delta| delta.shares < 0) {
+                let owned_shares = account
+                    .as_ref()
+                    .and_then(|acc| {
+                        acc.positions
+                            .get(&(trade.market_id, delta.outcome_index))
+                            .copied()
+                    })
+                    .unwrap_or(0);
+                if owned_shares < -delta.shares {
+                    return Err(Error::InvalidTransaction {
+                        reason: format!(
+                            "Insufficient shares: trying to sell {} but only \
+                             own {owned_shares} for outcome {}",
+                            -delta.shares, delta.outcome_index
+                        ),
+                    });
+                }
             }
         }
 
@@ -657,19 +661,19 @@ mod tests {
     }
 
     #[test]
-    fn market_negative_shares_rejected() {
+    fn market_negative_shares() {
         let shares = Array1::from_vec(vec![100, -1]);
         assert!(MarketValidator::validate_market_shares(&shares).is_err());
     }
 
     #[test]
-    fn market_fewer_than_two_outcomes_rejected() {
+    fn market_too_few_outcomes() {
         let shares = Array1::from_vec(vec![100]);
         assert!(MarketValidator::validate_market_shares(&shares).is_err());
     }
 
     #[test]
-    fn market_creation_duplicate_dimension_rejected() {
+    fn market_duplicate_dimension() {
         use crate::state::decisions::Decision;
         use crate::state::markets::compute_market_id;
         use crate::types::{
@@ -682,7 +686,7 @@ mod tests {
             .map_size(16 * 1024 * 1024)
             .max_dbs(crate::state::State::NUM_DBS);
         let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
-        let state = crate::state::State::new(&env, None).unwrap();
+        let state = crate::state::State::new(&env, None, true).unwrap();
 
         let maker = Address([1; 20]);
         let decision_id = DecisionId::new(false, 1, 0).unwrap();
@@ -859,14 +863,15 @@ mod tests {
         }
     }
 
+    /// The treasury output must pay the market's treasury address
     #[test]
-    fn treasury_output_must_pay_market_treasury_address() {
+    fn treasury_output_address() {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(64 * 1024 * 1024)
             .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
-        let state = State::new(&env, None).unwrap();
+        let state = State::new(&env, None, true).unwrap();
 
         let maker = Address([7; 20]);
         let decision_id = DecisionId::new(false, 1, 0).unwrap();
@@ -920,7 +925,7 @@ mod tests {
         let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
         options.map_size(16 * 1024 * 1024).max_dbs(State::NUM_DBS);
         let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
-        let state = State::new(&env, None).unwrap();
+        let state = State::new(&env, None, true).unwrap();
         let maker = Address([7; 20]);
         let decision_id = DecisionId::new(true, 1, 0).unwrap();
         let labels = match &decision_type {
@@ -1004,13 +1009,15 @@ mod tests {
         }
     }
 
+    /// A binary market validates only when paying exactly its storage fee
     #[test]
-    fn market_storage_fee_exact_and_below() {
+    fn binary_storage_fee() {
         check_market_fee(DecisionType::Binary, false);
     }
 
+    /// A categorical market's storage fee scales with its option count
     #[test]
-    fn market_category_storage_fee_uses_option_count() {
+    fn category_storage_fee() {
         check_market_fee(
             DecisionType::Category {
                 options: vec!["a".into(), "b".into(), "c".into()],
@@ -1019,13 +1026,15 @@ mod tests {
         );
     }
 
+    /// The market fee includes the fee for a newly claimed decision
     #[test]
-    fn market_fee_includes_new_claim_fee() {
+    fn market_claim_fee() {
         check_market_fee(DecisionType::Binary, true);
     }
 
+    /// A newly claimed categorical decision's fee uses its option count
     #[test]
-    fn market_new_category_fee_uses_option_count() {
+    fn category_claim_fee() {
         check_market_fee(
             DecisionType::Category {
                 options: vec!["a".into(), "b".into(), "c".into()],
@@ -1066,23 +1075,98 @@ mod tests {
         tx
     }
 
+    /// One market creation cannot claim more non-standard decisions than a
+    /// period's cap holds, even with claims no dimension uses
     #[test]
-    fn market_creation_new_claim_window_follows_current_period() {
+    fn new_claims_nonstandard_cap() {
+        use crate::{
+            math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX,
+            types::ClaimDecisionPayload,
+        };
+
         let dir = tempfile::tempdir().unwrap();
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(64 * 1024 * 1024)
             .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
         let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
-        let state = State::new(&env, None).unwrap();
-
-        let genesis_ts = 1_700_000_000;
+        let state = State::new(&env, None, true).unwrap();
         let mut rwtxn = env.write_txn().unwrap();
         state
-            .put_timestamps_for_test(
-                &mut rwtxn,
-                genesis_ts,
-                genesis_ts + 9 * 86_400 + 60,
-            )
+            .put_timestamps_for_test(&mut rwtxn, 1000, 1000)
+            .unwrap();
+        state
+            .decisions()
+            .mint_genesis(&mut rwtxn, 1000, 0, 1000)
+            .unwrap();
+        rwtxn.commit().unwrap();
+        let rotxn = env.read_txn().unwrap();
+
+        let maker = Address([9; 20]);
+        let market_with_claims = |claims: u64| {
+            let mut tx = create_market_with_new_claim_tx(
+                maker,
+                DecisionId::new(false, 2, 0).unwrap(),
+            );
+            tx.spent_utxos[0].content =
+                OutputContent::Value(bitcoin::Amount::from_sat(100_000_000));
+            if let Some(TransactionData::CreateMarket { new_claims, .. }) =
+                &mut tx.transaction.data
+            {
+                new_claims.extend((1..claims).map(|index| {
+                    ClaimDecisionPayload {
+                        decision_type: DecisionType::Binary,
+                        decisions: vec![DecisionClaimEntry {
+                            decision_id_bytes: DecisionId::new(
+                                false,
+                                2,
+                                index as u32,
+                            )
+                            .unwrap()
+                            .as_bytes(),
+                            header: "decision".to_string(),
+                            description: String::new(),
+                            option_0_label: None,
+                            option_1_label: None,
+                            option_labels: None,
+                            tags: None,
+                        }],
+                    }
+                }));
+            }
+            MarketValidator::validate_market_creation(&state, &rotxn, &tx, None)
+        };
+
+        market_with_claims(NONSTANDARD_SLOTS_PER_PERIOD_MAX).unwrap();
+        let over_cap = market_with_claims(NONSTANDARD_SLOTS_PER_PERIOD_MAX + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(over_cap.contains("cap"), "{over_cap}");
+    }
+
+    /// New decision claims must fall in the current period's window
+    #[test]
+    fn new_claim_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None, true).unwrap();
+
+        use crate::state::voting::period_calculator::{
+            utc_quarter, utc_quarter_start,
+        };
+
+        let genesis_ts = 1_700_000_000;
+        let tenth_period_ts =
+            utc_quarter_start(utc_quarter(genesis_ts) + 9) + 60;
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .put_timestamps_for_test(&mut rwtxn, genesis_ts, tenth_period_ts)
+            .unwrap();
+        state
+            .decisions()
+            .mint_genesis(&mut rwtxn, tenth_period_ts, 0, genesis_ts)
             .unwrap();
         rwtxn.commit().unwrap();
         let rotxn = env.read_txn().unwrap();

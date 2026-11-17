@@ -89,6 +89,10 @@ jobs:
 
       - name: Build electrs
         if: steps.check-cache.outputs.cache-hit != 'true'
+        # The RocksDB 8.1 headers electrs builds use uint64_t without
+        # including <cstdint>, which newer GCC no longer pulls in for them.
+        env:
+          CXXFLAGS: -include cstdint
         run: |
           git clone --branch ${{ env.ELECTRS_VERSION }} --depth 1 https://github.com/mempool/electrs.git ${{ runner.temp }}/electrs
           pushd ${{ runner.temp }}/electrs
@@ -131,7 +135,7 @@ jobs:
             echo "$name=$tag" >> "$GITHUB_OUTPUT"
           done
         env:
-          BITCOIN_PATCHED_URL: https://releases.drivechain.info/L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
+          BITCOIN_PATCHED_URL: https://releases.drivechain.info/L1-bitcoin-patched-v30.2-x86_64-unknown-linux-gnu.zip
           ENFORCER_URL: https://releases.drivechain.info/bip300301-enforcer-latest-x86_64-unknown-linux-gnu.zip
 
       - name: Cache bitcoin-patched
@@ -145,12 +149,12 @@ jobs:
         if: steps.cache-bitcoin-patched.outputs.cache-hit != 'true'
         run: |
           cd "${{ runner.temp }}"
-          wget -q https://releases.drivechain.info/L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
-          unzip -q L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
-          rm L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu.zip
+          wget -q https://releases.drivechain.info/L1-bitcoin-patched-v30.2-x86_64-unknown-linux-gnu.zip
+          unzip -q L1-bitcoin-patched-v30.2-x86_64-unknown-linux-gnu.zip
+          rm L1-bitcoin-patched-v30.2-x86_64-unknown-linux-gnu.zip
           mkdir -p deps
           rm -rf deps/bitcoin-patched
-          mv L1-bitcoin-patched-latest-x86_64-unknown-linux-gnu deps/bitcoin-patched
+          mv L1-bitcoin-patched-v30.2-x86_64-unknown-linux-gnu deps/bitcoin-patched
           chmod +x deps/bitcoin-patched/bitcoind deps/bitcoin-patched/bitcoin-cli
 
       - name: Cache bitcoin unpatched
@@ -271,10 +275,12 @@ jobs:
             name: x86_64-pc-windows-gnu
             binary-suffix: .exe
             rustflags: "-C linker=/usr/bin/x86_64-w64-mingw32-gcc"
-    name: Test, Build, Release ((${{ matrix.name }}))
+    name: Test, Build ((${{ matrix.name }}))
     runs-on: ${{ matrix.os }}
+    # Builds run dependency build scripts, so they get no write token. The
+    # publish job below releases what they upload.
     permissions:
-      contents: write
+      contents: read
     timeout-minutes: 30
     steps:
       - name: Install windows-specific deps
@@ -284,6 +290,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+          persist-credentials: false
       
       - name: Install pinned Rust toolchain
         # Channel comes from rust-toolchain.toml; the cross-compilation
@@ -364,30 +371,7 @@ jobs:
           path: |
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_APP_FILENAME }}
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_CLI_FILENAME }}
-
-      - name: Extract Git tag name
-        id: git-tag-name
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          echo "git_tag_name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Parse Git tag name as semver
-        uses: madhead/semver-utils@v5.0.0
-        if: startsWith(github.ref, 'refs/tags/')
-        id: parse-git-tag-name-semver
-        with:
-          version: ${{ steps.git-tag-name.outputs.git_tag_name }}
-
-      - name: Release
-        uses: softprops/action-gh-release@v3.0.1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: |
-            target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_APP_FILENAME }}
-            target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_CLI_FILENAME }}
             target/${{ matrix.name }}/release/${{ env.TRUTHCOIN_ZIP_FILENAME }}
-          fail_on_unmatched_files: true
-          prerelease: ${{ steps.parse-git-tag-name-semver.outputs.prerelease != '' }}
 
   parse-semver:
     name: Parse version info
@@ -407,10 +391,33 @@ jobs:
         with:
           version: ${{ steps.git-tag-name.outputs.git_tag_name }}
 
+  # A tag ships only once lint, the integration tests and every target's build
+  # pass. Only this job holds a write token, and it runs no build.
+  publish-github-release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: [check-lint, integration-test, test-build-release, parse-semver]
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          prerelease: ${{ needs.parse-semver.outputs.prerelease != '' }}
+
   upload-releases-to-releases-drivechain-info:
     name: Upload releases to releases.drivechain.info
     runs-on: ubuntu-latest
-    needs: [integration-test, test-build-release, parse-semver]
+    needs: [publish-github-release, parse-semver]
     if: startsWith(github.ref, 'refs/tags/') && needs.parse-semver.outputs.prerelease == ''
     steps:
       - name: Download release assets

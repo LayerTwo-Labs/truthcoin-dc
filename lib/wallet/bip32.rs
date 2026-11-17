@@ -157,7 +157,7 @@ pub(in crate::wallet) type NonHardenedDeriveError =
 pub(in crate::wallet) type Xpriv = bip32ish::Xpriv<Ristretto255>;
 
 pub(in crate::wallet) fn new_master_xpriv(seed: &[u8]) -> Xpriv {
-    let mut hasher = blake3::Hasher::new_derive_key("Thunder seed");
+    let mut hasher = blake3::Hasher::new_derive_key("Truthcoin seed");
     hasher.update(seed);
     let mut output_reader = hasher.finalize_xof();
     let mut secret_bytes = [0u8; 64];

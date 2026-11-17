@@ -14,6 +14,43 @@ impl DecisionValidator {
         Ok(DecisionId::from_hex(decision_id_hex)?)
     }
 
+    /// The non-standard claims of one transaction fit, together with those
+    /// already claimed, in each period's non-standard cap
+    pub fn validate_nonstandard_cap<T>(
+        decisions_db: &T,
+        rotxn: &RoTxn,
+        decision_ids: impl IntoIterator<Item = DecisionId>,
+    ) -> Result<(), Error>
+    where
+        T: DecisionValidationInterface,
+    {
+        use crate::math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX;
+
+        let mut claims_per_period = std::collections::BTreeMap::new();
+        for decision_id in decision_ids {
+            if !decision_id.is_standard() {
+                *claims_per_period
+                    .entry(decision_id.period_index())
+                    .or_insert(0u64) += 1;
+            }
+        }
+        for (period, claims) in claims_per_period {
+            let claimed = decisions_db
+                .get_nonstandard_claimed_count_in_period(rotxn, period)?;
+            if claimed.saturating_add(claims) > NONSTANDARD_SLOTS_PER_PERIOD_MAX
+            {
+                return Err(Error::InvalidTransaction {
+                    reason: format!(
+                        "{claims} non-standard claims would exceed the \
+                         {NONSTANDARD_SLOTS_PER_PERIOD_MAX} cap of period \
+                         {period}, which holds {claimed}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Validate a single claim payload's type constraints and slot
     /// availability. Returns the total listing fee that this payload owes.
     /// Caller is responsible for verifying the enclosing tx pays at least
@@ -148,9 +185,6 @@ impl DecisionValidator {
         let mut total_listing_fee: u64 = 0;
         for entry in &payload.decisions {
             let id = DecisionId::from_bytes(entry.decision_id_bytes)?;
-            if !id.is_standard() {
-                continue;
-            }
             let fee = decisions_db.fee_for_decision_id(rotxn, id)?;
             total_listing_fee =
                 total_listing_fee.checked_add(fee).ok_or_else(|| {
@@ -187,6 +221,13 @@ impl DecisionValidator {
             market_maker_address,
             override_height,
         )?;
+        Self::validate_nonstandard_cap(
+            decisions_db,
+            rotxn,
+            payload.decisions.iter().filter_map(|entry| {
+                DecisionId::from_bytes(entry.decision_id_bytes).ok()
+            }),
+        )?;
 
         if total_listing_fee > 0 {
             let tx_fee = crate::validation::tx_fee(tx)?;
@@ -210,6 +251,99 @@ impl DecisionValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nonstandard_claim_tx(fee_sats: u64) -> FilledTransaction {
+        use crate::types::{
+            Address, ClaimDecisionPayload, DecisionClaimEntry, OutPoint,
+            Output, OutputContent, Transaction, TransactionData, Txid,
+        };
+
+        FilledTransaction {
+            transaction: Transaction {
+                inputs: vec![(
+                    OutPoint::Regular {
+                        txid: Txid([1; 32]),
+                        vout: 0,
+                    },
+                    [0; 32],
+                )]
+                .into(),
+                data: Some(TransactionData::ClaimDecision(
+                    ClaimDecisionPayload {
+                        decision_type:
+                            crate::state::decisions::DecisionType::Binary,
+                        decisions: vec![DecisionClaimEntry {
+                            decision_id_bytes: DecisionId::new(false, 2, 0)
+                                .unwrap()
+                                .as_bytes(),
+                            header: "decision".to_string(),
+                            description: String::new(),
+                            option_0_label: None,
+                            option_1_label: None,
+                            option_labels: None,
+                            tags: None,
+                        }],
+                    },
+                )),
+                ..Default::default()
+            },
+            spent_utxos: vec![Output {
+                address: Address([9; 20]),
+                content: OutputContent::Value(bitcoin::Amount::from_sat(
+                    fee_sats,
+                )),
+            }],
+            actor_address: None,
+        }
+    }
+
+    /// Non-standard claims pay the tier-zero price, floored at the minimum
+    #[test]
+    fn nonstandard_claim_fee() {
+        use crate::math::decisions::{
+            NONSTANDARD_MIN_LISTING_FEE_SATS, nonstandard_listing_fee,
+            slot_price,
+        };
+
+        assert_eq!(
+            nonstandard_listing_fee(0),
+            NONSTANDARD_MIN_LISTING_FEE_SATS
+        );
+        assert_eq!(nonstandard_listing_fee(100_000), slot_price(100_000, 0));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(crate::state::State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = crate::state::State::new(&env, None, true).unwrap();
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .put_timestamps_for_test(&mut rwtxn, 1000, 1000)
+            .unwrap();
+        state
+            .decisions()
+            .mint_genesis(&mut rwtxn, 1000, 0, 1000)
+            .unwrap();
+        rwtxn.commit().unwrap();
+        let rotxn = env.read_txn().unwrap();
+        let fee = state
+            .decisions()
+            .fee_for_decision_id(&rotxn, DecisionId::new(false, 2, 0).unwrap())
+            .unwrap();
+        assert!(fee >= NONSTANDARD_MIN_LISTING_FEE_SATS);
+
+        let validate = |fee_sats| {
+            DecisionValidator::validate_complete_decision_claim(
+                state.decisions(),
+                &rotxn,
+                &nonstandard_claim_tx(fee_sats),
+                Some(1),
+            )
+        };
+        assert!(validate(fee - 1).is_err());
+        validate(fee).unwrap();
+    }
 
     #[test]
     fn parse_valid_hex_decision_id() {

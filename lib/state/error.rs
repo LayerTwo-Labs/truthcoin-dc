@@ -278,6 +278,22 @@ pub enum Error {
          total={total}, anchor={anchor}, drift={drift}"
     )]
     ReputationAnchorViolation { total: f64, anchor: f64, drift: f64 },
+    #[error(
+        "consensus produced an invalid reputation {reputation} for {address}"
+    )]
+    InvalidConsensusReputation {
+        address: crate::types::Address,
+        reputation: f64,
+    },
+    #[error("votecoin total is {total} units, expected exactly 1000000")]
+    VotecoinTotalViolation { total: u64 },
+    #[error("mainnet genesis voter whitelist is empty")]
+    EmptyGenesisVoters,
+    #[error("invalid mainnet genesis voter address {address}")]
+    InvalidGenesisVoter {
+        address: String,
+        source: crate::types::error::ParseAddress,
+    },
 }
 
 impl From<crate::archive::Error> for Error {

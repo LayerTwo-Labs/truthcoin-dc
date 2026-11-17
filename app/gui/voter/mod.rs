@@ -87,7 +87,7 @@ impl Voter {
 
 pub(super) struct VoterHeader {
     pub current_period: u32,
-    pub total_reputation: f64,
+    pub total_reputation: truthcoin_dc::types::Votecoin,
     decisions_available: u32,
     votes_cast_this_period: u32,
     error: Option<String>,
@@ -99,7 +99,7 @@ impl Default for VoterHeader {
     fn default() -> Self {
         Self {
             current_period: 0,
-            total_reputation: 0.0,
+            total_reputation: truthcoin_dc::types::Votecoin::ZERO,
             decisions_available: 0,
             votes_cast_this_period: 0,
             error: None,
@@ -155,15 +155,18 @@ impl VoterHeader {
         };
         let state = app.node.state();
 
-        self.total_reputation = addresses
-            .iter()
-            .map(|addr| {
-                state
-                    .reputation()
-                    .get_reputation(&rotxn, addr)
-                    .unwrap_or(0.0)
-            })
-            .sum();
+        self.total_reputation = truthcoin_dc::types::Votecoin(
+            addresses
+                .iter()
+                .map(|addr| {
+                    state
+                        .reputation()
+                        .get_reputation(&rotxn, addr)
+                        .unwrap_or_default()
+                        .0
+                })
+                .sum(),
+        );
 
         let mainchain_ts = state
             .try_get_mainchain_timestamp(&rotxn)
@@ -239,13 +242,10 @@ impl VoterHeader {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Reputation").small().weak());
                         ui.label(
-                            RichText::new(format!(
-                                "{:.6}",
-                                self.total_reputation
-                            ))
-                            .size(20.0)
-                            .strong()
-                            .color(Color32::from_rgb(100, 200, 100)),
+                            RichText::new(format!("{}", self.total_reputation))
+                                .size(20.0)
+                                .strong()
+                                .color(Color32::from_rgb(100, 200, 100)),
                         );
                     });
 
@@ -279,7 +279,8 @@ impl VoterHeader {
 
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Status").small().weak());
-                        let (text, color) = if self.total_reputation > 0.0 {
+                        let (text, color) = if !self.total_reputation.is_zero()
+                        {
                             ("Active voter", Color32::from_rgb(100, 200, 100))
                         } else {
                             ("No reputation", Color32::from_rgb(200, 120, 120))

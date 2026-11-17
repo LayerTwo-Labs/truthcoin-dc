@@ -4,7 +4,7 @@ use eframe::egui::{self, Button, Color32, RichText, ScrollArea, Vec2};
 use truthcoin_dc::math::trading;
 use truthcoin_dc::state::decisions::{Decision, DecisionId, DecisionType};
 use truthcoin_dc::state::{Market, MarketId, MarketState};
-use truthcoin_dc::types::Address;
+use truthcoin_dc::types::{Address, ShareDelta};
 
 use crate::app::App;
 
@@ -2185,16 +2185,19 @@ impl Browse {
         current_price: f64,
     ) {
         let beta = app.node.get_market_beta(market).unwrap_or(0.0);
-        let calc_cost = |shares: u64| -> Option<trading::BuyCost> {
-            let mut new_shares = market.shares.clone();
-            new_shares[actual_idx] += shares as i64;
-            let base_cost = trading::calculate_update_cost(
+        let calc_cost = |shares: u64| -> Option<(u64, trading::TradeQuote)> {
+            let deltas = [ShareDelta {
+                outcome_index: actual_idx as u32,
+                shares: i64::try_from(shares).ok()?,
+            }];
+            let quote = trading::quote_trade(
                 market.shares(),
-                &new_shares,
+                &deltas,
                 beta,
+                market.trading_fee,
             )
             .ok()?;
-            trading::calculate_buy_cost(base_cost, market.trading_fee).ok()
+            Some((u64::try_from(quote.net_cost_sats).ok()?, quote))
         };
 
         let (shares, buy_cost) = match self.trading_panel.input_mode {
@@ -2213,13 +2216,14 @@ impl Browse {
                 // Binary search for max whole shares affordable within budget
                 let mut low: u64 = 0;
                 let mut high: u64 = budget_sats;
-                let mut last_valid_cost: Option<trading::BuyCost> = None;
+                let mut last_valid_cost: Option<(u64, trading::TradeQuote)> =
+                    None;
 
                 while low < high {
                     let mid = (low + high).div_ceil(2);
 
                     if let Some(cost) = calc_cost(mid) {
-                        if cost.total_cost_sats <= budget_sats {
+                        if cost.0 <= budget_sats {
                             low = mid;
                             last_valid_cost = Some(cost);
                         } else {
@@ -2264,9 +2268,8 @@ impl Browse {
             }
         };
 
-        let mut new_shares = market.shares.clone();
-        new_shares[actual_idx] += shares as i64;
-        let new_price = trading::calculate_prices(&new_shares, beta)
+        let (total_cost_sats, quote) = buy_cost;
+        let new_price = trading::calculate_prices(&quote.new_shares, beta)
             .ok()
             .and_then(|p| p.get(actual_idx).copied())
             .filter(|p| *p > 0.0)
@@ -2274,9 +2277,9 @@ impl Browse {
 
         self.trading_panel.preview = Some(TradePreview {
             shares,
-            total_cost_sats: buy_cost.total_cost_sats,
-            fee_sats: buy_cost.trading_fee_sats,
-            base_amount_sats: buy_cost.base_cost_sats,
+            total_cost_sats,
+            fee_sats: quote.fee_sats,
+            base_amount_sats: quote.buy_cost_sats,
             new_price,
         });
     }
@@ -2311,47 +2314,18 @@ impl Browse {
             return;
         }
 
-        let mut new_shares = market.shares.clone();
-        new_shares[actual_idx] -= shares as i64;
-
-        if new_shares[actual_idx] < 0 {
-            self.trading_panel.preview_error =
-                Some("Would result in negative shares".to_string());
-            return;
-        }
-
         let beta = app.node.get_market_beta(market).unwrap_or(0.0);
-
-        let old_cost = match trading::calculate_treasury(&market.shares, beta) {
-            Ok(c) => c,
-            Err(e) => {
-                self.trading_panel.preview_error =
-                    Some(format!("Cost error: {e:?}"));
-                return;
-            }
-        };
-
-        let new_cost = match trading::calculate_treasury(&new_shares, beta) {
-            Ok(c) => c,
-            Err(e) => {
-                self.trading_panel.preview_error =
-                    Some(format!("Cost error: {e:?}"));
-                return;
-            }
-        };
-
-        let gross_proceeds_f64 = old_cost - new_cost;
-        if gross_proceeds_f64 < 0.0 {
-            self.trading_panel.preview_error =
-                Some("Invalid proceeds".to_string());
-            return;
-        }
-
-        let sell_proceeds = match trading::calculate_sell_proceeds(
-            gross_proceeds_f64,
+        let deltas = [ShareDelta {
+            outcome_index: actual_idx as u32,
+            shares: -(shares as i64),
+        }];
+        let quote = match trading::quote_trade(
+            market.shares(),
+            &deltas,
+            beta,
             market.trading_fee,
         ) {
-            Ok(p) => p,
+            Ok(quote) => quote,
             Err(e) => {
                 self.trading_panel.preview_error =
                     Some(format!("Proceeds error: {e}"));
@@ -2359,13 +2333,16 @@ impl Browse {
             }
         };
 
-        if sell_proceeds.trading_fee_sats >= sell_proceeds.gross_proceeds_sats {
+        let Some(net_proceeds_sats) = u64::try_from(-quote.net_cost_sats)
+            .ok()
+            .filter(|net| *net > 0)
+        else {
             self.trading_panel.preview_error =
                 Some("Trade too small: fee exceeds proceeds".to_string());
             return;
-        }
+        };
 
-        let new_price = trading::calculate_prices(&new_shares, beta)
+        let new_price = trading::calculate_prices(&quote.new_shares, beta)
             .ok()
             .and_then(|p| p.get(actual_idx).copied())
             .filter(|p| *p > 0.0)
@@ -2373,9 +2350,9 @@ impl Browse {
 
         self.trading_panel.preview = Some(TradePreview {
             shares,
-            total_cost_sats: sell_proceeds.net_proceeds_sats,
-            fee_sats: sell_proceeds.trading_fee_sats,
-            base_amount_sats: sell_proceeds.gross_proceeds_sats,
+            total_cost_sats: net_proceeds_sats,
+            fee_sats: quote.fee_sats,
+            base_amount_sats: quote.sell_gross_sats,
             new_price,
         });
     }
@@ -2523,9 +2500,7 @@ impl Browse {
 
         // 2% slippage buffer for price movement between preview and execution
         let slippage_buffer = (preview.total_cost_sats / 50).max(1);
-        let limit_sats = preview.total_cost_sats
-            + trading::TRADE_MINER_FEE_SATS
-            + slippage_buffer;
+        let max_cost = (preview.total_cost_sats + slippage_buffer) as i64;
         let prev_block_hash = match app.node.try_get_tip() {
             Ok(Some(h)) => h,
             Ok(None) => {
@@ -2553,10 +2528,12 @@ impl Browse {
         match app.wallet.trade(
             options,
             market.id,
-            actual_idx,
-            preview.shares as i64,
+            vec![ShareDelta {
+                outcome_index: actual_idx as u32,
+                shares: preview.shares as i64,
+            }],
             trader,
-            limit_sats,
+            max_cost,
             Some(market.tx_pow_config()),
             prev_block_hash,
         ) {
@@ -2634,10 +2611,12 @@ impl Browse {
         match app.wallet.trade(
             options,
             market.id,
-            actual_idx,
-            -(preview.shares as i64),
+            vec![ShareDelta {
+                outcome_index: actual_idx as u32,
+                shares: -(preview.shares as i64),
+            }],
             seller_address,
-            preview.total_cost_sats,
+            -(preview.total_cost_sats as i64),
             Some(market.tx_pow_config()),
             prev_block_hash,
         ) {

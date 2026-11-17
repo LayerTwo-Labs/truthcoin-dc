@@ -283,8 +283,9 @@ mod tests {
 
     const TOKEN: &str = "0123456789abcdef";
 
+    /// Creates an owner-only hex cookie and reuses it on the next load
     #[test]
-    fn creates_a_private_cookie_and_reuses_it() -> anyhow::Result<()> {
+    fn create_private_cookie() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join(COOKIE_FILE_NAME);
         let token = load_or_create_cookie(&path)?;

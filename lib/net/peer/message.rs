@@ -9,7 +9,10 @@ use truthcoin_dc_types::Block;
 use crate::{
     net::peer::{PeerState, PeerStateId},
     state::State,
-    types::{AuthorizedTransaction, BlockHash, Header, Network, Tip, Txid},
+    types::{
+        AuthorizedTransaction, BlockHash, Header, Network, OfferId,
+        SignedOffer, Tip, Txid,
+    },
 };
 
 pub const MAGIC_BYTES_LEN: usize = 4;
@@ -139,11 +142,33 @@ impl PushTransactionRequest {
     }
 }
 
+#[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize)]
+pub struct PushOfferRequest {
+    pub offer: Box<SignedOffer>,
+}
+
+impl PushOfferRequest {
+    pub const fn read_response_limit(&self) -> NonZeroUsize {
+        NonZeroUsize::new(256).unwrap()
+    }
+}
+
+#[derive(BorshSerialize, Clone, Debug, Deserialize, Serialize)]
+pub struct GetOffersRequest;
+
+impl GetOffersRequest {
+    pub const fn read_response_limit(&self) -> NonZeroUsize {
+        NonZeroUsize::new(1024 * 1024).unwrap()
+    }
+}
+
 #[derive(BorshSerialize, Clone, Debug)]
 pub enum Request {
     GetBlock(GetBlockRequest),
     GetHeaders(GetHeadersRequest),
     PushTransaction(PushTransactionRequest),
+    PushOffer(PushOfferRequest),
+    GetOffers(GetOffersRequest),
 }
 
 impl Request {
@@ -154,6 +179,8 @@ impl Request {
             Self::GetBlock(request) => request.read_response_limit(),
             Self::GetHeaders(request) => request.read_response_limit(),
             Self::PushTransaction(request) => request.read_response_limit(),
+            Self::PushOffer(request) => request.read_response_limit(),
+            Self::GetOffers(request) => request.read_response_limit(),
         }
     }
 }
@@ -173,6 +200,18 @@ impl From<GetHeadersRequest> for Request {
 impl From<PushTransactionRequest> for Request {
     fn from(request: PushTransactionRequest) -> Self {
         Self::PushTransaction(request)
+    }
+}
+
+impl From<PushOfferRequest> for Request {
+    fn from(request: PushOfferRequest) -> Self {
+        Self::PushOffer(request)
+    }
+}
+
+impl From<GetOffersRequest> for Request {
+    fn from(request: GetOffersRequest) -> Self {
+        Self::GetOffers(request)
     }
 }
 
@@ -217,6 +256,8 @@ impl<'a> Serialize for RequestMessageRef<'a> {
             GetBlock(&'b GetBlockRequest),
             GetHeaders(&'b GetHeadersRequest),
             PushTransaction(&'b PushTransactionRequest),
+            PushOffer(&'b PushOfferRequest),
+            GetOffers(&'b GetOffersRequest),
         }
 
         let repr = match self {
@@ -229,6 +270,8 @@ impl<'a> Serialize for RequestMessageRef<'a> {
                 Request::PushTransaction(request) => {
                     Repr::PushTransaction(request)
                 }
+                Request::PushOffer(request) => Repr::PushOffer(request),
+                Request::GetOffers(request) => Repr::GetOffers(request),
             },
         };
         repr.serialize(serializer)
@@ -240,7 +283,9 @@ impl<'a> Serialize for RequestMessageRef<'a> {
 #[transitive(
     from(GetBlockRequest, Request),
     from(GetHeadersRequest, Request),
-    from(PushTransactionRequest, Request)
+    from(PushTransactionRequest, Request),
+    from(PushOfferRequest, Request),
+    from(GetOffersRequest, Request)
 )]
 pub enum RequestMessage {
     Heartbeat(Heartbeat),
@@ -287,12 +332,16 @@ impl<'de> Deserialize<'de> for RequestMessage {
             GetBlock(GetBlockRequest),
             GetHeaders(GetHeadersRequest),
             PushTransaction(PushTransactionRequest),
+            PushOffer(PushOfferRequest),
+            GetOffers(GetOffersRequest),
         }
         let res = match Repr::deserialize(deserializer)? {
             Repr::Heartbeat(heartbeat) => heartbeat.into(),
             Repr::GetBlock(request) => request.into(),
             Repr::GetHeaders(request) => request.into(),
             Repr::PushTransaction(request) => request.into(),
+            Repr::PushOffer(request) => request.into(),
+            Repr::GetOffers(request) => request.into(),
         };
         Ok(res)
     }
@@ -312,6 +361,9 @@ pub enum ResponseMessage {
     },
     TransactionAccepted(Txid),
     TransactionRejected(Txid),
+    OfferAccepted(OfferId),
+    OfferRejected(OfferId),
+    Offers(Vec<SignedOffer>),
 }
 
 impl ResponseMessage {
@@ -359,8 +411,9 @@ mod test {
         [0b1000_0101, 0b0001_1000, 0b1001_0101, id]
     }
 
+    /// Magic bytes differ from thunder's on every network pair.
     #[test]
-    fn magic_bytes_differ_from_thunder_on_every_network() {
+    fn magic_differs_from_thunder() {
         for ours in NETWORKS {
             for theirs in NETWORKS {
                 assert_ne!(magic_bytes(ours), thunder_magic_bytes(theirs));
@@ -371,7 +424,7 @@ mod test {
     const BLOCKS_PER_MONTH: u32 = 6 * 24 * 30;
 
     #[test]
-    fn largest_block_message_fits_read_cap() -> anyhow::Result<()> {
+    fn largest_block_fits_read_cap() -> anyhow::Result<()> {
         let body = Body::new(Vec::new(), Coinbase::default());
         let header = Header {
             merkle_root: Body::compute_merkle_root::<FilledTransaction>(

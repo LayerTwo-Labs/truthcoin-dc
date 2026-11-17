@@ -48,6 +48,8 @@ const fn request_cost(req: &Request) -> NonZeroU32 {
         Request::GetBlock { .. } => NonZeroU32::new(1000).unwrap(),
         Request::GetHeaders { .. } => NonZeroU32::new(10_000).unwrap(),
         Request::PushTransaction { .. } => NonZeroU32::new(10).unwrap(),
+        Request::PushOffer { .. } => NonZeroU32::new(10).unwrap(),
+        Request::GetOffers { .. } => NonZeroU32::new(10_000).unwrap(),
     }
 }
 
@@ -170,6 +172,12 @@ impl Sender {
             .map_err(|_| error::request_queue::SendHeartbeat)
     }
 
+    /// Let a request be sent again, once its response has arrived. A block
+    /// whose body failed to connect is then fetched again from this peer.
+    pub fn forget(&self, request: &Request) {
+        let _removed: bool = self.request_hashes.lock().remove(&hash(request));
+    }
+
     /// Returns `Ok(true)` if the request was sent. Requests may be ignored if they
     /// are duplicates of messages that have already been sent.
     /// Returns `Ok(false)` if the request was ignored.
@@ -238,8 +246,9 @@ mod test {
         .into()
     }
 
+    /// The inbound budget refuses a request once the burst is spent.
     #[test]
-    fn the_budget_refuses_a_request_over_the_burst() {
+    fn budget_caps_burst() {
         let budget = InboundBudget::new();
         let request = get_headers();
         let burst = INBOUND_REQUEST_QUOTA.burst_size().get()
@@ -290,7 +299,7 @@ mod test {
             magic_bytes,
             resolved_address: server_connection.addr().into(),
             mempool: MemPool::new(&env)?,
-            state: State::new(&env, None)?,
+            state: State::new(&env, None, true)?,
             env,
         };
         let (_handle, info_rx) = handle(ctxt, server_connection);
@@ -320,6 +329,20 @@ mod test {
         .await?
         .ok_or_else(|| anyhow::anyhow!("the connection task sent no error"))?;
         assert!(error.is_ban(), "{error:#}");
+        Ok(())
+    }
+
+    /// A request is sent once until its response arrives, then it may be sent
+    /// again, so a body that failed to connect is fetched again
+    #[test]
+    fn answered_request_resendable() -> anyhow::Result<()> {
+        let (sender, _err_rx) = super::new();
+        let request = get_headers();
+
+        assert!(sender.send_request(request.clone())?);
+        assert!(!sender.send_request(request.clone())?);
+        sender.forget(&request);
+        assert!(sender.send_request(request)?);
         Ok(())
     }
 }

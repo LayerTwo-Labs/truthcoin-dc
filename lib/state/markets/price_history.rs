@@ -143,24 +143,26 @@ fn market_changes(
         .iter()
         .enumerate()
         .filter(|(idx, _)| !skipped_tx_indices.contains(&(*idx as u32)))
-        .filter_map(|(_, tx)| match &tx.data {
+        .flat_map(|(_, tx)| match &tx.data {
             Some(TxData::Trade {
                 market_id: trade_market_id,
-                outcome_index,
-                shares,
+                deltas,
                 ..
-            }) if trade_market_id == market_id => Some(MarketChange::Trade {
-                outcome_index: *outcome_index,
-                shares: *shares,
-            }),
+            }) if trade_market_id == market_id => deltas
+                .iter()
+                .map(|delta| MarketChange::Trade {
+                    outcome_index: delta.outcome_index,
+                    shares: delta.shares,
+                })
+                .collect(),
             Some(TxData::AmplifyBeta {
                 market_id: amplify_market_id,
                 amount,
                 ..
             }) if amplify_market_id == market_id => {
-                Some(MarketChange::AmplifyBeta { amount: *amount })
+                vec![MarketChange::AmplifyBeta { amount: *amount }]
             }
-            _ => None,
+            _ => Vec::new(),
         })
         .collect()
 }
@@ -276,10 +278,12 @@ mod tests {
     fn trade(market_id: MarketId, outcome_index: u32, shares: i64) -> TxData {
         TxData::Trade {
             market_id,
-            outcome_index,
-            shares,
+            deltas: vec![crate::types::ShareDelta {
+                outcome_index,
+                shares,
+            }],
             trader: Address::ALL_ZEROS,
-            limit_sats: 0,
+            max_cost: 0,
             tx_pow_nonce: None,
             prev_block_hash: hashes::BlockHash([0; 32]),
         }
@@ -309,8 +313,9 @@ mod tests {
         .prices()
     }
 
+    /// market_changes drops skipped transactions and those of other markets.
     #[test]
-    fn market_changes_drop_skipped_and_other_market_txs() {
+    fn changes_skip_foreign_txs() {
         let body = Body {
             coinbase: Default::default(),
             transactions: vec![
@@ -339,6 +344,37 @@ mod tests {
                     shares: -400
                 },
                 MarketChange::AmplifyBeta { amount: 5_000 },
+            ]
+        );
+    }
+
+    /// A vector trade yields a change for each of its outcomes.
+    #[test]
+    fn vector_trade_changes_all() {
+        let mut data = trade(MARKET_ID, 0, 300);
+        if let TxData::Trade { deltas, .. } = &mut data {
+            deltas.push(crate::types::ShareDelta {
+                outcome_index: 1,
+                shares: -200,
+            });
+        }
+        let body = Body {
+            coinbase: Default::default(),
+            transactions: vec![tx(data)],
+            authorizations: Vec::new(),
+            actor_proofs: Vec::new(),
+        };
+        assert_eq!(
+            market_changes(&body, &[], &MARKET_ID),
+            vec![
+                MarketChange::Trade {
+                    outcome_index: 0,
+                    shares: 300
+                },
+                MarketChange::Trade {
+                    outcome_index: 1,
+                    shares: -200
+                },
             ]
         );
     }
@@ -399,8 +435,9 @@ mod tests {
         Ok(())
     }
 
+    /// Rebuilding fails without the market's creation block.
     #[test]
-    fn rebuild_without_creation_block_fails() {
+    fn rebuild_needs_creation() {
         let result = rebuild_price_history(
             MARKET_ID,
             MarketSnapshot {

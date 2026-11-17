@@ -594,6 +594,8 @@ pub enum Error {
     SendBlockingTask,
     #[error("mempool error")]
     MemPool(#[from] crate::mempool::Error),
+    #[error("offer board error")]
+    Offers(#[from] crate::offers::Error),
     #[error(transparent)]
     SendHeartbeat(#[from] request_queue::SendHeartbeat),
     #[error("Failed to push info message")]
@@ -613,6 +615,7 @@ impl Recoverable for Error {
             | Self::DbEnv(_)
             | Self::MemPool(_)
             | Self::MissingPeerState(_)
+            | Self::Offers(_)
             | Self::SendBlockingTask
             | Self::SendInfo
             | Self::State(_) => true,
@@ -667,6 +670,7 @@ impl Error {
             | Self::DbEnv(_)
             | Self::MemPool(_)
             | Self::MissingPeerState(_)
+            | Self::Offers(_)
             | Self::PeerBan(_)
             | Self::SendBlockingTask
             | Self::SendHeartbeat(_)
@@ -687,8 +691,9 @@ mod test {
 
     const FOREIGN_MAGIC: message::MagicBytes = [0x85, 0x18, 0x95, 0x01];
 
+    /// Only the handshake timeout counts as a connect timeout.
     #[test]
-    fn only_the_handshake_timeout_is_a_connect_timeout() {
+    fn connect_timeout_scope() {
         assert!(
             Error::Connection(quinn::ConnectionError::TimedOut)
                 .is_connect_timeout()
@@ -709,8 +714,9 @@ mod test {
         }
     }
 
+    /// A duplicate close still reads as one through the request path.
     #[test]
-    fn duplicate_close_survives_the_request_path() {
+    fn duplicate_close_request_path() {
         let close = quinn::ConnectionError::ApplicationClosed(
             quinn::ApplicationClose {
                 error_code: 1_u32.into(),
@@ -723,8 +729,9 @@ mod test {
         assert!(err.is_duplicate_connection());
     }
 
+    /// A duplicate close still reads as one through the response path.
     #[test]
-    fn duplicate_close_survives_the_response_path() {
+    fn duplicate_close_response_path() {
         let close = quinn::ConnectionError::ApplicationClosed(
             quinn::ApplicationClose {
                 error_code: 1_u32.into(),
@@ -736,8 +743,9 @@ mod test {
         assert!(err.is_duplicate_connection());
     }
 
+    /// Timeouts and closes with another code or reason are not duplicates.
     #[test]
-    fn other_connection_errors_are_not_duplicate_closes() {
+    fn other_errors_not_duplicate() {
         for error in [
             quinn::ConnectionError::TimedOut,
             quinn::ConnectionError::ApplicationClosed(
@@ -760,7 +768,7 @@ mod test {
     // A peer that answers a request with another network's magic must read as
     // bad magic through every wrapper the error passes.
     #[test]
-    fn bad_magic_survives_the_request_path() {
+    fn bad_magic_request_path() {
         let inner = connection::Receive::BadMagic(FOREIGN_MAGIC);
         let err = Error::Mailbox(mailbox::Error::ReceiveRequest(
             connection::ReceiveRequest::from(inner),
@@ -769,7 +777,7 @@ mod test {
     }
 
     #[test]
-    fn bad_magic_survives_the_response_path() {
+    fn bad_magic_response_path() {
         let inner = connection::Receive::BadMagic(FOREIGN_MAGIC);
         let err =
             Error::ReceiveResponse(connection::ReceiveResponse::from(inner));
@@ -785,8 +793,9 @@ mod test {
         assert!(!err.is_bad_magic());
     }
 
+    /// A ban reason survives the blocking task error path.
     #[test]
-    fn a_ban_reason_survives_the_blocking_task_path() {
+    fn ban_reason_blocking_path() {
         let ban_reason = crate::net::peer::BanReason::BmmVerificationFailed(
             crate::types::Tip {
                 block_hash: crate::types::BlockHash([0; 32]),
@@ -802,7 +811,7 @@ mod test {
     }
 
     #[test]
-    fn a_heartbeat_timeout_is_not_bad_magic() {
+    fn heartbeat_not_bad_magic() {
         let err = Error::Mailbox(mailbox::Error::HeartbeatTimeout);
         assert!(!err.is_bad_magic());
     }

@@ -12,10 +12,36 @@ use truthcoin_dc_app_rpc_api::{
 };
 use truthcoin_dc_types::wallet::TransferDests;
 use truthcoin_dc_types::{
-    Address, EncryptionPubKey, M6id, Txid, VerifyingKey,
+    Address, EncryptionPubKey, M6id, OfferId, Txid, VerifyingKey, Votecoin,
     authorization::{Dst, Signature},
     net::PeerAddress,
 };
+
+/// Trade legs parsed from "outcome:shares,outcome:shares"
+#[derive(Clone, Debug)]
+pub struct ShareDeltas(Vec<truthcoin_dc_types::ShareDelta>);
+
+fn parse_share_deltas(s: &str) -> Result<ShareDeltas, String> {
+    s.split(',')
+        .map(|leg| {
+            let (outcome_index, shares) = leg
+                .trim()
+                .split_once(':')
+                .ok_or_else(|| format!("leg `{leg}` is not outcome:shares"))?;
+            Ok(truthcoin_dc_types::ShareDelta {
+                outcome_index: outcome_index
+                    .trim()
+                    .parse()
+                    .map_err(|err| format!("outcome in `{leg}`: {err}"))?,
+                shares: shares
+                    .trim()
+                    .parse()
+                    .map_err(|err| format!("shares in `{leg}`: {err}"))?,
+            })
+        })
+        .collect::<Result<_, _>>()
+        .map(ShareDeltas)
+}
 
 struct JsonParser<T>(PhantomData<T>);
 
@@ -251,6 +277,11 @@ pub enum Command {
     OpenApiSchema,
     /// Remove a tx from the mempool
     RemoveFromMempool { txid: Txid },
+    /// Import a ristretto255 private key (32-byte FROST-serialized scalar,
+    /// hex) into the wallet, and print its address. The seed does not back
+    /// up an imported key.
+    #[command(name = "import-private-key")]
+    ImportPrivateKey { private_key: String },
     /// Set the wallet seed from a mnemonic seed phrase
     SetSeedFromMnemonic { mnemonic: String },
     /// Get total sidechain wealth
@@ -470,6 +501,25 @@ pub enum Command {
         #[arg(long, default_value = "0")]
         min_proceeds: u64,
     },
+    /// Buy and sell several outcomes of a market in one transaction
+    #[command(name = "market-trade", alias = "trade")]
+    MarketTrade {
+        #[arg(long)]
+        market_id: String,
+        /// Comma-separated "outcome:shares" legs, negative shares to sell,
+        /// e.g. "0:10,2:-5"
+        #[arg(long, value_parser = parse_share_deltas)]
+        deltas: ShareDeltas,
+        /// The most the trade may cost, without the miner fee; negative is
+        /// the least it must pay out
+        #[arg(long, allow_hyphen_values = true)]
+        max_cost: Option<i64>,
+        /// Address holding the shares, required when any leg sells
+        #[arg(long)]
+        trader_address: Option<Address>,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Amplify a market's LMSR beta by funding its treasury (market author only)
     #[command(name = "market-amplify-beta")]
     MarketAmplifyBeta {
@@ -517,18 +567,39 @@ pub enum Command {
     /// List all registered voters
     #[command(name = "vote-voters", alias = "voters")]
     VoteVoters,
-    /// Submit vote(s) - use comma-separated "id:value" for batch
+    /// List this wallet's addresses that hold votecoin
+    #[command(name = "voter-addresses")]
+    VoterAddresses,
+    /// Seal a ballot covering every decision in the period - use
+    /// comma-separated "id:value" for batch, "id:abstain" to abstain
     #[command(name = "vote-submit", alias = "vote")]
     VoteSubmit {
-        /// Single vote: --decision-id X --vote-value Y, or batch: --votes "id1:val1,id2:val2"
+        /// Single vote: --decision-id X --vote-value Y, or batch: --votes "id1:val1,id2:abstain"
         #[arg(long)]
         decision_id: Option<String>,
         #[arg(long)]
         vote_value: Option<f64>,
         #[arg(long)]
         votes: Option<String>,
-        #[arg(long, default_value = "1000")]
-        fee_sats: u64,
+        /// Defaults to the minimum fee for the ballot's size
+        #[arg(long)]
+        fee_sats: Option<u64>,
+        /// Defaults to the one wallet address that holds votecoin
+        #[arg(long)]
+        voter: Option<Address>,
+    },
+    /// Reveal this wallet's sealed ballot for a period after its voting
+    /// closes
+    #[command(name = "vote-reveal")]
+    VoteReveal {
+        #[arg(long)]
+        period: u32,
+        /// Defaults to the minimum fee for the reveal's size
+        #[arg(long)]
+        fee_sats: Option<u64>,
+        /// Defaults to the one wallet address that holds votecoin
+        #[arg(long)]
+        voter: Option<Address>,
     },
     /// Query votes with filters
     #[command(name = "vote-list")]
@@ -551,15 +622,53 @@ pub enum Command {
     VotecoinTransfer {
         dest: Address,
         #[arg(long)]
-        amount: f64,
+        amount: Votecoin,
         #[arg(long, default_value = "1000")]
         fee_sats: u64,
+        /// Defaults to the one wallet address that holds votecoin
+        #[arg(long)]
+        sender: Option<Address>,
     },
     /// Get votecoin balance
     #[command(name = "votecoin-balance")]
     VotecoinBalance {
         /// Address to check
         address: Address,
+    },
+    /// Offer votecoin for sale on the offer board, until the current voting
+    /// period ends
+    #[command(name = "create-offer")]
+    CreateOffer {
+        #[arg(long)]
+        amount: Votecoin,
+        #[arg(long)]
+        price_sats: u64,
+        /// Defaults to the one wallet address that holds votecoin
+        #[arg(long)]
+        seller: Option<Address>,
+        /// Defaults to the seller
+        #[arg(long)]
+        pay_to: Option<Address>,
+    },
+    /// List the votecoin offers on the board, cheapest first
+    #[command(name = "list-offers")]
+    ListOffers,
+    /// Take an offer: pay its price and receive its votecoin
+    #[command(name = "take-offer")]
+    TakeOffer {
+        offer_id: OfferId,
+        #[arg(long, default_value = "1000")]
+        fee_sats: u64,
+        /// Defaults to a new wallet address
+        #[arg(long)]
+        buyer: Option<Address>,
+    },
+    /// Cancel an offer of this wallet
+    #[command(name = "cancel-offer")]
+    CancelOffer {
+        offer_id: OfferId,
+        #[arg(long, default_value = "1000")]
+        fee_sats: u64,
     },
 }
 
@@ -792,6 +901,10 @@ where
         Command::RemoveFromMempool { txid } => {
             let () = rpc_client.remove_from_mempool(txid).await?;
             String::default()
+        }
+        Command::ImportPrivateKey { private_key } => {
+            let address = rpc_client.import_private_key(private_key).await?;
+            format!("{address}")
         }
         Command::SetSeedFromMnemonic { mnemonic } => {
             let () = rpc_client.set_seed_from_mnemonic(mnemonic).await?;
@@ -1195,6 +1308,25 @@ where
                 txid_display
             )
         }
+        Command::MarketTrade {
+            market_id,
+            deltas,
+            max_cost,
+            trader_address,
+            dry_run,
+        } => {
+            use truthcoin_dc_app_rpc_api::markets::MarketTradeRequest;
+            let result = rpc_client
+                .market_trade(MarketTradeRequest {
+                    market_id,
+                    deltas: deltas.0,
+                    trader_address,
+                    max_cost,
+                    dry_run: Some(dry_run),
+                })
+                .await?;
+            serde_json::to_string_pretty(&result)?
+        }
         Command::MarketAmplifyBeta {
             market_id,
             amount_sats,
@@ -1295,11 +1427,16 @@ where
             let voters = rpc_client.vote_voters().await?;
             json_response(&voters)?
         }
+        Command::VoterAddresses => {
+            let voters = rpc_client.voter_addresses().await?;
+            json_response(&voters)?
+        }
         Command::VoteSubmit {
             decision_id,
             vote_value,
             votes,
             fee_sats,
+            voter,
         } => {
             use truthcoin_dc_app_rpc_api::markets::BallotItem;
             let vote_items = if let Some(batch) = votes {
@@ -1309,7 +1446,10 @@ where
                     .filter_map(|pair| {
                         let parts: Vec<&str> = pair.trim().split(':').collect();
                         if parts.len() == 2 {
-                            let val: f64 = parts[1].parse().ok()?;
+                            let val = match parts[1] {
+                                "abstain" => None,
+                                val => Some(val.parse().ok()?),
+                            };
                             Some(BallotItem {
                                 decision_id: parts[0].to_string(),
                                 vote_value: val,
@@ -1322,7 +1462,7 @@ where
             } else if let (Some(id), Some(val)) = (decision_id, vote_value) {
                 vec![BallotItem {
                     decision_id: id,
-                    vote_value: val,
+                    vote_value: Some(val),
                 }]
             } else {
                 return Ok(
@@ -1330,8 +1470,17 @@ where
                         .to_string(),
                 );
             };
-            let txid = rpc_client.vote_submit(vote_items, fee_sats).await?;
+            let txid =
+                rpc_client.vote_submit(vote_items, fee_sats, voter).await?;
             format!("Vote submitted: {txid}")
+        }
+        Command::VoteReveal {
+            period,
+            fee_sats,
+            voter,
+        } => {
+            let txid = rpc_client.vote_reveal(period, fee_sats, voter).await?;
+            format!("Ballot revealed: {txid}")
         }
         Command::VoteList {
             voter,
@@ -1355,14 +1504,43 @@ where
             dest,
             amount,
             fee_sats,
+            sender,
         } => {
-            let txid =
-                rpc_client.transfer_votecoin(dest, amount, fee_sats).await?;
+            let txid = rpc_client
+                .transfer_votecoin(dest, amount, fee_sats, sender)
+                .await?;
             format!("Votecoin transferred: {txid}")
         }
         Command::VotecoinBalance { address } => {
             let balance = rpc_client.votecoin_balance(address).await?;
             format!("{balance}")
+        }
+        Command::CreateOffer {
+            amount,
+            price_sats,
+            seller,
+            pay_to,
+        } => {
+            let offer_id = rpc_client
+                .create_offer(amount, price_sats, seller, pay_to)
+                .await?;
+            format!("{offer_id}")
+        }
+        Command::ListOffers => {
+            let offers = rpc_client.list_offers().await?;
+            json_response(&offers)?
+        }
+        Command::TakeOffer {
+            offer_id,
+            fee_sats,
+            buyer,
+        } => {
+            let txid = rpc_client.take_offer(offer_id, fee_sats, buyer).await?;
+            format!("Offer taken: {txid}")
+        }
+        Command::CancelOffer { offer_id, fee_sats } => {
+            let txid = rpc_client.cancel_offer(offer_id, fee_sats).await?;
+            format!("Offer cancelled: {txid}")
         }
     })
 }
@@ -1483,8 +1661,9 @@ mod tests {
         assert!(result.is_err(), "the CLI accepted a second map: {result:?}");
     }
 
+    /// Text after a transfer map is refused
     #[test]
-    fn refuse_text_after_a_transfer_map() {
+    fn refuse_trailing_text() {
         let address = Address([1u8; 20]);
         let result = Cli::try_parse_from([
             "truthcoin-cli",
@@ -1496,8 +1675,9 @@ mod tests {
         assert!(result.is_err(), "the CLI accepted extra text: {result:?}");
     }
 
+    /// A transfer parse error starts with the offending address path
     #[test]
-    fn the_transfer_error_has_the_address_path() {
+    fn transfer_error_path() {
         let address = Address([1u8; 20]);
         let error = JsonParser::<TransferDests>::parse(&format!(
             "{{\"{address}\": \"invalid\"}}"

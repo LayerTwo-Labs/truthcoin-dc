@@ -27,10 +27,22 @@ use crate::{
         request_queue,
     },
     types::{
-        AuthorizedTransaction, BlockHash, BmmResult, Header, Tip, VERSION,
+        AuthorizedTransaction, BlockHash, BmmResult, Header, SignedOffer, Tip,
+        VERSION,
     },
     util::{ErrorChain, join_set},
 };
+
+/// A transaction can be valid at a tip this node has not reached yet, such
+/// as a ballot reveal relayed before the block that opens its reveal window,
+/// so only a bad signature ends the connection.
+fn rejected_tx_is_misbehavior(err: &crate::state::Error) -> bool {
+    matches!(
+        err,
+        crate::state::Error::Authorization(_)
+            | crate::state::Error::WrongPubKeyForAddress
+    )
+}
 
 /// Maximum number of peer states retained per connection.
 /// Peer states are retained so that follow-up internal messages can be
@@ -741,7 +753,11 @@ impl ConnectionTask {
                     ResponseMessage::TransactionRejected(txid),
                 )
                 .await?;
-                Err(Error::from(err))
+                if rejected_tx_is_misbehavior(&err) {
+                    Err(Error::from(err))
+                } else {
+                    Ok(())
+                }
             }
             Ok(_) => {
                 Connection::send_response(
@@ -756,6 +772,57 @@ impl ConnectionTask {
                 Ok(())
             }
         }
+    }
+
+    async fn handle_push_offer(
+        ctxt: &ConnectionContext,
+        info_tx: &mpsc::UnboundedSender<Info>,
+        response_tx: SendStream,
+        offer: Box<SignedOffer>,
+    ) -> Result<(), Error> {
+        let offer_id = offer.id();
+        let validate_result = {
+            let rotxn = ctxt.env.read_txn().map_err(EnvError::from)?;
+            crate::validation::OfferValidator::validate_open_offer(
+                &ctxt.state,
+                &rotxn,
+                &offer,
+            )
+        };
+        let response = match validate_result {
+            Ok(()) => ResponseMessage::OfferAccepted(offer_id),
+            Err(_) => ResponseMessage::OfferRejected(offer_id),
+        };
+        Connection::send_response(ctxt.magic_bytes, response_tx, response)
+            .await?;
+        if !offer.is_signed_by_seller() {
+            return Err(Error::from(
+                crate::state::Error::WrongPubKeyForAddress,
+            ));
+        }
+        if validate_result.is_ok() {
+            info_tx
+                .unbounded_send(Info::NewOffer(offer))
+                .map_err(|_| Error::SendInfo)?;
+        }
+        Ok(())
+    }
+
+    async fn handle_get_offers(
+        ctxt: &ConnectionContext,
+        response_tx: SendStream,
+    ) -> Result<(), Error> {
+        let offers = {
+            let rotxn = ctxt.env.read_txn().map_err(EnvError::from)?;
+            ctxt.mempool.offers.all(&rotxn)?
+        };
+        Connection::send_response(
+            ctxt.magic_bytes,
+            response_tx,
+            ResponseMessage::Offers(offers),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Record a peer state, evicting the least recently received states if the
@@ -789,6 +856,11 @@ impl ConnectionTask {
                 let new_peer_state = heartbeat.0;
                 let new_peer_state_id =
                     Self::insert_peer_state(peer_states, new_peer_state);
+                if peer_state.is_none() {
+                    let _: bool = mailbox_sender
+                        .request_tx
+                        .send_request(message::GetOffersRequest.into())?;
+                }
                 if *peer_state != Some(new_peer_state_id) {
                     let ctxt = Arc::clone(ctxt);
                     let info_tx = info_tx.clone();
@@ -840,6 +912,14 @@ impl ConnectionTask {
                 Self::handle_push_tx(ctxt, info_tx, response_tx, transaction)
                     .await
             }
+            RequestMessage::Request(Request::PushOffer(
+                message::PushOfferRequest { offer },
+            )) => {
+                Self::handle_push_offer(ctxt, info_tx, response_tx, offer).await
+            }
+            RequestMessage::Request(Request::GetOffers(
+                message::GetOffersRequest,
+            )) => Self::handle_get_offers(ctxt, response_tx).await,
         }
     }
 
@@ -1012,6 +1092,7 @@ impl ConnectionTask {
                     .await?;
                 }
                 MailboxItem::PeerResponse(peer_response) => {
+                    self.mailbox_tx.request_tx.forget(&peer_response.request);
                     let info = match peer_response.response {
                         Ok(resp) => Info::Response(Box::new((
                             resp,
@@ -1036,7 +1117,7 @@ impl ConnectionTask {
 mod tests {
     use hashlink::LinkedHashMap;
 
-    use super::{ConnectionTask, MAX_PEER_STATES};
+    use super::{ConnectionTask, MAX_PEER_STATES, rejected_tx_is_misbehavior};
     use crate::{
         net::peer::{PeerState, PeerStateId},
         types::Version,
@@ -1078,9 +1159,9 @@ mod tests {
         }
     }
 
+    /// Delayed messages for removed peer states do not stop the connection.
     #[test]
-    fn delayed_messages_for_removed_peer_states_do_not_stop_the_connection()
-    -> anyhow::Result<()> {
+    fn stale_peer_state_messages() -> anyhow::Result<()> {
         use std::{net::Ipv4Addr, sync::Arc};
 
         use futures::channel::mpsc;
@@ -1115,7 +1196,7 @@ mod tests {
                 (Ipv4Addr::LOCALHOST, 4000).into(),
             ),
             mempool: MemPool::new(&env)?,
-            state: State::new(&env, None)?,
+            state: State::new(&env, None, true)?,
             env,
         });
         let mut peer_states = LinkedHashMap::new();
@@ -1150,5 +1231,19 @@ mod tests {
             )?;
         }
         Ok(())
+    }
+
+    /// Only a bad signature ends the connection; other rejected txs do not.
+    #[test]
+    fn bad_signature_is_misbehavior() {
+        use crate::state::Error;
+
+        assert!(rejected_tx_is_misbehavior(&Error::Authorization(
+            crate::types::authorization::Error::NotEnoughAuthorizations
+        )));
+        assert!(rejected_tx_is_misbehavior(&Error::WrongPubKeyForAddress));
+        assert!(!rejected_tx_is_misbehavior(&Error::InvalidTransaction {
+            reason: "Voting period 4 is not revealing".to_owned(),
+        }));
     }
 }

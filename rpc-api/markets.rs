@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use truthcoin_dc_types::{
-    Address, BlockHash, Txid, decision::DecisionType, market::MarketState,
+    Address, BlockHash, ShareDelta, Txid, Votecoin, decision::DecisionType,
+    market::MarketState,
 };
 use utoipa::ToSchema;
 
@@ -38,17 +39,53 @@ pub struct MarketAmplifyBetaRequest {
     pub amount_sats: u64,
 }
 
+/// Request to move a market's share vector: buy and sell any of its
+/// outcomes in one transaction, at the LMSR cost of the whole move
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketTradeRequest {
+    pub market_id: String,
+    /// Shares of each outcome to buy (positive) or sell (negative)
+    pub deltas: Vec<ShareDelta>,
+    /// Address of the share-holder, required when any leg sells. Otherwise
+    /// the wallet's first address trades.
+    pub trader_address: Option<Address>,
+    /// The most the trade may cost, without the miner fee. A negative value
+    /// is the least it must pay out. Required unless `dry_run`.
+    pub max_cost: Option<i64>,
+    pub dry_run: Option<bool>,
+}
+
+/// Cost of a share-vector trade
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MarketTradeResponse {
+    /// Transaction ID (None for dry runs)
+    pub txid: Option<String>,
+    /// LMSR cost of the buy legs
+    pub buy_cost_sats: u64,
+    /// LMSR proceeds of the sell legs
+    pub sell_gross_sats: u64,
+    /// Trading fee on the gross of both, to the market author
+    pub trading_fee_sats: u64,
+    /// What the trader pays, or receives when negative, without the miner
+    /// fee
+    pub net_cost_sats: i64,
+    /// Price of every outcome after the trade
+    pub new_prices: Vec<f64>,
+}
+
 /// Request to build and sign (but not submit) a Trade transaction with
 /// a caller-supplied `prev_block_hash`.
 ///
-/// `shares_amount` is positive for buy, negative for sell. For sells,
-/// `trader_address` must be supplied and must own the shares.
+/// For a trade that sells, `trader_address` must be supplied and must own
+/// the shares.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct CreateTradeRequest {
     pub market_id: String,
-    pub outcome_index: usize,
-    pub shares_amount: i64,
-    pub limit_sats: u64,
+    /// Shares of each outcome to buy (positive) or sell (negative)
+    pub deltas: Vec<ShareDelta>,
+    /// The most the trade may cost, without the miner fee; negative is the
+    /// least it must pay out
+    pub max_cost: i64,
     /// Address of the share-holder (required for sells; ignored for buys,
     /// in which case the wallet's first address is used as trader).
     pub trader_address: Option<Address>,
@@ -187,7 +224,7 @@ pub struct ConsensusResults {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VoterInfoFull {
     pub address: String,
-    pub votecoin_balance: f64,
+    pub votecoin_balance: Votecoin,
     pub total_votes: u64,
     pub periods_active: u32,
     pub is_active: bool,
@@ -525,19 +562,14 @@ pub struct BallotItem {
     /// For scaled decisions, the value must equal `min + k * increment`
     /// for some non-negative integer `k`, with `vote_value <= max`.
     /// For binary decisions, use 0.0 (No) or 1.0 (Yes).
-    pub vote_value: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct SubmitBallotRequest {
-    pub votes: Vec<BallotItem>,
-    pub fee_sats: u64,
+    /// `None` abstains.
+    pub vote_value: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct VoterInfo {
     pub address: String,
-    pub votecoin_balance: f64,
+    pub votecoin_balance: Votecoin,
     pub total_votes: u64,
     pub is_active: bool,
 }
@@ -559,6 +591,6 @@ pub struct VoteInfo {
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ScoreChange {
-    pub old_score: f64,
-    pub new_score: f64,
+    pub old_score: Votecoin,
+    pub new_score: Votecoin,
 }

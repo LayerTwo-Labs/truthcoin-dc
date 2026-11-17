@@ -1,7 +1,7 @@
 use eframe::egui::{self, Button, RichText};
 use truthcoin_dc::math::trading;
 use truthcoin_dc::state::MarketId;
-use truthcoin_dc::types::Address;
+use truthcoin_dc::types::{Address, ShareDelta};
 
 use crate::app::App;
 
@@ -111,50 +111,18 @@ impl SellShares {
             return;
         }
 
-        // Calculate proceeds: C(current_shares) - C(new_shares)
-        let mut new_shares = market.shares.clone();
-        new_shares[actual_idx] -= shares;
-
-        // Check for negative shares
-        if new_shares[actual_idx] < 0 {
-            self.preview_error =
-                Some("Would result in negative market shares".to_string());
-            return;
-        }
-
         let beta = app.node.get_market_beta(&market).unwrap_or(0.0);
-
-        let old_cost = match trading::calculate_treasury(&market.shares, beta) {
-            Ok(c) => c,
-            Err(e) => {
-                self.preview_error =
-                    Some(format!("Cost calculation error: {e:?}"));
-                return;
-            }
-        };
-
-        let new_cost = match trading::calculate_treasury(&new_shares, beta) {
-            Ok(c) => c,
-            Err(e) => {
-                self.preview_error =
-                    Some(format!("Cost calculation error: {e:?}"));
-                return;
-            }
-        };
-
-        let gross_proceeds_f64 = old_cost - new_cost;
-        if gross_proceeds_f64 < 0.0 {
-            self.preview_error =
-                Some("Invalid proceeds calculation".to_string());
-            return;
-        }
-
-        // Use shared trading calculation for consistency
-        let sell_proceeds = match trading::calculate_sell_proceeds(
-            gross_proceeds_f64,
+        let deltas = [ShareDelta {
+            outcome_index: self.outcome_index,
+            shares: -shares,
+        }];
+        let quote = match trading::quote_trade(
+            &market.shares,
+            &deltas,
+            beta,
             self.trading_fee_pct,
         ) {
-            Ok(proceeds) => proceeds,
+            Ok(quote) => quote,
             Err(e) => {
                 self.preview_error =
                     Some(format!("Proceeds calculation error: {e}"));
@@ -162,16 +130,18 @@ impl SellShares {
             }
         };
 
-        // Check for fee >= proceeds (would result in 0 or negative net proceeds)
-        if sell_proceeds.trading_fee_sats >= sell_proceeds.gross_proceeds_sats {
+        // Net proceeds must be positive: the fee must not eat them
+        let Some(net_proceeds_sats) = u64::try_from(-quote.net_cost_sats)
+            .ok()
+            .filter(|net| *net > 0)
+        else {
             self.preview_error =
                 Some("Trade too small: fee would exceed proceeds".to_string());
             return;
-        }
-
-        let gross_proceeds_sats = sell_proceeds.gross_proceeds_sats;
-        let trading_fee_sats = sell_proceeds.trading_fee_sats;
-        let net_proceeds_sats = sell_proceeds.net_proceeds_sats;
+        };
+        let gross_proceeds_sats = quote.sell_gross_sats;
+        let trading_fee_sats = quote.fee_sats;
+        let new_shares = quote.new_shares;
 
         let new_price = trading::calculate_prices(&new_shares, beta)
             .ok()
@@ -193,9 +163,6 @@ impl SellShares {
         let Some(preview) = &self.preview else {
             return;
         };
-
-        // outcome_index is already the actual state index (not a display index)
-        let actual_idx = self.outcome_index as usize;
 
         // Use exact preview value for slippage protection (consistent with buy)
         // Transaction will fail if market conditions change and proceeds fall below this
@@ -223,10 +190,12 @@ impl SellShares {
         match app.wallet.trade(
             options,
             self.market_id,
-            actual_idx,
-            -preview.shares, // Negative for sell
+            vec![ShareDelta {
+                outcome_index: self.outcome_index,
+                shares: -preview.shares,
+            }],
             self.seller_address,
-            min_proceeds,
+            -(min_proceeds as i64),
             Some(self.tx_pow_config),
             prev_block_hash,
         ) {

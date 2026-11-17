@@ -29,7 +29,7 @@ fn make_scaled_decision(min: f64, max: f64, increment: f64) -> Decision {
 }
 
 #[test]
-fn test_binary_decision_no_normalization() {
+fn test_binary_passthrough() {
     let decision = make_binary_decision();
 
     // Binary decisions pass through unchanged
@@ -43,7 +43,7 @@ fn test_binary_decision_no_normalization() {
 }
 
 #[test]
-fn test_scaled_decision_normalization() {
+fn test_scaled_normalize() {
     // Electoral votes: 0-538
     let decision = make_scaled_decision(0.0, 538.0, 1.0);
 
@@ -55,7 +55,7 @@ fn test_scaled_decision_normalization() {
 }
 
 #[test]
-fn test_scaled_decision_denormalization() {
+fn test_scaled_denormalize() {
     // Electoral votes: 0-538
     let decision = make_scaled_decision(0.0, 538.0, 1.0);
 
@@ -66,7 +66,7 @@ fn test_scaled_decision_denormalization() {
 }
 
 #[test]
-fn test_scaled_decision_with_offset() {
+fn test_scaled_offset() {
     // Score: 50 to 150 (range of 100)
     let decision = make_scaled_decision(50.0, 150.0, 1.0);
 
@@ -96,7 +96,7 @@ fn test_roundtrip_normalization() {
 }
 
 #[test]
-fn test_validate_and_normalize_success() {
+fn test_validate_in_range() {
     let decision = make_scaled_decision(0.0, 100.0, 1.0);
 
     // Valid values
@@ -110,7 +110,7 @@ fn test_validate_and_normalize_success() {
 }
 
 #[test]
-fn test_validate_and_normalize_out_of_bounds() {
+fn test_validate_out_of_range() {
     let decision = make_scaled_decision(0.0, 100.0, 1.0);
 
     // Out of bounds
@@ -119,7 +119,7 @@ fn test_validate_and_normalize_out_of_bounds() {
 }
 
 #[test]
-fn test_validate_and_normalize_nan_abstain() {
+fn test_validate_nan_abstains() {
     let decision = make_scaled_decision(0.0, 100.0, 1.0);
     // NaN is valid - it means "abstain" in voting
     let result = decision.validate_and_normalize(f64::NAN);
@@ -179,8 +179,9 @@ fn try_new_scaled(
     )
 }
 
+/// Scaled claims reject bad bounds, non-positive or unaligned increments
 #[test]
-fn test_scaled_claim_rejects_invalid_bounds() {
+fn test_scaled_rejects_invalid() {
     use crate::state::Error::InvalidScaled;
     assert!(matches!(
         try_new_scaled(0.0, 10.0, 0.0),
@@ -209,7 +210,7 @@ fn test_scaled_claim_rejects_invalid_bounds() {
 }
 
 #[test]
-fn test_scaled_claim_accepts_aligned_range() {
+fn test_scaled_accepts_aligned() {
     assert!(try_new_scaled(0.0, 10.0, 1.0).is_ok());
     assert!(try_new_scaled(0.0, 10.0, 2.0).is_ok());
     assert!(try_new_scaled(32.0, 100.0, 0.5).is_ok());
@@ -217,7 +218,7 @@ fn test_scaled_claim_accepts_aligned_range() {
 }
 
 #[test]
-fn test_validate_and_normalize_step_alignment() {
+fn test_validate_step_alignment() {
     use crate::state::Error::InvalidVoteValue;
 
     let integer_step = make_scaled_decision(0.0, 10.0, 2.0);
@@ -253,7 +254,7 @@ fn test_validate_and_normalize_step_alignment() {
 }
 
 #[test]
-fn test_denormalize_roundtrips_step_values() {
+fn test_step_values_roundtrip() {
     let decision = make_scaled_decision(32.0, 100.0, 0.5);
     for v in [32.0, 32.5, 65.0, 99.5, 100.0] {
         let normalized = decision.normalize_value(v);
@@ -322,7 +323,7 @@ fn test_decision_id_hex_roundtrip() {
 }
 
 #[test]
-fn test_decision_id_standard_bit_encoding() {
+fn test_decision_id_standard_bit() {
     let std_id = DecisionId::new(true, 1, 0).unwrap();
     let nonstd_id = DecisionId::new(false, 1, 0).unwrap();
     assert_ne!(std_id.as_bytes(), nonstd_id.as_bytes());
@@ -333,11 +334,11 @@ fn test_decision_id_standard_bit_encoding() {
 }
 
 #[test]
-fn category_claim_accepts_option_limit() {
+fn category_accepts_max() {
     let decision = Decision::new(
         [0; 20],
         DecisionType::Category {
-            options: vec![String::new(); usize::from(u16::MAX)],
+            options: vec![String::new(); super::types::MAX_CATEGORY_OPTIONS],
         },
         String::new(),
         String::new(),
@@ -346,15 +347,21 @@ fn category_claim_accepts_option_limit() {
         vec![],
     )
     .unwrap();
-    assert_eq!(decision.inconclusive_index(), Some(u16::MAX));
+    assert_eq!(
+        decision.inconclusive_index(),
+        Some(super::types::MAX_CATEGORY_OPTIONS as u16)
+    );
 }
 
 #[test]
-fn category_claim_rejects_excess_options() {
+fn category_rejects_excess() {
     let result = Decision::new(
         [0; 20],
         DecisionType::Category {
-            options: vec![String::new(); usize::from(u16::MAX) + 1],
+            options: vec![
+                String::new();
+                super::types::MAX_CATEGORY_OPTIONS + 1
+            ],
         },
         String::new(),
         String::new(),
@@ -448,13 +455,15 @@ fn check_claim_rollback(direct: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reverting a claim then rolling back matches a clean state
 #[test]
-fn claim_reorg_preserves_period_and_prices() -> anyhow::Result<()> {
+fn claim_revert_matches_clean() -> anyhow::Result<()> {
     check_claim_rollback(true)
 }
 
+/// Rolling back without reverting the claim matches a clean state
 #[test]
-fn state_rollback_preserves_period_and_prices() -> anyhow::Result<()> {
+fn rollback_matches_clean() -> anyhow::Result<()> {
     check_claim_rollback(false)
 }
 
@@ -465,8 +474,9 @@ fn decision_id_key_bytes(id: &DecisionId) -> Vec<u8> {
         .into_owned()
 }
 
+/// Decision ids with periods above 127 round-trip through every encoding
 #[test]
-fn test_decision_id_period_above_127_roundtrips() {
+fn test_high_period_roundtrip() {
     for (is_standard, period, index) in
         [(true, 128, 0), (true, 200, 7), (false, 32767, 65535)]
     {
@@ -495,7 +505,7 @@ fn test_decision_id_period_above_127_roundtrips() {
 }
 
 #[test]
-fn test_decision_id_key_order_follows_period() {
+fn test_key_order_by_period() {
     for is_standard in [false, true] {
         let ids: Vec<DecisionId> = [(1, 65535), (127, 0), (128, 0), (300, 5)]
             .into_iter()
@@ -513,8 +523,9 @@ fn test_decision_id_key_order_follows_period() {
     }
 }
 
+/// A decision can be claimed in a period above 127
 #[test]
-fn test_claim_decision_in_period_above_127() {
+fn test_high_period_claim() {
     use super::{Dbs, DecisionConfig};
     use crate::types::{Hash, Txid};
     use std::num::NonZeroU32;
@@ -558,4 +569,252 @@ fn test_claim_decision_in_period_above_127() {
     assert_eq!(entry.decision_id, decision_id);
     assert!(entry.decision.is_some());
     assert_eq!(dbs.claimed_count_in_period(&rwtxn, period).unwrap(), 1);
+}
+
+/// Claims are rejected for a period once it is voting
+#[test]
+fn claims_close_at_voting() {
+    use super::{Dbs, DecisionConfig};
+    use std::num::NonZeroU32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
+    options.map_size(16 * 1024 * 1024).max_dbs(Dbs::NUM_DBS);
+    let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
+    let mut rwtxn = env.write_txn().unwrap();
+    let dbs = Dbs::new_with_config(
+        &env,
+        &mut rwtxn,
+        DecisionConfig::testing(NonZeroU32::new(10).unwrap()),
+    )
+    .unwrap();
+    let height = 25;
+    dbs.mint_genesis(&mut rwtxn, 0, height, 0).unwrap();
+    let current = dbs.get_current_period(0, Some(height), 0).unwrap();
+    let validate = |is_standard, period| {
+        dbs.validate_decision_claim(
+            &rwtxn,
+            DecisionId::new(is_standard, period, 0).unwrap(),
+            &make_binary_decision(),
+            0,
+            Some(height),
+            0,
+        )
+    };
+
+    for is_standard in [false, true] {
+        assert!(validate(is_standard, current - 1).is_err());
+        validate(is_standard, current).unwrap();
+    }
+}
+
+/// Open-period and resolution indexes track each transition and rollback
+#[test]
+fn decision_state_machine() {
+    use super::{Dbs, DecisionConfig};
+    use std::{collections::BTreeSet, num::NonZeroU32};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
+    options.map_size(16 * 1024 * 1024).max_dbs(Dbs::NUM_DBS);
+    let env = unsafe { sneed::Env::open(&options, dir.path()) }.unwrap();
+    let mut rwtxn = env.write_txn().unwrap();
+    let dbs = Dbs::new_with_config(
+        &env,
+        &mut rwtxn,
+        DecisionConfig::testing(NonZeroU32::new(10).unwrap()),
+    )
+    .unwrap();
+    dbs.mint_genesis(&mut rwtxn, 0, 0, 0).unwrap();
+    let decision_id = DecisionId::new(false, 1, 0).unwrap();
+    let voting_period = decision_id.voting_period();
+    dbs.claim_decision(
+        &mut rwtxn,
+        decision_id,
+        make_binary_decision(),
+        crate::types::Txid([0; 32]),
+        Some(1),
+    )
+    .unwrap();
+    assert_eq!(
+        dbs.get_claimed_decisions_needing_voting(&rwtxn, voting_period)
+            .unwrap(),
+        vec![decision_id],
+    );
+    assert!(dbs.get_open_voting_periods(&rwtxn).unwrap().is_empty());
+
+    dbs.transition_decision_to_voting(&mut rwtxn, decision_id, 10)
+        .unwrap();
+    dbs.transition_decision_to_revealing(&mut rwtxn, decision_id, 20)
+        .unwrap();
+    assert_eq!(
+        dbs.get_open_voting_periods(&rwtxn).unwrap(),
+        BTreeSet::from([voting_period]),
+    );
+    assert_eq!(
+        dbs.get_revealing_decisions_needing_resolution(&rwtxn, 0, Some(21), 0)
+            .unwrap(),
+        vec![decision_id],
+    );
+
+    dbs.transition_decision_to_resolved(&mut rwtxn, decision_id, 21, 1.0)
+        .unwrap();
+    assert!(dbs.get_open_voting_periods(&rwtxn).unwrap().is_empty());
+    assert!(
+        dbs.get_revealing_decisions_needing_resolution(&rwtxn, 0, Some(21), 0)
+            .unwrap()
+            .is_empty()
+    );
+
+    dbs.rollback_decision_states_to_height(&mut rwtxn, 20)
+        .unwrap();
+    assert_eq!(
+        dbs.get_open_voting_periods(&rwtxn).unwrap(),
+        BTreeSet::from([voting_period]),
+    );
+
+    dbs.revert_decision_claim(&mut rwtxn, decision_id).unwrap();
+    dbs.rollback_decision_states_to_height(&mut rwtxn, 0)
+        .unwrap();
+    assert!(dbs.get_open_voting_periods(&rwtxn).unwrap().is_empty());
+    assert!(
+        dbs.get_claimed_decisions_needing_voting(&rwtxn, voting_period)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Nonstandard claims past the period cap fail while standard claims still pass
+#[test]
+fn nonstandard_claim_cap() -> anyhow::Result<()> {
+    use crate::math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX;
+    use crate::state::test::fresh_state;
+
+    let (_dir, env, state) = fresh_state("nonstandard_claims_cap")?;
+    let decisions = state.decisions();
+    let mut rwtxn = env.write_txn()?;
+    decisions.mint_genesis(&mut rwtxn, 1000, 0, 1000)?;
+    let decision = make_binary_decision();
+    let cap = NONSTANDARD_SLOTS_PER_PERIOD_MAX as u32;
+    for index in 0..cap {
+        decisions.claim_decision(
+            &mut rwtxn,
+            DecisionId::new(false, 2, index)?,
+            decision.clone(),
+            crate::types::Txid([1; 32]),
+            Some(1),
+        )?;
+    }
+
+    let over_cap = DecisionId::new(false, 2, cap)?;
+    assert!(
+        decisions
+            .validate_decision_claim(
+                &rwtxn,
+                over_cap,
+                &decision,
+                1000,
+                Some(1),
+                1000,
+            )
+            .is_err()
+    );
+    assert!(
+        decisions
+            .claim_decision(
+                &mut rwtxn,
+                over_cap,
+                decision.clone(),
+                crate::types::Txid([1; 32]),
+                Some(1),
+            )
+            .is_err()
+    );
+    decisions.validate_decision_claim(
+        &rwtxn,
+        DecisionId::new(true, 2, 0)?,
+        &decision,
+        1000,
+        Some(1),
+        1000,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn option_labels_capped() {
+    let label = |len: usize| "x".repeat(len);
+    let binary = |option_0: String| {
+        Decision::new(
+            [0; 20],
+            DecisionType::Binary,
+            String::new(),
+            String::new(),
+            Some(option_0),
+            None,
+            vec![],
+        )
+    };
+    let category = |option: String| {
+        Decision::new(
+            [0; 20],
+            DecisionType::Category {
+                options: vec![option, "B".into()],
+            },
+            String::new(),
+            String::new(),
+            None,
+            None,
+            vec![],
+        )
+    };
+    let max = super::types::MAX_OPTION_LABEL_BYTES;
+
+    binary(label(max)).unwrap();
+    assert!(binary(label(max + 1)).is_err());
+    category(label(max)).unwrap();
+    assert!(category(label(max + 1)).is_err());
+}
+
+#[test]
+fn decisions_keyed_by_id() -> anyhow::Result<()> {
+    use crate::state::test::fresh_state;
+
+    let (_dir, env, state) = fresh_state("decisions_by_id")?;
+    let decisions = state.decisions();
+    let mut rwtxn = env.write_txn()?;
+    decisions.mint_genesis(&mut rwtxn, 1000, 0, 1000)?;
+    let ids: Vec<DecisionId> = (0..300)
+        .map(|index| DecisionId::new(false, 2, index))
+        .collect::<Result<_, _>>()?;
+    for (index, id) in ids.iter().enumerate() {
+        let mut decision = make_binary_decision();
+        decision.header = format!("decision {index}");
+        decisions.claim_decision(
+            &mut rwtxn,
+            *id,
+            decision,
+            crate::types::Txid([1; 32]),
+            Some(1),
+        )?;
+    }
+
+    let found = decisions
+        .get_decision_entry(&rwtxn, ids[123])?
+        .and_then(|entry| entry.decision)
+        .map(|decision| decision.header);
+    assert_eq!(found.as_deref(), Some("decision 123"));
+    assert_eq!(
+        decisions.get_claimed_decisions_in_period(&rwtxn, 2)?.len(),
+        300
+    );
+
+    decisions.revert_decision_claim(&mut rwtxn, ids[123])?;
+    assert!(decisions.get_decision_entry(&rwtxn, ids[123])?.is_none());
+    assert_eq!(
+        decisions.get_claimed_decisions_in_period(&rwtxn, 2)?.len(),
+        299
+    );
+    assert_eq!(decisions.get_highest_minted_period(&rwtxn)?, Some(20));
+    Ok(())
 }

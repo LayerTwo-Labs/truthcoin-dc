@@ -16,6 +16,19 @@ use crate::{
     },
 };
 
+/// Utreexo roots compared as the bytes that the header hash commits, so an
+/// empty root matches a zero hash however a peer encoded it
+fn roots_match(
+    roots: &[UtreexoNodeHash],
+    header_roots: &[UtreexoNodeHash],
+) -> bool {
+    roots.len() == header_roots.len()
+        && roots
+            .iter()
+            .zip(header_roots)
+            .all(|(root, header_root)| **root == **header_root)
+}
+
 /// Prevalidate a block: compute and verify all read-only checks and
 /// prepare data needed for fast connection.
 pub fn prevalidate(
@@ -43,6 +56,7 @@ pub fn prevalidate(
     if body_size > State::body_size_limit(next_height) as u64 {
         return Err(Error::BodyTooLarge);
     }
+    crate::validation::vote::check_ballot_conflicts(&body.transactions)?;
 
     let mut accumulator = state
         .utreexo_accumulator
@@ -109,25 +123,14 @@ pub fn prevalidate(
         if !accumulator.verify(&transaction.proof, &spent_utxo_hashes)? {
             return Err(Error::UtreexoProofFailed { txid });
         }
-        let filled_tx = FilledTransaction {
+        filled_transactions.push(FilledTransaction {
             spent_utxos,
             transaction: transaction.clone(),
             actor_address: actor_address(body, tx_idx),
-        };
-        total_fees = total_fees
-            .checked_add(state.validate_filled_transaction(
-                rotxn,
-                prev_main_height,
-                &filled_tx,
-                archive,
-                Some(next_height),
-            )?)
-            .ok_or(AmountOverflowError)?;
-        filled_transactions.push(filled_tx);
+        });
     }
-    let () =
-        crate::validation::check_duplicate_decision_claims(&body.transactions)?;
-    crate::validation::vote::check_duplicate_votes(&body.transactions)?;
+    // A body that does not match its header fails here, before the costlier
+    // per-transaction validation below.
     let computed_merkle_root = Body::compute_merkle_root(
         &body.coinbase,
         filled_transactions.as_slice(),
@@ -141,6 +144,21 @@ pub fn prevalidate(
         };
         return Err(err);
     }
+    for filled_tx in &filled_transactions {
+        total_fees = total_fees
+            .checked_add(state.validate_filled_transaction(
+                rotxn,
+                prev_main_height,
+                filled_tx,
+                archive,
+                Some(next_height),
+            )?)
+            .ok_or(AmountOverflowError)?;
+    }
+    let () =
+        crate::validation::check_duplicate_decision_claims(&body.transactions)?;
+    let () =
+        crate::validation::check_duplicate_offer_closes(&body.transactions)?;
     {
         use rayon::prelude::ParallelSliceMut;
         all_input_keys.par_sort_unstable();
@@ -204,7 +222,7 @@ pub fn prevalidate(
     let () = accumulator.apply_diff(accumulator_diff.clone())?;
     let () = accumulator.apply_diff(construction_diff)?;
     let roots: Vec<UtreexoNodeHash> = accumulator.get_roots();
-    if roots != header.roots {
+    if !roots_match(&roots, &header.roots) {
         return Err(Error::UtreexoRootsMismatch);
     }
 
@@ -386,6 +404,7 @@ pub fn validate(
     if body_size > State::body_size_limit(height) as u64 {
         return Err(Error::BodyTooLarge);
     }
+    crate::validation::vote::check_ballot_conflicts(&body.transactions)?;
     let mut accumulator = state
         .utreexo_accumulator
         .try_get(rotxn, &())
@@ -510,7 +529,8 @@ pub fn validate(
     }
     let () =
         crate::validation::check_duplicate_decision_claims(&body.transactions)?;
-    crate::validation::vote::check_duplicate_votes(&body.transactions)?;
+    let () =
+        crate::validation::check_duplicate_offer_closes(&body.transactions)?;
     if coinbase_value > total_fees {
         return Err(Error::NotEnoughFees);
     }
@@ -528,7 +548,7 @@ pub fn validate(
     // Check root consistency without committing to DB
     let () = accumulator.apply_diff(accumulator_diff)?;
     let roots: Vec<UtreexoNodeHash> = accumulator.get_roots();
-    if roots != header.roots {
+    if !roots_match(&roots, &header.roots) {
         return Err(Error::UtreexoRootsMismatch);
     }
     Ok((total_fees, merkle_root))
@@ -793,13 +813,14 @@ pub fn disconnect_tip_body(
         &skipped_tx_indices,
         trade_share_deltas,
     )?;
-    if header.prev_side_hash.is_none()
-        && height == 0
-        && let Some(output) = body.coinbase.outputs.iter().next()
-    {
-        state
-            .reputation()
-            .delete_reputation(rwtxn, &output.address)?;
+    if header.prev_side_hash.is_none() && height == 0 {
+        let allocation = super::reputation::genesis_allocation(
+            state.genesis_reputation_to_miner,
+            body,
+        )?;
+        for address in allocation.keys() {
+            state.reputation().delete_reputation(rwtxn, address)?;
+        }
     }
     // NOTE: the tip, height, and coinbase height are NOT rolled back
     // here; that happens after 2WPD is disconnected, in
@@ -870,8 +891,9 @@ mod test {
         types::FilledTransaction,
     };
 
+    /// Block actor proofs obey the signature limit.
     #[test]
-    fn block_actor_proofs_obey_signature_limit() -> anyhow::Result<()> {
+    fn actor_proofs_obey_limit() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::{
@@ -958,8 +980,9 @@ mod test {
         Ok(())
     }
 
+    /// A genesis reorg replaces the reputation credit.
     #[test]
-    fn genesis_reorg_replaces_reputation_credit() -> anyhow::Result<()> {
+    fn genesis_reorg_replaces_credit() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::types::{
@@ -1020,7 +1043,7 @@ mod test {
             )?;
             assert_eq!(
                 state.reputation().get_reputation(&rwtxn, &address)?,
-                1.0
+                crate::types::Votecoin::TOTAL
             );
             if address == first_address {
                 state.disconnect_withdrawal_bundle_creation(&mut rwtxn)?;
@@ -1035,14 +1058,259 @@ mod test {
 
         assert_eq!(
             state.reputation().get_reputation(&rwtxn, &first_address)?,
-            0.0
+            crate::types::Votecoin::ZERO
         );
         assert_eq!(state.reputation().count_holders(&rwtxn)?, 1);
         Ok(())
     }
 
+    /// A body that does not match its header fails on the merkle root,
+    /// before any transaction is validated
     #[test]
-    fn validation_rejects_outpoint_utxo_hash_mismatch() -> anyhow::Result<()> {
+    fn body_mismatch_fails_early() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::{
+            state::Error,
+            types::{
+                Body, Header, MerkleRoot, Transaction, TransactionData,
+                authorization::BatchVerificationContext,
+            },
+        };
+
+        let (_temp_dir, env, state) =
+            fresh_state("a_mismatched_body_fails_before_validation")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let header = Header {
+            merkle_root: MerkleRoot::from([9; 32]),
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        // A claim with no inputs fails validation (no maker), but only after
+        // the merkle root check
+        let body = Body::new(
+            vec![crate::types::Authorized {
+                transaction: Transaction {
+                    data: Some(TransactionData::ClaimDecision(
+                        crate::types::ClaimDecisionPayload {
+                            decision_type:
+                                crate::state::decisions::DecisionType::Binary,
+                            decisions: Vec::new(),
+                        },
+                    )),
+                    ..Default::default()
+                },
+                authorizations: Vec::new(),
+                actor_proof: None,
+            }],
+            Coinbase::default(),
+        );
+        let rotxn = env.read_txn()?;
+        let result = super::prevalidate(
+            &BatchVerificationContext::new(&mut rand::rng()),
+            &state,
+            &rotxn,
+            &header,
+            0,
+            &body,
+            &archive,
+        );
+        assert!(
+            matches!(result, Err(Error::InvalidBody { .. })),
+            "{:?}",
+            result.err()
+        );
+        Ok(())
+    }
+
+    /// An empty utreexo root and a zero hash are the same bytes in the
+    /// header hash, so a peer that swaps one for the other changes neither
+    /// the block hash nor root validation
+    #[test]
+    fn root_encoding_ignored() {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::types::{Header, MerkleRoot, UtreexoNodeHash};
+
+        let header = |root| Header {
+            merkle_root: MerkleRoot::from([1; 32]),
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: vec![UtreexoNodeHash::Some([7; 32]), root],
+        };
+        let honest = header(UtreexoNodeHash::Empty);
+        let swapped = header(UtreexoNodeHash::Some([0; 32]));
+
+        assert_eq!(honest.hash(), swapped.hash());
+        assert!(super::roots_match(&honest.roots, &swapped.roots));
+        assert!(!super::roots_match(
+            &honest.roots,
+            &header(UtreexoNodeHash::Some([8; 32])).roots
+        ));
+        assert!(!super::roots_match(&honest.roots, &honest.roots[..1]));
+    }
+
+    /// A disconnect returns the mainchain timestamp to the parent's, so a
+    /// replacement block validates against the same time on every node, even
+    /// when the disconnected block crossed into the next quarter.
+    #[test]
+    fn disconnect_restores_timestamp() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::types::{
+            AccumulatorDiff, Address, Body, Header, OutPoint, PointedOutput,
+            authorization::BatchVerificationContext,
+        };
+
+        const Q4_2026: u64 = 1_790_812_800;
+        const Q1_2027: u64 = 1_798_761_600;
+
+        let (_temp_dir, env, state) =
+            fresh_state("disconnect_restores_mainchain_timestamp")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let batch = BatchVerificationContext::new(&mut rand::rng());
+        let mut rwtxn = env.write_txn()?;
+        let mut prev_side_hash = None;
+        let mut blocks = Vec::new();
+        for (index, timestamp) in [Q4_2026, Q1_2027].into_iter().enumerate() {
+            let output = value_output(Address([index as u8 + 1; 20]), 0);
+            let body = Body::new(
+                Vec::new(),
+                Coinbase {
+                    outputs: vec![output.clone()].into(),
+                    ..Default::default()
+                },
+            );
+            let mut header = Header {
+                merkle_root: Body::compute_merkle_root::<FilledTransaction>(
+                    &body.coinbase,
+                    &[],
+                    &body.authorizations,
+                    &body.actor_proofs,
+                )?,
+                prev_side_hash,
+                prev_main_hash: bitcoin::BlockHash::all_zeros(),
+                roots: Vec::new(),
+            };
+            let mut accumulator = state.get_accumulator(&rwtxn)?;
+            let mut diff = AccumulatorDiff::default();
+            diff.insert(
+                (&PointedOutput {
+                    outpoint: OutPoint::Coinbase {
+                        txid: header.compute_coinbase_txid(),
+                        vout: 0,
+                    },
+                    output,
+                })
+                    .into(),
+            );
+            accumulator.apply_diff(diff)?;
+            header.roots = accumulator.get_roots();
+            state.apply_block(
+                &mut rwtxn, &batch, &header, 0, &body, &archive, timestamp,
+            )?;
+            archive.put_header(&mut rwtxn, &header)?;
+            prev_side_hash = Some(header.hash());
+            blocks.push((header, body));
+        }
+        assert_eq!(state.try_get_mainchain_timestamp(&rwtxn)?, Some(Q1_2027));
+
+        for (header, body) in blocks.iter().rev() {
+            state.disconnect_tip_body(&mut rwtxn, header, body)?;
+            state.disconnect_tip_header(&mut rwtxn, header)?;
+            let expected = header.prev_side_hash.map(|_| Q4_2026);
+            assert_eq!(state.try_get_mainchain_timestamp(&rwtxn)?, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_credits_whitelist() -> anyhow::Result<()> {
+        use std::collections::BTreeSet;
+
+        use bitcoin::hashes::Hash as _;
+
+        use crate::{
+            state::{State, reputation::GENESIS_VOTERS, test::temp_env},
+            types::{
+                AccumulatorDiff, Address, Body, Header, OutPoint,
+                PointedOutput, authorization::BatchVerificationContext,
+            },
+        };
+
+        let (_temp_dir, env) = temp_env("genesis_credits_whitelist")?;
+        let state = State::new(&env, None, false)?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let batch = BatchVerificationContext::new(&mut rand::rng());
+        let mut rwtxn = env.write_txn()?;
+        let output = value_output(Address([1; 20]), 0);
+        let body = Body::new(
+            Vec::new(),
+            Coinbase {
+                outputs: vec![output.clone()].into(),
+                ..Default::default()
+            },
+        );
+        let mut header = Header {
+            merkle_root: Body::compute_merkle_root::<FilledTransaction>(
+                &body.coinbase,
+                &[],
+                &body.authorizations,
+                &body.actor_proofs,
+            )?,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        let mut accumulator = state.get_accumulator(&rwtxn)?;
+        let mut diff = AccumulatorDiff::default();
+        diff.insert(
+            (&PointedOutput {
+                outpoint: OutPoint::Coinbase {
+                    txid: header.compute_coinbase_txid(),
+                    vout: 0,
+                },
+                output,
+            })
+                .into(),
+        );
+        accumulator.apply_diff(diff)?;
+        header.roots = accumulator.get_roots();
+        state.apply_block(
+            &mut rwtxn,
+            &batch,
+            &header,
+            0,
+            &body,
+            &archive,
+            1_700_000_000,
+        )?;
+
+        let whitelist = GENESIS_VOTERS
+            .iter()
+            .map(|address| address.parse())
+            .collect::<Result<BTreeSet<Address>, _>>()?;
+        let reputations = state.reputation().get_all_reputations(&rwtxn)?;
+        assert_eq!(
+            reputations.keys().copied().collect::<BTreeSet<_>>(),
+            whitelist
+        );
+        assert!(
+            reputations
+                .values()
+                .all(|&rep| rep == crate::types::Votecoin(20_000))
+        );
+
+        state.disconnect_tip_body(&mut rwtxn, &header, &body)?;
+        state.disconnect_tip_header(&mut rwtxn, &header)?;
+        assert_eq!(state.reputation().count_holders(&rwtxn)?, 0);
+        Ok(())
+    }
+
+    /// Validation rejects an outpoint whose UTXO hash does not match.
+    #[test]
+    fn utxo_hash_mismatch_rejected() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::types::{
@@ -1406,8 +1674,9 @@ mod test {
         Ok((temp_dir, env, state, header, body, batch_verification_ctxt))
     }
 
+    /// A block may carry a parent transaction and its child.
     #[test]
-    fn a_block_carries_a_parent_and_its_child() -> anyhow::Result<()> {
+    fn parent_and_child_accepted() -> anyhow::Result<()> {
         let (_temp_dir, env, state, header, body, ctxt) =
             chained_block("a_block_carries_a_parent_and_its_child", false)?;
         let archive = crate::archive::Archive::new(&env)?;
@@ -1435,7 +1704,7 @@ mod test {
     }
 
     #[test]
-    fn a_child_before_its_parent_is_rejected() -> anyhow::Result<()> {
+    fn child_before_parent_rejected() -> anyhow::Result<()> {
         let (_temp_dir, env, state, header, body, ctxt) =
             chained_block("a_child_before_its_parent_is_rejected", true)?;
         let archive = crate::archive::Archive::new(&env)?;
@@ -1469,8 +1738,9 @@ mod test {
         Ok(())
     }
 
+    /// A block with duplicate sealed ballots is rejected.
     #[test]
-    fn duplicate_signed_votes_in_block_are_rejected() -> anyhow::Result<()> {
+    fn duplicate_ballots_rejected() -> anyhow::Result<()> {
         use crate::{
             state::decisions::{Decision, DecisionId, DecisionType},
             types::{
@@ -1501,7 +1771,11 @@ mod test {
         state.genesis_timestamp.put(&mut txn, &(), &1000)?;
         state.mainchain_timestamp.put(&mut txn, &(), &timestamp)?;
         state.height.put(&mut txn, &(), &10)?;
-        state.reputation().set_reputation(&mut txn, &voter, 1.0)?;
+        state.reputation().set_reputation(
+            &mut txn,
+            &voter,
+            crate::types::Votecoin::TOTAL,
+        )?;
         state
             .decisions()
             .mint_genesis(&mut txn, timestamp, 10, 1000)?;
@@ -1517,80 +1791,65 @@ mod test {
             decision_id,
             1,
         )?;
-        for ballots in
-            [[false, false], [false, true], [true, false], [true, true]]
-        {
-            let mut txs = vec![];
-            let mut filled = vec![];
-            for (value, ballot) in [0.0, 1.0].into_iter().zip(ballots) {
-                let transaction = Transaction {
-                    data: Some(if ballot {
-                        TxData::SubmitBallot {
-                            voter,
-                            voting_period: 2,
-                            votes: vec![crate::types::BallotItem {
-                                decision_id_bytes: decision_id.as_bytes(),
-                                vote_value: value,
-                            }],
-                        }
-                    } else {
-                        TxData::SubmitVote {
-                            voter,
-                            decision_id_bytes: decision_id.as_bytes(),
-                            vote_value: value,
-                            voting_period: 2,
-                        }
-                    }),
-                    ..Default::default()
-                };
-                let proof = Authorization {
-                    verifying_key: (&key).into(),
-                    signature: authorization::sign_tx(
-                        &mut rng,
-                        &key,
-                        &transaction,
-                    )?,
-                };
-                filled.push(FilledTransaction {
-                    transaction: transaction.clone(),
-                    spent_utxos: vec![],
-                    actor_address: Some(voter),
-                });
-                txs.push(AuthorizedTransaction {
-                    transaction,
-                    authorizations: vec![],
-                    actor_proof: Some(Box::new(proof)),
-                });
-            }
-            let body = Body::new(txs, Coinbase::default());
-            let header = Header {
-                merkle_root: Body::compute_merkle_root(
-                    &body.coinbase,
-                    &filled,
-                    &body.authorizations,
-                    &body.actor_proofs,
-                )?,
-                prev_side_hash: None,
-                prev_main_hash: bitcoin::BlockHash::all_zeros(),
-                roots: state.get_accumulator(&txn)?.get_roots(),
+        let mut txs = vec![];
+        let mut filled = vec![];
+        for commitment in [[1; 32], [2; 32]] {
+            let transaction = Transaction {
+                data: Some(TxData::SubmitBallot {
+                    voter,
+                    voting_period: 2,
+                    commitment,
+                }),
+                ..Default::default()
             };
-            let batch = BatchVerificationContext::new(&mut rng);
-            let validation =
-                state.validate_block(&txn, &batch, &header, 0, &body, &archive);
-            let prevalidation = state
-                .prevalidate_block(&txn, &batch, &header, 0, &body, &archive);
-            assert!(
-                matches!(validation, Err(crate::state::Error::InvalidTransaction { reason }) if reason == "Duplicate vote in block")
-            );
-            assert!(
-                matches!(prevalidation, Err(crate::state::Error::InvalidTransaction { reason }) if reason == "Duplicate vote in block")
-            );
+            let proof = Authorization {
+                verifying_key: (&key).into(),
+                signature: authorization::sign_tx(
+                    &mut rng,
+                    &key,
+                    &transaction,
+                )?,
+            };
+            filled.push(FilledTransaction {
+                transaction: transaction.clone(),
+                spent_utxos: vec![],
+                actor_address: Some(voter),
+            });
+            txs.push(AuthorizedTransaction {
+                transaction,
+                authorizations: vec![],
+                actor_proof: Some(Box::new(proof)),
+            });
         }
+        let body = Body::new(txs, Coinbase::default());
+        let header = Header {
+            merkle_root: Body::compute_merkle_root(
+                &body.coinbase,
+                &filled,
+                &body.authorizations,
+                &body.actor_proofs,
+            )?,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: state.get_accumulator(&txn)?.get_roots(),
+        };
+        let batch = BatchVerificationContext::new(&mut rng);
+        let validation =
+            state.validate_block(&txn, &batch, &header, 0, &body, &archive);
+        let prevalidation =
+            state.prevalidate_block(&txn, &batch, &header, 0, &body, &archive);
+        assert!(
+            matches!(validation, Err(crate::state::Error::InvalidTransaction { reason }) if reason == "Duplicate ballot in block")
+        );
+        assert!(
+            matches!(prevalidation, Err(crate::state::Error::InvalidTransaction { reason }) if reason == "Duplicate ballot in block")
+        );
         Ok(())
     }
 
+    /// The body size limit counts utreexo proofs.
     #[test]
-    fn body_size_counts_utreexo_proofs() -> anyhow::Result<()> {
+    fn body_size_counts_proofs() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::{
@@ -1650,8 +1909,9 @@ mod test {
         Ok(())
     }
 
+    /// A block rejects outputs without inputs.
     #[test]
-    fn a_block_rejects_outputs_without_inputs() -> anyhow::Result<()> {
+    fn inputless_outputs_rejected() -> anyhow::Result<()> {
         use bitcoin::hashes::Hash as _;
 
         use crate::{

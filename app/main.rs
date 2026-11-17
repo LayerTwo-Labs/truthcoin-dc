@@ -237,6 +237,7 @@ fn main() -> anyhow::Result<()> {
         add_peers: config.add_peers,
         datadir: config.datadir,
         decision_config_testing: config.decision_config_testing,
+        genesis_reputation_to_miner: config.genesis_reputation_to_miner,
         mainchain_grpc_url: config.mainchain_grpc_url,
         mainchain_grpc_ca_cert: config.mainchain_grpc_ca_cert,
         mnemonic_seed_phrase_path: config.mnemonic_seed_phrase_path,

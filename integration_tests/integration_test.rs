@@ -18,6 +18,7 @@ use crate::{
     ibd::{ibd_trial, reorg_across_deposit_trial},
     list_mempool::list_mempool_trial,
     mainchain_tls::mainchain_tls_trial,
+    production_periods::production_periods_trial,
     receive_address::receive_address_trial,
     roundtrip::roundtrip_trial,
     setup::{Init, PostSetup},
@@ -205,6 +206,11 @@ pub fn tests(
             failure_collector.clone(),
         ),
         list_mempool_trial(
+            bin_paths.clone(),
+            file_registry.clone(),
+            failure_collector.clone(),
+        ),
+        production_periods_trial(
             bin_paths.clone(),
             file_registry.clone(),
             failure_collector.clone(),

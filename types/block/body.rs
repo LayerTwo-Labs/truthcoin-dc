@@ -379,7 +379,7 @@ mod test {
     /// CVE-2012-2459: a tree that pads an odd level with a copy of its last
     /// node gives the same root to a body with a repeated tail.
     #[test]
-    fn repeated_tail_changes_merkle_root() -> anyhow::Result<()> {
+    fn repeated_tail_merkle_root() -> anyhow::Result<()> {
         const MAX_TXS: u8 = 9;
         let coinbase = Coinbase::default();
         let txs: Vec<_> = (1..=MAX_TXS).map(filled_tx).collect();

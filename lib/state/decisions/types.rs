@@ -5,6 +5,9 @@ use std::num::NonZeroU32;
 
 pub use truthcoin_dc_types::decision::{DecisionId, DecisionType};
 
+pub const MAX_CATEGORY_OPTIONS: usize = 256;
+pub const MAX_OPTION_LABEL_BYTES: usize = 64;
+
 fn is_step_aligned(delta: f64, step: f64) -> bool {
     let k = (delta / step).round();
     let tolerance = (step.abs() * 1e-9).max(1e-12);
@@ -56,6 +59,16 @@ impl Decision {
                 });
             }
         }
+        for label in [&option_0_label, &option_1_label].into_iter().flatten() {
+            if label.len() > MAX_OPTION_LABEL_BYTES {
+                return Err(Error::InvalidDecisionId {
+                    reason: format!(
+                        "Option label '{label}' exceeds \
+                         {MAX_OPTION_LABEL_BYTES} byte limit"
+                    ),
+                });
+            }
+        }
 
         match &decision_type {
             DecisionType::Binary => {}
@@ -95,11 +108,23 @@ impl Decision {
                             .to_string(),
                     });
                 }
-                if options.len() > usize::from(u16::MAX) {
+                if options.len() > MAX_CATEGORY_OPTIONS {
                     return Err(Error::InvalidDecisionId {
-                        reason:
-                            "Category decisions permit at most 65535 options"
-                                .to_string(),
+                        reason: format!(
+                            "Category decisions permit at most \
+                             {MAX_CATEGORY_OPTIONS} options"
+                        ),
+                    });
+                }
+                if let Some(option) = options
+                    .iter()
+                    .find(|option| option.len() > MAX_OPTION_LABEL_BYTES)
+                {
+                    return Err(Error::InvalidDecisionId {
+                        reason: format!(
+                            "Category option '{option}' exceeds \
+                             {MAX_OPTION_LABEL_BYTES} byte limit"
+                        ),
                     });
                 }
             }
@@ -321,6 +346,23 @@ impl DecisionStateHistory {
         Ok(())
     }
 
+    pub fn transition_to_revealing(
+        &mut self,
+        height: u32,
+    ) -> Result<(), Error> {
+        let current = self.current_state();
+        if !current.can_transition_to(DecisionState::Revealing) {
+            return Err(Error::InvalidDecisionState {
+                reason: format!(
+                    "Cannot transition to Revealing from {current:?}"
+                ),
+            });
+        }
+        self.state_history
+            .push((DecisionState::Revealing, height, None));
+        Ok(())
+    }
+
     pub fn transition_to_resolved(
         &mut self,
         consensus_outcome: f64,
@@ -404,6 +446,8 @@ pub struct DecisionEntry {
 
 pub(crate) const FUTURE_PERIODS: u32 = 20;
 pub(crate) const INITIAL_DECISIONS_PER_PERIOD: u64 = 500;
+pub(crate) const REVEAL_WINDOW_SECONDS: u32 = 7 * 24 * 3600;
+pub(crate) const REVEAL_WINDOW_BLOCKS: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct DecisionConfig {
@@ -413,14 +457,13 @@ pub struct DecisionConfig {
 
 impl Default for DecisionConfig {
     fn default() -> Self {
-        Self {
-            is_blocks: false,
-            quantity: 86400,
-        }
+        Self::production()
     }
 }
 
 impl DecisionConfig {
+    /// Calendar quarters. `quantity` is a quarter's nominal length, which
+    /// only sets the reprice interval; period boundaries follow the calendar.
     pub fn production() -> Self {
         Self {
             is_blocks: false,
@@ -439,6 +482,14 @@ impl DecisionConfig {
         self.is_blocks
     }
 
+    pub fn reveal_window(&self) -> u32 {
+        if self.is_blocks {
+            REVEAL_WINDOW_BLOCKS
+        } else {
+            REVEAL_WINDOW_SECONDS
+        }
+    }
+
     pub fn blocks_per_period(&self) -> Option<u32> {
         if self.is_blocks {
             Some(self.quantity)
@@ -446,32 +497,34 @@ impl DecisionConfig {
             None
         }
     }
-
-    pub fn seconds_per_period(&self) -> Option<u64> {
-        if !self.is_blocks {
-            Some(self.quantity as u64)
-        } else {
-            None
-        }
-    }
 }
 
 /// Convert period index to human-readable name (single source of truth).
-/// Returns "Genesis" for period 0, otherwise "Q{quarter} Y{year}".
+/// Returns "Genesis" for period 0, otherwise "Q{quarter} Y{year}" for the
+/// calendar quarter of the period, counting the quarter of `genesis_ts` as
+/// period 1.
 #[inline]
-pub fn period_to_name(period: u32) -> String {
+pub fn period_to_name(period: u32, genesis_ts: u64) -> String {
     if period == 0 {
         return "Genesis".to_string();
     }
-    let year = 2009 + (period - 1) / 4;
-    let quarter = ((period - 1) % 4) + 1;
-    format!("Q{quarter} Y{year}")
+    let quarter =
+        crate::state::voting::period_calculator::utc_quarter(genesis_ts)
+            + u64::from(period)
+            - 1;
+    let year = 1970 + quarter / 4;
+    let quarter_of_year = quarter % 4 + 1;
+    format!("Q{quarter_of_year} Y{year}")
 }
 
-pub fn period_to_string(period_idx: u32, config: &DecisionConfig) -> String {
+pub fn period_to_string(
+    period_idx: u32,
+    config: &DecisionConfig,
+    genesis_ts: u64,
+) -> String {
     if config.is_blocks {
         format!("Testing Period {period_idx}")
     } else {
-        period_to_name(period_idx)
+        period_to_name(period_idx, genesis_ts)
     }
 }

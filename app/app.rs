@@ -49,8 +49,19 @@ pub enum Error {
     MainchainTls(#[source] tonic::transport::Error),
     #[error("miner error")]
     Miner(#[from] miner::Error),
+    #[error(
+        "several addresses hold votecoin, choose a voter: {}",
+        .addresses
+            .iter()
+            .map(Address::as_base58)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    MultipleVoters { addresses: Vec<Address> },
     #[error("node error")]
     Node(#[source] Box<node::Error>),
+    #[error("{address} is not an address of this wallet")]
+    NotWalletAddress { address: Address },
     #[error("No CUSF mainchain wallet client")]
     NoCusfMainchainWalletClient,
     #[error("Failed to request mainchain ancestor info for {block_hash}")]
@@ -249,6 +260,8 @@ pub struct Config {
     pub datadir: PathBuf,
     /// Blocks per voting period, for a test network
     pub decision_config_testing: Option<u32>,
+    /// Credit the genesis votecoin to the genesis miner, for testing
+    pub genesis_reputation_to_miner: bool,
     pub mainchain_grpc_url: url::Url,
     /// Extra CA certificate (PEM) to trust for an `https` mainchain URL
     pub mainchain_grpc_ca_cert: Option<PathBuf>,
@@ -572,6 +585,7 @@ impl App {
                 network: config.network,
                 server_names: config.server_names,
                 decision_config_testing: config.decision_config_testing,
+                genesis_reputation_to_miner: config.genesis_reputation_to_miner,
             },
             cusf_mainchain,
             cusf_mainchain_block_producer,
@@ -647,6 +661,57 @@ impl App {
     pub fn sign_and_send(&self, tx: Transaction) -> Result<(), Error> {
         let authorized_transaction = self.wallet.authorize(rand::rng(), tx)?;
         self.submit_transaction(authorized_transaction)
+    }
+
+    fn wallet_addresses(&self) -> Result<HashSet<Address>, Error> {
+        let mut addresses = self.wallet.get_addresses()?;
+        addresses.insert(self.wallet.voter_address()?);
+        Ok(addresses)
+    }
+
+    /// The wallet's addresses that hold votecoin, with their votecoin
+    pub fn voter_addresses(
+        &self,
+    ) -> Result<Vec<(Address, truthcoin_dc::types::Votecoin)>, Error> {
+        let rotxn = self.node.read_txn()?;
+        let mut holders = Vec::new();
+        for address in self.wallet_addresses()? {
+            let votecoin = self
+                .node
+                .reputation()
+                .get_reputation(&rotxn, &address)
+                .map_err(node::Error::from)?;
+            if !votecoin.is_zero() {
+                holders.push((address, votecoin));
+            }
+        }
+        holders.sort_by_key(|(address, _)| *address);
+        Ok(holders)
+    }
+
+    /// The voter to act as: `voter` if it is a wallet address, or else the
+    /// one wallet address that holds votecoin, or the voter address when
+    /// none does
+    pub fn resolve_voter(
+        &self,
+        voter: Option<Address>,
+    ) -> Result<Address, Error> {
+        if let Some(address) = voter {
+            if !self.wallet_addresses()?.contains(&address) {
+                return Err(Error::NotWalletAddress { address });
+            }
+            return Ok(address);
+        }
+        match self.voter_addresses()?.as_slice() {
+            [] => Ok(self.wallet.voter_address()?),
+            [(address, _)] => Ok(*address),
+            holders => Err(Error::MultipleVoters {
+                addresses: holders
+                    .iter()
+                    .map(|(address, _)| *address)
+                    .collect(),
+            }),
+        }
     }
 
     pub async fn get_new_main_address(
@@ -1135,7 +1200,7 @@ mod test {
     /// The node may start before the mainchain node, so it waits for the
     /// validator service instead of an error.
     #[tokio::test]
-    async fn wait_for_the_validator_service() -> anyhow::Result<()> {
+    async fn wait_for_validator() -> anyhow::Result<()> {
         let reserved =
             reserve_port::ReservedSocketAddr::reserve_random_socket_addr()?;
         let addr = reserved.socket_addr();

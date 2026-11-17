@@ -12,11 +12,13 @@ use crate::{
     decision::DecisionType,
     error,
     hashes::{
-        self, Hash, InputsMerkleRoot, M6id, OutputsMerkleRoot, TxMerkleRoot,
-        Txid, hash_with_scratch_buffer,
+        self, Hash, InputsMerkleRoot, M6id, OfferId, OutputsMerkleRoot,
+        TxMerkleRoot, Txid, hash_with_scratch_buffer,
     },
     market::{DimensionSpec, MarketId},
+    offer::{SignedOffer, VotecoinOffer},
     schema,
+    votecoin::Votecoin,
 };
 
 pub mod inputs;
@@ -58,6 +60,25 @@ pub enum InPoint {
     Redistribution,
 }
 
+/// One leg of a trade: shares of one tradeable outcome to buy (positive) or
+/// sell (negative)
+#[derive(
+    BorshSerialize,
+    Clone,
+    Copy,
+    Debug,
+    Deserialize,
+    Eq,
+    PartialEq,
+    Serialize,
+    ToSchema,
+)]
+pub struct ShareDelta {
+    /// Position within the market's tradeable outcomes
+    pub outcome_index: u32,
+    pub shares: i64,
+}
+
 /// Struct representing a single vote in a batch vote transaction
 #[derive(
     BorshSerialize,
@@ -72,8 +93,10 @@ pub enum InPoint {
 pub struct BallotItem {
     /// 4 byte decision ID
     pub decision_id_bytes: [u8; 4],
-    /// The vote value (0.0-1.0 for binary, scaled range for scaled decisions)
-    pub vote_value: f64,
+    /// The vote value (0.0-1.0 for binary, scaled range for scaled decisions),
+    /// or `None` to abstain
+    #[borsh(serialize_with = "crate::util::borsh::serialize::option_f64")]
+    pub vote_value: Option<f64>,
 }
 
 #[derive(
@@ -114,41 +137,42 @@ pub enum TransactionData {
         #[schema(value_type = Vec<String>)]
         dimension_specs: Vec<DimensionSpec>,
         new_claims: Vec<ClaimDecisionPayload>,
+        #[borsh(serialize_with = "crate::util::borsh::serialize::option_f64")]
         trading_fee: Option<f64>,
         tx_pow_hash_selector: Option<u8>,
         tx_pow_ordering: Option<u8>,
         tx_pow_difficulty: Option<u8>,
     },
-    /// Trade shares in a prediction market (buy or sell).
-    /// `outcome_index` is the position within the market's tradeable outcomes
-    /// (i.e. index into `Market::get_valid_state_combos()`), not a full-state
-    /// combo index. Abstain/invalid states are voter-only and never tradeable.
+    /// Move a market's share vector: buy and sell any of its tradeable
+    /// outcomes at once, at the LMSR cost of the whole move. `max_cost` bounds
+    /// the net cost; a negative value is the least the trader accepts.
     Trade {
         market_id: MarketId,
-        outcome_index: u32,
-        shares: i64,
+        deltas: Vec<ShareDelta>,
         trader: Address,
-        limit_sats: u64,
+        max_cost: i64,
         tx_pow_nonce: Option<u64>,
         prev_block_hash: hashes::BlockHash,
     },
-    /// Submit a vote for a decision
-    SubmitVote {
-        voter: Address,
-        decision_id_bytes: [u8; 4],
-        vote_value: f64,
-        voting_period: u32,
-    },
-    /// Submit multiple votes efficiently
+    /// Seal a voter's one ballot for a voting period
     SubmitBallot {
         voter: Address,
-        votes: Vec<BallotItem>,
         voting_period: u32,
+        #[schema(value_type = Vec<u8>)]
+        commitment: Hash,
+    },
+    /// Open a sealed ballot after its voting period closes
+    RevealBallot {
+        voter: Address,
+        voting_period: u32,
+        votes: Vec<BallotItem>,
+        #[schema(value_type = Vec<u8>)]
+        salt: [u8; 32],
     },
     TransferReputation {
         sender: Address,
         dest: Address,
-        amount: f64,
+        amount: Votecoin,
     },
     /// Amplify a market's LMSR beta by funding its treasury.
     /// Only the market author may submit this transaction.
@@ -156,6 +180,13 @@ pub enum TransactionData {
         market_id: MarketId,
         amount: u64,
         market_author: Address,
+    },
+    TakeOffer {
+        offer: Box<SignedOffer>,
+        buyer: Address,
+    },
+    CancelOffer {
+        offer: VotecoinOffer,
     },
 }
 
@@ -174,12 +205,12 @@ impl TxData {
         matches!(self, Self::Trade { .. })
     }
 
-    pub fn is_submit_vote(&self) -> bool {
-        matches!(self, Self::SubmitVote { .. })
-    }
-
     pub fn is_submit_ballot(&self) -> bool {
         matches!(self, Self::SubmitBallot { .. })
+    }
+
+    pub fn is_reveal_ballot(&self) -> bool {
+        matches!(self, Self::RevealBallot { .. })
     }
 
     pub fn is_transfer_reputation(&self) -> bool {
@@ -188,6 +219,48 @@ impl TxData {
 
     pub fn is_amplify_beta(&self) -> bool {
         matches!(self, Self::AmplifyBeta { .. })
+    }
+
+    pub fn is_take_offer(&self) -> bool {
+        matches!(self, Self::TakeOffer { .. })
+    }
+
+    pub fn is_cancel_offer(&self) -> bool {
+        matches!(self, Self::CancelOffer { .. })
+    }
+
+    pub fn reputation_move(&self) -> Option<(Address, Address, Votecoin)> {
+        match self {
+            Self::TransferReputation {
+                sender,
+                dest,
+                amount,
+            } => Some((*sender, *dest, *amount)),
+            Self::TakeOffer { offer, buyer } => {
+                Some((offer.offer.seller, *buyer, offer.offer.amount))
+            }
+            Self::ClaimDecision(_)
+            | Self::CreateMarket { .. }
+            | Self::Trade { .. }
+            | Self::SubmitBallot { .. }
+            | Self::RevealBallot { .. }
+            | Self::AmplifyBeta { .. }
+            | Self::CancelOffer { .. } => None,
+        }
+    }
+
+    pub fn closed_offer_id(&self) -> Option<OfferId> {
+        match self {
+            Self::TakeOffer { offer, .. } => Some(offer.id()),
+            Self::CancelOffer { offer } => Some(offer.id()),
+            Self::ClaimDecision(_)
+            | Self::CreateMarket { .. }
+            | Self::Trade { .. }
+            | Self::SubmitBallot { .. }
+            | Self::RevealBallot { .. }
+            | Self::TransferReputation { .. }
+            | Self::AmplifyBeta { .. } => None,
+        }
     }
 }
 
@@ -204,61 +277,68 @@ pub struct MarketCreationView<'a> {
     pub new_claims: &'a [ClaimDecisionPayload],
 }
 
-/// Struct describing a trade operation (buy or sell shares).
-/// Sign of shares determines direction: positive = buy, negative = sell.
-/// `outcome_index` is the position within the market's tradeable outcomes
-/// (i.e. index into `Market::get_valid_state_combos()`), not a full-state
-/// combo index.
+/// Struct describing a trade: the share deltas it moves a market by, each at
+/// a position within the market's tradeable outcomes (an index into
+/// `Market::get_valid_state_combos()`), not a full-state combo index.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Trade {
     pub market_id: MarketId,
-    pub outcome_index: u32,
-    pub shares: i64,
+    pub deltas: Vec<ShareDelta>,
     pub trader: Address,
-    pub limit_sats: u64,
+    pub max_cost: i64,
     pub tx_pow_nonce: Option<u64>,
     pub prev_block_hash: hashes::BlockHash,
 }
 
 impl Trade {
-    /// Returns true if this is a buy trade (positive shares)
-    pub fn is_buy(&self) -> bool {
-        self.shares > 0
-    }
-
-    /// Returns true if this is a sell trade (negative shares)
-    pub fn is_sell(&self) -> bool {
-        self.shares < 0
-    }
-
-    /// Returns the absolute number of shares
-    pub fn shares_abs(&self) -> u64 {
-        self.shares.unsigned_abs()
+    /// Whether any leg sells shares
+    pub fn sells(&self) -> bool {
+        self.deltas.iter().any(|delta| delta.shares < 0)
     }
 }
 
-/// Struct describing a vote submission
+/// Struct describing a sealed ballot submission
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SubmitVote {
-    pub voter: Address,
-    pub decision_id_bytes: [u8; 4],
-    pub vote_value: f64,
-    pub voting_period: u32,
-}
-
-/// Struct describing a ballot submission
-#[derive(Clone, Debug, PartialEq)]
 pub struct SubmitBallot {
     pub voter: Address,
-    pub votes: Vec<BallotItem>,
     pub voting_period: u32,
+    pub commitment: Hash,
+}
+
+/// Struct describing a sealed ballot reveal
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RevealBallot {
+    pub voter: Address,
+    pub voting_period: u32,
+    pub votes: Vec<BallotItem>,
+    pub salt: [u8; 32],
+}
+
+impl RevealBallot {
+    pub fn commitment(&self) -> Hash {
+        ballot_commitment(
+            self.voter,
+            self.voting_period,
+            &self.votes,
+            &self.salt,
+        )
+    }
+}
+
+pub fn ballot_commitment(
+    voter: Address,
+    voting_period: u32,
+    votes: &[BallotItem],
+    salt: &[u8; 32],
+) -> Hash {
+    hashes::hash(&(voter, voting_period, votes, salt))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TransferReputation {
     pub sender: Address,
     pub dest: Address,
-    pub amount: f64,
+    pub amount: Votecoin,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -423,12 +503,12 @@ impl FilledTransaction {
         self.data().as_ref().is_some_and(TxData::is_trade)
     }
 
-    pub fn is_submit_vote(&self) -> bool {
-        self.data().as_ref().is_some_and(TxData::is_submit_vote)
-    }
-
     pub fn is_submit_ballot(&self) -> bool {
         self.data().as_ref().is_some_and(TxData::is_submit_ballot)
+    }
+
+    pub fn is_reveal_ballot(&self) -> bool {
+        self.data().as_ref().is_some_and(TxData::is_reveal_ballot)
     }
 
     pub fn is_transfer_reputation(&self) -> bool {
@@ -439,6 +519,30 @@ impl FilledTransaction {
 
     pub fn is_amplify_beta(&self) -> bool {
         self.data().as_ref().is_some_and(TxData::is_amplify_beta)
+    }
+
+    pub fn is_take_offer(&self) -> bool {
+        self.data().as_ref().is_some_and(TxData::is_take_offer)
+    }
+
+    pub fn is_cancel_offer(&self) -> bool {
+        self.data().as_ref().is_some_and(TxData::is_cancel_offer)
+    }
+
+    pub fn take_offer(&self) -> Option<(&SignedOffer, Address)> {
+        match &self.transaction.data {
+            Some(TransactionData::TakeOffer { offer, buyer }) => {
+                Some((offer.as_ref(), *buyer))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn cancel_offer(&self) -> Option<&VotecoinOffer> {
+        match &self.transaction.data {
+            Some(TransactionData::CancelOffer { offer }) => Some(offer),
+            _ => None,
+        }
     }
 
     pub fn claim_decision(&self) -> Option<&ClaimDecisionPayload> {
@@ -479,38 +583,18 @@ impl FilledTransaction {
         match &self.transaction.data {
             Some(TransactionData::Trade {
                 market_id,
-                outcome_index,
-                shares,
+                deltas,
                 trader,
-                limit_sats,
+                max_cost,
                 tx_pow_nonce,
                 prev_block_hash,
             }) => Some(Trade {
                 market_id: *market_id,
-                outcome_index: *outcome_index,
-                shares: *shares,
+                deltas: deltas.clone(),
                 trader: *trader,
-                limit_sats: *limit_sats,
+                max_cost: *max_cost,
                 tx_pow_nonce: *tx_pow_nonce,
                 prev_block_hash: *prev_block_hash,
-            }),
-            _ => None,
-        }
-    }
-
-    /// If the tx is a vote submission, returns the corresponding [`SubmitVote`].
-    pub fn submit_vote(&self) -> Option<SubmitVote> {
-        match &self.transaction.data {
-            Some(TransactionData::SubmitVote {
-                voter,
-                decision_id_bytes,
-                vote_value,
-                voting_period,
-            }) => Some(SubmitVote {
-                voter: *voter,
-                decision_id_bytes: *decision_id_bytes,
-                vote_value: *vote_value,
-                voting_period: *voting_period,
             }),
             _ => None,
         }
@@ -520,12 +604,29 @@ impl FilledTransaction {
         match &self.transaction.data {
             Some(TransactionData::SubmitBallot {
                 voter,
-                votes,
                 voting_period,
+                commitment,
             }) => Some(SubmitBallot {
                 voter: *voter,
-                votes: votes.clone(),
                 voting_period: *voting_period,
+                commitment: *commitment,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn reveal_ballot(&self) -> Option<RevealBallot> {
+        match &self.transaction.data {
+            Some(TransactionData::RevealBallot {
+                voter,
+                voting_period,
+                votes,
+                salt,
+            }) => Some(RevealBallot {
+                voter: *voter,
+                voting_period: *voting_period,
+                votes: votes.clone(),
+                salt: *salt,
             }),
             _ => None,
         }
@@ -614,10 +715,40 @@ mod test {
         },
     };
 
+    // a float encodes as borsh encodes it, and a NaN hashes too
+    #[test]
+    fn float_hashing() {
+        use crate::transaction::{BallotItem, TxData};
+
+        for value in [0.0, 1.0, -2.5, f64::MAX, f64::INFINITY] {
+            let item = BallotItem {
+                decision_id_bytes: [1; 4],
+                vote_value: Some(value),
+            };
+            assert_eq!(
+                borsh::to_vec(&item).unwrap(),
+                borsh::to_vec(&([1u8; 4], Some(value))).unwrap(),
+            );
+        }
+        let transaction = Transaction {
+            data: Some(TxData::RevealBallot {
+                voter: Address::ALL_ZEROS,
+                voting_period: 2,
+                votes: vec![BallotItem {
+                    decision_id_bytes: [1; 4],
+                    vote_value: Some(f64::NAN),
+                }],
+                salt: [0; 32],
+            }),
+            ..Default::default()
+        };
+        let _ = transaction.txid();
+    }
+
     // a withdrawal output must be funded for both its payout and its mainchain
     // fee, since both leave the treasury
     #[test]
-    fn withdrawal_value_includes_main_fee() {
+    fn withdrawal_main_fee() {
         let value = bitcoin::Amount::from_sat(1000);
         let main_fee = bitcoin::Amount::from_sat(300);
         let main_address = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
@@ -656,7 +787,7 @@ mod test {
     }
 
     #[test]
-    fn claim_decision_variant_wire_format() -> anyhow::Result<()> {
+    fn claim_decision_wire_format() -> anyhow::Result<()> {
         use crate::{
             decision::DecisionType,
             transaction::{

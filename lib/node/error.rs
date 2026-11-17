@@ -134,6 +134,9 @@ pub mod net_task {
         #[error("Net error")]
         #[fatal(true)]
         Net(#[from] Box<net::Error>),
+        #[error("offer board error")]
+        #[fatal(true)]
+        Offers(#[from] crate::offers::Error),
         #[error("peer info stream closed")]
         #[fatal(true)]
         PeerInfoRxClosed,
@@ -188,6 +191,8 @@ pub enum Error {
     MarketPriceHistory(#[from] state::markets::price_history::Error),
     #[error("mempool error")]
     MemPool(#[from] mempool::Error),
+    #[error("offer board error")]
+    Offers(#[from] crate::offers::Error),
     #[error("net error")]
     Net(#[from] Box<net::Error>),
     #[error("net task error")]
