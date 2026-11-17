@@ -102,7 +102,7 @@ fn weighted_median(
 
     for (i, &(value, weight)) in sorted.iter().enumerate() {
         cumulative_weight += weight;
-        if cumulative_weight >= half_weight {
+        if cumulative_weight > half_weight - 1e-10 {
             // Use epsilon comparison instead of exact equality for f64
             // Exact equality (==) on f64 is unreliable due to floating-point precision
             if (cumulative_weight - half_weight).abs() < 1e-10
@@ -123,8 +123,10 @@ fn score_reflect(
     component: &DVector<f64>,
     previous_reputation: &DVector<f64>,
 ) -> Result<DVector<f64>, VotingMathError> {
-    let unique_count = component.len();
-    if unique_count <= 2 {
+    let mut distinct: Vec<f64> = component.iter().copied().collect();
+    distinct.sort_by(|a, b| safe_cmp_f64(*a, *b));
+    distinct.dedup_by(|a, b| (*a - *b).abs() <= SVD_NUMERICAL_TOLERANCE);
+    if distinct.len() <= 2 {
         return Ok(component.clone());
     }
 
@@ -242,6 +244,14 @@ fn reference_outcomes(
     )
 }
 
+fn normalize_by_rep(v: &DVector<f64>, rep: &DVector<f64>) -> DVector<f64> {
+    let total = v.dot(rep);
+    if total > 0.0 {
+        return v / total;
+    }
+    DVector::from_element(v.len(), 1.0 / rep.sum())
+}
+
 fn get_reward_weights(
     vote_matrix: &DMatrix<f64>,
     rep: Option<&DVector<f64>>,
@@ -315,20 +325,19 @@ fn get_reward_weights(
         let max_non_compliance = non_compliance_per_voter.max();
         let compliance_raw =
             non_compliance_per_voter.map(|x| (x - max_non_compliance).abs());
-        let compliance_scores = normalize_weights(&compliance_raw, true);
+        let compliance_scores = normalize_by_rep(&compliance_raw, &old_rep);
+        let compliance_spread =
+            max_non_compliance - non_compliance_per_voter.min();
 
-        let weighted_score_1 = normalize_weights(&new_score_1, false);
-        let difference_1 = &weighted_score_1 - &compliance_scores;
-        let choice1: f64 = difference_1.iter().map(|&x| x.powi(2)).sum();
-
-        let weighted_score_2 = normalize_weights(&new_score_2, false);
-        let difference_2 = &weighted_score_2 - &compliance_scores;
-        let choice2: f64 = difference_2.iter().map(|&x| x.powi(2)).sum();
-
-        let ref_ind = choice1 - choice2;
+        let choice = |new_score: &DVector<f64>| {
+            let difference =
+                normalize_by_rep(new_score, &old_rep) - &compliance_scores;
+            old_rep.dot(&difference.map(|x| x.powi(2)))
+        };
+        let ref_ind = choice(&new_score_1) - choice(&new_score_2);
 
         let rep_mean = old_rep.mean();
-        if rep_mean > 0.0 {
+        if rep_mean > 0.0 && compliance_spread > SVD_NUMERICAL_TOLERANCE {
             let scaled_rep = old_rep.map(|x| x / rep_mean);
 
             let rep1 = normalize_weights(
@@ -1036,5 +1045,118 @@ mod tests {
         let rep = DVector::from_vec(vec![1.0]);
         let result = factory(&m, Some(&rep), None, None, &[]);
         assert!(result.is_ok());
+    }
+
+    /// Cumulative weight one ULP short of half still takes the midpoint.
+    #[test]
+    fn median_ulp_short() {
+        let values = DVector::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+        let weights = DVector::from_vec(vec![0.1, 0.35, 0.05, 0.5]);
+        assert_eq!(weighted_median(&values, &weights).unwrap(), 3.5);
+    }
+
+    /// Splitting the lower half's weight into pieces keeps the midpoint.
+    #[test]
+    fn median_split_pieces() {
+        let whole = weighted_median(
+            &DVector::from_vec(vec![0.2, 0.8]),
+            &DVector::from_vec(vec![0.5, 0.5]),
+        )
+        .unwrap();
+        let pieces = weighted_median(
+            &DVector::from_vec(vec![0.2, 0.2, 0.2, 0.2, 0.2, 0.8]),
+            &DVector::from_vec(vec![0.1, 0.1, 0.1, 0.1, 0.1, 0.5]),
+        )
+        .unwrap();
+        assert_eq!(whole, 0.5);
+        assert_eq!(pieces, 0.5);
+    }
+
+    /// Five identical scores count as one distinct value and are returned
+    /// unchanged.
+    #[test]
+    fn reflect_identical_scores() {
+        let component = DVector::from_element(5, 0.3);
+        let rep = DVector::from_element(5, 0.2);
+        assert_eq!(score_reflect(&component, &rep).unwrap(), component);
+    }
+
+    /// Five addresses holding two distinct scores skip reflection.
+    #[test]
+    fn reflect_two_values() {
+        let component = DVector::from_vec(vec![0.0, 0.0, 1.0, 1.0, 1.0]);
+        let rep = DVector::from_element(5, 0.2);
+        assert_eq!(score_reflect(&component, &rep).unwrap(), component);
+    }
+
+    /// Three distinct scores reflect: the above-median score is pulled
+    /// halfway toward the median.
+    #[test]
+    fn reflect_three_values() {
+        let component = DVector::from_vec(vec![0.0, 0.5, 1.0]);
+        let rep = DVector::from_element(3, 1.0 / 3.0);
+        assert_eq!(
+            score_reflect(&component, &rep).unwrap(),
+            DVector::from_vec(vec![0.0, 0.5, 0.75])
+        );
+    }
+
+    /// Scores within SVD_NUMERICAL_TOLERANCE of each other count once.
+    #[test]
+    fn reflect_near_duplicates() {
+        let component = DVector::from_vec(vec![0.0, 1.0, 1.0 + 1e-12, 1.0]);
+        let rep = DVector::from_element(4, 0.25);
+        assert_eq!(score_reflect(&component, &rep).unwrap(), component);
+    }
+
+    /// An all-zero vector falls back to uniform per unit of reputation.
+    #[test]
+    fn normalize_by_rep_zeros() {
+        let rep = DVector::from_vec(vec![0.2, 0.3, 0.5]);
+        let result = normalize_by_rep(&DVector::zeros(3), &rep);
+        assert!(result.iter().all(|x| x.is_finite()));
+        assert!((rep.dot(&result) - 1.0).abs() < 1e-12);
+    }
+
+    /// One voter split into three clones gets the same summed smooth
+    /// reputation as when unsplit.
+    #[test]
+    fn reward_weights_split_invariant() {
+        let rows = [
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 0.5],
+            [1.0, 0.0, 0.0, 1.0],
+        ];
+        let whole = DMatrix::from_fn(3, 4, |i, j| rows[i][j]);
+        let split = DMatrix::from_fn(5, 4, |i, j| rows[[0, 1, 1, 1, 2][i]][j]);
+        let whole_rep = DVector::from_vec(vec![0.5, 0.3, 0.2]);
+        let split_rep = DVector::from_vec(vec![0.5, 0.1, 0.1, 0.1, 0.2]);
+        let pinned = [None; 4];
+
+        let whole_smooth = get_reward_weights(
+            &whole,
+            Some(&whole_rep),
+            0.3,
+            &DVector::from_element(3, 1.0),
+            1.0,
+            &pinned,
+        )
+        .unwrap()
+        .smooth_rep;
+        let split_smooth = get_reward_weights(
+            &split,
+            Some(&split_rep),
+            0.3,
+            &DVector::from_element(5, 1.0),
+            1.0,
+            &pinned,
+        )
+        .unwrap()
+        .smooth_rep;
+
+        let clone_sum = split_smooth[1] + split_smooth[2] + split_smooth[3];
+        assert!((whole_smooth[0] - split_smooth[0]).abs() < 1e-9);
+        assert!((whole_smooth[1] - clone_sum).abs() < 1e-9);
+        assert!((whole_smooth[2] - split_smooth[4]).abs() < 1e-9);
     }
 }
