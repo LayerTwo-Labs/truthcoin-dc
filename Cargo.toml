@@ -7,7 +7,7 @@ authors = ["Ash Manning <ash@layertwolabs.com>"]
 edition = "2024"
 license-file = "LICENSE.txt"
 publish = false
-version = "0.16.3"
+version = "0.16.4"
 
 [workspace.dependencies]
 addr = "0.15.6"
