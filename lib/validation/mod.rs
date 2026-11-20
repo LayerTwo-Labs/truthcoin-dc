@@ -3,7 +3,7 @@ pub mod market;
 pub mod offer;
 pub mod vote;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use sneed::RoTxn;
 
@@ -14,8 +14,8 @@ use crate::{
         decisions::{Decision, DecisionId},
     },
     types::{
-        AmountOverflowError, ComputeFeeError, FilledTransaction, Output,
-        OutputContent, Transaction, TransactionData,
+        AmountOverflowError, ComputeFeeError, FilledTransaction, Hash,
+        OutPoint, Output, OutputContent, Transaction, TransactionData,
     },
 };
 
@@ -84,12 +84,149 @@ pub(crate) fn tx_fee(tx: &FilledTransaction) -> Result<bitcoin::Amount, Error> {
     })
 }
 
+pub const MIN_FEERATE_SATS_PER_BYTE: u64 = 1;
+
+/// Serialized size of one authorization: a verifying key and a signature
+pub const AUTHORIZATION_SIZE: u64 = 104;
+
+/// Size of a transaction for its fee: the serialized size of its inputs,
+/// outputs and data, plus one authorization per input and its actor proof.
+/// The utreexo proof is left out, because the node regenerates it as the
+/// chain grows.
+pub fn tx_size(
+    transaction: &Transaction,
+    actor_proof: bool,
+) -> Result<u64, bincode::Error> {
+    let body = bincode::serialized_size(&(
+        &transaction.inputs,
+        &transaction.outputs,
+        &transaction.data,
+    ))?;
+    let authorizations =
+        transaction.inputs.len() as u64 + u64::from(actor_proof);
+    Ok(body + authorizations * AUTHORIZATION_SIZE)
+}
+
+/// Size that spending the output at `outpoint` adds to a transaction: its
+/// input and authorization
+pub fn input_size(outpoint: &OutPoint) -> Result<u64, bincode::Error> {
+    Ok(bincode::serialized_size(&(outpoint, Hash::default()))?
+        + AUTHORIZATION_SIZE)
+}
+
+/// Minimum fee of a transaction, at the minimum fee rate
+pub fn min_tx_fee(
+    transaction: &Transaction,
+    actor_proof: bool,
+) -> Result<bitcoin::Amount, bincode::Error> {
+    Ok(bitcoin::Amount::from_sat(
+        tx_size(transaction, actor_proof)? * MIN_FEERATE_SATS_PER_BYTE,
+    ))
+}
+
+/// Miner fee of a trade or an amplify beta transaction: the flat trade fee,
+/// or the minimum fee for its size when that is larger
+pub fn trade_miner_fee(
+    transaction: &Transaction,
+    actor_proof: bool,
+) -> Result<bitcoin::Amount, bincode::Error> {
+    Ok(min_tx_fee(transaction, actor_proof)?
+        .max(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)))
+}
+
+/// Add a listing fee owed to the pool of `period`
+pub(crate) fn add_listing_fee(
+    listing_fees: &mut BTreeMap<u32, u64>,
+    period: u32,
+    fee: u64,
+) -> Result<(), Error> {
+    let owed = listing_fees.entry(period).or_insert(0);
+    *owed = owed
+        .checked_add(fee)
+        .ok_or_else(|| Error::InvalidTransaction {
+            reason: "Listing fee overflow".to_string(),
+        })?;
+    Ok(())
+}
+
+/// The listing fee outputs of a transaction pay each period's pool at least
+/// the listing fees owed there, one output per period. A claim quoted
+/// before a price drop overpays, and the excess stays in the pool.
+pub(crate) fn validate_listing_outputs(
+    tx: &FilledTransaction,
+    listing_fees: &BTreeMap<u32, u64>,
+) -> Result<(), Error> {
+    use crate::state::markets::payouts::generate_listing_pool_address;
+
+    let mut paid = BTreeMap::new();
+    for output in &tx.transaction.outputs {
+        let OutputContent::ListingFees { period, amount } = &output.content
+        else {
+            continue;
+        };
+        if output.address != generate_listing_pool_address(*period) {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Listing fees of period {period} are not paid to its pool"
+                ),
+            });
+        }
+        if paid.insert(*period, amount.to_sat()).is_some() {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "More than one listing fee output for period {period}"
+                ),
+            });
+        }
+    }
+    let owed: BTreeMap<u32, u64> = listing_fees
+        .iter()
+        .filter(|(_, fee)| **fee > 0)
+        .map(|(period, fee)| (*period, *fee))
+        .collect();
+    if paid.len() != owed.len()
+        || owed
+            .iter()
+            .any(|(period, fee)| paid.get(period).is_none_or(|paid| paid < fee))
+    {
+        return Err(Error::InvalidTransaction {
+            reason: format!(
+                "Listing fee outputs {paid:?} do not cover the listing fees \
+                 owed {owed:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The transaction pays `required` plus the minimum fee rate to the miner
+pub(crate) fn validate_fee_floor(
+    tx: &FilledTransaction,
+    required: bitcoin::Amount,
+) -> Result<(), Error> {
+    let fee = tx_fee(tx)?;
+    let floor = min_tx_fee(&tx.transaction, tx.actor_address.is_some())
+        .map_err(Error::BincodeSerialize)?
+        .checked_add(required)
+        .ok_or(AmountOverflowError)?;
+    if fee < floor {
+        return Err(Error::InvalidTransaction {
+            reason: format!("Fee {fee} is below the minimum {floor}"),
+        });
+    }
+    Ok(())
+}
+
 /// Fee that a transaction pays to the block producer
 pub fn miner_fee(
     filled_tx: &FilledTransaction,
 ) -> Result<bitcoin::Amount, Error> {
     if filled_tx.is_trade() || filled_tx.is_amplify_beta() {
-        return Ok(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS));
+        return trade_miner_fee(
+            &filled_tx.transaction,
+            filled_tx.actor_address.is_some(),
+        )
+        .map_err(Error::BincodeSerialize);
     }
     tx_fee(filled_tx)
 }
@@ -103,6 +240,19 @@ pub(crate) fn validate_market_transaction(
     archive: &crate::archive::Archive,
     override_height: Option<u32>,
 ) -> Result<Option<bitcoin::Amount>, Error> {
+    if !(tx.is_claim_decision() || tx.is_create_market())
+        && tx
+            .transaction
+            .outputs
+            .iter()
+            .any(|output| output.content.is_listing_fees())
+    {
+        return Err(Error::InvalidTransaction {
+            reason: "Only a decision claim or market creation may pay \
+                     listing fees"
+                .to_string(),
+        });
+    }
     if tx.is_claim_decision() {
         DecisionValidator::validate_complete_decision_claim(
             state,
@@ -127,7 +277,10 @@ pub(crate) fn validate_market_transaction(
             tx,
             override_height,
         )?;
-        return Ok(Some(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)));
+        return Ok(Some(
+            trade_miner_fee(&tx.transaction, tx.actor_address.is_some())
+                .map_err(Error::BincodeSerialize)?,
+        ));
     }
     if tx.is_amplify_beta() {
         MarketValidator::validate_amplify_beta(
@@ -136,7 +289,10 @@ pub(crate) fn validate_market_transaction(
             tx,
             override_height,
         )?;
-        return Ok(Some(bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)));
+        return Ok(Some(
+            trade_miner_fee(&tx.transaction, tx.actor_address.is_some())
+                .map_err(Error::BincodeSerialize)?,
+        ));
     }
     if tx.is_submit_ballot() {
         VoteValidator::validate_ballot(state, rotxn, tx, override_height)?;
@@ -207,12 +363,13 @@ pub fn check_duplicate_decision_claims(
     Ok(())
 }
 
-/// Reject market funds in the coinbase
+/// Reject market funds and listing fees in the coinbase
 pub fn validate_coinbase_outputs(coinbase: &[Output]) -> Result<(), Error> {
     for output in coinbase {
         match &output.content {
             OutputContent::Value(_) | OutputContent::Withdrawal { .. } => {}
-            OutputContent::MarketFunds { .. } => {
+            OutputContent::MarketFunds { .. }
+            | OutputContent::ListingFees { .. } => {
                 return Err(Error::BadCoinbaseOutputContent);
             }
         }
@@ -277,6 +434,68 @@ mod tests {
             },
         }];
         assert!(super::validate_coinbase_outputs(&outputs).is_err());
+    }
+
+    /// A coinbase may never pay listing fees
+    #[test]
+    fn coinbase_listing_fees() {
+        let outputs = vec![Output {
+            address: Address::ALL_ZEROS,
+            content: OutputContent::ListingFees {
+                period: 1,
+                amount: bitcoin::Amount::from_sat(1000),
+            },
+        }];
+        assert!(super::validate_coinbase_outputs(&outputs).is_err());
+    }
+
+    /// A transaction that claims no decision may not pay listing fees
+    #[test]
+    fn transfer_listing_fees() {
+        use crate::{
+            archive::Archive,
+            state::State,
+            types::{FilledTransaction, OutPoint, Txid},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None, true).unwrap();
+        let archive = Archive::new(&env).unwrap();
+        let tx = FilledTransaction {
+            transaction: Transaction {
+                inputs: vec![(
+                    OutPoint::Regular {
+                        txid: Txid([1; 32]),
+                        vout: 0,
+                    },
+                    [0; 32],
+                )]
+                .into(),
+                outputs: vec![Output {
+                    address:
+                        crate::state::markets::payouts::generate_listing_pool_address(1),
+                    content: OutputContent::ListingFees {
+                        period: 1,
+                        amount: bitcoin::Amount::from_sat(1000),
+                    },
+                }]
+                .into(),
+                ..Default::default()
+            },
+            spent_utxos: vec![bitcoin_output(2000)],
+            actor_address: None,
+        };
+        let rotxn = env.read_txn().unwrap();
+        assert!(
+            super::validate_market_transaction(
+                &state, &rotxn, &tx, &archive, None
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -380,6 +599,99 @@ mod tests {
             super::miner_fee(&amplify).unwrap(),
             bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
         );
+    }
+
+    /// The fee size counts one authorization per input and the actor
+    /// proof, each the size of a real authorization
+    #[test]
+    fn size_counts_signatures() {
+        use crate::types::{
+            OutPoint, Txid,
+            authorization::{Authorization, SigningKey, sign_tx},
+        };
+
+        let key = SigningKey::new(&mut rand::rng());
+        let transaction = Transaction {
+            inputs: vec![
+                (
+                    OutPoint::Regular {
+                        txid: Txid([1; 32]),
+                        vout: 0,
+                    },
+                    [0; 32],
+                );
+                2
+            ]
+            .into(),
+            ..Transaction::default()
+        };
+        let authorization = Authorization {
+            verifying_key: (&key).into(),
+            signature: sign_tx(rand::rng(), &key, &transaction).unwrap(),
+        };
+        assert_eq!(
+            bincode::serialized_size(&authorization).unwrap(),
+            super::AUTHORIZATION_SIZE
+        );
+        let bare = bincode::serialized_size(&(
+            &transaction.inputs,
+            &transaction.outputs,
+            &transaction.data,
+        ))
+        .unwrap();
+        assert_eq!(
+            super::tx_size(&transaction, false).unwrap(),
+            bare + 2 * super::AUTHORIZATION_SIZE
+        );
+        assert_eq!(
+            super::tx_size(&transaction, true).unwrap(),
+            bare + 3 * super::AUTHORIZATION_SIZE
+        );
+    }
+
+    /// A trade pays the flat trade fee, or its minimum fee once larger
+    #[test]
+    fn trade_fee_by_size() {
+        use crate::{
+            math::trading::TRADE_MINER_FEE_SATS,
+            state::markets::MarketId,
+            types::{BlockHash, OutPoint, ShareDelta, TxData, Txid},
+        };
+
+        let trade = |inputs: u32| Transaction {
+            inputs: (0..inputs)
+                .map(|vout| {
+                    (
+                        OutPoint::Regular {
+                            txid: Txid([1; 32]),
+                            vout,
+                        },
+                        [0; 32],
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            data: Some(TxData::Trade {
+                market_id: MarketId::new([1; 6]),
+                deltas: vec![ShareDelta {
+                    outcome_index: 0,
+                    shares: 1,
+                }],
+                trader: Address::ALL_ZEROS,
+                max_cost: 1_000,
+                tx_pow_nonce: None,
+                prev_block_hash: BlockHash::default(),
+            }),
+            ..Transaction::default()
+        };
+        assert_eq!(
+            super::trade_miner_fee(&trade(1), false).unwrap(),
+            bitcoin::Amount::from_sat(TRADE_MINER_FEE_SATS)
+        );
+        let large = trade(20);
+        let min_fee = super::min_tx_fee(&large, false).unwrap();
+        assert!(min_fee.to_sat() > TRADE_MINER_FEE_SATS);
+        assert_eq!(super::trade_miner_fee(&large, false).unwrap(), min_fee);
     }
 
     #[test]

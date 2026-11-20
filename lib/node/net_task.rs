@@ -2135,7 +2135,7 @@ mod test {
                     outputs: vec![Output {
                         address: sender,
                         content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(900),
+                            bitcoin::Amount::from_sat(700),
                         ),
                     }]
                     .into(),
@@ -2192,7 +2192,7 @@ mod test {
                 1_700_000_000,
             )?;
             assert_eq!(selected_count, expected_count);
-            assert_eq!(fee.to_sat(), 100 * expected_count as u64);
+            assert_eq!(fee.to_sat(), 300 * expected_count as u64);
             assert_eq!(
                 node.state.reputation().get_reputation(&rwtxn, &sender)?,
                 Votecoin(start_reputation - transferred)
@@ -2695,7 +2695,7 @@ mod test {
                     output: Output {
                         address,
                         content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(1_000),
+                            bitcoin::Amount::from_sat(100_000),
                         ),
                     },
                 };
@@ -2822,7 +2822,7 @@ mod test {
                     outputs: vec![Output {
                         address,
                         content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(41_000),
+                            bitcoin::Amount::from_sat(34_000),
                         ),
                     }]
                     .into(),
@@ -2862,7 +2862,7 @@ mod test {
 
             let (selected, fee) = node.get_transactions(1_000)?;
             assert_eq!(selected.len(), state::State::body_sigops_limit(0) / 43);
-            assert_eq!(fee.to_sat(), selected.len() as u64 * 1_000);
+            assert_eq!(fee.to_sat(), selected.len() as u64 * 8_000);
             let sigops: usize = selected
                 .iter()
                 .map(|tx| {
@@ -2951,10 +2951,10 @@ mod test {
                 )?;
                 Ok(tx)
             };
-            let first_tx = make_tx(vec![inputs[0]].into(), 900)?;
+            let first_tx = make_tx(vec![inputs[0]].into(), 600)?;
             let conflict_tx =
-                make_tx(vec![inputs[1], inputs[0]].into(), 1_800)?;
-            let next_tx = make_tx(vec![inputs[1]].into(), 900)?;
+                make_tx(vec![inputs[1], inputs[0]].into(), 1_200)?;
+            let next_tx = make_tx(vec![inputs[1]].into(), 600)?;
             node.mempool.put(&mut rwtxn, &first_tx)?;
             rwtxn.commit()?;
 
@@ -3703,7 +3703,7 @@ mod test {
                         Output {
                             address: creator,
                             content: OutputContent::Value(
-                                bitcoin::Amount::from_sat(3_900),
+                                bitcoin::Amount::from_sat(3_000),
                             ),
                         },
                     ]
@@ -3743,7 +3743,7 @@ mod test {
                     outputs: vec![Output {
                         address: Address([4; 20]),
                         content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(3_000),
+                            bitcoin::Amount::from_sat(2_600),
                         ),
                     }]
                     .into(),
@@ -3765,7 +3765,7 @@ mod test {
                 selected_txids,
                 vec![market_txs[kept].txid(), child_txids[kept]]
             );
-            assert_eq!(fee.to_sat(), 2_000);
+            assert_eq!(fee.to_sat(), 2_400);
             // The block template's dropped transactions leave the mempool, so
             // they hold no inputs or claims there.
             {

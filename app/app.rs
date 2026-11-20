@@ -137,7 +137,8 @@ fn update_wallet(
                 OutPoint::Regular { .. }
                 | OutPoint::MarketFunds { .. }
                 | OutPoint::Payout { .. }
-                | OutPoint::UnsuccessfulWithdrawal { .. } => (),
+                | OutPoint::UnsuccessfulWithdrawal { .. }
+                | OutPoint::ListingFees { .. } => (),
             }
         }
     }

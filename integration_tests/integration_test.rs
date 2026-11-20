@@ -122,7 +122,7 @@ async fn deposit_withdraw_roundtrip(
     // as later blocks build on it.
     let rpc = &sidechain_post_setup.rpc_client;
     let dest = rpc.get_new_address().await?;
-    let txid = rpc.create_transfer(dest, 1_000_000, 1_000).await?;
+    let txid = rpc.create_transfer(dest, 1_000_000, None).await?;
     let mut included_in = None;
     // check that everything is ok after BMM'ing 3 blocks
     for _ in 0..3 {

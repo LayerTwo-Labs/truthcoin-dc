@@ -21,6 +21,14 @@ pub fn show_btc_amount(amount: bitcoin::Amount) -> String {
     )
 }
 
+/// A fee rate typed in sat/byte, the minimum when left empty
+pub fn parse_fee_rate(input: &str) -> Result<u64, std::num::ParseIntError> {
+    match input.trim() {
+        "" => Ok(truthcoin_dc::validation::MIN_FEERATE_SATS_PER_BYTE),
+        rate => rate.parse(),
+    }
+}
+
 pub trait InnerResponseExt {
     fn join(self) -> Response;
 }

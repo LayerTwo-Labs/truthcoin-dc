@@ -380,7 +380,7 @@ impl Ballot {
             voter,
             items,
             period,
-            None,
+            truthcoin_dc::validation::MIN_FEERATE_SATS_PER_BYTE,
             options,
         ) {
             Ok(tx) => tx,

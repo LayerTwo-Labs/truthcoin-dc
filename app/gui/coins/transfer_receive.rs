@@ -2,7 +2,10 @@ use eframe::egui::{self, Button};
 use strum::{EnumIter, IntoEnumIterator};
 use truthcoin_dc::types::Address;
 
-use crate::{app::App, gui::util::UiExt};
+use crate::{
+    app::App,
+    gui::util::{UiExt, parse_fee_rate},
+};
 
 #[derive(
     Clone, Copy, Debug, Default, EnumIter, Eq, PartialEq, strum::Display,
@@ -17,14 +20,14 @@ struct Transfer {
     transfer_type: TransferType,
     dest: String,
     amount: String,
-    fee: String,
+    fee_rate: String,
 }
 
 fn create_bitcoin_transfer(
     app: &App,
     dest: Address,
     amount: bitcoin::Amount,
-    fee: bitcoin::Amount,
+    fee_rate: u64,
 ) -> anyhow::Result<()> {
     let accumulator = app.node.get_tip_accumulator()?;
     let tx = app.wallet.create_transaction(
@@ -32,7 +35,7 @@ fn create_bitcoin_transfer(
         app.spend_options()?,
         dest,
         amount,
-        fee,
+        fee_rate,
     )?;
     app.sign_and_send(tx)?;
     Ok(())
@@ -80,20 +83,17 @@ impl Transfer {
 
         ui.add_sized((110., 10.), |ui: &mut egui::Ui| {
             ui.horizontal(|ui| {
-                let fee_edit = egui::TextEdit::singleline(&mut self.fee)
-                    .hint_text("fee")
+                let fee_edit = egui::TextEdit::singleline(&mut self.fee_rate)
+                    .hint_text("fee rate (1)")
                     .desired_width(80.);
                 ui.add(fee_edit);
-                ui.label("BTC");
+                ui.label("sat/byte");
             })
             .response
         });
 
         let dest: Option<Address> = self.dest.parse().ok();
-        let fee = bitcoin::Amount::from_str_in(
-            &self.fee,
-            bitcoin::Denomination::Bitcoin,
-        );
+        let fee = parse_fee_rate(&self.fee_rate);
 
         let transfer_enabled = match self.transfer_type {
             TransferType::Bitcoin => {

@@ -303,6 +303,37 @@ pub(crate) fn allocate_decision_slots(
     Ok(allocated)
 }
 
+/// The listing fees of allocated slots, by decision period
+pub(crate) fn listing_fees_by_period(
+    allocated: &[AllocatedSlot],
+) -> RpcResult<std::collections::BTreeMap<u32, u64>> {
+    let mut listing_fees = std::collections::BTreeMap::new();
+    for slot in allocated {
+        let owed: &mut u64 = listing_fees
+            .entry(slot.decision_id.period_index())
+            .or_default();
+        *owed = owed
+            .checked_add(slot.listing_fee_sats)
+            .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
+    }
+    Ok(listing_fees)
+}
+
+/// The listing fees of all periods together
+fn total_listing_fee(
+    listing_fees: &std::collections::BTreeMap<u32, u64>,
+) -> RpcResult<u64> {
+    listing_fees
+        .values()
+        .try_fold(0u64, |total, fee| total.checked_add(*fee))
+        .ok_or_else(|| custom_err_msg("listing fee overflow"))
+}
+
+/// The fee rate the caller asked for, or else the minimum, in sat/byte
+pub(crate) fn fee_rate_or_min(fee_rate: Option<u64>) -> u64 {
+    fee_rate.unwrap_or(truthcoin_dc::validation::MIN_FEERATE_SATS_PER_BYTE)
+}
+
 fn parse_market_id(
     market_id: &str,
 ) -> RpcResult<truthcoin_dc::state::MarketId> {
@@ -740,10 +771,9 @@ fn share_deltas(mut deltas: Vec<ShareDelta>) -> Vec<ShareDelta> {
 }
 
 fn check_buy_limit(cost_sats: u64, max_cost: u64) -> RpcResult<()> {
-    if cost_sats.saturating_add(trading::TRADE_MINER_FEE_SATS) > max_cost {
+    if cost_sats > max_cost {
         return Err(custom_err_msg(format!(
-            "Share cost {cost_sats} sats + miner fee {} sats exceeds maximum cost {max_cost} sats (slippage protection)",
-            trading::TRADE_MINER_FEE_SATS,
+            "Share cost {cost_sats} sats exceeds maximum cost {max_cost} sats (slippage protection)",
         )));
     }
     Ok(())
@@ -2293,7 +2323,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         &self,
         dest: Address,
         value_sats: u64,
-        fee_sats: u64,
+        fee_rate: Option<u64>,
     ) -> RpcResult<Txid> {
         let accumulator =
             self.app.node.get_tip_accumulator().map_err(custom_err)?;
@@ -2305,7 +2335,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 self.app.spend_options().map_err(custom_err)?,
                 dest,
                 Amount::from_sat(value_sats),
-                Amount::from_sat(fee_sats),
+                fee_rate_or_min(fee_rate),
             )
             .map_err(custom_err)?;
         let txid = tx.txid();
@@ -2316,7 +2346,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
     async fn create_transfer_many(
         &self,
         dests: TransferDests,
-        fee_sats: u64,
+        fee_rate: Option<u64>,
     ) -> RpcResult<Txid> {
         let dests = dests
             .0
@@ -2334,7 +2364,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 &accumulator,
                 self.app.spend_options().map_err(custom_err)?,
                 &dests,
-                Amount::from_sat(fee_sats),
+                fee_rate_or_min(fee_rate),
             )
             .map_err(custom_err)?;
         let txid = tx.txid();
@@ -2346,7 +2376,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         &self,
         mainchain_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
         amount_sats: u64,
-        fee_sats: u64,
+        fee_rate: Option<u64>,
         mainchain_fee_sats: u64,
     ) -> RpcResult<Txid> {
         let accumulator =
@@ -2360,7 +2390,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 mainchain_address,
                 Amount::from_sat(amount_sats),
                 Amount::from_sat(mainchain_fee_sats),
-                Amount::from_sat(fee_sats),
+                fee_rate_or_min(fee_rate),
             )
             .map_err(custom_err)?;
         let txid = tx.txid();
@@ -2602,7 +2632,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         &self,
         dest: Address,
         amount: Votecoin,
-        fee_sats: u64,
+        fee_rate: Option<u64>,
         sender: Option<Address>,
     ) -> RpcResult<Txid> {
         let sender = self.app.resolve_voter(sender).map_err(custom_err)?;
@@ -2614,7 +2644,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 sender,
                 dest,
                 amount,
-                Amount::from_sat(fee_sats),
+                fee_rate_or_min(fee_rate),
             )
             .map_err(custom_err)?;
         let txid = tx.txid();
@@ -2655,7 +2685,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
     async fn take_offer(
         &self,
         offer_id: OfferId,
-        fee_sats: u64,
+        fee_rate: Option<u64>,
         buyer: Option<Address>,
     ) -> RpcResult<Txid> {
         let offer = self
@@ -2676,7 +2706,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .take_offer(
                 offer,
                 buyer,
-                Amount::from_sat(fee_sats),
+                fee_rate_or_min(fee_rate),
                 self.app.spend_options().map_err(custom_err)?,
             )
             .map_err(custom_err)?;
@@ -2688,7 +2718,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
     async fn cancel_offer(
         &self,
         offer_id: OfferId,
-        fee_sats: u64,
+        fee_rate: Option<u64>,
     ) -> RpcResult<Txid> {
         let offer = self
             .app
@@ -2708,7 +2738,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .wallet
             .cancel_offer(
                 offer,
-                Amount::from_sat(fee_sats),
+                fee_rate_or_min(fee_rate),
                 self.app.spend_options().map_err(custom_err)?,
             )
             .map_err(custom_err)?;
@@ -2785,10 +2815,8 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         let allocated =
             allocate_decision_slots(&self.app.node, &slot_requests)?;
 
-        let listing_fee_paid_sats: u64 = allocated
-            .iter()
-            .try_fold(0u64, |acc, slot| acc.checked_add(slot.listing_fee_sats))
-            .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
+        let listing_fees = listing_fees_by_period(&allocated)?;
+        let listing_fee_paid_sats = total_listing_fee(&listing_fees)?;
 
         if let Some(cap) = request.max_listing_fee_sats
             && listing_fee_paid_sats > cap
@@ -2806,12 +2834,6 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .map(|slot| slot.decision_id.to_hex())
             .collect();
 
-        let total_fee = Amount::from_sat(
-            listing_fee_paid_sats
-                .checked_add(request.tx_fee_sats)
-                .ok_or_else(|| custom_err_msg("total fee overflow"))?,
-        );
-
         let tx = self
             .app
             .wallet
@@ -2821,7 +2843,8 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                     decision_type,
                     decisions: entries,
                 },
-                total_fee,
+                &listing_fees,
+                fee_rate_or_min(request.fee_rate),
             )
             .map_err(custom_err)?;
 
@@ -2941,16 +2964,14 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
         let allocated =
             allocate_decision_slots(&self.app.node, &slot_requests)?;
 
-        let total_listing_fee: u64 = allocated
-            .iter()
-            .try_fold(0u64, |acc, slot| acc.checked_add(slot.listing_fee_sats))
-            .ok_or_else(|| custom_err_msg("listing fee overflow"))?;
+        let listing_fees = listing_fees_by_period(&allocated)?;
+        let listing_fee_sats = total_listing_fee(&listing_fees)?;
 
         if let Some(cap) = request.max_listing_fee_sats
-            && total_listing_fee > cap
+            && listing_fee_sats > cap
         {
             return Err(custom_err_msg(format!(
-                "Listing fee {total_listing_fee} exceeds \
+                "Listing fee {listing_fee_sats} exceeds \
                  max_listing_fee_sats {cap}"
             )));
         }
@@ -3033,12 +3054,6 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             })
             .collect();
 
-        let total_fee = Amount::from_sat(
-            total_listing_fee
-                .checked_add(request.tx_fee_sats)
-                .ok_or_else(|| custom_err_msg("total fee overflow"))?,
-        );
-
         let (tx, market_id) = self
             .app
             .wallet
@@ -3057,7 +3072,8 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                     tx_pow_difficulty: request.tx_pow_difficulty,
                     new_claims,
                 },
-                total_fee,
+                &listing_fees,
+                fee_rate_or_min(request.fee_rate),
             )
             .map_err(custom_err)?;
 
@@ -3111,9 +3127,8 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
 
         check_buy_limit(cost_sats, max_cost)?;
 
-        let trade_max_cost =
-            i64::try_from(max_cost - trading::TRADE_MINER_FEE_SATS)
-                .map_err(|_| custom_err_msg("max_cost is too large"))?;
+        let trade_max_cost = i64::try_from(max_cost)
+            .map_err(|_| custom_err_msg("max_cost is too large"))?;
         let txid = self.send_market_trade(
             &market,
             deltas,
@@ -3295,7 +3310,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
     async fn vote_submit(
         &self,
         votes: Vec<truthcoin_dc_app_rpc_api::markets::BallotItem>,
-        fee_sats: Option<u64>,
+        fee_rate: Option<u64>,
         voter: Option<Address>,
     ) -> RpcResult<String> {
         use truthcoin_dc::types::BallotItem;
@@ -3379,7 +3394,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 voter,
                 batch_items,
                 period_id,
-                fee_sats.map(bitcoin::Amount::from_sat),
+                fee_rate_or_min(fee_rate),
                 self.app.spend_options().map_err(custom_err)?,
             )
             .map_err(custom_err)?;
@@ -3394,7 +3409,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
     async fn vote_reveal(
         &self,
         voting_period: u32,
-        fee_sats: Option<u64>,
+        fee_rate: Option<u64>,
         voter: Option<Address>,
     ) -> RpcResult<String> {
         let voter = self.app.resolve_voter(voter).map_err(custom_err)?;
@@ -3423,7 +3438,7 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
             .wallet
             .reveal_ballot(
                 ballot,
-                fee_sats.map(bitcoin::Amount::from_sat),
+                fee_rate_or_min(fee_rate),
                 self.app.spend_options().map_err(custom_err)?,
             )
             .map_err(custom_err)?;
@@ -3714,18 +3729,17 @@ mod tests {
     use truthcoin_dc::types::Address;
     use truthcoin_dc_app_rpc_api::markets::MarketDimensionKind;
 
-    /// A market buy's cost limit counts the miner fee
+    /// A market buy's cost limit leaves out the miner fee
     #[test]
-    fn buy_limit_miner_fee() -> anyhow::Result<()> {
-        let Err(err) = check_buy_limit(1011, 1100) else {
-            anyhow::bail!("max_cost 1100 sats passed the buy limit");
+    fn buy_limit_excludes_miner_fee() -> anyhow::Result<()> {
+        let Err(err) = check_buy_limit(1011, 1010) else {
+            anyhow::bail!("max_cost 1010 sats passed the buy limit");
         };
         assert_eq!(
             err.message(),
-            "Share cost 1011 sats + miner fee 1000 sats exceeds maximum cost 1100 sats (slippage protection)"
+            "Share cost 1011 sats exceeds maximum cost 1010 sats (slippage protection)"
         );
-        assert!(check_buy_limit(1011, 2010).is_err());
-        assert!(check_buy_limit(1011, 2011).is_ok());
+        assert!(check_buy_limit(1011, 1011).is_ok());
         Ok(())
     }
 

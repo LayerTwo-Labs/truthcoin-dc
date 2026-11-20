@@ -1,6 +1,6 @@
 use eframe::egui::{self, Button, Color32};
 
-use crate::app::App;
+use crate::{app::App, gui::util::parse_fee_rate};
 
 #[derive(Default)]
 pub struct Deposit {
@@ -114,7 +114,7 @@ impl Deposit {
 pub struct Withdrawal {
     mainchain_address: String,
     amount: String,
-    fee: String,
+    fee_rate: String,
     mainchain_fee: String,
     error: Option<String>,
     generate_promise: Option<
@@ -129,7 +129,7 @@ impl std::fmt::Debug for Withdrawal {
         f.debug_struct("Withdrawal")
             .field("mainchain_address", &self.mainchain_address)
             .field("amount", &self.amount)
-            .field("fee", &self.fee)
+            .field("fee_rate", &self.fee_rate)
             .field("mainchain_fee", &self.mainchain_fee)
             .field("error", &self.error)
             .field("generate_active", &self.generate_promise.is_some())
@@ -141,7 +141,7 @@ fn create_withdrawal(
     app: &App,
     mainchain_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
     amount: bitcoin::Amount,
-    fee: bitcoin::Amount,
+    fee_rate: u64,
     mainchain_fee: bitcoin::Amount,
 ) -> anyhow::Result<()> {
     let accumulator = app.node.get_tip_accumulator()?;
@@ -151,7 +151,7 @@ fn create_withdrawal(
         mainchain_address,
         amount,
         mainchain_fee,
-        fee,
+        fee_rate,
     )?;
     app.sign_and_send(tx)?;
     Ok(())
@@ -217,11 +217,11 @@ impl Withdrawal {
         });
         ui.add_sized((110., 10.), |ui: &mut egui::Ui| {
             ui.horizontal(|ui| {
-                let fee_edit = egui::TextEdit::singleline(&mut self.fee)
-                    .hint_text("fee")
+                let fee_edit = egui::TextEdit::singleline(&mut self.fee_rate)
+                    .hint_text("fee rate (1)")
                     .desired_width(80.);
                 ui.add(fee_edit);
-                ui.label("BTC");
+                ui.label("sat/byte");
             })
             .response
         });
@@ -243,10 +243,7 @@ impl Withdrawal {
             &self.amount,
             bitcoin::Denomination::Bitcoin,
         );
-        let fee = bitcoin::Amount::from_str_in(
-            &self.fee,
-            bitcoin::Denomination::Bitcoin,
-        );
+        let fee = parse_fee_rate(&self.fee_rate);
         let mainchain_fee = bitcoin::Amount::from_str_in(
             &self.mainchain_fee,
             bitcoin::Denomination::Bitcoin,

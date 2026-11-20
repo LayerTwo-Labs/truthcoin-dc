@@ -250,11 +250,11 @@ pub fn calculate_fee_distribution(
     Ok(fee_payouts)
 }
 
-fn generate_market_address(market_id: &MarketId, domain: &[u8]) -> Address {
+fn domain_address(domain: &[u8], id: &[u8]) -> Address {
     use blake3::Hasher;
     let mut hasher = Hasher::new();
     hasher.update(domain);
-    hasher.update(&market_id.0);
+    hasher.update(id);
     let hash = hasher.finalize();
     let mut address_bytes = [0u8; 20];
     address_bytes.copy_from_slice(&hash.as_bytes()[0..20]);
@@ -262,11 +262,34 @@ fn generate_market_address(market_id: &MarketId, domain: &[u8]) -> Address {
 }
 
 pub fn generate_market_treasury_address(market_id: &MarketId) -> Address {
-    generate_market_address(market_id, b"MARKET_TREASURY_ADDRESS")
+    domain_address(b"MARKET_TREASURY_ADDRESS", &market_id.0)
 }
 
 pub fn generate_market_author_fee_address(market_id: &MarketId) -> Address {
-    generate_market_address(market_id, b"MARKET_AUTHOR_FEE_ADDRESS")
+    domain_address(b"MARKET_AUTHOR_FEE_ADDRESS", &market_id.0)
+}
+
+pub fn generate_listing_pool_address(period: u32) -> Address {
+    domain_address(b"LISTING_FEE_POOL", &period.to_le_bytes())
+}
+
+/// Deterministic outpoint of a holder's share of a listing fee pool
+pub fn generate_listing_payout_outpoint(
+    period: u32,
+    holder: &Address,
+    block_height: u32,
+    sequence: u32,
+) -> OutPoint {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"LISTING_PAYOUT");
+    hasher.update(&period.to_le_bytes());
+    hasher.update(&holder.0);
+    hasher.update(&block_height.to_le_bytes());
+    hasher.update(&sequence.to_le_bytes());
+    OutPoint::Payout {
+        hash: MerkleRoot::from(*hasher.finalize().as_bytes()),
+        vout: sequence,
+    }
 }
 
 /// Generate a deterministic outpoint for share payouts

@@ -1079,7 +1079,8 @@ fn parent_txid(outpoint: &OutPoint) -> Option<Txid> {
         | OutPoint::Deposit(_)
         | OutPoint::MarketFunds { .. }
         | OutPoint::Payout { .. }
-        | OutPoint::UnsuccessfulWithdrawal { .. } => None,
+        | OutPoint::UnsuccessfulWithdrawal { .. }
+        | OutPoint::ListingFees { .. } => None,
     }
 }
 

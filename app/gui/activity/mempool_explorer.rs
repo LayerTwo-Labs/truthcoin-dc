@@ -146,6 +146,14 @@ impl MempoolExplorer {
                                         format!("{m6id}"),
                                         *vout,
                                     ),
+                                    OutPoint::ListingFees {
+                                        period,
+                                        block_height,
+                                    } => (
+                                        "listing_fees",
+                                        format!("{period:08}"),
+                                        *block_height,
+                                    ),
                                 };
                                 let output = &utxos[input];
                                 let hash = &hash[0..8];

@@ -79,6 +79,11 @@ pub enum OutPoint {
         /// Index of the spent output within the bundle's spend_utxos
         vout: u32,
     },
+    /// Pool of the decision listing fees of a period
+    ListingFees {
+        period: u32,
+        block_height: u32,
+    },
 }
 
 impl std::fmt::Display for OutPoint {
@@ -107,6 +112,10 @@ impl std::fmt::Display for OutPoint {
             Self::UnsuccessfulWithdrawal { m6id, height, vout } => {
                 write!(f, "unsuccessful withdrawal {m6id} {height} {vout}")
             }
+            Self::ListingFees {
+                period,
+                block_height,
+            } => write!(f, "listing_fees {period} {block_height}"),
         }
     }
 }
@@ -249,6 +258,10 @@ mod test {
                 m6id: M6id(bitcoin::Txid::from_byte_array([0; 32])),
                 height: u32::MAX,
                 vout: u32::MAX,
+            },
+            OutPoint::ListingFees {
+                period: u32::MAX,
+                block_height: u32::MAX,
             },
         ];
 

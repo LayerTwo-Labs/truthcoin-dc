@@ -16,6 +16,7 @@ use truthcoin_dc::types::DecisionClaimEntry;
 use truthcoin_dc::wallet::DecisionClaimInput;
 
 use crate::app::App;
+use crate::gui::util::parse_fee_rate;
 use crate::util::PromiseStream;
 
 type NodeUpdates = PromiseStream<Pin<Box<dyn Stream<Item = ()> + Send>>>;
@@ -67,7 +68,7 @@ struct Claim {
     option_1_label: String,
     outcomes: Vec<String>,
     tags_input: String,
-    tx_fee_sats_input: String,
+    fee_rate_input: String,
     max_listing_fee_sats_input: String,
     is_processing: bool,
 }
@@ -85,7 +86,7 @@ impl Default for Claim {
             option_1_label: String::new(),
             outcomes: vec![String::new(), String::new()],
             tags_input: String::new(),
-            tx_fee_sats_input: "1000".to_string(),
+            fee_rate_input: "1".to_string(),
             max_listing_fee_sats_input: String::new(),
             is_processing: false,
         }
@@ -378,15 +379,14 @@ impl Decisions {
             return;
         }
 
-        let tx_fee_sats =
-            match self.claim.tx_fee_sats_input.trim().parse::<u64>() {
-                Ok(v) => v,
-                Err(_) => {
-                    self.error =
-                        Some("Invalid miner fee: must be a number".to_string());
-                    return;
-                }
-            };
+        let fee_rate = match parse_fee_rate(&self.claim.fee_rate_input) {
+            Ok(fee_rate) => fee_rate,
+            Err(_) => {
+                self.error =
+                    Some("Invalid fee rate: must be a number".to_string());
+                return;
+            }
+        };
 
         let trimmed_max = self.claim.max_listing_fee_sats_input.trim();
         let max_listing_fee_sats: Option<u64> = if trimmed_max.is_empty() {
@@ -426,8 +426,10 @@ impl Decisions {
             decisions: vec![entry],
         };
 
-        let total_fee =
-            bitcoin::Amount::from_sat(listing_fee.saturating_add(tx_fee_sats));
+        let listing_fees = std::collections::BTreeMap::from([(
+            decision_id.period_index(),
+            listing_fee,
+        )]);
 
         let options = match app.spend_options() {
             Ok(options) => options,
@@ -437,7 +439,10 @@ impl Decisions {
                 return;
             }
         };
-        match app.wallet.claim_decision(options, input, total_fee) {
+        match app
+            .wallet
+            .claim_decision(options, input, &listing_fees, fee_rate)
+        {
             Ok(tx) => {
                 if let Err(e) = app.sign_and_send(tx) {
                     self.error = Some(format!("Failed to send: {e:#}"));
@@ -878,13 +883,11 @@ impl Decisions {
                 );
                 ui.end_row();
 
-                ui.label("Miner fee (sats):");
+                ui.label("Fee rate (sat/byte):");
                 ui.add(
-                    egui::TextEdit::singleline(
-                        &mut self.claim.tx_fee_sats_input,
-                    )
-                    .hint_text("e.g. 1000")
-                    .desired_width(120.0),
+                    egui::TextEdit::singleline(&mut self.claim.fee_rate_input)
+                        .hint_text("1 is the minimum")
+                        .desired_width(120.0),
                 );
                 ui.end_row();
             });

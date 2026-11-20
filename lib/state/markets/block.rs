@@ -12,8 +12,8 @@ use crate::{
     },
     types::{
         AccumulatorDiff, Address, Body, FilledTransaction, GetValue as _,
-        MerkleRoot, OutPoint, OutPointKey, OutputContent, Transaction, TxData,
-        Votecoin,
+        MerkleRoot, OutPoint, OutPointKey, Output, OutputContent, Transaction,
+        TxData, Votecoin,
         state::{MarketUtxo, MarketUtxoChanges, MarketUtxoReason},
     },
 };
@@ -25,6 +25,8 @@ struct StateUpdate {
     share_account_changes: HashMap<(Address, MarketId), HashMap<u32, i64>>,
     vote_submissions: Vec<VoteSubmission>,
     pending_trade_settlements: Vec<PendingTradeSettlement>,
+    /// Listing fee outputs of the block's claims, with their periods
+    listing_fee_outputs: Vec<(u32, OutPoint)>,
 }
 
 struct MarketStateUpdate {
@@ -56,6 +58,7 @@ pub struct PendingTradeSettlement {
     pub buy_cost_sats: u64,
     pub sell_gross_sats: u64,
     pub fee_sats: u64,
+    pub miner_fee_sats: u64,
     pub transaction_id: [u8; 32],
     pub is_amplify: bool,
 }
@@ -68,6 +71,26 @@ pub enum TradeApplyResult {
 impl StateUpdate {
     fn new() -> Self {
         Self::default()
+    }
+
+    fn record_listing_fees(&mut self, filled_tx: &FilledTransaction) {
+        let txid = filled_tx.txid();
+        self.listing_fee_outputs.extend(
+            filled_tx.transaction.outputs.iter().enumerate().filter_map(
+                |(vout, output)| match output.content {
+                    OutputContent::ListingFees { period, .. } => Some((
+                        period,
+                        OutPoint::Regular {
+                            txid,
+                            vout: vout as u32,
+                        },
+                    )),
+                    OutputContent::Value(_)
+                    | OutputContent::Withdrawal { .. }
+                    | OutputContent::MarketFunds { .. } => None,
+                },
+            ),
+        );
     }
 
     fn verify_internal_consistency(&self) -> Result<(), Error> {
@@ -315,7 +338,6 @@ impl StateUpdate {
         height: u32,
         pending_trade_settlements: &[PendingTradeSettlement],
     ) -> Result<Option<crate::state::undo::ConsolidationUndoData>, Error> {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
         use crate::state::markets::{
             generate_market_author_fee_address,
             generate_market_treasury_address,
@@ -418,7 +440,7 @@ impl StateUpdate {
                 let change = settlement
                     .input_value_sats
                     .checked_add(settlement.sell_gross_sats)
-                    .and_then(|v| v.checked_sub(TRADE_MINER_FEE_SATS))
+                    .and_then(|v| v.checked_sub(settlement.miner_fee_sats))
                     .and_then(|v| v.checked_sub(settlement.buy_cost_sats))
                     .and_then(|v| v.checked_sub(settlement.fee_sats))
                     .ok_or_else(|| Error::InvalidTransaction {
@@ -427,7 +449,7 @@ impl StateUpdate {
                              miner fee {} + buy {} + market fee {}",
                             settlement.input_value_sats,
                             settlement.sell_gross_sats,
-                            TRADE_MINER_FEE_SATS,
+                            settlement.miner_fee_sats,
                             settlement.buy_cost_sats,
                             settlement.fee_sats,
                         ),
@@ -703,9 +725,11 @@ pub(in crate::state) fn connect_txs(
                     &mut state_update,
                     height,
                 )?;
+                state_update.record_listing_fees(filled_tx);
             }
             Some(TxData::ClaimDecision(_)) => {
                 apply_decision_claim(state, rwtxn, filled_tx, height)?;
+                state_update.record_listing_fees(filled_tx);
             }
             Some(TxData::SubmitBallot { .. }) => {
                 apply_submit_ballot(state, rwtxn, filled_tx)?;
@@ -803,6 +827,17 @@ pub(in crate::state) fn connect_end(
             .consolidation_undo
             .put(rwtxn, &height, &consolidation_undo)?;
     }
+    let mut listing_pool_undo = crate::state::undo::ListingPoolUndoData {
+        consolidations: consolidate_listing_fees(
+            state,
+            rwtxn,
+            accumulator_diff,
+            &mut market_utxos,
+            height,
+            &state_update.listing_fee_outputs,
+        )?,
+        payouts: Vec::new(),
+    };
     if height == 0 {
         state.decisions().mint_genesis(
             rwtxn,
@@ -882,6 +917,25 @@ pub(in crate::state) fn connect_end(
         )? {
             consensus_undo_entries.push(undo_entry);
         }
+        if let Some(decision_period) = vp_num.checked_sub(1)
+            && let Some(payout) = pay_out_listing_pool(
+                state,
+                rwtxn,
+                accumulator_diff,
+                &mut market_utxos,
+                decision_period,
+                height,
+            )?
+        {
+            listing_pool_undo.payouts.push(payout);
+        }
+    }
+    if !listing_pool_undo.consolidations.is_empty()
+        || !listing_pool_undo.payouts.is_empty()
+    {
+        state
+            .listing_pool_undo
+            .put(rwtxn, &height, &listing_pool_undo)?;
     }
     if !consensus_undo_entries.is_empty() {
         let undo_data = crate::state::undo::ConsensusUndoData {
@@ -965,6 +1019,17 @@ pub(in crate::state) fn disconnect_begin(
             height,
         )?;
         state.settlement_undo.delete(rwtxn, &height)?;
+    }
+    if let Some(listing_pool_undo) =
+        state.listing_pool_undo.try_get(rwtxn, &height)?
+    {
+        revert_listing_pools(
+            state,
+            rwtxn,
+            accumulator_diff,
+            &listing_pool_undo,
+        )?;
+        state.listing_pool_undo.delete(rwtxn, &height)?;
     }
     if let Some(consensus_undo) =
         state.consensus_undo.try_get(rwtxn, &height)?
@@ -1144,6 +1209,219 @@ fn revert_delete_utxo(
             "UTXO not found during revert \
              (expected for zero-value outputs): {outpoint:?}"
         );
+    }
+    Ok(())
+}
+
+/// Remove a listing fee UTXO from the UTXO set, returning its output
+fn take_listing_utxo(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    accumulator_diff: &mut AccumulatorDiff,
+    market_utxos: &mut MarketUtxoChanges,
+    outpoint: &OutPoint,
+) -> Result<Output, Error> {
+    let output = state
+        .utxos
+        .try_get(rwtxn, &OutPointKey::from(outpoint))?
+        .ok_or(crate::state::error::NoUtxo {
+            outpoint: *outpoint,
+        })?;
+    state.delete_market_utxo(
+        rwtxn,
+        accumulator_diff,
+        market_utxos,
+        outpoint,
+        MarketUtxoReason::ListingPool,
+    )?;
+    Ok(output)
+}
+
+/// Merge each period's new listing fee outputs and its old pool into one
+/// pool UTXO
+fn consolidate_listing_fees(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    accumulator_diff: &mut AccumulatorDiff,
+    market_utxos: &mut MarketUtxoChanges,
+    height: u32,
+    listing_fee_outputs: &[(u32, OutPoint)],
+) -> Result<Vec<crate::state::undo::ListingPoolConsolidation>, Error> {
+    use crate::state::markets::payouts::generate_listing_pool_address;
+
+    let mut by_period: BTreeMap<u32, Vec<OutPoint>> = BTreeMap::new();
+    for (period, outpoint) in listing_fee_outputs {
+        by_period.entry(*period).or_default().push(*outpoint);
+    }
+    let mut consolidations = Vec::new();
+    for (period, outpoints) in by_period {
+        let old_pool = state.decisions().get_listing_pool(rwtxn, period)?;
+        let mut consumed = Vec::new();
+        let mut amount = bitcoin::Amount::ZERO;
+        for outpoint in old_pool.iter().chain(&outpoints) {
+            let output = take_listing_utxo(
+                state,
+                rwtxn,
+                accumulator_diff,
+                market_utxos,
+                outpoint,
+            )?;
+            amount = amount
+                .checked_add(output.get_value())
+                .ok_or(crate::types::AmountOverflowError)?;
+            consumed.push((*outpoint, output));
+        }
+        let new_pool = OutPoint::ListingFees {
+            period,
+            block_height: height,
+        };
+        state.insert_market_utxo(
+            rwtxn,
+            accumulator_diff,
+            market_utxos,
+            MarketUtxo {
+                outpoint: new_pool,
+                output: Output {
+                    address: generate_listing_pool_address(period),
+                    content: OutputContent::ListingFees { period, amount },
+                },
+                reason: MarketUtxoReason::ListingPool,
+            },
+        )?;
+        state
+            .decisions()
+            .set_listing_pool(rwtxn, period, Some(new_pool))?;
+        consolidations.push(crate::state::undo::ListingPoolConsolidation {
+            period,
+            consumed,
+            old_pool,
+            new_pool,
+        });
+    }
+    Ok(consolidations)
+}
+
+/// Pay the listing fee pool of `period` to the reputation holders, in
+/// proportion to their holdings. A share too small to pay for its own
+/// spend at the minimum fee rate goes to the largest holder.
+fn pay_out_listing_pool(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    accumulator_diff: &mut AccumulatorDiff,
+    market_utxos: &mut MarketUtxoChanges,
+    period: u32,
+    height: u32,
+) -> Result<Option<crate::state::undo::ListingPoolPayout>, Error> {
+    use crate::{
+        math::allocation::split_by_holdings,
+        state::markets::payouts::generate_listing_payout_outpoint,
+    };
+
+    let Some(pool_outpoint) =
+        state.decisions().get_listing_pool(rwtxn, period)?
+    else {
+        return Ok(None);
+    };
+    let pool_sats = state
+        .utxos
+        .try_get(rwtxn, &OutPointKey::from(&pool_outpoint))?
+        .map_or(0, |output| output.get_value().to_sat());
+    let holdings: BTreeMap<Address, u64> = state
+        .reputation()
+        .get_all_reputations(rwtxn)?
+        .into_iter()
+        .map(|(address, units)| (address, units.0))
+        .collect();
+    let spend_size =
+        crate::validation::input_size(&generate_listing_payout_outpoint(
+            period,
+            &Address::ALL_ZEROS,
+            height,
+            0,
+        ))
+        .map_err(Error::BincodeSerialize)?;
+    let shares = split_by_holdings(
+        pool_sats,
+        &holdings,
+        spend_size * crate::validation::MIN_FEERATE_SATS_PER_BYTE,
+    );
+    if shares.is_empty() {
+        return Ok(None);
+    }
+    let pool_output = take_listing_utxo(
+        state,
+        rwtxn,
+        accumulator_diff,
+        market_utxos,
+        &pool_outpoint,
+    )?;
+    state.decisions().set_listing_pool(rwtxn, period, None)?;
+    let mut payouts = Vec::with_capacity(shares.len());
+    for (sequence, (holder, sats)) in shares.into_iter().enumerate() {
+        let outpoint = generate_listing_payout_outpoint(
+            period,
+            &holder,
+            height,
+            sequence as u32,
+        );
+        state.insert_market_utxo(
+            rwtxn,
+            accumulator_diff,
+            market_utxos,
+            MarketUtxo {
+                outpoint,
+                output: Output {
+                    address: holder,
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        sats,
+                    )),
+                },
+                reason: MarketUtxoReason::ListingPayout,
+            },
+        )?;
+        payouts.push(outpoint);
+    }
+    Ok(Some(crate::state::undo::ListingPoolPayout {
+        period,
+        pool: (pool_outpoint, pool_output),
+        payouts,
+    }))
+}
+
+/// Revert the listing fee pools that a block paid out and consolidated
+fn revert_listing_pools(
+    state: &State,
+    rwtxn: &mut RwTxn,
+    accumulator_diff: &mut AccumulatorDiff,
+    undo: &crate::state::undo::ListingPoolUndoData,
+) -> Result<(), Error> {
+    for payout in undo.payouts.iter().rev() {
+        for outpoint in &payout.payouts {
+            revert_delete_utxo(state, rwtxn, accumulator_diff, outpoint)?;
+        }
+        let (outpoint, output) = &payout.pool;
+        state.insert_utxo(rwtxn, outpoint, output, accumulator_diff)?;
+        state.decisions().set_listing_pool(
+            rwtxn,
+            payout.period,
+            Some(*outpoint),
+        )?;
+    }
+    for consolidation in undo.consolidations.iter().rev() {
+        revert_delete_utxo(
+            state,
+            rwtxn,
+            accumulator_diff,
+            &consolidation.new_pool,
+        )?;
+        for (outpoint, output) in &consolidation.consumed {
+            state.insert_utxo(rwtxn, outpoint, output, accumulator_diff)?;
+        }
+        state.decisions().set_listing_pool(
+            rwtxn,
+            consolidation.period,
+            consolidation.old_pool,
+        )?;
     }
     Ok(())
 }
@@ -1768,6 +2046,12 @@ fn apply_trade(
         buy_cost_sats: quote.buy_cost_sats,
         sell_gross_sats: quote.sell_gross_sats,
         fee_sats: quote.fee_sats,
+        miner_fee_sats: crate::validation::trade_miner_fee(
+            &filled_tx.transaction,
+            filled_tx.actor_address.is_some(),
+        )
+        .map_err(Error::BincodeSerialize)?
+        .to_sat(),
         transaction_id: filled_tx.transaction.txid().0,
         is_amplify: false,
     });
@@ -1955,6 +2239,12 @@ fn apply_amplify_beta(
         buy_cost_sats: amplify.amount,
         sell_gross_sats: 0,
         fee_sats: 0,
+        miner_fee_sats: crate::validation::trade_miner_fee(
+            &filled_tx.transaction,
+            filled_tx.actor_address.is_some(),
+        )
+        .map_err(Error::BincodeSerialize)?
+        .to_sat(),
         transaction_id: filled_tx.transaction.txid().0,
         is_amplify: true,
     });
@@ -2394,6 +2684,41 @@ mod tests {
         Ok(())
     }
 
+    /// A trade's change leaves out the miner fee stored with its settlement
+    #[test]
+    fn settlement_miner_fee() -> anyhow::Result<()> {
+        let fixture = trading_fixture();
+        let state = &fixture.state;
+        let market_id = fixture.market.id;
+        let buyer = Address([2; 20]);
+        let mut rwtxn = fixture.env.write_txn()?;
+        StateUpdate::consolidate_market_utxos(
+            state,
+            &mut rwtxn,
+            &mut AccumulatorDiff::default(),
+            &mut MarketUtxoChanges::default(),
+            1,
+            &[PendingTradeSettlement {
+                market_id,
+                trader_address: buyer,
+                input_value_sats: 50_000,
+                buy_cost_sats: 2_000,
+                sell_gross_sats: 0,
+                fee_sats: 20,
+                miner_fee_sats: 2_500,
+                transaction_id: [4; 32],
+                is_amplify: false,
+            }],
+        )?;
+        let change = StateUpdate::generate_trade_change_outpoint(
+            &market_id, &buyer, [4; 32],
+        );
+        anyhow::ensure!(
+            utxo(state, &rwtxn, &change) == Some(50_000 - 2_000 - 20 - 2_500)
+        );
+        Ok(())
+    }
+
     /// Consolidation records every UTXO write it makes.
     #[test]
     fn consolidation_records_writes() -> anyhow::Result<()> {
@@ -2456,6 +2781,7 @@ mod tests {
                     buy_cost_sats: 0,
                     sell_gross_sats: 3_030,
                     fee_sats: 30,
+                    miner_fee_sats: 1_000,
                     transaction_id: [3; 32],
                     is_amplify: false,
                 },
@@ -2466,6 +2792,7 @@ mod tests {
                     buy_cost_sats: 2_000,
                     sell_gross_sats: 0,
                     fee_sats: 20,
+                    miner_fee_sats: 1_000,
                     transaction_id: [4; 32],
                     is_amplify: false,
                 },
@@ -3304,6 +3631,7 @@ mod tests {
             buy_cost_sats: 12_345,
             sell_gross_sats: 0,
             fee_sats: 0,
+            miner_fee_sats: 0,
             transaction_id: [0u8; 32],
             is_amplify: false,
         });
@@ -3505,5 +3833,238 @@ mod tests {
             "the replay reached other roots: {replayed_roots:?} != {roots:?}"
         );
         Ok(())
+    }
+
+    fn listing_state() -> (tempfile::TempDir, sneed::Env, State) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024).max_dbs(State::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None, true).unwrap();
+        (dir, env, state)
+    }
+
+    fn utxo(state: &State, rotxn: &RoTxn, outpoint: &OutPoint) -> Option<u64> {
+        state
+            .utxos
+            .try_get(rotxn, &OutPointKey::from(outpoint))
+            .unwrap()
+            .map(|output| output.get_value().to_sat())
+    }
+
+    /// Insert a claim's listing fee output for `period`
+    fn listing_output(
+        state: &State,
+        rwtxn: &mut RwTxn,
+        txid: u8,
+        period: u32,
+        sats: u64,
+    ) -> OutPoint {
+        let outpoint = OutPoint::Regular {
+            txid: crate::types::Txid([txid; 32]),
+            vout: 0,
+        };
+        let output = Output {
+            address:
+                crate::state::markets::payouts::generate_listing_pool_address(
+                    period,
+                ),
+            content: OutputContent::ListingFees {
+                period,
+                amount: bitcoin::Amount::from_sat(sats),
+            },
+        };
+        state
+            .insert_utxo(
+                rwtxn,
+                &outpoint,
+                &output,
+                &mut AccumulatorDiff::default(),
+            )
+            .unwrap();
+        outpoint
+    }
+
+    fn consolidate(
+        state: &State,
+        rwtxn: &mut RwTxn,
+        height: u32,
+        outputs: &[(u32, OutPoint)],
+    ) -> crate::state::undo::ListingPoolUndoData {
+        crate::state::undo::ListingPoolUndoData {
+            consolidations: consolidate_listing_fees(
+                state,
+                rwtxn,
+                &mut AccumulatorDiff::default(),
+                &mut MarketUtxoChanges::default(),
+                height,
+                outputs,
+            )
+            .unwrap(),
+            payouts: Vec::new(),
+        }
+    }
+
+    /// Listing fees of two blocks merge into one pool UTXO, and reverting
+    /// each block restores the pool and outputs before it
+    #[test]
+    fn pool_accumulates_blocks() {
+        let (_dir, env, state) = listing_state();
+        let mut rwtxn = env.write_txn().unwrap();
+        let first = listing_output(&state, &mut rwtxn, 1, 2, 300);
+        let second = listing_output(&state, &mut rwtxn, 2, 2, 200);
+        let undo_5 =
+            consolidate(&state, &mut rwtxn, 5, &[(2, first), (2, second)]);
+        let pool_5 = OutPoint::ListingFees {
+            period: 2,
+            block_height: 5,
+        };
+        let third = listing_output(&state, &mut rwtxn, 3, 2, 100);
+        let undo_6 = consolidate(&state, &mut rwtxn, 6, &[(2, third)]);
+        let pool_6 = OutPoint::ListingFees {
+            period: 2,
+            block_height: 6,
+        };
+        assert_eq!(utxo(&state, &rwtxn, &pool_6), Some(600));
+        assert_eq!(
+            state.decisions().get_listing_pool(&rwtxn, 2).unwrap(),
+            Some(pool_6)
+        );
+        assert!(
+            [first, second, third, pool_5]
+                .iter()
+                .all(|outpoint| utxo(&state, &rwtxn, outpoint).is_none())
+        );
+
+        let mut diff = AccumulatorDiff::default();
+        revert_listing_pools(&state, &mut rwtxn, &mut diff, &undo_6).unwrap();
+        assert_eq!(utxo(&state, &rwtxn, &pool_5), Some(500));
+        assert_eq!(utxo(&state, &rwtxn, &third), Some(100));
+        assert_eq!(utxo(&state, &rwtxn, &pool_6), None);
+        assert_eq!(
+            state.decisions().get_listing_pool(&rwtxn, 2).unwrap(),
+            Some(pool_5)
+        );
+
+        revert_listing_pools(&state, &mut rwtxn, &mut diff, &undo_5).unwrap();
+        assert_eq!(utxo(&state, &rwtxn, &first), Some(300));
+        assert_eq!(utxo(&state, &rwtxn, &second), Some(200));
+        assert_eq!(utxo(&state, &rwtxn, &pool_5), None);
+        assert_eq!(
+            state.decisions().get_listing_pool(&rwtxn, 2).unwrap(),
+            None
+        );
+    }
+
+    /// Each period's listing fees go to that period's own pool
+    #[test]
+    fn pool_per_period() {
+        let (_dir, env, state) = listing_state();
+        let mut rwtxn = env.write_txn().unwrap();
+        let early = listing_output(&state, &mut rwtxn, 1, 2, 300);
+        let late = listing_output(&state, &mut rwtxn, 2, 7, 200);
+        consolidate(&state, &mut rwtxn, 5, &[(2, early), (7, late)]);
+        for (period, sats) in [(2, 300), (7, 200)] {
+            let pool =
+                state.decisions().get_listing_pool(&rwtxn, period).unwrap();
+            assert_eq!(utxo(&state, &rwtxn, &pool.unwrap()), Some(sats));
+        }
+    }
+
+    /// A paid out pool reaches every holder in proportion to its holdings,
+    /// the remainder to the largest, and reverting restores the pool
+    #[test]
+    fn pool_pays_holders() {
+        let (_dir, env, state) = listing_state();
+        let mut rwtxn = env.write_txn().unwrap();
+        let holders = [
+            (Address([1; 20]), 1, 250),
+            (Address([2; 20]), 1, 250),
+            (Address([3; 20]), 2, 501),
+        ];
+        for (address, units, _) in holders {
+            state
+                .reputation()
+                .set_reputation(&mut rwtxn, &address, Votecoin(units))
+                .unwrap();
+        }
+        let fees = listing_output(&state, &mut rwtxn, 1, 2, 1_001);
+        consolidate(&state, &mut rwtxn, 5, &[(2, fees)]);
+        let pool = state.decisions().get_listing_pool(&rwtxn, 2).unwrap();
+
+        let mut diff = AccumulatorDiff::default();
+        let payout = pay_out_listing_pool(
+            &state,
+            &mut rwtxn,
+            &mut diff,
+            &mut MarketUtxoChanges::default(),
+            2,
+            9,
+        )
+        .unwrap()
+        .unwrap();
+        for (sequence, (address, _, sats)) in holders.into_iter().enumerate() {
+            let outpoint = crate::state::markets::payouts::generate_listing_payout_outpoint(
+                2,
+                &address,
+                9,
+                sequence as u32,
+            );
+            let output = state
+                .utxos
+                .try_get(&rwtxn, &OutPointKey::from(&outpoint))
+                .unwrap()
+                .unwrap();
+            assert_eq!(output.address, address);
+            assert_eq!(
+                output.content,
+                OutputContent::Value(bitcoin::Amount::from_sat(sats),)
+            );
+        }
+        assert_eq!(utxo(&state, &rwtxn, &pool.unwrap()), None);
+        assert_eq!(
+            state.decisions().get_listing_pool(&rwtxn, 2).unwrap(),
+            None
+        );
+
+        let undo = crate::state::undo::ListingPoolUndoData {
+            consolidations: Vec::new(),
+            payouts: vec![payout.clone()],
+        };
+        revert_listing_pools(&state, &mut rwtxn, &mut diff, &undo).unwrap();
+        assert_eq!(utxo(&state, &rwtxn, &pool.unwrap()), Some(1_001));
+        assert_eq!(
+            state.decisions().get_listing_pool(&rwtxn, 2).unwrap(),
+            pool
+        );
+        assert!(
+            payout
+                .payouts
+                .iter()
+                .all(|outpoint| utxo(&state, &rwtxn, outpoint).is_none())
+        );
+    }
+
+    /// A period without listing fees pays nothing out
+    #[test]
+    fn pool_absent_skips() {
+        let (_dir, env, state) = listing_state();
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .reputation()
+            .set_reputation(&mut rwtxn, &Address([1; 20]), Votecoin(1))
+            .unwrap();
+        assert!(
+            pay_out_listing_pool(
+                &state,
+                &mut rwtxn,
+                &mut AccumulatorDiff::default(),
+                &mut MarketUtxoChanges::default(),
+                2,
+                9,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }

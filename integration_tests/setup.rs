@@ -288,7 +288,8 @@ impl Sidechain for PostSetup {
                 && match utxo.output.content {
                     OutputContent::Value(utxo_value) => utxo_value == value,
                     OutputContent::Withdrawal { .. }
-                    | OutputContent::MarketFunds { .. } => false,
+                    | OutputContent::MarketFunds { .. }
+                    | OutputContent::ListingFees { .. } => false,
                 }
                 && match utxo.outpoint {
                     truthcoin_dc::types::OutPoint::Deposit(outpoint) => {
@@ -334,7 +335,7 @@ impl Sidechain for PostSetup {
             .create_withdrawal(
                 receive_address.as_unchecked().clone(),
                 value.to_sat(),
-                0,
+                None,
                 fee.to_sat(),
             )
             .await?;

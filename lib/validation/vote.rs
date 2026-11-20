@@ -72,36 +72,6 @@ pub(crate) fn check_ballot_conflicts(
     }
 }
 
-pub const MIN_BALLOT_FEERATE_SATS_PER_BYTE: u64 = 1;
-
-/// Minimum fee of a ballot commit or reveal, by the serialized size of its
-/// inputs, outputs and data. The utreexo proof is left out, because the node
-/// regenerates it as the chain grows.
-pub fn min_ballot_fee(
-    transaction: &crate::types::Transaction,
-) -> Result<bitcoin::Amount, bincode::Error> {
-    let size = bincode::serialized_size(&(
-        &transaction.inputs,
-        &transaction.outputs,
-        &transaction.data,
-    ))?;
-    Ok(bitcoin::Amount::from_sat(
-        size * MIN_BALLOT_FEERATE_SATS_PER_BYTE,
-    ))
-}
-
-fn validate_ballot_fee(filled_tx: &FilledTransaction) -> Result<(), Error> {
-    let fee = super::tx_fee(filled_tx)?;
-    let min_fee = min_ballot_fee(&filled_tx.transaction)
-        .map_err(Error::BincodeSerialize)?;
-    if fee < min_fee {
-        return Err(Error::InvalidTransaction {
-            reason: format!("Ballot fee {fee} is below the minimum {min_fee}"),
-        });
-    }
-    Ok(())
-}
-
 pub struct VoteValidator;
 
 impl VoteValidator {
@@ -369,7 +339,6 @@ impl VoteValidator {
 
         Self::validate_actor_identity(filled_tx, ballot.voter)?;
         Self::validate_voter_eligibility(state, rotxn, &ballot.voter)?;
-        validate_ballot_fee(filled_tx)?;
 
         if Self::period_decisions_in_state(
             state,
@@ -518,7 +487,6 @@ impl VoteValidator {
         })?;
 
         Self::validate_actor_identity(filled_tx, reveal.voter)?;
-        validate_ballot_fee(filled_tx)?;
 
         let revealing = Self::period_decisions_in_state(
             state,
@@ -981,10 +949,7 @@ mod tests {
         }
     }
 
-    fn reveal_tx_with_fee(
-        reveal: &crate::types::RevealBallot,
-        fee_sats: u64,
-    ) -> FilledTransaction {
+    fn reveal_tx(reveal: &crate::types::RevealBallot) -> FilledTransaction {
         filled_tx(
             reveal.voter,
             crate::types::TransactionData::RevealBallot {
@@ -993,16 +958,8 @@ mod tests {
                 votes: reveal.votes.clone(),
                 salt: reveal.salt,
             },
-            fee_sats,
+            FEE_SATS,
         )
-    }
-
-    fn reveal_tx(reveal: &crate::types::RevealBallot) -> FilledTransaction {
-        reveal_tx_with_fee(reveal, FEE_SATS)
-    }
-
-    fn min_fee_sats(tx: &FilledTransaction) -> u64 {
-        super::min_ballot_fee(&tx.transaction).unwrap().to_sat()
     }
 
     #[test]
@@ -1032,42 +989,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    /// Seal and reveal txs must pay the minimum fee for their size
-    #[test]
-    fn ballot_minimum_fee() {
-        let f = voting_fixture();
-        let min_seal_fee = min_fee_sats(&f.submit(FEE_SATS));
-        let validate_seal = |fee_sats| {
-            let rotxn = f.env.read_txn().unwrap();
-            VoteValidator::validate_ballot(
-                &f.state,
-                &rotxn,
-                &f.submit(fee_sats),
-                None,
-            )
-        };
-        assert!(min_seal_fee > 0);
-        assert!(validate_seal(min_seal_fee - 1).is_err());
-        validate_seal(min_seal_fee).unwrap();
-
-        let reveal = f.reveal(vec![f.item(0, Some(1.0)), f.item(1, None)]);
-        f.seal(reveal.commitment(), false);
-        f.close_voting();
-        let min_reveal_fee = min_fee_sats(&reveal_tx(&reveal));
-        let validate_reveal = |fee_sats| {
-            let rotxn = f.env.read_txn().unwrap();
-            VoteValidator::validate_reveal(
-                &f.state,
-                &rotxn,
-                &reveal_tx_with_fee(&reveal, fee_sats),
-                None,
-            )
-        };
-        assert!(min_reveal_fee > min_seal_fee);
-        assert!(validate_reveal(min_reveal_fee - 1).is_err());
-        validate_reveal(min_reveal_fee).unwrap();
     }
 
     /// A reveal is only valid once voting has closed

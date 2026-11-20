@@ -1,6 +1,6 @@
 use crate::math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX;
 use crate::state::Error;
-use crate::types::Txid;
+use crate::types::{OutPoint, Txid};
 use crate::validation::DecisionValidationInterface;
 use fallible_iterator::FallibleIterator;
 use heed::types::SerdeBincode;
@@ -40,11 +40,13 @@ pub struct Dbs {
         SerdeBincode<u32>,
         SerdeBincode<Vec<PeriodPricingUndoEntry>>,
     >,
+    /// The UTXO pooling the listing fees paid for each period's decisions
+    listing_pools: DatabaseUnique<SerdeBincode<u32>, SerdeBincode<OutPoint>>,
     config: DecisionConfig,
 }
 
 impl Dbs {
-    pub const NUM_DBS: u32 = 6;
+    pub const NUM_DBS: u32 = 7;
 
     fn get_claimed_decision_ids_for_period(
         &self,
@@ -137,8 +139,35 @@ impl Dbs {
                 rwtxn,
                 "period_pricing_undo",
             )?,
+            listing_pools: DatabaseUnique::create(env, rwtxn, "listing_pools")?,
             config,
         })
+    }
+
+    /// The UTXO pooling the listing fees of `period`
+    pub fn get_listing_pool(
+        &self,
+        rotxn: &RoTxn,
+        period: u32,
+    ) -> Result<Option<OutPoint>, Error> {
+        Ok(self.listing_pools.try_get(rotxn, &period)?)
+    }
+
+    pub fn set_listing_pool(
+        &self,
+        rwtxn: &mut RwTxn,
+        period: u32,
+        pool: Option<OutPoint>,
+    ) -> Result<(), Error> {
+        match pool {
+            Some(outpoint) => {
+                self.listing_pools.put(rwtxn, &period, &outpoint)?
+            }
+            None => {
+                self.listing_pools.delete(rwtxn, &period)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn get_current_period(

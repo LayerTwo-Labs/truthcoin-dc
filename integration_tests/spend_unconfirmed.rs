@@ -31,7 +31,6 @@ use crate::{
 
 const DEPOSIT_AMOUNT: Amount = Amount::from_sat(21_000_000);
 const DEPOSIT_FEE: Amount = Amount::from_sat(1_000_000);
-const TRANSFER_FEE: Amount = Amount::from_sat(1_000);
 
 /// Initial setup for the test
 async fn setup(
@@ -89,7 +88,7 @@ async fn spend_unconfirmed_task(
     tracing::debug!("Sending the parent transfer");
     let parent = sidechain
         .rpc_client
-        .create_transfer(dest, half, TRANSFER_FEE.to_sat())
+        .create_transfer(dest, half, None)
         .await?;
     anyhow::ensure!(
         sidechain.rpc_client.getblockcount().await? == block_count,
@@ -113,7 +112,7 @@ async fn spend_unconfirmed_task(
     tracing::debug!("Sending the child transfer, which spends the change");
     let child = sidechain
         .rpc_client
-        .create_transfer(dest, half / 2, TRANSFER_FEE.to_sat())
+        .create_transfer(dest, half / 2, None)
         .await?;
     anyhow::ensure!(child != parent);
 
@@ -208,10 +207,18 @@ async fn spend_unconfirmed_off_task(
 
     let dest = sidechain.rpc_client.get_new_address().await?;
     let half = DEPOSIT_AMOUNT.to_sat() / 2;
-    let _parent = sidechain
+    let parent = sidechain
         .rpc_client
-        .create_transfer(dest, half, TRANSFER_FEE.to_sat())
+        .create_transfer(dest, half, None)
         .await?;
+    let parent_fee = sidechain
+        .rpc_client
+        .list_mempool()
+        .await?
+        .iter()
+        .find(|tx| tx.txid == parent)
+        .map(|tx| truthcoin_dc::validation::min_tx_fee(&tx.tx, false))
+        .ok_or_else(|| anyhow::anyhow!("the parent is in the mempool"))??;
 
     let pending = sidechain.rpc_client.balance().await?;
     anyhow::ensure!(
@@ -219,7 +226,7 @@ async fn spend_unconfirmed_off_task(
         "the change must stay visible, got {pending:?}",
     );
     anyhow::ensure!(
-        pending.total == DEPOSIT_AMOUNT - TRANSFER_FEE,
+        pending.total == DEPOSIT_AMOUNT - parent_fee,
         "the wallet still holds the deposit less the fee, got {pending:?}",
     );
     anyhow::ensure!(
@@ -228,7 +235,7 @@ async fn spend_unconfirmed_off_task(
     );
     let refused = sidechain
         .rpc_client
-        .create_transfer(dest, half / 2, TRANSFER_FEE.to_sat())
+        .create_transfer(dest, half / 2, None)
         .await;
     let Err(err) = refused else {
         anyhow::bail!("the wallet must refuse to spend its unconfirmed change");

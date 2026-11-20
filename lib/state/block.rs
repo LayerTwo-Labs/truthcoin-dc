@@ -939,8 +939,15 @@ mod test {
             prev_main_hash: bitcoin::BlockHash::all_zeros(),
             roots: state.get_accumulator(&rotxn)?.get_roots(),
         };
-        state.validate_block(&rotxn, &batch, &header, 0, &body, &archive)?;
-        state.prevalidate_block(&rotxn, &batch, &header, 0, &body, &archive)?;
+        assert!(matches!(
+            state.validate_block(&rotxn, &batch, &header, 0, &body, &archive),
+            Err(Error::InvalidTransaction { .. })
+        ));
+        assert!(matches!(
+            state
+                .prevalidate_block(&rotxn, &batch, &header, 0, &body, &archive),
+            Err(Error::InvalidTransaction { .. })
+        ));
 
         let missing_outpoint = OutPoint::Regular {
             txid: authorized.transaction.txid(),
@@ -1735,6 +1742,187 @@ mod test {
                 .is_err(),
             "prevalidate must reject the same body",
         );
+        Ok(())
+    }
+
+    /// A block whose transaction carries an actor proof is valid when the fee
+    /// covers the proof's bytes, and rejected one sat short of that.
+    #[test]
+    fn actor_proof_pays_floor() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+
+        use crate::types::{
+            Accumulator, AccumulatorDiff, Address, Authorization,
+            AuthorizedTransaction, Body, Header, OutPoint, OutPointKey,
+            PointedOutput, Transaction, TxData, UtreexoNodeHash, Votecoin,
+            authorization::{
+                BatchVerificationContext, SigningKey, authorize, get_address,
+                sign_tx,
+            },
+            hash,
+        };
+
+        let (_temp_dir, env, state) = fresh_state("actor_proof_pays_floor")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let mut rng = rand::rng();
+        let ctxt = BatchVerificationContext::new(&mut rng);
+        let funder = SigningKey::new(&mut rng);
+        let funder_addr = get_address(&(&funder).into());
+        let sender = SigningKey::new(&mut rng);
+        let sender_addr = get_address(&(&sender).into());
+
+        let deposit_txid = bitcoin::Txid::from_byte_array([0xCC; 32]);
+        let deposit_outpoint = OutPoint::Deposit(bitcoin::OutPoint {
+            txid: deposit_txid,
+            vout: 0,
+        });
+        let deposit_output = value_output(funder_addr, 10_000);
+        let deposit_pointed = PointedOutput {
+            outpoint: deposit_outpoint,
+            output: deposit_output.clone(),
+        };
+        let deposit_leaf: UtreexoNodeHash = (&deposit_pointed).into();
+        let mut accumulator = Accumulator::default();
+        let mut diff = AccumulatorDiff::default();
+        diff.insert(deposit_leaf);
+        accumulator.apply_diff(diff)?;
+        {
+            let mut rwtxn = env.write_txn()?;
+            state.utxos.put(
+                &mut rwtxn,
+                &OutPointKey::from(&deposit_outpoint),
+                &deposit_output,
+            )?;
+            state.deposit_mainchain_height.put(
+                &mut rwtxn,
+                &deposit_txid,
+                &0,
+            )?;
+            state
+                .utreexo_accumulator
+                .put(&mut rwtxn, &(), &accumulator)?;
+            state.reputation().set_reputation(
+                &mut rwtxn,
+                &sender_addr,
+                Votecoin(500_000),
+            )?;
+            rwtxn.commit()?;
+        }
+
+        let transfer = |change: u64| -> anyhow::Result<Transaction> {
+            Ok(Transaction {
+                inputs: vec![(deposit_outpoint, hash(&deposit_pointed))].into(),
+                proof: accumulator.prove(&[deposit_leaf])?,
+                outputs: vec![value_output(funder_addr, change)].into(),
+                data: Some(TxData::TransferReputation {
+                    sender: sender_addr,
+                    dest: Address([7; 20]),
+                    amount: Votecoin(100_000),
+                }),
+            })
+        };
+        let block = |change: u64| -> anyhow::Result<(Header, Body)> {
+            let transaction = transfer(change)?;
+            let actor_proof = Authorization {
+                verifying_key: (&sender).into(),
+                signature: sign_tx(rand::rng(), &sender, &transaction)?,
+            };
+            let mut authorized: AuthorizedTransaction = authorize(
+                rand::rng(),
+                &[(funder_addr, &funder)],
+                transaction.clone(),
+            )?;
+            authorized.actor_proof = Some(Box::new(actor_proof));
+            let body = Body::new(vec![authorized], Coinbase::default());
+            let filled = [FilledTransaction {
+                transaction: transaction.clone(),
+                spent_utxos: vec![deposit_output.clone()],
+                actor_address: Some(sender_addr),
+            }];
+            let mut post_accumulator = Accumulator::default();
+            let mut diff = AccumulatorDiff::default();
+            diff.insert(deposit_leaf);
+            post_accumulator.apply_diff(diff)?;
+            let mut diff = AccumulatorDiff::default();
+            diff.remove(deposit_leaf);
+            diff.insert(
+                (&PointedOutput {
+                    outpoint: OutPoint::Regular {
+                        txid: transaction.txid(),
+                        vout: 0,
+                    },
+                    output: value_output(funder_addr, change),
+                })
+                    .into(),
+            );
+            post_accumulator.apply_diff(diff)?;
+            let header = Header {
+                merkle_root: Body::compute_merkle_root(
+                    &body.coinbase,
+                    &filled,
+                    &body.authorizations,
+                    &body.actor_proofs,
+                )?,
+                prev_side_hash: None,
+                prev_main_hash: bitcoin::BlockHash::all_zeros(),
+                roots: post_accumulator.get_roots(),
+            };
+            Ok((header, body))
+        };
+
+        let min_fee = crate::validation::min_tx_fee(&transfer(0)?, true)?;
+        let rotxn = env.read_txn()?;
+        let (header, body) = block(10_000 - min_fee.to_sat())?;
+        let (fees, _) = state.validate_block(
+            &rotxn,
+            &ctxt,
+            &header,
+            DEPOSIT_MATURITY,
+            &body,
+            &archive,
+        )?;
+        anyhow::ensure!(fees == min_fee);
+        state.prevalidate_block(
+            &rotxn,
+            &ctxt,
+            &header,
+            DEPOSIT_MATURITY,
+            &body,
+            &archive,
+        )?;
+
+        let (header, body) = block(10_000 - min_fee.to_sat() + 1)?;
+        for result in [
+            state
+                .validate_block(
+                    &rotxn,
+                    &ctxt,
+                    &header,
+                    DEPOSIT_MATURITY,
+                    &body,
+                    &archive,
+                )
+                .map(|_| ()),
+            state
+                .prevalidate_block(
+                    &rotxn,
+                    &ctxt,
+                    &header,
+                    DEPOSIT_MATURITY,
+                    &body,
+                    &archive,
+                )
+                .map(|_| ()),
+        ] {
+            anyhow::ensure!(
+                matches!(
+                    &result,
+                    Err(crate::state::Error::InvalidTransaction { reason })
+                        if reason.contains("below the minimum")
+                ),
+                "expected a fee floor rejection, got {result:?}"
+            );
+        }
         Ok(())
     }
 
