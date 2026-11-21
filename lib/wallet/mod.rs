@@ -299,14 +299,14 @@ impl Wallet {
             // the public chain alone after a crash; fsync on commit is the
             // correct durability trade-off.
             //
-            // WRITE_MAP/NO_READ_AHEAD are gated off on Windows: LMDB's
-            // writable-mmap path returns ERROR_INVALID_HANDLE on commit there.
+            // TODO: Don't store the seed in plaintext (encrypt at rest).
             #[cfg(not(windows))]
-            {
-                let durable_flags =
-                    EnvFlags::WRITE_MAP | EnvFlags::NO_READ_AHEAD;
-                unsafe { env_open_options.flags(durable_flags) };
-            }
+            let durable_flags = EnvFlags::WRITE_MAP | EnvFlags::NO_READ_AHEAD;
+            // With WRITE_MAP, LMDB opens no sync handle for the meta page, but
+            // a Windows commit without NO_SYNC writes the meta page to it.
+            #[cfg(windows)]
+            let durable_flags = EnvFlags::empty();
+            unsafe { env_open_options.flags(durable_flags) };
             unsafe { Env::open(&env_open_options, path) }
                 .map_err(EnvError::from)?
         };

@@ -89,8 +89,8 @@ jobs:
 
       - name: Build electrs
         if: steps.check-cache.outputs.cache-hit != 'true'
-        # The RocksDB 8.1 headers electrs builds use uint64_t without
-        # including <cstdint>, which newer GCC no longer pulls in for them.
+        # The rocksdb source in electrs uses uint64_t without <cstdint>, which
+        # GCC 13 and later reject.
         env:
           CXXFLAGS: -include cstdint
         run: |
@@ -257,7 +257,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             name: x86_64-unknown-linux-gnu
             binary-suffix: ""
             rustflags: ""
