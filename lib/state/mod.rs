@@ -18,14 +18,14 @@ use crate::{
     types::{
         Accumulator, AccumulatorDiff, Address, AmountOverflowError,
         AmountUnderflowError, Authorized, AuthorizedTransaction, BlockHash,
-        Body, Coinbase, CoinbaseTxid, FilledTransaction, GetAddress, GetValue,
-        Header, InPoint, M6id, MerkleRoot, OfferId, OutPoint, OutPointKey,
-        Output, PointedOutput, PointedOutputRef, SpentOutput, Transaction,
-        UtreexoNodeHash, UtreexoProof, VERSION, Version, WithdrawalBundle,
-        WithdrawalBundleStatus,
+        BlockIndexEvents, Body, Coinbase, CoinbaseTxid, FilledTransaction,
+        GetAddress, GetValue, Header, InPoint, M6id, MerkleRoot, OfferId,
+        OutPoint, OutPointKey, Output, PointedOutput, PointedOutputRef,
+        SpentOutput, Transaction, UtreexoNodeHash, UtreexoProof, VERSION,
+        Version, WithdrawalBundle, WithdrawalBundleStatus,
         authorization::{self, BatchVerificationContext},
         proto::mainchain::TwoWayPegData,
-        state::{MarketUtxoChanges, TwoWayPegEvent, WithdrawalBundleInfo},
+        state::{MarketUtxoChanges, WithdrawalBundleInfo},
         transaction::outpoint::{COINBASE_MATURITY, DEPOSIT_MATURITY},
     },
     util::Watchable,
@@ -74,6 +74,10 @@ pub struct PrevalidatedBlock {
 #[derive(Clone)]
 pub struct State {
     genesis_reputation_to_miner: bool,
+    /// Coin movements that no block body carries, keyed by the height of the
+    /// block that applied them
+    block_index_events:
+        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<BlockIndexEvents>>,
     /// Sidechain heights for each coinbase txid
     pub coinbase_height:
         DatabaseUnique<SerdeBincode<CoinbaseTxid>, SerdeBincode<u32>>,
@@ -113,10 +117,6 @@ pub struct State {
         SerdeBincode<M6id>,
         SerdeBincode<(WithdrawalBundleInfo, RollBack<WithdrawalBundleStatus>)>,
     >,
-    /// Coin movements that no block body carries, keyed by the height that
-    /// applied them, in the order the node applied them
-    two_way_peg_events:
-        DatabaseUnique<SerdeBincode<u32>, SerdeBincode<Vec<TwoWayPegEvent>>>,
     /// Timestamp of the mainchain block that the tip names
     mainchain_timestamp: DatabaseUnique<UnitKey, SerdeBincode<u64>>,
     /// Mainchain timestamp before each height connected, restored when that
@@ -168,6 +168,9 @@ impl State {
         genesis_reputation_to_miner: bool,
     ) -> Result<Self, Error> {
         let mut rwtxn = env.write_txn().map_err(EnvError::from)?;
+        let block_index_events =
+            DatabaseUnique::create(env, &mut rwtxn, "block_index_events")
+                .map_err(EnvError::from)?;
         let coinbase_height =
             DatabaseUnique::create(env, &mut rwtxn, "coinbase_height")
                 .map_err(EnvError::from)?;
@@ -201,9 +204,6 @@ impl State {
             .map_err(EnvError::from)?;
         let tip = DatabaseUnique::create(env, &mut rwtxn, "tip")
             .map_err(EnvError::from)?;
-        let two_way_peg_events =
-            DatabaseUnique::create(env, &mut rwtxn, "two_way_peg_events")
-                .map_err(EnvError::from)?;
         let utreexo_accumulator =
             DatabaseUnique::create(env, &mut rwtxn, "utreexo_accumulator")
                 .map_err(EnvError::from)?;
@@ -288,6 +288,7 @@ impl State {
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(Self {
             genesis_reputation_to_miner,
+            block_index_events,
             coinbase_height,
             deposit_blocks,
             deposit_mainchain_height,
@@ -297,7 +298,6 @@ impl State {
             pending_withdrawal_bundle,
             stxos,
             tip,
-            two_way_peg_events,
             utreexo_accumulator,
             utxos,
             _version: version,
@@ -410,18 +410,44 @@ impl State {
         self.markets.clear_mempool_shares(rwtxn, market_id)
     }
 
-    /// Coin movements that the block at this height applied outside its body,
-    /// in the order the node applied them
-    pub fn get_two_way_peg_events(
+    /// Coin movements that the block at `height` applied outside its body
+    pub fn get_block_index_events(
         &self,
         rotxn: &RoTxn,
         height: u32,
-    ) -> Result<Vec<TwoWayPegEvent>, Error> {
+    ) -> Result<BlockIndexEvents, Error> {
         let events = self
-            .two_way_peg_events
+            .block_index_events
             .try_get(rotxn, &height)?
             .unwrap_or_default();
         Ok(events)
+    }
+
+    /// Add `events` after the events already stored for the block at
+    /// `height`
+    pub(crate) fn record_block_index_events(
+        &self,
+        rwtxn: &mut RwTxn,
+        height: u32,
+        events: BlockIndexEvents,
+    ) -> Result<(), Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut stored = self.get_block_index_events(rwtxn, height)?;
+        stored.extend(events);
+        self.block_index_events.put(rwtxn, &height, &stored)?;
+        Ok(())
+    }
+
+    /// Delete the events stored for the block at `height`
+    pub(crate) fn delete_block_index_events(
+        &self,
+        rwtxn: &mut RwTxn,
+        height: u32,
+    ) -> Result<(), Error> {
+        self.block_index_events.delete(rwtxn, &height)?;
+        Ok(())
     }
 
     /// Market outputs that the block at this height created and removed
@@ -1426,13 +1452,11 @@ impl Watchable<()> for State {
 mod test {
     use std::collections::HashMap;
 
-    use bitcoin::hashes::Hash as _;
-
     use crate::{
         state::State,
         types::{
-            Address, InPoint, M6id, OutPoint, OutPointKey, Output,
-            OutputContent, SpentOutput, Transaction, state::TwoWayPegEvent,
+            Address, InPoint, OutPoint, OutPointKey, Output, OutputContent,
+            SpentOutput, Transaction,
         },
     };
 
@@ -1630,65 +1654,6 @@ mod test {
         let (_temp_dir, env, state) = fresh_state("state-reopen")?;
         drop(state);
         State::new(&env, None, true)?;
-        Ok(())
-    }
-
-    #[test]
-    fn two_way_peg_events_round_trip() -> anyhow::Result<()> {
-        let (_temp_dir, env, state) = fresh_state("two-way-peg-events")?;
-        let deposit_outpoint = |byte: u8| {
-            OutPoint::Deposit(bitcoin::OutPoint {
-                txid: bitcoin::Txid::from_byte_array([byte; 32]),
-                vout: 0,
-            })
-        };
-        let m6id = M6id(bitcoin::Txid::from_byte_array([3; 32]));
-        let events = vec![
-            TwoWayPegEvent::Deposit {
-                outpoint: deposit_outpoint(1),
-                output: value_output(Address::ALL_ZEROS, 5000),
-            },
-            TwoWayPegEvent::BundleSpend {
-                outpoint: deposit_outpoint(2),
-                m6id,
-            },
-            TwoWayPegEvent::BundleReturn {
-                outpoint: deposit_outpoint(2),
-                output: value_output(Address::ALL_ZEROS, 7000),
-                m6id,
-            },
-        ];
-        {
-            let mut rwtxn = env.write_txn()?;
-            state.two_way_peg_events.put(&mut rwtxn, &7, &events)?;
-            rwtxn.commit()?;
-        }
-        {
-            let rotxn = env.read_txn()?;
-            anyhow::ensure!(state.get_two_way_peg_events(&rotxn, 7)? == events);
-            // A height that moved nothing outside its body reads as empty.
-            anyhow::ensure!(
-                state.get_two_way_peg_events(&rotxn, 8)?.is_empty()
-            );
-        }
-
-        // A disconnect drops the events, so a reorg leaves nothing behind for
-        // the block that takes the height.
-        {
-            let mut rwtxn = env.write_txn()?;
-            state.two_way_peg_events.delete(&mut rwtxn, &7)?;
-            rwtxn.commit()?;
-        }
-        let rotxn = env.read_txn()?;
-        anyhow::ensure!(state.get_two_way_peg_events(&rotxn, 7)?.is_empty());
-
-        // A height that moved nothing writes no row, so deleting it again is
-        // still safe.
-        {
-            let mut rwtxn = env.write_txn()?;
-            state.two_way_peg_events.delete(&mut rwtxn, &8)?;
-            rwtxn.commit()?;
-        }
         Ok(())
     }
 }

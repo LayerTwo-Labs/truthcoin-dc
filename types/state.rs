@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{M6id, OutPoint, Output, WithdrawalBundle};
+use crate::{OutPoint, Output, WithdrawalBundle};
 
 /// Information we have regarding a withdrawal bundle
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -16,22 +16,6 @@ pub enum WithdrawalBundleInfo {
     /// considered spent.
     UnknownConfirmed {
         spend_utxos: BTreeMap<OutPoint, Output>,
-    },
-}
-
-/// A coin movement that a block applied outside its body
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
-pub enum TwoWayPegEvent {
-    /// A mainchain deposit created this output
-    Deposit { outpoint: OutPoint, output: Output },
-    /// A withdrawal bundle spent this output
-    BundleSpend { outpoint: OutPoint, m6id: M6id },
-    /// A failed or dropped withdrawal bundle made this output again, at an
-    /// unsuccessful withdrawal outpoint
-    BundleReturn {
-        outpoint: OutPoint,
-        output: Output,
-        m6id: M6id,
     },
 }
 
