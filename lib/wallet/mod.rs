@@ -192,11 +192,19 @@ pub enum Error {
     InvalidDecisionId { reason: String },
 }
 
+/// Number of addresses that the wallet watches past the last issued address.
+/// A wallet restored from a seed finds coins on these addresses.
+pub const ADDRESS_LOOKAHEAD: u32 = 20;
+
+/// Index of the voter address. Issued addresses start after it.
+const VOTER_ADDRESS_INDEX: u32 = 0;
+
 /// Marker type for Wallet Env
 pub struct WalletEnv;
 
 type DatabaseUnique<KC, DC> = sneed::DatabaseUnique<KC, DC, WalletEnv>;
 type RoTxn<'a> = sneed::RoTxn<'a, heed::AnyTls, WalletEnv>;
+type RwTxn<'a> = sneed::RwTxn<'a, WalletEnv>;
 
 /// The chain heights and the option that decide which coins a wallet may pick
 #[derive(Clone, Copy, Debug)]
@@ -234,9 +242,14 @@ pub struct Wallet {
     /// Mainchain heights for each deposit txid
     deposit_mainchain_height:
         DatabaseUnique<SerdeBincode<bitcoin::Txid>, SerdeBincode<u32>>,
-    /// Map each address index to an address
+    /// Map each address index to an address. Holds the issued addresses and
+    /// the `ADDRESS_LOOKAHEAD` addresses after them.
     index_to_address:
         DatabaseUnique<SerdeBincode<[u8; 4]>, SerdeBincode<Address>>,
+    /// Index of the last address that the wallet issued or that received an
+    /// output. 0 if there is no such address, because issued indexes start
+    /// at 1.
+    last_issued_index: DatabaseUnique<UnitKey, SerdeBincode<u32>>,
     utxos: DatabaseUnique<OutPointKey, SerdeBincode<Output>>,
     stxos: DatabaseUnique<OutPointKey, SerdeBincode<SpentOutput>>,
     /// Unconfirmed outputs that the wallet may spend. The node fills it from
@@ -268,7 +281,7 @@ pub struct Wallet {
 }
 
 impl Wallet {
-    pub const NUM_DBS: u32 = 16;
+    pub const NUM_DBS: u32 = 17;
 
     pub fn new(path: &Path) -> Result<Self, Error> {
         std::fs::create_dir_all(path)?;
@@ -328,6 +341,9 @@ impl Wallet {
         let index_to_address =
             DatabaseUnique::create(&env, &mut rwtxn, "index_to_address")
                 .map_err(EnvError::from)?;
+        let last_issued_index =
+            DatabaseUnique::create(&env, &mut rwtxn, "last_issued_index")
+                .map_err(EnvError::from)?;
         let utxos = DatabaseUnique::create(&env, &mut rwtxn, "utxos")
             .map_err(EnvError::from)?;
         let stxos = DatabaseUnique::create(&env, &mut rwtxn, "stxos")
@@ -377,14 +393,14 @@ impl Wallet {
                 .put(&mut rwtxn, &(), &*VERSION)
                 .map_err(DbError::from)?,
         };
-        rwtxn.commit().map_err(RwTxnError::from)?;
-        Ok(Self {
-            env,
+        let wallet = Self {
+            env: env.clone(),
             seed: seed_db,
             address_to_index,
             coinbase_height,
             deposit_mainchain_height,
             index_to_address,
+            last_issued_index,
             utxos,
             stxos,
             unconfirmed_utxos,
@@ -396,7 +412,30 @@ impl Wallet {
             index_to_vk,
             sealed_ballots,
             imported_keys,
-        })
+        };
+        // A wallet from before the lookahead issued every address it holds.
+        if wallet
+            .last_issued_index
+            .try_get(&rwtxn, &())
+            .map_err(DbError::from)?
+            .is_none()
+        {
+            let last_index = wallet.last_derived_index(&rwtxn)?;
+            wallet
+                .last_issued_index
+                .put(&mut rwtxn, &(), &last_index)
+                .map_err(DbError::from)?;
+        }
+        if wallet
+            .seed
+            .try_get(&rwtxn, &0)
+            .map_err(DbError::from)?
+            .is_some()
+        {
+            wallet.derive_lookahead(&mut rwtxn)?;
+        }
+        rwtxn.commit().map_err(RwTxnError::from)?;
+        Ok(wallet)
     }
 
     /// Overwrite the seed, or set it if it does not already exist.
@@ -409,6 +448,9 @@ impl Wallet {
         self.index_to_address
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
+        self.last_issued_index
+            .put(&mut rwtxn, &(), &0)
+            .map_err(DbError::from)?;
         self.utxos.clear(&mut rwtxn).map_err(DbError::from)?;
         self.stxos.clear(&mut rwtxn).map_err(DbError::from)?;
         self.unconfirmed_utxos
@@ -420,6 +462,7 @@ impl Wallet {
         self.sealed_ballots
             .clear(&mut rwtxn)
             .map_err(DbError::from)?;
+        self.derive_lookahead(&mut rwtxn)?;
         rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(())
     }
@@ -784,7 +827,8 @@ impl Wallet {
 
     /// Make the confirmed table say what the chain says. `utxos` is every
     /// output the chain holds for this wallet, and `spent` is what a block
-    /// spent since the last call.
+    /// spent since the last call. Returns true if the wallet derived new
+    /// addresses, which the caller must then scan.
     ///
     /// A block that disconnects takes an output off the chain without a spend,
     /// and it takes the utreexo leaf with it. A row that stays behind reads as
@@ -796,7 +840,7 @@ impl Wallet {
         deposit_main_heights: &HashMap<bitcoin::Txid, u32>,
         utxos: &HashMap<OutPoint, Output>,
         spent: &[(OutPoint, InPoint)],
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
         for (coinbase_txid, height) in coinbase_heights {
             self.coinbase_height
@@ -814,6 +858,7 @@ impl Wallet {
                 .put(&mut rwtxn, &OutPointKey::from(outpoint), output)
                 .map_err(DbError::from)?;
         }
+        let derived_new = self.issue_used_addresses(&mut rwtxn, utxos)?;
         for (outpoint, inpoint) in spent {
             let key = OutPointKey::from(outpoint);
             let Some(output) =
@@ -841,15 +886,19 @@ impl Wallet {
             self.utxos.delete(&mut rwtxn, key).map_err(DbError::from)?;
         }
         rwtxn.commit().map_err(RwTxnError::from)?;
-        Ok(())
+        Ok(derived_new)
     }
 
+    /// Store the utxos. An output to an address in the lookahead marks that
+    /// address and each address before it as issued, and moves the lookahead
+    /// forward. Returns true if the wallet derived new addresses, which the
+    /// caller must then scan.
     pub fn put_utxos(
         &self,
         coinbase_heights: &HashMap<CoinbaseTxid, u32>,
         deposit_main_heights: &HashMap<bitcoin::Txid, u32>,
         utxos: &HashMap<OutPoint, Output>,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
         for (coinbase_txid, height) in coinbase_heights {
             self.coinbase_height
@@ -868,8 +917,43 @@ impl Wallet {
                 .put(&mut rwtxn, &key, output)
                 .map_err(DbError::from)?;
         }
+        let derived_new = self.issue_used_addresses(&mut rwtxn, utxos)?;
         rwtxn.commit().map_err(RwTxnError::from)?;
-        Ok(())
+        Ok(derived_new)
+    }
+
+    /// Mark each address that an output of `utxos` pays, and each address
+    /// before it, as issued, and move the lookahead forward. Returns true if
+    /// the wallet derived new addresses.
+    fn issue_used_addresses(
+        &self,
+        rwtxn: &mut RwTxn,
+        utxos: &HashMap<OutPoint, Output>,
+    ) -> Result<bool, Error> {
+        let mut last_used_index = 0;
+        for output in utxos.values() {
+            // A new seed between the scan and this write clears the index.
+            if let Some(index) = self
+                .address_to_index
+                .try_get(rwtxn, &output.address)
+                .map_err(DbError::from)?
+            {
+                last_used_index =
+                    last_used_index.max(BigEndian::read_u32(&index));
+            }
+        }
+        if last_used_index
+            <= self
+                .last_issued_index
+                .get(rwtxn, &())
+                .map_err(DbError::from)?
+        {
+            return Ok(false);
+        }
+        self.last_issued_index
+            .put(rwtxn, &(), &last_used_index)
+            .map_err(DbError::from)?;
+        self.derive_lookahead(rwtxn)
     }
 
     /// The value the wallet holds. A confirmed output that a mempool
@@ -1017,6 +1101,7 @@ impl Wallet {
         Ok(stxos)
     }
 
+    /// Get the issued addresses and the lookahead addresses.
     pub fn get_addresses(&self) -> Result<HashSet<Address>, Error> {
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         let mut addresses: HashSet<_> = self
@@ -1185,35 +1270,30 @@ impl Wallet {
     /// Derives an address the wallet never used. A change output takes one of
     /// these, so two transactions never share a change address.
     pub fn get_new_address(&self) -> Result<Address, Error> {
-        let mut txn = self.env.write_txn().map_err(EnvError::from)?;
-        let index =
-            match self.index_to_address.last(&txn).map_err(DbError::from)? {
-                Some((last_index, _)) => BigEndian::read_u32(&last_index) + 1,
-                None => 0,
-            };
-        let signing_key = self.get_signing_key(&txn, index)?;
-        let address = get_address(&(&signing_key).into());
-        let index = index.to_be_bytes();
-        self.index_to_address
-            .put(&mut txn, &index, &address)
+        let mut rwtxn = self.env.write_txn().map_err(EnvError::from)?;
+        let index = self
+            .last_issued_index
+            .get(&rwtxn, &())
+            .map_err(DbError::from)?
+            + 1;
+        self.last_issued_index
+            .put(&mut rwtxn, &(), &index)
             .map_err(DbError::from)?;
-        self.address_to_index
-            .put(&mut txn, &address, &index)
+        let _: bool = self.derive_lookahead(&mut rwtxn)?;
+        let address = self
+            .index_to_address
+            .get(&rwtxn, &index.to_be_bytes())
             .map_err(DbError::from)?;
-        txn.commit().map_err(RwTxnError::from)?;
+        rwtxn.commit().map_err(RwTxnError::from)?;
         Ok(address)
     }
 
     /// The address to receive at. Derives a new one only once the current one
     /// receives.
     pub fn get_receive_address(&self) -> Result<Address, Error> {
-        {
+        if let Some(address) = self.try_get_last_address()? {
             let rotxn = self.env.read_txn().map_err(EnvError::from)?;
-            let last =
-                self.index_to_address.last(&rotxn).map_err(DbError::from)?;
-            if let Some((_, address)) = last
-                && !self.address_received(&rotxn, &address)?
-            {
+            if !self.address_received(&rotxn, &address)? {
                 return Ok(address);
             }
         }
@@ -1241,15 +1321,25 @@ impl Wallet {
         Ok(false)
     }
 
-    /// Gets the latest generated address.
+    /// Gets the latest issued address.
     pub fn try_get_last_address(&self) -> Result<Option<Address>, Error> {
-        let txn = self.env.read_txn().map_err(EnvError::from)?;
-        let last = self.index_to_address.last(&txn).map_err(DbError::from)?;
-        Ok(last.map(|(_, address)| address))
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let index = self
+            .last_issued_index
+            .get(&rotxn, &())
+            .map_err(DbError::from)?;
+        if index == 0 {
+            return Ok(None);
+        }
+        let address = self
+            .index_to_address
+            .get(&rotxn, &index.to_be_bytes())
+            .map_err(DbError::from)?;
+        Ok(Some(address))
     }
 
-    /// Gets the latest generated address, or generates a new one if no
-    /// addresses have already been generated.
+    /// Gets the latest issued address, or issues a new one if no
+    /// addresses have already been issued.
     pub fn get_or_generate_last_address(&self) -> Result<Address, Error> {
         if let Some(address) = self.try_get_last_address()? {
             Ok(address)
@@ -1258,10 +1348,51 @@ impl Wallet {
         }
     }
 
+    /// Get the number of issued addresses.
     pub fn get_num_addresses(&self) -> Result<u32, Error> {
-        let txn = self.env.read_txn().map_err(EnvError::from)?;
-        let num = self.index_to_address.len(&txn).map_err(DbError::from)?;
-        Ok(num as u32)
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let index = self
+            .last_issued_index
+            .get(&rotxn, &())
+            .map_err(DbError::from)?;
+        Ok(index)
+    }
+
+    /// Get the issued addresses and the imported addresses, without the
+    /// lookahead.
+    pub fn get_issued_addresses(&self) -> Result<Vec<Address>, Error> {
+        let rotxn = self.env.read_txn().map_err(EnvError::from)?;
+        let last_issued_index = self
+            .last_issued_index
+            .get(&rotxn, &())
+            .map_err(DbError::from)?;
+        let mut addresses: Vec<_> = self
+            .index_to_address
+            .iter(&rotxn)
+            .map_err(DbError::from)?
+            .map(|(index, address)| Ok((BigEndian::read_u32(&index), address)))
+            .take_while(|(index, _)| Ok(*index <= last_issued_index))
+            .map(|(_, address)| Ok(address))
+            .collect()
+            .map_err(DbError::from)?;
+        let imported: Vec<_> = self
+            .imported_keys
+            .iter_keys(&rotxn)
+            .map_err(DbError::from)?
+            .collect()
+            .map_err(DbError::from)?;
+        addresses.extend(imported);
+        Ok(addresses)
+    }
+
+    /// Index of the last derived address, or 0 if there is none.
+    fn last_derived_index(&self, rotxn: &RoTxn) -> Result<u32, Error> {
+        let last_index = self
+            .index_to_address
+            .last(rotxn)
+            .map_err(DbError::from)?
+            .map_or(0, |(index, _)| BigEndian::read_u32(&index));
+        Ok(last_index)
     }
 
     /// Derive the xpriv at
@@ -1295,6 +1426,46 @@ impl Wallet {
             }
         }
         Ok(xpriv)
+    }
+
+    /// Derive the voter address, and each address up to `ADDRESS_LOOKAHEAD`
+    /// past the last issued address. Returns true if it derived a new address.
+    fn derive_lookahead(&self, rwtxn: &mut RwTxn) -> Result<bool, Error> {
+        let derive_voter = self
+            .index_to_address
+            .try_get(rwtxn, &VOTER_ADDRESS_INDEX.to_be_bytes())
+            .map_err(DbError::from)?
+            .is_none();
+        if derive_voter {
+            let _: Address = self.derive_address(rwtxn, VOTER_ADDRESS_INDEX)?;
+        }
+        let last_issued_index = self
+            .last_issued_index
+            .get(rwtxn, &())
+            .map_err(DbError::from)?;
+        let first_index = self.last_derived_index(rwtxn)? + 1;
+        let last_index = last_issued_index + ADDRESS_LOOKAHEAD;
+        for index in first_index..=last_index {
+            let _: Address = self.derive_address(rwtxn, index)?;
+        }
+        Ok(derive_voter || first_index <= last_index)
+    }
+
+    fn derive_address(
+        &self,
+        rwtxn: &mut RwTxn,
+        index: u32,
+    ) -> Result<Address, Error> {
+        let signing_key = self.get_signing_key(rwtxn, index)?;
+        let address = get_address(&(&signing_key).into());
+        let index = index.to_be_bytes();
+        self.index_to_address
+            .put(rwtxn, &index, &address)
+            .map_err(DbError::from)?;
+        self.address_to_index
+            .put(rwtxn, &address, &index)
+            .map_err(DbError::from)?;
+        Ok(address)
     }
 
     fn get_signing_key(
@@ -1397,23 +1568,15 @@ impl Wallet {
     /// The address that votes and holds reputation: address index 0
     pub fn voter_address(&self) -> Result<Address, Error> {
         let mut txn = self.env.write_txn().map_err(EnvError::from)?;
-        let index = 0u32.to_be_bytes();
         if let Some(address) = self
             .index_to_address
-            .try_get(&txn, &index)
+            .try_get(&txn, &VOTER_ADDRESS_INDEX.to_be_bytes())
             .map_err(DbError::from)?
         {
             txn.abort();
             return Ok(address);
         }
-        let signing_key = self.get_signing_key(&txn, 0)?;
-        let address = get_address(&(&signing_key).into());
-        self.index_to_address
-            .put(&mut txn, &index, &address)
-            .map_err(DbError::from)?;
-        self.address_to_index
-            .put(&mut txn, &address, &index)
-            .map_err(DbError::from)?;
+        let address = self.derive_address(&mut txn, VOTER_ADDRESS_INDEX)?;
         txn.commit().map_err(RwTxnError::from)?;
         Ok(address)
     }
@@ -2103,6 +2266,7 @@ impl Watchable<()> for Wallet {
             coinbase_height: _,
             deposit_mainchain_height: _,
             index_to_address,
+            last_issued_index,
             utxos,
             stxos,
             unconfirmed_utxos,
@@ -2119,6 +2283,7 @@ impl Watchable<()> for Wallet {
             seed.watch().clone(),
             address_to_index.watch().clone(),
             index_to_address.watch().clone(),
+            last_issued_index.watch().clone(),
             utxos.watch().clone(),
             stxos.watch().clone(),
             unconfirmed_utxos.watch().clone(),
@@ -2144,6 +2309,8 @@ impl Watchable<()> for Wallet {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::Txid;
+
     use super::*;
 
     fn options(spend_zero_conf_change: bool) -> SpendOptions {
@@ -2382,6 +2549,168 @@ mod tests {
         assert_eq!(wallet.get_receive_address()?, second);
 
         let _unused = std::fs::remove_dir_all(&test_dir);
+        Ok(())
+    }
+
+    fn temp_wallet_dir(name: &str) -> anyhow::Result<PathBuf> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Tests run in parallel, and the clock can give two of them one value.
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        Ok(std::env::temp_dir()
+            .join(format!("truthcoin_test_{name}_{nanos}_{count}")))
+    }
+
+    /// Issue `count` addresses from a wallet with `seed`, and return them.
+    fn issue_addresses(
+        seed: &[u8; 64],
+        count: u32,
+    ) -> anyhow::Result<Vec<Address>> {
+        let dir = temp_wallet_dir("issuer")?;
+        let wallet = Wallet::new(&dir)?;
+        wallet.set_seed(seed)?;
+        let addresses = (0..count)
+            .map(|_| wallet.get_new_address())
+            .collect::<Result<_, _>>()?;
+        drop(wallet);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(addresses)
+    }
+
+    fn utxo_to(address: Address, vout: u32) -> HashMap<OutPoint, Output> {
+        HashMap::from([(
+            OutPoint::Regular {
+                txid: Txid([7; 32]),
+                vout,
+            },
+            Output {
+                address,
+                content: OutputContent::Value(bitcoin::Amount::from_sat(1000)),
+            },
+        )])
+    }
+
+    fn put_utxos(
+        wallet: &Wallet,
+        utxos: HashMap<OutPoint, Output>,
+    ) -> Result<bool, Error> {
+        wallet.put_utxos(&HashMap::new(), &HashMap::new(), &utxos)
+    }
+
+    #[test]
+    fn restored_wallet_finds_coins_on_unissued_addresses() -> anyhow::Result<()>
+    {
+        let seed = [3u8; 64];
+        let issued = issue_addresses(&seed, 2 * ADDRESS_LOOKAHEAD + 1)?;
+
+        let dir = temp_wallet_dir("restore")?;
+        let wallet = Wallet::new(&dir)?;
+        wallet.set_seed(&seed)?;
+        assert_eq!(wallet.get_num_addresses()?, 0);
+        let voter = wallet.voter_address()?;
+        assert_eq!(wallet.get_issued_addresses()?, vec![voter]);
+        let watched = wallet.get_addresses()?;
+        assert_eq!(watched.len(), ADDRESS_LOOKAHEAD as usize + 1);
+        assert!(watched.contains(&voter));
+
+        // The last lookahead address receives coins.
+        let first_coins = issued[ADDRESS_LOOKAHEAD as usize - 1];
+        assert!(watched.contains(&first_coins));
+        let farther = issued[2 * ADDRESS_LOOKAHEAD as usize - 1];
+        assert!(!watched.contains(&farther));
+        assert!(put_utxos(&wallet, utxo_to(first_coins, 0))?);
+        assert_eq!(wallet.get_num_addresses()?, ADDRESS_LOOKAHEAD);
+        assert_eq!(
+            wallet.get_addresses()?.len(),
+            2 * ADDRESS_LOOKAHEAD as usize + 1
+        );
+
+        // The next scan finds coins on an address of the new lookahead.
+        assert!(wallet.get_addresses()?.contains(&farther));
+        assert!(put_utxos(&wallet, utxo_to(farther, 1))?);
+        assert_eq!(wallet.get_num_addresses()?, 2 * ADDRESS_LOOKAHEAD);
+        assert_eq!(wallet.get_balance(false)?.total.to_sat(), 2000);
+
+        // A scan that finds nothing new derives nothing.
+        assert!(!put_utxos(&wallet, utxo_to(first_coins, 0))?);
+
+        // The wallet does not issue an address that received coins again.
+        assert_eq!(
+            wallet.get_new_address()?,
+            issued[2 * ADDRESS_LOOKAHEAD as usize]
+        );
+        let mut expected = vec![voter];
+        expected.extend(&issued);
+        assert_eq!(wallet.get_issued_addresses()?, expected);
+
+        drop(wallet);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_counts_old_addresses_as_issued() -> anyhow::Result<()> {
+        let seed = [5u8; 64];
+        let issued = issue_addresses(&seed, 3)?;
+
+        // Make the DB of a wallet from before the lookahead: three issued
+        // addresses and no `last_issued_index`.
+        let dir = temp_wallet_dir("old")?;
+        {
+            let wallet = Wallet::new(&dir)?;
+            wallet.set_seed(&seed)?;
+            let mut rwtxn = wallet.env.write_txn()?;
+            wallet.index_to_address.clear(&mut rwtxn)?;
+            wallet.address_to_index.clear(&mut rwtxn)?;
+            for (index, address) in (1u32..).zip(&issued) {
+                let index = index.to_be_bytes();
+                wallet.index_to_address.put(&mut rwtxn, &index, address)?;
+                wallet.address_to_index.put(&mut rwtxn, address, &index)?;
+            }
+            assert!(wallet.last_issued_index.delete(&mut rwtxn, &())?);
+            rwtxn.commit()?;
+        }
+
+        let wallet = Wallet::new(&dir)?;
+        assert_eq!(wallet.get_num_addresses()?, 3);
+        assert_eq!(wallet.try_get_last_address()?, Some(issued[2]));
+        let mut expected = vec![wallet.voter_address()?];
+        expected.extend(&issued);
+        assert_eq!(wallet.get_issued_addresses()?, expected);
+        assert_eq!(
+            wallet.get_addresses()?.len(),
+            3 + ADDRESS_LOOKAHEAD as usize + 1
+        );
+
+        drop(wallet);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn overwrite_seed_resets_issued_addresses() -> anyhow::Result<()> {
+        let dir = temp_wallet_dir("overwrite")?;
+        let wallet = Wallet::new(&dir)?;
+        wallet.set_seed(&[1u8; 64])?;
+        let _: Address = wallet.get_new_address()?;
+        let new_seed = [2u8; 64];
+        wallet.overwrite_seed(&new_seed)?;
+        assert_eq!(wallet.get_num_addresses()?, 0);
+        assert_eq!(wallet.try_get_last_address()?, None);
+        assert_eq!(
+            wallet.get_addresses()?.len(),
+            ADDRESS_LOOKAHEAD as usize + 1
+        );
+        assert_eq!(
+            wallet.get_new_address()?,
+            issue_addresses(&new_seed, 1)?[0]
+        );
+
+        drop(wallet);
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
