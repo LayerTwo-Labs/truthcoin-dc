@@ -26,12 +26,11 @@ use truthcoin_dc::{
     state::period_to_name,
     types::{
         Address, Authorization, AuthorizedTransaction, Block, BlockHash,
-        EncryptionPubKey, M6id, OfferId, PointedOutput, ShareDelta,
-        SpentOutput, Txid, VerifyingKey, Votecoin, VotecoinOffer,
-        WithdrawalBundle,
+        BlockIndex, BlockIndexTx, EncryptionPubKey, M6id, MempoolTx, OfferId,
+        PointedOutput, ShareDelta, SpentOutput, Txid, VerifyingKey, Votecoin,
+        VotecoinOffer, WithdrawalBundle,
         authorization::{self, Dst, Signature},
         net::{Peer, PeerAddress},
-        state::TwoWayPegEvent,
         wallet::{Balance, TransferDests},
     },
     validation::DecisionValidator,
@@ -927,6 +926,40 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         self.app.node.try_get_block_hash(height).map_err(custom_err)
     }
 
+    async fn get_block_index(
+        &self,
+        block_hash: truthcoin_dc::types::BlockHash,
+    ) -> RpcResult<BlockIndex> {
+        let (body, events) = self
+            .app
+            .node
+            .get_block_index(block_hash)
+            .map_err(custom_err)?;
+        let skipped_tx_indices = self
+            .app
+            .node
+            .get_skipped_tx_indices(block_hash)
+            .map_err(custom_err)?;
+        let txs = body
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(tx_idx, tx)| {
+                BlockIndexTx::new(
+                    tx,
+                    skipped_tx_indices.contains(&(tx_idx as u32)),
+                )
+            })
+            .collect::<Result<_, _>>()
+            .map_err(custom_err)?;
+        let market_utxos = self
+            .app
+            .node
+            .get_market_utxos(block_hash)
+            .map_err(custom_err)?;
+        Ok(BlockIndex::new(txs, events, market_utxos))
+    }
+
     async fn get_best_sidechain_block_hash(
         &self,
     ) -> RpcResult<Option<truthcoin_dc::types::BlockHash>> {
@@ -948,79 +981,6 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
             .get_best_main_verification(sidechain_hash)
             .map_err(custom_err)?;
         Ok(Some(block_hash))
-    }
-
-    async fn get_block_index(
-        &self,
-        block_hash: truthcoin_dc::types::BlockHash,
-    ) -> RpcResult<truthcoin_dc::types::BlockIndex> {
-        let body = self.app.node.get_body(block_hash).map_err(custom_err)?;
-        let skipped_tx_indices = self
-            .app
-            .node
-            .get_skipped_tx_indices(block_hash)
-            .map_err(custom_err)?;
-        let txs = body
-            .transactions
-            .iter()
-            .enumerate()
-            .map(|(tx_idx, tx)| {
-                Ok(truthcoin_dc::types::BlockIndexTx {
-                    txid: tx.txid(),
-                    size: tx.canonical_size()?,
-                    raw: const_hex::encode(tx.canonical_bytes()?),
-                    skipped: skipped_tx_indices.contains(&(tx_idx as u32)),
-                })
-            })
-            .collect::<Result<_, std::io::Error>>()
-            .map_err(custom_err)?;
-        let events = self
-            .app
-            .node
-            .get_two_way_peg_events(block_hash)
-            .map_err(custom_err)?;
-        let mut deposits = Vec::new();
-        let mut bundle_returns = Vec::new();
-        let mut bundle_spends = Vec::new();
-        for event in events {
-            match event {
-                TwoWayPegEvent::Deposit { outpoint, output } => {
-                    deposits.push(truthcoin_dc::types::BlockIndexDeposit {
-                        outpoint,
-                        output,
-                    })
-                }
-                TwoWayPegEvent::BundleSpend { outpoint, m6id } => bundle_spends
-                    .push(truthcoin_dc::types::BlockIndexSpend {
-                        outpoint,
-                        m6id,
-                    }),
-                TwoWayPegEvent::BundleReturn {
-                    outpoint,
-                    output,
-                    m6id,
-                } => {
-                    bundle_returns.push(truthcoin_dc::types::BlockIndexReturn {
-                        outpoint,
-                        output,
-                        m6id,
-                    })
-                }
-            }
-        }
-        let market_utxos = self
-            .app
-            .node
-            .get_market_utxos(block_hash)
-            .map_err(custom_err)?;
-        Ok(truthcoin_dc::types::BlockIndex {
-            txs,
-            deposits,
-            bundle_returns,
-            bundle_spends,
-            market_creates: market_utxos.creates,
-            market_deletes: market_utxos.deletes,
-        })
     }
 
     async fn get_bmm_inclusions(
@@ -1061,16 +1021,6 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                     rpc_api::node::GetTransactionResponse { tx, block_hash }
                 });
         Ok(res)
-    }
-
-    async fn get_two_way_peg_events(
-        &self,
-        block_hash: truthcoin_dc::types::BlockHash,
-    ) -> RpcResult<Vec<TwoWayPegEvent>> {
-        self.app
-            .node
-            .get_two_way_peg_events(block_hash)
-            .map_err(custom_err)
     }
 
     async fn get_utxos(
@@ -1124,28 +1074,17 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
         Ok(height)
     }
 
+    async fn list_mempool(&self) -> RpcResult<Vec<MempoolTx>> {
+        let txs = self.app.node.get_all_transactions().map_err(custom_err)?;
+        txs.into_iter()
+            .map(|authorized| MempoolTx::new(authorized.transaction))
+            .collect::<Result<_, _>>()
+            .map_err(custom_err)
+    }
+
     async fn list_peers(&self) -> RpcResult<Vec<Peer>> {
         let peers = self.app.node.get_active_peers();
         Ok(peers)
-    }
-
-    async fn list_mempool(&self) -> RpcResult<Vec<rpc_api::node::MempoolTx>> {
-        let txs = self.app.node.get_all_transactions().map_err(custom_err)?;
-        txs.into_iter()
-            .map(|authorized| {
-                let tx = authorized.transaction;
-                let size = tx.canonical_size().map_err(custom_err)?;
-                let raw = const_hex::encode(
-                    tx.canonical_bytes().map_err(custom_err)?,
-                );
-                Ok(rpc_api::node::MempoolTx {
-                    txid: tx.txid(),
-                    size,
-                    raw,
-                    tx,
-                })
-            })
-            .collect()
     }
 
     async fn list_offers(&self) -> RpcResult<Vec<rpc_api::node::OfferInfo>> {
@@ -2413,8 +2352,8 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
     }
 
     async fn get_wallet_addresses(&self) -> RpcResult<Vec<Address>> {
-        let addrs = self.app.wallet.get_addresses().map_err(custom_err)?;
-        let mut res: Vec<_> = addrs.into_iter().collect();
+        let mut res =
+            self.app.wallet.get_issued_addresses().map_err(custom_err)?;
         res.sort_by_key(|addr| addr.as_base58());
         Ok(res)
     }

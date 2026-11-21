@@ -17,6 +17,11 @@ pub mod authorization;
 pub use authorization::Authorization;
 pub mod block;
 pub use block::{Block, Body, Coinbase, Header};
+pub mod block_index;
+pub use block_index::{
+    BlockIndex, BlockIndexEvents, BlockIndexOutput, BlockIndexSpend,
+    BlockIndexTx, MempoolTx,
+};
 pub mod decision;
 pub mod error;
 pub use error::{
@@ -98,66 +103,6 @@ pub static OP_DRIVECHAIN_SCRIPT: LazyLock<bitcoin::ScriptBuf> =
         script.push_opcode(bitcoin::opcodes::OP_TRUE);
         script
     });
-
-/// One transaction of a block, with the fields its body omits
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct BlockIndexTx {
-    pub txid: Txid,
-    /// Canonical size in bytes
-    pub size: u64,
-    /// Borsh encoding, as hex
-    pub raw: String,
-    /// True for a trade that failed its price limit: the block keeps it in
-    /// the body, but it spends no input and creates no output
-    pub skipped: bool,
-}
-
-/// One output a mainchain deposit created
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct BlockIndexDeposit {
-    pub outpoint: transaction::OutPoint,
-    pub output: transaction::Output,
-}
-
-/// One output a withdrawal bundle removed, with the bundle that took it
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct BlockIndexSpend {
-    pub outpoint: transaction::OutPoint,
-    pub m6id: M6id,
-}
-
-/// One output that a failed or dropped withdrawal bundle made again, with the
-/// bundle
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct BlockIndexReturn {
-    pub outpoint: transaction::OutPoint,
-    pub output: transaction::Output,
-    pub m6id: M6id,
-}
-
-/// Everything about a block that its body does not carry
-//  Each pair is a named struct: a tuple of ref schemas does not compose.
-#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-pub struct BlockIndex {
-    /// Transactions in body order
-    pub txs: Vec<BlockIndexTx>,
-    /// Outputs that mainchain deposits created. Apply them before `txs`.
-    pub deposits: Vec<BlockIndexDeposit>,
-    /// Outputs that a failed or dropped withdrawal bundle made again. Apply
-    /// them before `txs`, because a transaction of the block can spend one.
-    pub bundle_returns: Vec<BlockIndexReturn>,
-    /// Outputs that a withdrawal bundle removed. Apply them after `txs`,
-    /// because the bundle that this block builds can take an output of the
-    /// block.
-    pub bundle_spends: Vec<BlockIndexSpend>,
-    /// Outputs that market trades and settlement created outside any
-    /// transaction
-    pub market_creates: Vec<state::MarketUtxo>,
-    /// Outputs that market trades and settlement removed outside any
-    /// transaction. Apply them after `market_creates`, because settlement can
-    /// remove a treasury that the same block created.
-    pub market_deletes: Vec<state::MarketUtxo>,
-}
 
 /// Step of the startup sync with the mainchain
 #[derive(

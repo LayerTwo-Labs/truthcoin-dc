@@ -88,19 +88,18 @@ pub mod node {
     use serde::{Deserialize, Serialize};
     use truthcoin_dc_types::{
         Address, Authorization, Authorized, Block, BlockHash, BlockIndex,
-        BlockIndexDeposit, BlockIndexReturn, BlockIndexSpend, BlockIndexTx,
-        Body, ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
+        BlockIndexOutput, BlockIndexSpend, BlockIndexTx, Body,
+        ClaimDecisionPayload, Coinbase, CoinbaseTxid, DecisionClaimEntry,
         Header, InPoint, M6id, MainchainSyncPhase, MainchainSyncProgress,
-        MerkleRoot, OfferId, OutPoint, Output, OutputContent, PointedOutput,
-        ShareDelta, SignedOffer, SpentOutput, Transaction, TxData, TxIn, Txid,
-        Votecoin, VotecoinOffer, WithdrawalBundle, WithdrawalBundleStatus,
+        MempoolTx, MerkleRoot, OfferId, OutPoint, Output, OutputContent,
+        PointedOutput, ShareDelta, SignedOffer, SpentOutput, Transaction,
+        TxData, TxIn, Txid, Votecoin, VotecoinOffer, WithdrawalBundle,
+        WithdrawalBundleStatus,
         authorization::Signature,
         decision::DecisionType,
         market::MarketId,
         net::{Peer, PeerAddress, PeerConnectionStatus},
-        state::{
-            MarketUtxo, MarketUtxoReason, TwoWayPegEvent, WithdrawalBundleInfo,
-        },
+        state::{MarketUtxo, MarketUtxoReason, WithdrawalBundleInfo},
         transaction::Outputs,
     };
     use typewit::const_marker::Bool;
@@ -355,18 +354,6 @@ pub mod node {
         pub block_hash: Option<BlockHash>,
     }
 
-    /// One transaction the mempool holds
-    #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
-    pub struct MempoolTx {
-        /// Blake3 over the canonical encoding
-        pub txid: Txid,
-        /// Canonical size in bytes
-        pub size: u64,
-        /// Borsh encoding, as hex
-        pub raw: String,
-        pub tx: Transaction,
-    }
-
     #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
     pub struct OfferInfo {
         pub offer_id: OfferId,
@@ -386,8 +373,8 @@ pub mod node {
     #[open_api(
         merge_apis[get_block::RpcDoc],
         ref_schemas[
-            Address, Authorization, BallotItem, BlockHash, BlockIndexDeposit,
-            BlockIndexReturn, BlockIndexSpend, BlockIndexTx, Body,
+            Address, Authorization, BallotItem, BlockHash, BlockIndexOutput,
+            BlockIndexSpend, BlockIndexTx, Body,
             ClaimDecisionPayload, Coinbase, CoinbaseTxid, ConsensusResults,
             DecisionClaimEntry,
             DecisionContentInfo, DecisionInfo, DecisionState, DecisionSummary,
@@ -443,9 +430,9 @@ pub mod node {
             height: u32,
         ) -> RpcResult<Option<truthcoin_dc_types::BlockHash>>;
 
-        /// Get the transaction ids, sizes and encodings of a block, with the
-        /// mainchain deposits, withdrawal bundle spends and market outputs it
-        /// applied outside its transactions
+        /// Get the txids, sizes and encodings of the transactions of a block
+        /// in the active chain, with the outputs that the block created or
+        /// spent outside its body
         #[open_api_method(output_schema(ToSchema))]
         #[method(name = "get_block_index")]
         async fn get_block_index(
@@ -495,16 +482,6 @@ pub mod node {
             txid: Txid,
         ) -> RpcResult<Option<GetTransactionResponse>>;
 
-        /// Get the coin movements that a block applied outside its body: a
-        /// mainchain deposit, a withdrawal bundle spend, and the outputs a
-        /// failed bundle returned. The list keeps the order the node applied.
-        #[open_api_method(output_schema(ToSchema))]
-        #[method(name = "get_two_way_peg_events")]
-        async fn get_two_way_peg_events(
-            &self,
-            block_hash: truthcoin_dc_types::BlockHash,
-        ) -> RpcResult<Vec<TwoWayPegEvent>>;
-
         /// Get utxos for addresses
         #[method(name = "get_utxos")]
         async fn get_utxos(
@@ -529,7 +506,9 @@ pub mod node {
             &self,
         ) -> RpcResult<Option<u32>>;
 
-        /// List the transactions the mempool holds, in no particular order.
+        /// List the transactions that the mempool holds, in no particular
+        /// order
+        #[open_api_method(output_schema(ToSchema))]
         #[method(name = "list_mempool")]
         async fn list_mempool(&self) -> RpcResult<Vec<MempoolTx>>;
 
@@ -860,7 +839,7 @@ pub mod wallet {
         #[method(name = "get_new_address")]
         async fn get_new_address(&self) -> RpcResult<Address>;
 
-        /// Get wallet addresses, sorted by base58 encoding
+        /// Get the issued wallet addresses, sorted by base58 encoding
         #[method(name = "get_wallet_addresses")]
         async fn get_wallet_addresses(&self) -> RpcResult<Vec<Address>>;
 
