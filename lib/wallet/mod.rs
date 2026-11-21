@@ -2523,12 +2523,12 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(wallet.get_receive_address()?, first);
         }
-        assert_eq!(wallet.get_addresses()?.len(), 1);
+        assert_eq!(wallet.get_num_addresses()?, 1);
 
         // A fresh address is still fresh, so a change output never reuses one.
         let fresh = wallet.get_new_address()?;
         assert_ne!(fresh, first);
-        assert_eq!(wallet.get_addresses()?.len(), 2);
+        assert_eq!(wallet.get_num_addresses()?, 2);
 
         // The receive address moves on once it receives.
         let outpoint = OutPoint::Regular {
