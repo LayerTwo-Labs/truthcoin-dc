@@ -290,6 +290,7 @@ impl VotingSystem {
             }
         }
 
+        let mut reveal_heights = HashMap::new();
         let mut vote_matrix = SparseVoteMatrix::new(voters, decisions);
         let mut unguaranteed_votes: BTreeMap<
             DecisionId,
@@ -302,6 +303,8 @@ impl VotingSystem {
             };
             let vote_value = vote_entry.to_float();
             if vote_key.decision_id.is_standard() {
+                reveal_heights
+                    .insert(vote_key.voter_address, vote_entry.block_height);
                 vote_matrix
                     .set_vote(
                         vote_key.voter_address,
@@ -328,6 +331,7 @@ impl VotingSystem {
                     &weight_vector,
                     &scaled_decisions,
                     &categorical_decisions,
+                    &reveal_heights,
                 )
                 .map_err(|e| Error::InvalidTransaction {
                     reason: format!("Failed to calculate consensus: {e:?}"),

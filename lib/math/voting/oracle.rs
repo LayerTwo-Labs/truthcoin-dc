@@ -1,6 +1,7 @@
 use super::constants::{
     BITCOIN_HIVEMIND_NEUTRAL_VALUE, CONSENSUS_CATCH_TOLERANCE,
-    LOADING_NOISE_FLOOR, REPUTATION_SMOOTHING_ALPHA, SVD_NUMERICAL_TOLERANCE,
+    LOADING_NOISE_FLOOR, REPUTATION_SMOOTHING_ALPHA, REVEAL_TIER_MULTIPLIERS,
+    REVEAL_TIER_SHARE, SCALED_MATCH_TOLERANCE, SVD_NUMERICAL_TOLERANCE,
     round_outcome, round_reputation,
 };
 use super::{
@@ -219,7 +220,9 @@ fn weighted_prin_comp(
 
 struct RewardWeightsResult {
     pub first_loading: DVector<f64>,
+    pub new_rep: DVector<f64>,
     pub smooth_rep: DVector<f64>,
+    pub deadlocked: Vec<bool>,
 }
 
 fn column_median(
@@ -408,7 +411,9 @@ fn get_reward_weights(
 
     Ok(RewardWeightsResult {
         first_loading,
+        new_rep,
         smooth_rep,
+        deadlocked,
     })
 }
 
@@ -706,6 +711,254 @@ pub fn resolve_categorical_plurality(
     results
 }
 
+/// How a voter's sealed ballot fared, with the block it was revealed in
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Reveal {
+    Silent,
+    Correct(u32),
+    Incorrect(u32),
+}
+
+fn vote_matches(vote: f64, outcome: f64, scaled: bool) -> bool {
+    let tolerance = if scaled { SCALED_MATCH_TOLERANCE } else { 0.0 };
+    (vote - outcome).abs() <= tolerance + SVD_NUMERICAL_TOLERANCE
+}
+
+/// The outcomes some revealer matched. A decision no revealer matched is
+/// left out of the correctness check, so it cannot disqualify everyone.
+fn matched_outcomes(
+    matrix: &DMatrix<f64>,
+    outcomes: &[Option<f64>],
+    scaled: &[bool],
+    revealed: &[bool],
+) -> Vec<Option<f64>> {
+    outcomes
+        .iter()
+        .enumerate()
+        .map(|(j, outcome)| {
+            outcome.filter(|&outcome| {
+                (0..matrix.nrows()).any(|i| {
+                    revealed[i]
+                        && vote_matches(matrix[(i, j)], outcome, scaled[j])
+                })
+            })
+        })
+        .collect()
+}
+
+/// Whether the voter's row matches every column that has an outcome.
+/// `outcomes[j]` is `None` for a column left out of the check. A scaled
+/// vote matches within 1% of the decision's range.
+fn ballot_correct(
+    matrix: &DMatrix<f64>,
+    voter: usize,
+    outcomes: &[Option<f64>],
+    scaled: &[bool],
+) -> bool {
+    outcomes.iter().any(Option::is_some)
+        && outcomes.iter().enumerate().all(|(j, outcome)| {
+            outcome.is_none_or(|outcome| {
+                vote_matches(matrix[(voter, j)], outcome, scaled[j])
+            })
+        })
+}
+
+/// Once anyone has revealed, each revealer smooths toward its share of
+/// the revealers' SVD reputation and each silent voter toward zero. When
+/// the SVD scores every revealer zero, revealers keep their share of the
+/// revealers' old reputation.
+fn exclude_silent(
+    smooth_rep: DVector<f64>,
+    old_rep: &DVector<f64>,
+    new_rep: &DVector<f64>,
+    reveals: &[Reveal],
+) -> DVector<f64> {
+    let revealed_sum = |weights: &DVector<f64>| -> f64 {
+        reveals
+            .iter()
+            .zip(weights.iter())
+            .filter(|(reveal, _)| **reveal != Reveal::Silent)
+            .map(|(_, weight)| weight)
+            .sum()
+    };
+    let new_share = revealed_sum(new_rep);
+    let (weights, revealed_share) = if new_share > SVD_NUMERICAL_TOLERANCE {
+        (new_rep, new_share)
+    } else {
+        (old_rep, revealed_sum(old_rep))
+    };
+    if revealed_share <= 0.0 {
+        return smooth_rep;
+    }
+    DVector::from_iterator(
+        old_rep.len(),
+        reveals.iter().enumerate().map(|(i, reveal)| {
+            let share = match *reveal {
+                Reveal::Silent => 0.0,
+                Reveal::Correct(_) | Reveal::Incorrect(_) => {
+                    weights[i] / revealed_share
+                }
+            };
+            REPUTATION_SMOOTHING_ALPHA * share
+                + (1.0 - REPUTATION_SMOOTHING_ALPHA) * old_rep[i]
+        }),
+    )
+}
+
+/// Each `(voter, height, space)` entry's share of the two reveal tiers,
+/// filled earliest block first. Entries sharing a block split it pro rata.
+fn tier_slices(mut ranked: Vec<(usize, u32, f64)>) -> Vec<(usize, [f64; 2])> {
+    ranked.sort_by_key(|&(i, height, _)| (height, i));
+    let mut capacity = [REVEAL_TIER_SHARE; 2];
+    let mut slices = Vec::new();
+    for block in ranked.chunk_by(|a, b| a.1 == b.1) {
+        if capacity.iter().all(|cap| *cap <= SVD_NUMERICAL_TOLERANCE) {
+            break;
+        }
+        let block_space: f64 = block.iter().map(|&(_, _, space)| space).sum();
+        if block_space <= 0.0 {
+            continue;
+        }
+        let mut left = block_space;
+        let taken = capacity.each_mut().map(|cap| {
+            let take = left.min(*cap);
+            *cap -= take;
+            left -= take;
+            take
+        });
+        slices.extend(block.iter().map(|&(i, _, space)| {
+            (i, taken.map(|take| take / block_space * space))
+        }));
+    }
+    slices
+}
+
+/// Payout weights for correct revealers who gained, filling the tiers by
+/// reputation at 1.5/1.25; a first block holding both tiers' worth of
+/// reputation therefore shares the whole pool pro rata.
+fn gainer_weights(gainers: Vec<(usize, u32, f64)>) -> Vec<(usize, f64)> {
+    tier_slices(gainers)
+        .into_iter()
+        .map(|(i, slices)| {
+            (
+                i,
+                REVEAL_TIER_MULTIPLIERS
+                    .iter()
+                    .zip(slices)
+                    .map(|(m, s)| m * s)
+                    .sum(),
+            )
+        })
+        .collect()
+}
+
+/// Pool weights when no correct revealer gained: the correct revealers,
+/// or every revealer when none was correct, by old reputation.
+fn revealer_weights(
+    reveals: &[Reveal],
+    rep: &DVector<f64>,
+) -> Vec<(usize, f64)> {
+    let correct: Vec<(usize, f64)> = reveals
+        .iter()
+        .enumerate()
+        .filter_map(|(i, reveal)| match *reveal {
+            Reveal::Correct(_) => Some((i, rep[i])),
+            Reveal::Silent | Reveal::Incorrect(_) => None,
+        })
+        .collect();
+    if correct.iter().map(|(_, weight)| weight).sum::<f64>() > 0.0 {
+        return correct;
+    }
+    reveals
+        .iter()
+        .enumerate()
+        .filter(|(_, reveal)| **reveal != Reveal::Silent)
+        .map(|(i, _)| (i, rep[i]))
+        .collect()
+}
+
+/// Early incorrect revealers and silent voters smooth at a raised alpha.
+/// The extra loss goes to the earliest correct revealers who gained. When
+/// none gained, only silent voters pay and the revealers share it.
+fn apply_reveal_timing(
+    old_rep: &DVector<f64>,
+    smooth_rep: DVector<f64>,
+    reveals: &[Reveal],
+) -> DVector<f64> {
+    let change = |i: usize| smooth_rep[i] - old_rep[i];
+    let total = |weights: &[(usize, f64)]| -> f64 {
+        weights.iter().map(|(_, weight)| weight).sum()
+    };
+    let gainers = gainer_weights(
+        reveals
+            .iter()
+            .enumerate()
+            .filter_map(|(i, reveal)| match *reveal {
+                Reveal::Correct(height)
+                    if change(i) > SVD_NUMERICAL_TOLERANCE =>
+                {
+                    Some((i, height, old_rep[i]))
+                }
+                Reveal::Silent | Reveal::Correct(_) | Reveal::Incorrect(_) => {
+                    None
+                }
+            })
+            .collect(),
+    );
+    let tiered = total(&gainers) > 0.0;
+    let weights = if tiered {
+        gainers
+    } else {
+        revealer_weights(reveals, old_rep)
+    };
+    let total_weight = total(&weights);
+    if total_weight <= 0.0 {
+        return smooth_rep;
+    }
+
+    let [tier1, _] = REVEAL_TIER_MULTIPLIERS;
+    let mut extra = DVector::from_iterator(
+        old_rep.len(),
+        reveals.iter().enumerate().map(|(i, reveal)| match *reveal {
+            Reveal::Silent => (tier1 - 1.0) * -change(i),
+            Reveal::Correct(_) | Reveal::Incorrect(_) => 0.0,
+        }),
+    );
+    let losers = if tiered {
+        reveals
+            .iter()
+            .enumerate()
+            .filter_map(|(i, reveal)| match *reveal {
+                Reveal::Incorrect(height)
+                    if change(i) < -SVD_NUMERICAL_TOLERANCE =>
+                {
+                    Some((i, height, -change(i) / REPUTATION_SMOOTHING_ALPHA))
+                }
+                Reveal::Silent | Reveal::Correct(_) | Reveal::Incorrect(_) => {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for (i, slices) in tier_slices(losers) {
+        let raised: f64 = REVEAL_TIER_MULTIPLIERS
+            .iter()
+            .zip(slices)
+            .map(|(m, s)| (m - 1.0) * s)
+            .sum();
+        extra[i] = REPUTATION_SMOOTHING_ALPHA * raised;
+    }
+    let pool = extra.sum();
+
+    let mut adjusted = smooth_rep - extra;
+    for (i, weight) in weights {
+        adjusted[i] += pool * weight / total_weight;
+    }
+    adjusted
+}
+
 pub fn run_consensus(
     vote_matrix: &SparseVoteMatrix,
     reputation_vector: &VotingWeightVector,
@@ -713,6 +966,7 @@ pub fn run_consensus(
         crate::state::decisions::DecisionId,
     >,
     categorical_decisions: &HashMap<crate::state::decisions::DecisionId, u16>,
+    reveal_heights: &HashMap<crate::types::Address, u32>,
 ) -> Result<DetailedConsensusResult, VotingMathError> {
     let voters = vote_matrix.get_voters();
     let decisions = vote_matrix.get_decisions();
@@ -825,11 +1079,62 @@ pub fn run_consensus(
     }
 
     let (smooth_rep, first_loading, certainty) = match result {
-        Some(result) => (
-            result.agents.smooth_rep,
-            result.first_loading.iter().copied().collect(),
-            result.certainty,
-        ),
+        Some(result) => {
+            let references: Vec<Option<f64>> = svd_pinned
+                .iter()
+                .enumerate()
+                .map(|(j, pinned)| {
+                    let unresolved = result.agents.deadlocked[j]
+                        && result.decisions[j]
+                            == BITCOIN_HIVEMIND_NEUTRAL_VALUE;
+                    (result.has_votes[j] && !unresolved)
+                        .then(|| pinned.unwrap_or(result.decisions[j]))
+                })
+                .collect();
+            let heights: Vec<Option<u32>> = voters
+                .iter()
+                .map(|voter_id| reveal_heights.get(voter_id).copied())
+                .collect();
+            let revealed: Vec<bool> =
+                heights.iter().map(Option::is_some).collect();
+            let references = matched_outcomes(
+                &svd_matrix,
+                &references,
+                &svd_scaled,
+                &revealed,
+            );
+            let reveals: Vec<Reveal> = heights
+                .iter()
+                .enumerate()
+                .map(|(i, height)| match *height {
+                    None => Reveal::Silent,
+                    Some(height)
+                        if ballot_correct(
+                            &svd_matrix,
+                            i,
+                            &references,
+                            &svd_scaled,
+                        ) =>
+                    {
+                        Reveal::Correct(height)
+                    }
+                    Some(height) => Reveal::Incorrect(height),
+                })
+                .collect();
+            let smooth_rep = exclude_silent(
+                result.agents.smooth_rep,
+                &rep_vector,
+                &result.agents.new_rep,
+                &reveals,
+            );
+            let smooth_rep =
+                apply_reveal_timing(&rep_vector, smooth_rep, &reveals);
+            (
+                smooth_rep,
+                result.first_loading.iter().copied().collect(),
+                result.certainty,
+            )
+        }
         None => (rep_vector, Vec::new(), 0.0),
     };
 
@@ -916,15 +1221,20 @@ mod tests {
         let mut matrix =
             SparseVoteMatrix::new(voters.clone(), decisions.clone());
         let mut rep = VotingWeightVector::new();
-        for (voter, &(share, votes, _)) in voters.iter().zip(rows) {
+        let mut heights = HashMap::new();
+        for (voter, &(share, votes, height)) in voters.iter().zip(rows) {
             rep.set_reputation(*voter, share);
             for (decision, &vote) in decisions.iter().zip(votes) {
                 matrix.set_vote(*voter, *decision, vote).unwrap();
             }
+            if let Some(height) = height {
+                heights.insert(*voter, height);
+            }
         }
         let scaled = scaled.iter().map(|&j| decisions[j]).collect();
         let result =
-            run_consensus(&matrix, &rep, &scaled, &HashMap::new()).unwrap();
+            run_consensus(&matrix, &rep, &scaled, &HashMap::new(), &heights)
+                .unwrap();
         (
             decisions.iter().map(|d| result.outcomes[d]).collect(),
             voters
@@ -1220,6 +1530,175 @@ mod tests {
         assert!((whole_smooth[2] - split_smooth[4]).abs() < 1e-9);
     }
 
+    fn assert_close(actual: &DVector<f64>, expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!((a - e).abs() < 1e-12, "index {i}: {a} != {e}");
+        }
+    }
+
+    fn assert_slices(
+        slices: &[(usize, [f64; 2])],
+        expected: &[(usize, [f64; 2])],
+    ) {
+        assert_eq!(slices.len(), expected.len());
+        for ((i, got), (j, want)) in slices.iter().zip(expected) {
+            assert_eq!(i, j);
+            assert!((got[0] - want[0]).abs() < 1e-12, "voter {i}");
+            assert!((got[1] - want[1]).abs() < 1e-12, "voter {i}");
+        }
+    }
+
+    /// An address straddling a tier boundary splits into t1, t2 and rest
+    #[test]
+    fn tier_split_straddle() {
+        assert_slices(
+            &tier_slices(vec![(2, 3, 0.93), (0, 1, 0.03), (1, 2, 0.04)]),
+            &[(0, [0.03, 0.0]), (1, [0.02, 0.02]), (2, [0.0, 0.03])],
+        );
+    }
+
+    /// Pro rata, a boundary block gives each voter the same tier fraction
+    #[test]
+    fn tier_same_block() {
+        assert_slices(
+            &tier_slices(vec![
+                (0, 1, 0.02),
+                (1, 2, 0.06),
+                (2, 2, 0.02),
+                (3, 3, 0.90),
+            ]),
+            &[
+                (0, [0.02, 0.0]),
+                (1, [0.0225, 0.0375]),
+                (2, [0.0075, 0.0125]),
+            ],
+        );
+    }
+
+    /// A first block holding over 10% shares the whole pool pro rata
+    #[test]
+    fn first_block_shares() {
+        let old = DVector::from_vec(vec![0.1, 0.3, 0.1, 0.5]);
+        let smooth = DVector::from_vec(vec![0.07, 0.31, 0.11, 0.51]);
+        let reveals = [
+            Reveal::Incorrect(1),
+            Reveal::Correct(1),
+            Reveal::Correct(1),
+            Reveal::Correct(2),
+        ];
+        let adjusted = apply_reveal_timing(&old, smooth, &reveals);
+        assert_close(&adjusted, &[0.05875, 0.3184375, 0.1128125, 0.51]);
+    }
+
+    /// Early wrong revealers pay 1.5x/1.25x to early correct revealers
+    #[test]
+    fn early_wrong_penalized() {
+        let old = DVector::from_vec(vec![0.04, 0.06, 0.4, 0.04, 0.06, 0.4]);
+        let smooth =
+            DVector::from_vec(vec![0.036, 0.054, 0.36, 0.044, 0.066, 0.44]);
+        let reveals = [
+            Reveal::Incorrect(1),
+            Reveal::Incorrect(2),
+            Reveal::Incorrect(3),
+            Reveal::Correct(1),
+            Reveal::Correct(2),
+            Reveal::Correct(3),
+        ];
+        let adjusted = apply_reveal_timing(&old, smooth, &reveals);
+        let third_extra =
+            0.3 * (0.5 * (0.05 - 0.04 / 3.0 - 0.02) + 0.25 * 0.05);
+        let pool = 0.002 + 0.003 + third_extra;
+        assert_close(
+            &adjusted,
+            &[
+                0.034,
+                0.051,
+                0.36 - third_extra,
+                0.044 + pool * 0.06 / 0.1375,
+                0.066 + pool * 0.0775 / 0.1375,
+                0.44,
+            ],
+        );
+        assert!((adjusted.sum() - 1.0).abs() < 1e-12);
+    }
+
+    /// Silence pays tier 1 untiered; an incorrect gainer is skipped
+    #[test]
+    fn silent_penalized_gainer_skipped() {
+        let old = DVector::from_vec(vec![0.3, 0.3, 0.04, 0.36]);
+        let smooth = DVector::from_vec(vec![0.21, 0.36, 0.036, 0.394]);
+        let reveals = [
+            Reveal::Silent,
+            Reveal::Correct(5),
+            Reveal::Incorrect(9),
+            Reveal::Incorrect(1),
+        ];
+        let adjusted = apply_reveal_timing(&old, smooth, &reveals);
+        assert_close(&adjusted, &[0.165, 0.407, 0.034, 0.394]);
+    }
+
+    /// A near-miss takes little tier space, leaving it to the fully wrong
+    #[test]
+    fn near_miss_small_space() {
+        let old = DVector::from_vec(vec![0.1, 0.1, 0.3, 0.5]);
+        let smooth = DVector::from_vec(vec![0.099, 0.07, 0.331, 0.5]);
+        let reveals = [
+            Reveal::Incorrect(1),
+            Reveal::Incorrect(2),
+            Reveal::Correct(1),
+            Reveal::Correct(2),
+        ];
+        let adjusted = apply_reveal_timing(&old, smooth, &reveals);
+        assert_close(&adjusted, &[0.0985, 0.05925, 0.34225, 0.5]);
+    }
+
+    /// Splitting a wrong address within a block changes no one's penalty
+    #[test]
+    fn punish_split_invariant() {
+        let whole = apply_reveal_timing(
+            &DVector::from_vec(vec![0.08, 0.08, 0.84]),
+            DVector::from_vec(vec![0.056, 0.056, 0.888]),
+            &[
+                Reveal::Incorrect(1),
+                Reveal::Incorrect(1),
+                Reveal::Correct(1),
+            ],
+        );
+        let split = apply_reveal_timing(
+            &DVector::from_vec(vec![0.02, 0.02, 0.02, 0.02, 0.08, 0.84]),
+            DVector::from_vec(vec![0.014, 0.014, 0.014, 0.014, 0.056, 0.888]),
+            &[
+                Reveal::Incorrect(1),
+                Reveal::Incorrect(1),
+                Reveal::Incorrect(1),
+                Reveal::Incorrect(1),
+                Reveal::Incorrect(1),
+                Reveal::Correct(1),
+            ],
+        );
+        let pieces: f64 = split.iter().take(4).sum();
+        assert!((whole[0] - pieces).abs() < 1e-12);
+        assert!((whole[1] - split[4]).abs() < 1e-12);
+        assert!((whole[2] - split[5]).abs() < 1e-12);
+    }
+
+    /// A float-noise loss takes no tier space from a later wrong voter
+    #[test]
+    fn noise_not_loser() {
+        let old = DVector::from_vec(vec![0.25, 0.1, 0.25, 0.4]);
+        let smooth =
+            DVector::from_vec(vec![0.25f64.next_down(), 0.07, 0.28, 0.4]);
+        let reveals = [
+            Reveal::Incorrect(1),
+            Reveal::Incorrect(2),
+            Reveal::Correct(1),
+            Reveal::Correct(3),
+        ];
+        let adjusted = apply_reveal_timing(&old, smooth, &reveals);
+        assert_close(&adjusted, &[0.25f64.next_down(), 0.05875, 0.29125, 0.4]);
+    }
+
     /// A caught 0.5 Yes/No split moves no one; lone dissent still loses
     #[test]
     fn deadlock_rewards_neither() {
@@ -1283,6 +1762,113 @@ mod tests {
         assert!((reps[0] / 0.5 - reps[1] / 0.4).abs() < 1e-5);
     }
 
+    /// A deadlock that resolves to 1 pays no pool to an early 0 voter
+    #[test]
+    fn deadlock_judged_resolved() {
+        let reps = |heights: [u32; 4]| {
+            let r = |w: f64| w / 149.0;
+            consensus(
+                &[
+                    (r(39.0), &[0.0, 0.0, 0.0, 0.0], Some(heights[0])),
+                    (r(44.0), &[0.5, 1.0, 1.0, 0.5], Some(heights[1])),
+                    (r(18.0), &[1.0, 0.0, 1.0, 0.0], Some(heights[2])),
+                    (r(48.0), &[1.0, 0.0, 0.5, 1.0], Some(heights[3])),
+                ],
+                &[],
+            )
+        };
+        let (outcomes, early) = reps([1, 2, 2, 2]);
+        let (_, late) = reps([2, 1, 1, 1]);
+        assert_eq!(outcomes[0], Some(1.0));
+        assert_eq!(early[0], late[0]);
+    }
+
+    /// A fully wrong revealer loses the full step despite 50% silence
+    #[test]
+    fn liar_loses_despite_silence() {
+        let (_, reps) = consensus(
+            &[
+                (0.2, &[1.0, 1.0, 0.0], Some(1)),
+                (0.2, &[1.0, 1.0, 0.0], Some(1)),
+                (0.1, &[0.0, 0.0, 1.0], Some(1)),
+                (0.5, &[], None),
+            ],
+            &[],
+        );
+        assert!(reps[2] < 0.1 * 0.7 + 1e-6);
+    }
+
+    /// All-zero SVD scores fall back to revealers' old-reputation shares
+    #[test]
+    fn zero_score_fallback() {
+        let old = DVector::from_vec(vec![0.2, 0.3, 0.5]);
+        let new_rep = DVector::from_vec(vec![0.0, 0.0, 1.0]);
+        let smooth = &new_rep * 0.3 + &old * 0.7;
+        let reveals =
+            [Reveal::Correct(1), Reveal::Incorrect(1), Reveal::Silent];
+        let adjusted = exclude_silent(smooth, &old, &new_rep, &reveals);
+        assert_close(&adjusted, &[0.26, 0.39, 0.35]);
+    }
+
+    /// With no revealers, silent exclusion leaves smoothing as is
+    #[test]
+    fn no_revealers_unchanged() {
+        let old = DVector::from_vec(vec![0.5, 0.5]);
+        let new_rep = DVector::from_vec(vec![0.6, 0.4]);
+        let smooth = DVector::from_vec(vec![0.53, 0.47]);
+        let adjusted = exclude_silent(
+            smooth.clone(),
+            &old,
+            &new_rep,
+            &[Reveal::Silent, Reveal::Silent],
+        );
+        assert_eq!(adjusted, smooth);
+    }
+
+    /// A correct loser is skipped, so a later correct gainer takes the pool
+    #[test]
+    fn correct_loser_skipped() {
+        let old = DVector::from_vec(vec![0.1, 0.3, 0.6]);
+        let smooth = DVector::from_vec(vec![0.07, 0.29, 0.64]);
+        let reveals =
+            [Reveal::Incorrect(1), Reveal::Correct(1), Reveal::Correct(2)];
+        let adjusted = apply_reveal_timing(&old, smooth, &reveals);
+        assert_close(&adjusted, &[0.05875, 0.29, 0.65125]);
+    }
+
+    /// With no correct revealer, the silent extra goes to the revealers
+    #[test]
+    fn no_correct_pays_revealers() {
+        let old = DVector::from_vec(vec![0.5, 0.5]);
+        let smooth = DVector::from_vec(vec![0.35, 0.65]);
+        let reveals = [Reveal::Silent, Reveal::Incorrect(1)];
+        let adjusted = apply_reveal_timing(&old, smooth, &reveals);
+        assert_close(&adjusted, &[0.275, 0.725]);
+    }
+
+    /// With no correct gainer, silence still pays the correct revealers
+    #[test]
+    fn silent_pays_correct() {
+        let old = DVector::from_vec(vec![0.4, 0.3, 0.3]);
+        let smooth = DVector::from_vec(vec![0.28, 0.3, 0.42]);
+        let reveals =
+            [Reveal::Silent, Reveal::Correct(1), Reveal::Incorrect(2)];
+        let adjusted = apply_reveal_timing(&old, smooth, &reveals);
+        assert_close(&adjusted, &[0.22, 0.36, 0.42]);
+    }
+
+    /// A silent voter's alpha share goes to the revealers
+    #[test]
+    fn silent_earns_nothing() {
+        let old = DVector::from_vec(vec![0.5, 0.25, 0.25]);
+        let new_rep = DVector::from_vec(vec![0.2, 0.3, 0.5]);
+        let smooth = &new_rep * 0.3 + &old * 0.7;
+        let reveals =
+            [Reveal::Silent, Reveal::Correct(1), Reveal::Incorrect(1)];
+        let adjusted = exclude_silent(smooth, &old, &new_rep, &reveals);
+        assert_close(&adjusted, &[0.35, 0.2875, 0.3625]);
+    }
+
     /// A 1-ulp reputation change can't move the SVD via a noise loading
     #[test]
     fn noise_loading_stable() {
@@ -1325,5 +1911,70 @@ mod tests {
         );
         assert!(reps[4] < 0.2);
         assert!(reps[0] > 0.2);
+    }
+
+    /// A missing cell on a column that has an outcome is a miss
+    #[test]
+    fn missing_vote_incorrect() {
+        let m = DMatrix::from_row_slice(2, 2, &[1.0, f64::NAN, 1.0, 0.0]);
+        let scaled = [false, false];
+        let outcomes = [Some(1.0), Some(0.0)];
+        assert!(!ballot_correct(&m, 0, &outcomes, &scaled));
+        assert!(ballot_correct(&m, 1, &outcomes, &scaled));
+        assert!(ballot_correct(&m, 0, &[Some(1.0), None], &scaled));
+        assert!(!ballot_correct(&m, 0, &[None, None], &scaled));
+    }
+
+    /// A decision only silent rows or no one matched leaves the check
+    #[test]
+    fn unmatched_dropped() {
+        let m = DMatrix::from_row_slice(
+            3,
+            3,
+            &[1.0, 0.0, 0.4, 1.0, 1.0, 0.4, 0.5, 0.5, 0.5],
+        );
+        let outcomes = [Some(1.0), Some(0.5), Some(0.5)];
+        let matched = matched_outcomes(
+            &m,
+            &outcomes,
+            &[false, false, true],
+            &[true, true, false],
+        );
+        assert_eq!(matched, vec![Some(1.0), None, None]);
+    }
+
+    /// A scaled vote matches within 1% of the range, even at the minimum
+    #[test]
+    fn scaled_one_percent() {
+        let m = DMatrix::from_row_slice(4, 1, &[0.509, 0.511, 0.009, 0.011]);
+        let scaled = [true];
+        assert!(ballot_correct(&m, 0, &[Some(0.5)], &scaled));
+        assert!(!ballot_correct(&m, 1, &[Some(0.5)], &scaled));
+        assert!(ballot_correct(&m, 2, &[Some(0.0)], &scaled));
+        assert!(!ballot_correct(&m, 3, &[Some(0.0)], &scaled));
+    }
+
+    /// Reveal heights move reputation, never outcomes; block 1 takes all
+    #[test]
+    fn timing_keeps_outcomes() {
+        let (yes, no) = (&[1.0, 1.0, 0.0, 1.0][..], &[0.0, 0.0, 1.0, 0.0][..]);
+        let rows = |heights: [Option<u32>; 4]| {
+            [
+                (0.2, yes, heights[0]),
+                (0.2, yes, heights[1]),
+                (0.2, yes, heights[2]),
+                (0.2, no, heights[3]),
+                (0.2, &[][..], None),
+            ]
+        };
+        let (plain_outcomes, plain_reps) = consensus(&rows([None; 4]), &[]);
+        let (timed_outcomes, timed_reps) =
+            consensus(&rows([Some(1), Some(2), Some(3), Some(1)]), &[]);
+        assert_eq!(plain_outcomes, timed_outcomes);
+        assert!((timed_reps[4] - 0.11).abs() < 1e-6);
+        assert!(timed_reps[0] > timed_reps[1]);
+        assert!((timed_reps[1] - timed_reps[2]).abs() < 1e-6);
+        assert!(timed_reps[3] < plain_reps[3]);
+        assert!((timed_reps.iter().sum::<f64>() - 1.0).abs() < 1e-6);
     }
 }

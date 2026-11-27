@@ -18,6 +18,16 @@ fn create_test_decision_ids(count: usize) -> Vec<DecisionId> {
         .collect()
 }
 
+/// Every voter with a vote, revealed in block 1 as in production
+fn revealed(matrix: &SparseVoteMatrix) -> HashMap<Address, u32> {
+    matrix
+        .get_voters()
+        .iter()
+        .filter(|voter| !matrix.get_voter_votes(**voter).is_empty())
+        .map(|voter| (*voter, 1))
+        .collect()
+}
+
 #[test]
 fn test_sparse_vote_matrix_creation() {
     let voters = create_test_voter_ids(3);
@@ -300,9 +310,14 @@ fn test_inconclusive_outcome_neutral() {
     let mut categorical = std::collections::HashMap::new();
     categorical.insert(decisions[0], 3_u16);
 
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     assert_eq!(result.categorical_winners[&decisions[0]], Some(3));
     let outcome = result.outcomes[&decisions[0]].unwrap();
@@ -393,9 +408,14 @@ fn test_mixed_binary_categorical() {
     let mut categorical = std::collections::HashMap::new();
     categorical.insert(decisions[1], 3_u16);
 
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     assert!(result.outcomes.contains_key(&decisions[0]));
     assert!(result.outcomes.contains_key(&decisions[1]));
@@ -426,9 +446,14 @@ fn test_categorical_clear_winner() {
     let mut categorical = std::collections::HashMap::new();
     categorical.insert(decisions[0], 3_u16);
 
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     assert_eq!(result.categorical_winners[&decisions[0]], Some(1));
 
@@ -465,9 +490,14 @@ fn test_figure5_conservation() {
 
     let scaled = std::collections::HashSet::new();
     let categorical = std::collections::HashMap::new();
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     let original_total: f64 =
         voters.iter().map(|v| reputation.get_reputation(*v)).sum();
@@ -510,9 +540,14 @@ fn test_absence_penalized() {
 
     let scaled = std::collections::HashSet::new();
     let categorical = std::collections::HashMap::new();
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     let rep_full = result.updated_reputations[&voters[0]];
     let rep_half = result.updated_reputations[&voters[1]];
@@ -562,9 +597,14 @@ fn test_full_participation() {
 
     let scaled = std::collections::HashSet::new();
     let categorical = std::collections::HashMap::new();
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     let dissenter = result.updated_reputations[&voters[2]];
     let conformer = result.updated_reputations[&voters[0]];
@@ -604,9 +644,14 @@ fn test_high_absence() {
 
     let scaled = std::collections::HashSet::new();
     let categorical = std::collections::HashMap::new();
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     let rep_voted_wrong = result.updated_reputations[&voters[1]];
     let rep_fully_absent = result.updated_reputations[&voters[2]];
@@ -643,9 +688,14 @@ fn test_dust_no_participation_gain() {
 
     let scaled = std::collections::HashSet::new();
     let categorical = std::collections::HashMap::new();
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     let dust_total: f64 =
         dust.iter().map(|v| result.updated_reputations[v]).sum();
@@ -656,9 +706,9 @@ fn test_dust_no_participation_gain() {
     );
 }
 
-/// When every voter abstains, reputation is unchanged.
+/// When no voter casts a vote, reputation is unchanged
 #[test]
-fn test_all_abstain_unchanged() {
+fn test_no_votes_unchanged() {
     let voters = create_test_voter_ids(3);
     let decisions = create_test_decision_ids(2);
     let matrix = SparseVoteMatrix::new(voters.clone(), decisions);
@@ -670,9 +720,14 @@ fn test_all_abstain_unchanged() {
 
     let scaled = std::collections::HashSet::new();
     let categorical = std::collections::HashMap::new();
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     for voter in &voters {
         assert!(
@@ -707,9 +762,14 @@ fn test_dust_keeps_dissent_penalty() {
 
     let scaled = std::collections::HashSet::new();
     let categorical = std::collections::HashMap::new();
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
 
     let after = result.updated_reputations[&dissenter];
     assert!(
@@ -732,9 +792,14 @@ fn categorical_consensus(
     let scaled = std::collections::HashSet::new();
     let mut categorical = std::collections::HashMap::new();
     categorical.insert(decisions[0], 3_u16);
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
     (voters, reputation, result)
 }
 
@@ -861,9 +926,14 @@ fn camp_consensus(camps: &[&[f64]], columns: &[Column]) -> CampResult {
         }
         camp_voters.push(members);
     }
-    let result =
-        calculate_consensus(&matrix, &reputation, &scaled, &categorical)
-            .unwrap();
+    let result = calculate_consensus(
+        &matrix,
+        &reputation,
+        &scaled,
+        &categorical,
+        &revealed(&matrix),
+    )
+    .unwrap();
     CampResult {
         outcomes: decisions.iter().map(|d| result.outcomes[d]).collect(),
         reputations: camp_voters

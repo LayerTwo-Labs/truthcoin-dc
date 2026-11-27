@@ -26,7 +26,9 @@ fn is_vote_correct(
         VoteValue::Scalar(v) => {
             if decision.is_scaled() {
                 use crate::math::safe_math::round_to_precision;
-                round_to_precision((v - consensus).abs(), 6) <= 0.05
+                use crate::math::voting::constants::SCALED_MATCH_TOLERANCE;
+                round_to_precision((v - consensus).abs(), 6)
+                    <= SCALED_MATCH_TOLERANCE
             } else {
                 *v == consensus
             }
@@ -500,19 +502,25 @@ mod payout_tests {
             false
         ));
         assert!(is_vote_correct(
-            &VoteValue::Scalar(0.55),
+            &VoteValue::Scalar(0.51),
             0.5,
             &decision,
             false
         ));
         assert!(is_vote_correct(
-            &VoteValue::Scalar(0.45),
+            &VoteValue::Scalar(0.49),
             0.5,
             &decision,
             false
         ));
         assert!(!is_vote_correct(
-            &VoteValue::Scalar(0.56),
+            &VoteValue::Scalar(0.52),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Scalar(0.55),
             0.5,
             &decision,
             false

@@ -267,12 +267,14 @@ pub fn calculate_consensus(
     reputation_vector: &VotingWeightVector,
     scaled_decisions: &HashSet<DecisionId>,
     categorical_decisions: &HashMap<DecisionId, u16>,
+    reveal_heights: &HashMap<crate::types::Address, u32>,
 ) -> Result<DetailedConsensusResult, VotingMathError> {
     oracle::run_consensus(
         vote_matrix,
         reputation_vector,
         scaled_decisions,
         categorical_decisions,
+        reveal_heights,
     )
 }
 

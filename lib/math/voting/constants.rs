@@ -6,6 +6,13 @@ pub const SVD_NUMERICAL_TOLERANCE: f64 = 1e-10;
 /// SVD loadings smaller than this fraction of the largest are float noise
 pub const LOADING_NOISE_FLOOR: f64 = 1e-9;
 pub const REPUTATION_SMOOTHING_ALPHA: f64 = 0.3;
+/// Share of network reputation in each reveal-timing tier
+pub const REVEAL_TIER_SHARE: f64 = 0.05;
+/// Smoothing multiplier for the first and second reveal-timing tiers
+pub const REVEAL_TIER_MULTIPLIERS: [f64; 2] = [1.5, 1.25];
+/// A scaled vote matches its outcome within this fraction of the
+/// decision's range
+pub const SCALED_MATCH_TOLERANCE: f64 = 0.01;
 pub const REPUTATION_MIN: f64 = 0.0;
 pub const REPUTATION_MAX: f64 = 1.0;
 /// Production period duration - re-exported from types for voting module use
