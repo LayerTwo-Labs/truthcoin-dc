@@ -226,7 +226,19 @@ impl VoteValidator {
         rotxn: &RoTxn,
         addresses: &[crate::types::Address],
     ) -> Result<(), Error> {
-        for period in state.decisions().get_open_voting_periods(rotxn)? {
+        let open_periods = state.decisions().get_open_voting_periods(rotxn)?;
+        if let Some(period) = open_periods
+            .iter()
+            .find_map(|(&period, &revealing)| revealing.then_some(period))
+        {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Reputation is locked for everyone while period {period} \
+                     is revealing"
+                ),
+            });
+        }
+        for &period in open_periods.keys() {
             let period_id =
                 crate::state::voting::types::VotingPeriodId::new(period);
             for &address in addresses {

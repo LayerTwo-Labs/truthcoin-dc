@@ -1508,7 +1508,7 @@ mod conservation_tests {
         Ok((env, state, decision_id))
     }
 
-    /// Reputation transfers are locked from the sealed ballot until resolution
+    /// Transfers lock from seal to resolution, and for all while revealing
     #[test]
     fn ballot_locks_reputation() -> anyhow::Result<()> {
         use crate::{
@@ -1550,11 +1550,9 @@ mod conservation_tests {
         assert!(!is_locked(&rwtxn)?);
         connect_height(&state, &mut rwtxn, 11, &seals)?;
         assert!(is_locked(&rwtxn)?);
+        let unsealed = transfer_tx(outsider, addr(4), 10_000);
         VoteValidator::validate_reputation_transfer(
-            &state,
-            &rwtxn,
-            &transfer_tx(outsider, addr(4), 10_000),
-            None,
+            &state, &rwtxn, &unsealed, None,
         )?;
         connect_height(&state, &mut rwtxn, 20, &[])?;
         assert_eq!(
@@ -1564,7 +1562,16 @@ mod conservation_tests {
             DecisionState::Revealing,
         );
         assert!(is_locked(&rwtxn)?);
+        assert!(
+            VoteValidator::validate_reputation_transfer(
+                &state, &rwtxn, &unsealed, None,
+            )
+            .is_err()
+        );
         connect_height(&state, &mut rwtxn, 21, &reveals)?;
+        VoteValidator::validate_reputation_transfer(
+            &state, &rwtxn, &unsealed, None,
+        )?;
         assert_eq!(
             state
                 .decisions()
@@ -2095,6 +2102,7 @@ mod conservation_tests {
         Ok(())
     }
 
+    /// A seal locks its voter's offers; the reveal window locks everyone's
     #[test]
     fn ballot_locks_offers() -> anyhow::Result<()> {
         use crate::{
@@ -2114,12 +2122,8 @@ mod conservation_tests {
         )?;
         let mut rwtxn = env.write_txn()?;
         connect_height(&state, &mut rwtxn, 10, &[])?;
-        connect_height(
-            &state,
-            &mut rwtxn,
-            11,
-            &[sealed_ballot_tx(&binary_ballot(voter, decision_id, 1.0, 1))],
-        )?;
+        let ballot = binary_ballot(voter, decision_id, 1.0, 1);
+        connect_height(&state, &mut rwtxn, 11, &[sealed_ballot_tx(&ballot)])?;
         let period = state.current_period(&rwtxn)?;
 
         assert!(
@@ -2140,6 +2144,28 @@ mod conservation_tests {
             )
             .is_err()
         );
+
+        connect_height(&state, &mut rwtxn, 20, &[])?;
+        let revealing_offer =
+            offer_of(&outsider_key, state.current_period(&rwtxn)?, 1);
+        assert!(
+            OfferValidator::validate_open_offer(
+                &state,
+                &rwtxn,
+                &revealing_offer
+            )
+            .is_err()
+        );
+        assert!(
+            OfferValidator::validate_take_offer(
+                &state,
+                &rwtxn,
+                &take_offer_tx(&revealing_offer, addr(5)),
+            )
+            .is_err()
+        );
+        connect_height(&state, &mut rwtxn, 21, &[reveal_ballot_tx(&ballot)])?;
+        OfferValidator::validate_open_offer(&state, &rwtxn, &revealing_offer)?;
         Ok(())
     }
 

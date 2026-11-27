@@ -693,7 +693,7 @@ fn claims_close_at_voting() {
 #[test]
 fn decision_state_machine() {
     use super::{Dbs, DecisionConfig};
-    use std::{collections::BTreeSet, num::NonZeroU32};
+    use std::{collections::BTreeMap, num::NonZeroU32};
 
     let dir = tempfile::tempdir().unwrap();
     let mut options = heed::EnvOpenOptions::new().read_txn_without_tls();
@@ -730,7 +730,7 @@ fn decision_state_machine() {
         .unwrap();
     assert_eq!(
         dbs.get_open_voting_periods(&rwtxn).unwrap(),
-        BTreeSet::from([voting_period]),
+        BTreeMap::from([(voting_period, true)]),
     );
     assert_eq!(
         dbs.get_revealing_decisions_needing_resolution(&rwtxn, 0, Some(21), 0)
@@ -751,7 +751,7 @@ fn decision_state_machine() {
         .unwrap();
     assert_eq!(
         dbs.get_open_voting_periods(&rwtxn).unwrap(),
-        BTreeSet::from([voting_period]),
+        BTreeMap::from([(voting_period, true)]),
     );
 
     dbs.revert_decision_claim(&mut rwtxn, decision_id).unwrap();

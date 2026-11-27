@@ -5,7 +5,7 @@ use crate::validation::DecisionValidationInterface;
 use fallible_iterator::FallibleIterator;
 use heed::types::SerdeBincode;
 use sneed::{DatabaseUnique, Env, RoTxn, RwTxn};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::pricing::{
     self, GENESIS_P_PERIOD_SATS, PeriodPricing, apply_reprice_with_floor,
@@ -616,17 +616,20 @@ impl Dbs {
         Ok(result)
     }
 
-    /// Voting periods with decisions that are voting or revealing
+    /// Voting periods with decisions that are voting or revealing, each
+    /// mapped to whether any of its decisions is in its reveal window
     pub fn get_open_voting_periods(
         &self,
         rotxn: &RoTxn,
-    ) -> Result<BTreeSet<u32>, Error> {
-        Ok(self
-            .open_decision_states(rotxn)?
-            .into_iter()
-            .filter(|(_, state)| state.allows_voting() || state.allows_reveal())
-            .map(|(decision_id, _)| decision_id.voting_period())
-            .collect())
+    ) -> Result<BTreeMap<u32, bool>, Error> {
+        let mut periods = BTreeMap::new();
+        for (decision_id, state) in self.open_decision_states(rotxn)? {
+            if state.allows_voting() || state.allows_reveal() {
+                *periods.entry(decision_id.voting_period()).or_insert(false) |=
+                    state.allows_reveal();
+            }
+        }
+        Ok(periods)
     }
 
     pub fn get_claimed_decisions_needing_voting(
