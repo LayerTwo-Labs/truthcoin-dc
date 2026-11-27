@@ -57,6 +57,46 @@ impl<T> JsonParser<T> {
     }
 }
 
+/// A vote value, or `None` for "inconclusive"
+fn parse_vote_value(value: &str) -> anyhow::Result<Option<f64>> {
+    match value.trim() {
+        word if word.eq_ignore_ascii_case("inconclusive") => Ok(None),
+        number => number
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid vote value {number:?}: expected a number or \
+                     \"inconclusive\""
+                )
+            }),
+    }
+}
+
+/// Parse a batch ballot "id1:val1,id2:inconclusive", rejecting any
+/// malformed entry
+fn parse_ballot(
+    batch: &str,
+) -> anyhow::Result<Vec<truthcoin_dc_app_rpc_api::markets::BallotItem>> {
+    batch
+        .split(',')
+        .map(|pair| {
+            let (decision_id, value) =
+                pair.trim().split_once(':').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid ballot entry {pair:?}: expected id:value"
+                    )
+                })?;
+            Ok(truthcoin_dc_app_rpc_api::markets::BallotItem {
+                decision_id: decision_id.trim().to_string(),
+                vote_value: parse_vote_value(value)?,
+            })
+        })
+        .collect()
+}
+
 pub fn json_response<T>(data: &T) -> anyhow::Result<String>
 where
     T: serde::Serialize,
@@ -577,14 +617,16 @@ pub enum Command {
     #[command(name = "voter-addresses")]
     VoterAddresses,
     /// Seal a ballot covering every decision in the period - use
-    /// comma-separated "id:value" for batch, "id:abstain" to abstain
+    /// comma-separated "id:value" for batch, "id:inconclusive" for Inconclusive
     #[command(name = "vote-submit", alias = "vote")]
     VoteSubmit {
-        /// Single vote: --decision-id X --vote-value Y, or batch: --votes "id1:val1,id2:abstain"
+        /// Single vote: --decision-id X --vote-value Y, or batch:
+        /// --votes "id1:val1,id2:inconclusive"
         #[arg(long)]
         decision_id: Option<String>,
+        /// A number, or "inconclusive"
         #[arg(long)]
-        vote_value: Option<f64>,
+        vote_value: Option<String>,
         #[arg(long)]
         votes: Option<String>,
         /// Miner fee rate in sat/byte, default 1
@@ -1449,29 +1491,11 @@ where
         } => {
             use truthcoin_dc_app_rpc_api::markets::BallotItem;
             let vote_items = if let Some(batch) = votes {
-                // Parse batch format: "id1:val1,id2:val2"
-                batch
-                    .split(',')
-                    .filter_map(|pair| {
-                        let parts: Vec<&str> = pair.trim().split(':').collect();
-                        if parts.len() == 2 {
-                            let val = match parts[1] {
-                                "abstain" => None,
-                                val => Some(val.parse().ok()?),
-                            };
-                            Some(BallotItem {
-                                decision_id: parts[0].to_string(),
-                                vote_value: val,
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+                parse_ballot(&batch)?
             } else if let (Some(id), Some(val)) = (decision_id, vote_value) {
                 vec![BallotItem {
                     decision_id: id,
-                    vote_value: Some(val),
+                    vote_value: parse_vote_value(&val)?,
                 }]
             } else {
                 return Ok(
@@ -1708,5 +1732,26 @@ mod tests {
             "5",
         ]);
         assert!(result.is_err());
+    }
+
+    /// Ballots parse numbers and "inconclusive", rejecting bad entries
+    #[test]
+    fn ballot_parsing() {
+        let items = parse_ballot("aa:1, bb :inconclusive,cc:0.5").unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.decision_id.as_str(), item.vote_value))
+                .collect::<Vec<_>>(),
+            vec![("aa", Some(1.0)), ("bb", None), ("cc", Some(0.5))]
+        );
+        assert!(parse_ballot("aa:1,bb:abstain").is_err());
+        assert!(parse_ballot("aa:1,bb").is_err());
+        assert_eq!(parse_vote_value("Inconclusive").unwrap(), None);
+        assert!(parse_vote_value("yes").is_err());
+        for word in ["nan", "NaN", "inf", "-inf", "infinity"] {
+            assert!(parse_vote_value(word).is_err(), "{word}");
+        }
+        assert!(parse_ballot("aa:1,bb:nan").is_err());
     }
 }

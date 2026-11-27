@@ -2400,16 +2400,21 @@ fn apply_reveal_ballot(
 
         let period_id = VotingPeriodId::new(voting_period);
 
-        let decision_ref = state
+        let decision = state
             .decisions()
             .get_decision_entry(rwtxn, decision_id)?
-            .and_then(|e| e.decision);
+            .and_then(|e| e.decision)
+            .ok_or_else(|| Error::InvalidTransaction {
+                reason: format!(
+                    "Decision {} has no decision claimed",
+                    decision_id.to_hex()
+                ),
+            })?;
 
-        let vote_value =
-            crate::validation::VoteValidator::convert_vote_value_with_decision(
-                vote_item.vote_value,
-                decision_ref.as_ref(),
-            );
+        let vote_value = crate::validation::VoteValidator::convert_vote_value(
+            vote_item.vote_value,
+            &decision,
+        );
 
         let vote = Vote::new(
             voter_address,

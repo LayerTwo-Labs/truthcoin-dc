@@ -300,9 +300,7 @@ impl VotingSystem {
             let Some(&weight) = reputations.get(&vote_key.voter_address) else {
                 continue;
             };
-            let Some(vote_value) = vote_entry.to_float_opt() else {
-                continue;
-            };
+            let vote_value = vote_entry.to_float();
             if vote_key.decision_id.is_standard() {
                 vote_matrix
                     .set_vote(
@@ -400,7 +398,7 @@ impl VotingSystem {
                 None => {
                     let default_value = categorical_default(*decision_id);
                     tracing::info!(
-                        "Decision {} has unanimous abstention \
+                        "Decision {} has no votes \
                          — using default {:.4}",
                         const_hex::encode(decision_id.as_bytes()),
                         default_value
@@ -621,13 +619,13 @@ impl VotingSystem {
         }
 
         let resolved_count = result.resolved_decision_count();
-        let abstained_count = result.abstained_decision_count();
+        let unresolved_count = result.unresolved_decision_count();
 
         tracing::info!(
             period_id = result.period_id.0,
             block_height = result.block_height,
             resolved = resolved_count,
-            abstained = abstained_count,
+            unresolved = unresolved_count,
             "Consensus commit completed successfully"
         );
 
@@ -800,17 +798,14 @@ impl VotingSystem {
         rotxn: &RoTxn,
         period_id: VotingPeriodId,
     ) -> Result<HashMap<(crate::types::Address, DecisionId), f64>, Error> {
-        let vote_entries =
-            self.databases.get_votes_for_period(rotxn, period_id)?;
-        let mut matrix = HashMap::new();
-
-        for (key, entry) in vote_entries {
-            if let Some(vote_value) = entry.to_float_opt() {
-                matrix.insert((key.voter_address, key.decision_id), vote_value);
-            }
-        }
-
-        Ok(matrix)
+        Ok(self
+            .databases
+            .get_votes_for_period(rotxn, period_id)?
+            .into_iter()
+            .map(|(key, entry)| {
+                ((key.voter_address, key.decision_id), entry.to_float())
+            })
+            .collect())
     }
 
     pub fn get_participation_stats(
@@ -1419,7 +1414,7 @@ mod conservation_tests {
             voting_period: decision_id.voting_period(),
             votes: vec![crate::types::BallotItem {
                 decision_id_bytes: decision_id.as_bytes(),
-                vote_value: Some(vote_value),
+                vote_value,
             }],
             salt: [salt; 32],
         }
@@ -1834,7 +1829,7 @@ mod conservation_tests {
                 .iter()
                 .map(|(decision_id, vote_value)| crate::types::BallotItem {
                     decision_id_bytes: decision_id.as_bytes(),
-                    vote_value: Some(*vote_value),
+                    vote_value: *vote_value,
                 })
                 .collect(),
             salt: [salt; 32],

@@ -118,13 +118,16 @@ fn test_validate_out_of_range() {
     assert!(decision.validate_and_normalize(101.0).is_err());
 }
 
+/// A NaN vote is rejected on every decision type
 #[test]
-fn test_validate_nan_abstains() {
-    let decision = make_scaled_decision(0.0, 100.0, 1.0);
-    // NaN is valid - it means "abstain" in voting
-    let result = decision.validate_and_normalize(f64::NAN);
-    assert!(result.is_ok());
-    assert!(result.unwrap().is_nan());
+fn nan_vote_rejected() {
+    let scaled = make_scaled_decision(0.0, 100.0, 1.0);
+    assert!(scaled.validate_and_normalize(f64::NAN).is_err());
+    assert!(
+        make_binary_decision()
+            .validate_and_normalize(f64::NAN)
+            .is_err()
+    );
 }
 
 #[test]
@@ -209,6 +212,73 @@ fn test_scaled_rejects_invalid() {
     ));
 }
 
+/// Scaled bounds may span at most `MAX_SCALED_STEPS` increments
+#[test]
+fn scaled_step_cap() {
+    use crate::state::Error::InvalidScaled;
+    assert!(try_new_scaled(0.0, 1e9, 1.0).is_ok());
+    assert!(matches!(
+        try_new_scaled(0.0, 1e9 + 1.0, 1.0),
+        Err(InvalidScaled { .. })
+    ));
+    assert!(matches!(
+        try_new_scaled(0.0, 1e13, 1.0),
+        Err(InvalidScaled { .. })
+    ));
+    assert!(matches!(
+        try_new_scaled(1e6, 1e6 + 100.0, 1e-4),
+        Err(InvalidScaled { .. })
+    ));
+}
+
+/// A binary vote is 0, 1 or the 0.5 Inconclusive at the RPC too
+#[test]
+fn binary_votes_strict() {
+    use crate::state::Error::InvalidVoteValue;
+    let decision = make_binary_decision();
+    for v in [0.0, 0.5, 1.0] {
+        assert_eq!(decision.validate_and_normalize(v).ok(), Some(v));
+    }
+    for v in [0.3, 0.99, -0.0001, 1.5] {
+        assert!(matches!(
+            decision.validate_and_normalize(v),
+            Err(InvalidVoteValue { .. })
+        ));
+    }
+}
+
+/// Scaled votes sit on the increment grid or the 0.5 midpoint
+#[test]
+fn scaled_votes_grid() {
+    let scaled = make_scaled_decision(0.0, 5.0, 1.0);
+    for v in [0.0, 0.2, 0.5, 1.0] {
+        assert!(scaled.validate_normalized(v).is_ok(), "{v}");
+    }
+    for v in [0.3, 1.2, -0.2] {
+        assert!(scaled.validate_normalized(v).is_err(), "{v}");
+    }
+    let fine = make_scaled_decision(0.0, 1e9, 1.0);
+    assert!(fine.validate_normalized(123_456_789.0 / 1e9).is_ok());
+    assert!(fine.validate_normalized(123_456_789.5 / 1e9).is_err());
+}
+
+/// A categorical vote is an option index up to the Inconclusive one
+#[test]
+fn categorical_votes_index() {
+    let category = Decision {
+        decision_type: DecisionType::Category {
+            options: vec!["A".into(), "B".into(), "C".into()],
+        },
+        ..make_binary_decision()
+    };
+    for v in [0.0, 2.0, 3.0] {
+        assert!(category.validate_normalized(v).is_ok(), "{v}");
+    }
+    for v in [4.0, -1.0, 1.5] {
+        assert!(category.validate_normalized(v).is_err(), "{v}");
+    }
+}
+
 #[test]
 fn test_scaled_accepts_aligned() {
     assert!(try_new_scaled(0.0, 10.0, 1.0).is_ok());
@@ -222,10 +292,10 @@ fn test_validate_step_alignment() {
     use crate::state::Error::InvalidVoteValue;
 
     let integer_step = make_scaled_decision(0.0, 10.0, 2.0);
-    for v in [0.0, 2.0, 4.0, 6.0, 8.0, 10.0] {
+    for v in [0.0, 2.0, 4.0, 5.0, 6.0, 8.0, 10.0] {
         assert!(integer_step.validate_and_normalize(v).is_ok(), "{v}");
     }
-    for v in [1.0, 3.0, 5.0, 7.0, 9.0] {
+    for v in [1.0, 3.0, 7.0, 9.0] {
         assert!(matches!(
             integer_step.validate_and_normalize(v),
             Err(InvalidVoteValue { .. })
@@ -251,6 +321,17 @@ fn test_validate_step_alignment() {
         v += 0.1;
         assert!(noisy.validate_and_normalize(v).is_ok(), "{v}");
     }
+}
+
+/// Grid votes pass however large the minimum is next to the increment
+#[test]
+fn large_min_step_aligned() {
+    let decision = make_scaled_decision(-1_000_000.0, -990_000.0, 0.01);
+    for v in [-999_989.3, -999_999.21, -990_000.0, -995_432.17] {
+        assert!(decision.validate_and_normalize(v).is_ok(), "{v}");
+    }
+    assert!(decision.validate_and_normalize(-999_989.305).is_err());
+    assert!(try_new_scaled(1_000_000.01, 1_000_100.01, 0.01).is_ok());
 }
 
 #[test]
@@ -817,4 +898,18 @@ fn decisions_keyed_by_id() -> anyhow::Result<()> {
     );
     assert_eq!(decisions.get_highest_minted_period(&rwtxn)?, Some(20));
     Ok(())
+}
+
+/// Inconclusive is the midpoint, or a categorical's extra option
+#[test]
+fn inconclusive_vote_values() {
+    let category = Decision {
+        decision_type: DecisionType::Category {
+            options: vec!["A".into(), "B".into(), "C".into()],
+        },
+        ..make_binary_decision()
+    };
+    assert_eq!(make_binary_decision().inconclusive_vote(), 0.5);
+    assert_eq!(make_scaled_decision(0.0, 5.0, 1.0).inconclusive_vote(), 0.5);
+    assert_eq!(category.inconclusive_vote(), 3.0);
 }

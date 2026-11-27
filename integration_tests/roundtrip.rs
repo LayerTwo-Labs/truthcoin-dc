@@ -80,7 +80,7 @@ mod expected_costs {
 /// - Binary decisions: weighted_mean + catch_tl(tolerance=0.2)
 ///   - If mean < 0.4 → 0.0 (No)
 ///   - If mean > 0.6 → 1.0 (Yes)
-///   - If 0.4 ≤ mean ≤ 0.6 → 0.5 (Abstain)
+///   - If 0.4 ≤ mean ≤ 0.6 → 0.5 (Inconclusive)
 /// - Scaled decisions: weighted_median (continuous value in [0,1])
 ///
 /// Final Price Calculation (calculate_final_prices):
@@ -2522,12 +2522,12 @@ async fn roundtrip_task_inner(
         } else {
             anyhow::ensure!(
                 resolution.winning_outcomes.len() == 2,
-                "Market with ABSTAIN consensus should have 2 winning outcomes (50/50 split)"
+                "Market with Inconclusive consensus should have 2 winning outcomes (50/50 split)"
             );
             for winning in &resolution.winning_outcomes {
                 anyhow::ensure!(
                     (winning.price - 0.5).abs() < tolerance,
-                    "ABSTAIN outcome should have price ~0.5"
+                    "Inconclusive outcome should have price ~0.5"
                 );
             }
         }
@@ -4513,7 +4513,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(2)).await;
 
-    let abstainer_votes = truthcoin_nodes
+    let inconclusive_votes = truthcoin_nodes
         .issuer
         .rpc_client
         .vote_list(VoteFilter {
@@ -4522,8 +4522,11 @@ async fn roundtrip_task_inner(
             period_id: Some(test_period + 1),
         })
         .await?;
-    anyhow::ensure!(abstainer_votes.len() == vote_matrix[6].len() - 1);
-    let abstained_outcome = truthcoin_nodes
+    anyhow::ensure!(inconclusive_votes.len() == vote_matrix[6].len());
+    anyhow::ensure!(inconclusive_votes.iter().any(|vote| {
+        vote.decision_id == bin_dec_30 && vote.vote_value == 0.5
+    }));
+    let inconclusive_outcome = truthcoin_nodes
         .issuer
         .rpc_client
         .vote_period(Some(test_period + 1))
@@ -4531,7 +4534,7 @@ async fn roundtrip_task_inner(
         .and_then(|info| info.consensus)
         .and_then(|consensus| consensus.outcomes.get(&bin_dec_30).copied());
     anyhow::ensure!(
-        abstained_outcome == Some(expected_phase2::binary::EXPECTED_BIN_30)
+        inconclusive_outcome == Some(expected_phase2::binary::EXPECTED_BIN_30)
     );
 
     // Verify consensus results for the period the decisions were voted in

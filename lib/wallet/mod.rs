@@ -2238,7 +2238,7 @@ mod tests {
         };
         let votes = vec![BallotItem {
             decision_id_bytes: [0, 0, 0, 1],
-            vote_value: None,
+            vote_value: 1.0,
         }];
 
         let voter_address = wallet.voter_address()?;

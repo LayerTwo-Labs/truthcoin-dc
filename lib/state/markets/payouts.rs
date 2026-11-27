@@ -19,7 +19,6 @@ fn is_vote_correct(
 ) -> bool {
     use crate::state::voting::types::VoteValue;
     match vote {
-        VoteValue::Abstain => false,
         VoteValue::Binary(b) => {
             let vote_f = if *b { 1.0 } else { 0.0 };
             vote_f == consensus
@@ -376,8 +375,18 @@ mod payout_tests {
             &decision,
             false
         ));
-
-        assert!(!is_vote_correct(&VoteValue::Abstain, 1.0, &decision, false));
+        assert!(is_vote_correct(
+            &VoteValue::Scalar(0.5),
+            0.5,
+            &decision,
+            false
+        ));
+        assert!(!is_vote_correct(
+            &VoteValue::Scalar(0.5),
+            1.0,
+            &decision,
+            false
+        ));
     }
 
     /// is_vote_correct on a categorical decision with a real winning option.
@@ -462,7 +471,6 @@ mod payout_tests {
             &decision,
             false
         ));
-        assert!(!is_vote_correct(&VoteValue::Abstain, 0.5, &decision, false));
     }
 
     #[test]
@@ -509,6 +517,5 @@ mod payout_tests {
             &decision,
             false
         ));
-        assert!(!is_vote_correct(&VoteValue::Abstain, 0.5, &decision, false));
     }
 }

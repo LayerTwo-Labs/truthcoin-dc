@@ -394,7 +394,7 @@ impl MarketValidator {
             }
         }
 
-        // Each leg must be a tradeable outcome. Abstain/invalid states
+        // Each leg must be a tradeable outcome. Inconclusive/invalid states
         // (voter-only) are not part of the tradeable outcome space and fall
         // outside `market.shares().len()`.
         crate::math::trading::check_deltas(

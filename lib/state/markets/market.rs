@@ -595,7 +595,8 @@ impl Market {
         Ok(prices)
     }
 
-    /// Returns the number of tradeable outcomes (excludes ABSTAIN states).
+    /// Returns the number of tradeable outcomes (excludes Inconclusive
+    /// states).
     pub fn get_outcome_count(&self) -> usize {
         self.get_valid_state_combos().len()
     }
@@ -682,14 +683,14 @@ impl Market {
                         decision.header,
                         decision.scale_max().unwrap_or(100.0)
                     ),
-                    _ => format!("{}: Abstain", decision.header),
+                    _ => format!("{}: Inconclusive", decision.header),
                 }
             } else {
                 let (label0, label1) = decision.get_binary_labels();
                 match positions[i] {
                     0 => format!("{}: {}", decision.header, label0),
                     1 => format!("{}: {}", decision.header, label1),
-                    _ => format!("{}: Abstain", decision.header),
+                    _ => format!("{}: Inconclusive", decision.header),
                 }
             };
 

@@ -365,7 +365,7 @@ pub struct MarketOutcome {
     pub price: f64,
     pub volume_sats: u64,
     /// Index into the full Cartesian state tensor, including non-tradeable
-    /// abstain coordinates.
+    /// Inconclusive coordinates.
     pub full_state_index: usize,
     /// One coordinate per ordered market dimension.
     pub coordinates: Vec<usize>,
@@ -565,8 +565,11 @@ pub struct BallotItem {
     /// The vote value in real units (e.g., 270 for electoral votes).
     /// For scaled decisions, the value must equal `min + k * increment`
     /// for some non-negative integer `k`, with `vote_value <= max`.
-    /// For binary decisions, use 0.0 (No) or 1.0 (Yes).
-    /// `None` abstains.
+    /// For binary decisions, use 0.0 (No), 1.0 (Yes) or 0.5 (Inconclusive).
+    /// `None` votes Inconclusive: 0.5 on a binary decision, the range
+    /// midpoint on a scaled one, and the Inconclusive option on a
+    /// categorical one. Prefer `None` to typing a scaled midpoint, which
+    /// float rounding can push off 0.5.
     pub vote_value: Option<f64>,
 }
 

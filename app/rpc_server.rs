@@ -1793,16 +1793,14 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                     continue;
                 }
 
-                if let Some(internal_value) = vote_entry.to_float_opt() {
-                    votes_to_process.push(VoteData {
-                        voter_address: voter_address.to_string(),
-                        decision_id: vote_key.decision_id,
-                        decision_id_hex: vote_key.decision_id.to_hex(),
-                        internal_value,
-                        period_id: vote_key.period_id.as_u32(),
-                        block_height: vote_entry.block_height,
-                    });
-                }
+                votes_to_process.push(VoteData {
+                    voter_address: voter_address.to_string(),
+                    decision_id: vote_key.decision_id,
+                    decision_id_hex: vote_key.decision_id.to_hex(),
+                    internal_value: vote_entry.to_float(),
+                    period_id: vote_key.period_id.as_u32(),
+                    block_height: vote_entry.block_height,
+                });
             }
         } else if let Some(ref decision_id) = filter.decision_id {
             let decision_id =
@@ -1826,16 +1824,14 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                     continue;
                 }
 
-                if let Some(internal_value) = vote_entry.to_float_opt() {
-                    votes_to_process.push(VoteData {
-                        voter_address: vote_key.voter_address.to_string(),
-                        decision_id: vote_key.decision_id,
-                        decision_id_hex: vote_key.decision_id.to_hex(),
-                        internal_value,
-                        period_id: vote_key.period_id.as_u32(),
-                        block_height: vote_entry.block_height,
-                    });
-                }
+                votes_to_process.push(VoteData {
+                    voter_address: vote_key.voter_address.to_string(),
+                    decision_id: vote_key.decision_id,
+                    decision_id_hex: vote_key.decision_id.to_hex(),
+                    internal_value: vote_entry.to_float(),
+                    period_id: vote_key.period_id.as_u32(),
+                    block_height: vote_entry.block_height,
+                });
             }
         } else if let Some(period_id) = filter.period_id {
             let voting_period_id = VotingPeriodId::new(period_id);
@@ -1848,16 +1844,14 @@ impl<const ENABLE_PRIVATE_API: bool> rpc_api::node::RpcServer
                 .map_err(custom_err)?;
 
             for (vote_key, vote_entry) in votes {
-                if let Some(internal_value) = vote_entry.to_float_opt() {
-                    votes_to_process.push(VoteData {
-                        voter_address: vote_key.voter_address.to_string(),
-                        decision_id: vote_key.decision_id,
-                        decision_id_hex: vote_key.decision_id.to_hex(),
-                        internal_value,
-                        period_id: vote_key.period_id.as_u32(),
-                        block_height: vote_entry.block_height,
-                    });
-                }
+                votes_to_process.push(VoteData {
+                    voter_address: vote_key.voter_address.to_string(),
+                    decision_id: vote_key.decision_id,
+                    decision_id_hex: vote_key.decision_id.to_hex(),
+                    internal_value: vote_entry.to_float(),
+                    period_id: vote_key.period_id.as_u32(),
+                    block_height: vote_entry.block_height,
+                });
             }
         }
 
@@ -3361,11 +3355,12 @@ impl rpc_api::wallet::RpcServer for RpcServerImpl<true> {
                 ))
             })?;
 
-            let normalized_value = vote
-                .vote_value
-                .map(|value| decision.validate_and_normalize(value))
-                .transpose()
-                .map_err(|e| custom_err_msg(format!("{e}")))?;
+            let normalized_value = match vote.vote_value {
+                Some(value) => decision
+                    .validate_and_normalize(value)
+                    .map_err(|e| custom_err_msg(format!("{e}")))?,
+                None => decision.inconclusive_vote(),
+            };
 
             batch_items.push(BallotItem {
                 decision_id_bytes: decision_id.as_bytes(),

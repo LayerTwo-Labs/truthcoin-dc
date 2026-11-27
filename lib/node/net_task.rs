@@ -2468,7 +2468,7 @@ mod test {
                     .iter()
                     .map(|decision_id| BallotItem {
                         decision_id_bytes: decision_id.as_bytes(),
-                        vote_value: Some(1.0),
+                        vote_value: 1.0,
                     })
                     .collect(),
                 salt: [3; 32],
@@ -2622,7 +2622,7 @@ mod test {
             assert_eq!(node.get_all_transactions()?.len(), 4);
             let ballot = [BallotItem {
                 decision_id_bytes: voting.as_bytes(),
-                vote_value: Some(1.0),
+                vote_value: 1.0,
             }];
             assert!(
                 node.prepare_ballot(voting.voting_period(), voter, &ballot)
