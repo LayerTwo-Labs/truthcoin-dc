@@ -87,7 +87,7 @@ fn consensus_golden_hash() {
     assert_eq!(result.first_loading.len(), 7);
     assert_eq!(
         hash_f64s(consensus_bits(&result)),
-        "5d43ba6425a1d7da22879b21f113778b8a304c44b8a3db6eb63e5754d02656b4"
+        "36c9eb6ab50993e9267f085764143585ac911d7c8787a4bab459f558866db370"
     );
 }
 

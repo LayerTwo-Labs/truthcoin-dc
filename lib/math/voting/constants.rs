@@ -3,6 +3,8 @@ use crate::types::SECONDS_PER_QUARTER;
 pub const BITCOIN_HIVEMIND_NEUTRAL_VALUE: f64 = 0.5;
 pub const CONSENSUS_CATCH_TOLERANCE: f64 = 0.2;
 pub const SVD_NUMERICAL_TOLERANCE: f64 = 1e-10;
+/// SVD loadings smaller than this fraction of the largest are float noise
+pub const LOADING_NOISE_FLOOR: f64 = 1e-9;
 pub const REPUTATION_SMOOTHING_ALPHA: f64 = 0.3;
 pub const REPUTATION_MIN: f64 = 0.0;
 pub const REPUTATION_MAX: f64 = 1.0;

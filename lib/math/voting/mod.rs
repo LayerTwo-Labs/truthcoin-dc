@@ -257,7 +257,6 @@ pub struct DetailedConsensusResult {
     pub first_loading: Vec<f64>,
     pub certainty: f64,
     pub updated_reputations: BTreeMap<crate::types::Address, f64>,
-    pub outliers: Vec<crate::types::Address>,
     /// Per-decision plurality result. See [`CategoricalResult::winning_option`]
     /// for the meaning of the inner `Option<u16>`.
     pub categorical_winners: HashMap<DecisionId, Option<u16>>,
