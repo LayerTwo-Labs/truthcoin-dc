@@ -13,10 +13,10 @@ use truthcoin_dc::types::transaction::outpoint::DEPOSIT_MATURITY;
 use truthcoin_dc_app_rpc_api::node::RpcClient as _;
 
 use crate::{
+    block_index::block_index_trial,
     block_template::block_template_trial,
     block_template_address::block_template_address_trial,
     ibd::{ibd_trial, reorg_across_deposit_trial},
-    list_mempool::list_mempool_trial,
     mainchain_tls::mainchain_tls_trial,
     production_periods::production_periods_trial,
     receive_address::receive_address_trial,
@@ -185,6 +185,11 @@ pub fn tests(
     failure_collector: TestFailureCollector,
 ) -> Vec<AsyncTrial<BoxFuture<'static, anyhow::Result<()>>>> {
     vec![
+        block_index_trial(
+            bin_paths.clone(),
+            file_registry.clone(),
+            failure_collector.clone(),
+        ),
         block_template_trial(
             bin_paths.clone(),
             file_registry.clone(),
@@ -201,11 +206,6 @@ pub fn tests(
             failure_collector.clone(),
         ),
         ibd_trial(
-            bin_paths.clone(),
-            file_registry.clone(),
-            failure_collector.clone(),
-        ),
-        list_mempool_trial(
             bin_paths.clone(),
             file_registry.clone(),
             failure_collector.clone(),

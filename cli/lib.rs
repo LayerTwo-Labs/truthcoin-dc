@@ -257,7 +257,8 @@ pub enum Command {
     /// Get the block hash at the specified height in the active chain, if it
     /// exists
     GetBlockHash { height: u32 },
-    /// Get everything about a block that its body does not carry
+    /// Get the transaction facts of a block in the active chain, with the
+    /// outputs that the block created or spent outside its body
     GetBlockIndex {
         block_hash: truthcoin_dc_types::BlockHash,
     },
@@ -276,16 +277,12 @@ pub enum Command {
     },
     /// Get transaction by txid
     GetTransaction { txid: Txid },
-    /// Get the coin movements that a block applied outside its body
-    GetTwoWayPegEvents {
-        block_hash: truthcoin_dc_types::BlockHash,
-    },
     /// Get utxos for addresses
     GetUtxos {
         #[arg(required = true)]
         addresses: Vec<Address>,
     },
-    /// Get wallet addresses, sorted by base58 encoding
+    /// Get the issued wallet addresses, sorted by base58 encoding
     GetWalletAddresses,
     /// Get wallet UTXOs
     GetWalletUtxos,
@@ -300,10 +297,10 @@ pub enum Command {
     },
     /// Get the height of the latest failed withdrawal bundle
     LatestFailedWithdrawalBundleHeight,
-    /// List the transactions the mempool holds
-    ListMempool,
     /// List peers
     ListPeers,
+    /// List the transactions that the mempool holds
+    ListMempool,
     /// List all UTXOs
     ListUtxos,
     /// Get the progress of the startup sync with the mainchain
@@ -775,6 +772,10 @@ where
             let block_hash = rpc_client.get_block_hash(height).await?;
             serde_json::to_string_pretty(&block_hash)?
         }
+        Command::GetBlockIndex { block_hash } => {
+            let block_index = rpc_client.get_block_index(block_hash).await?;
+            serde_json::to_string_pretty(&block_index)?
+        }
         Command::ConnectPeer { addr } => {
             let () = rpc_client.connect_peer(addr).await?;
             String::default()
@@ -853,10 +854,6 @@ where
             let blockcount = rpc_client.getblockcount().await?;
             format!("{blockcount}")
         }
-        Command::GetBlockIndex { block_hash } => {
-            let block_index = rpc_client.get_block_index(block_hash).await?;
-            serde_json::to_string_pretty(&block_index)?
-        }
         Command::GetBlockTemplate => {
             let template = rpc_client.get_block_template().await?;
             serde_json::to_string_pretty(&template)?
@@ -879,10 +876,6 @@ where
         Command::GetTransaction { txid } => {
             let tx_info = rpc_client.get_transaction(txid).await?;
             serde_json::to_string_pretty(&tx_info)?
-        }
-        Command::GetTwoWayPegEvents { block_hash } => {
-            let events = rpc_client.get_two_way_peg_events(block_hash).await?;
-            serde_json::to_string_pretty(&events)?
         }
         Command::GetUtxos { addresses } => {
             let addresses = addresses.into_iter().collect();
@@ -915,13 +908,13 @@ where
                 rpc_client.latest_failed_withdrawal_bundle_height().await?;
             serde_json::to_string_pretty(&height)?
         }
-        Command::ListMempool => {
-            let txs = rpc_client.list_mempool().await?;
-            serde_json::to_string_pretty(&txs)?
-        }
         Command::ListPeers => {
             let peers = rpc_client.list_peers().await?;
             serde_json::to_string_pretty(&peers)?
+        }
+        Command::ListMempool => {
+            let txs = rpc_client.list_mempool().await?;
+            serde_json::to_string_pretty(&txs)?
         }
         Command::ListUtxos => {
             let utxos = rpc_client.list_utxos().await?;

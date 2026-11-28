@@ -11,13 +11,13 @@ use crate::{
         error, rollback::RollBack,
     },
     types::{
-        AccumulatorDiff, AggregatedWithdrawal, AmountOverflowError, Coinbase,
+        AccumulatorDiff, AggregatedWithdrawal, AmountOverflowError,
+        BlockIndexEvents, BlockIndexOutput, BlockIndexSpend, Coinbase,
         CoinbaseTxid, FilledTransaction, InPoint, M6id, OutPoint, OutPointKey,
         Output, OutputContent, PointedOutput, PointedOutputRef, SpentOutput,
         WithdrawalBundle, WithdrawalBundleEvent, WithdrawalBundleEventStatus,
         WithdrawalBundleStatus, hash,
         proto::mainchain::{BlockEvent, TwoWayPegData},
-        state::TwoWayPegEvent,
     },
 };
 
@@ -251,11 +251,11 @@ fn recreate_bundle_outputs(
     state: &State,
     rwtxn: &mut RwTxn,
     accumulator_diff: &mut AccumulatorDiff,
-    two_way_peg_events: &mut Vec<TwoWayPegEvent>,
     block_height: u32,
     m6id: M6id,
     bundle: &WithdrawalBundle,
 ) -> Result<(), Error> {
+    let mut bundle_returns = Vec::with_capacity(bundle.spend_utxos().len());
     for (vout, (_outpoint, output)) in bundle.spend_utxos().iter().enumerate() {
         let vout = u32::try_from(vout).expect("bundle outputs fit in u32");
         let recreated_outpoint = OutPoint::UnsuccessfulWithdrawal {
@@ -272,13 +272,19 @@ fn recreate_bundle_outputs(
             output,
         });
         accumulator_diff.insert(utxo_hash.into());
-        two_way_peg_events.push(TwoWayPegEvent::BundleReturn {
+        bundle_returns.push(BlockIndexOutput {
             outpoint: recreated_outpoint,
             output: output.clone(),
-            m6id,
         });
     }
-    Ok(())
+    state.record_block_index_events(
+        rwtxn,
+        block_height,
+        BlockIndexEvents {
+            bundle_returns,
+            ..Default::default()
+        },
+    )
 }
 
 /// Delete the outputs recreated from an unsuccessful (failed or
@@ -325,7 +331,6 @@ fn maybe_drop_stale_pending_bundle(
     state: &State,
     rwtxn: &mut RwTxn,
     accumulator_diff: &mut AccumulatorDiff,
-    two_way_peg_events: &mut Vec<TwoWayPegEvent>,
     block_height: u32,
 ) -> Result<(), Error> {
     let Some(m6id) = state.pending_withdrawal_bundle.try_get(rwtxn, &())?
@@ -353,7 +358,6 @@ fn maybe_drop_stale_pending_bundle(
         state,
         rwtxn,
         accumulator_diff,
-        two_way_peg_events,
         block_height,
         m6id,
         &bundle,
@@ -612,7 +616,6 @@ fn connect_withdrawal_bundle_confirmed(
     rwtxn: &mut RwTxn,
     block_height: u32,
     accumulator_diff: &mut AccumulatorDiff,
-    two_way_peg_events: &mut Vec<TwoWayPegEvent>,
     event_block_hash: &bitcoin::BlockHash,
     m6id: M6id,
 ) -> Result<(), Error> {
@@ -670,12 +673,23 @@ fn connect_withdrawal_bundle_confirmed(
                         output: &spent_output.output,
                     });
                     accumulator_diff.remove(utxo_hash.into());
-                    two_way_peg_events.push(TwoWayPegEvent::BundleSpend {
-                        outpoint: *outpoint,
-                        m6id,
-                    });
                 }
                 state.utxos.clear(rwtxn).map_err(DbError::from)?;
+                let bundle_spends = utxos
+                    .keys()
+                    .map(|outpoint| BlockIndexSpend {
+                        outpoint: *outpoint,
+                        m6id,
+                    })
+                    .collect();
+                state.record_block_index_events(
+                    rwtxn,
+                    block_height,
+                    BlockIndexEvents {
+                        bundle_spends,
+                        ..Default::default()
+                    },
+                )?;
                 bundle = WithdrawalBundleInfo::UnknownConfirmed {
                     spend_utxos: utxos,
                 };
@@ -721,7 +735,6 @@ fn connect_withdrawal_bundle_failed(
     rwtxn: &mut RwTxn,
     block_height: u32,
     accumulator_diff: &mut AccumulatorDiff,
-    two_way_peg_events: &mut Vec<TwoWayPegEvent>,
     m6id: M6id,
 ) -> Result<(), Error> {
     tracing::debug!(
@@ -761,7 +774,6 @@ fn connect_withdrawal_bundle_failed(
                 state,
                 rwtxn,
                 accumulator_diff,
-                two_way_peg_events,
                 block_height,
                 m6id,
                 bundle,
@@ -799,7 +811,6 @@ fn connect_withdrawal_bundle_event(
     rwtxn: &mut RwTxn,
     block_height: u32,
     accumulator_diff: &mut AccumulatorDiff,
-    two_way_peg_events: &mut Vec<TwoWayPegEvent>,
     event_block_hash: &bitcoin::BlockHash,
     event: &WithdrawalBundleEvent,
 ) -> Result<(), Error> {
@@ -820,7 +831,6 @@ fn connect_withdrawal_bundle_event(
                 rwtxn,
                 block_height,
                 accumulator_diff,
-                two_way_peg_events,
                 event_block_hash,
                 event.m6id,
             )
@@ -831,7 +841,6 @@ fn connect_withdrawal_bundle_event(
                 rwtxn,
                 block_height,
                 accumulator_diff,
-                two_way_peg_events,
                 event.m6id,
             )
         }
@@ -844,7 +853,6 @@ fn connect_event(
     rwtxn: &mut RwTxn,
     block_height: u32,
     accumulator_diff: &mut AccumulatorDiff,
-    two_way_peg_events: &mut Vec<TwoWayPegEvent>,
     latest_deposit_block_hash: &mut Option<bitcoin::BlockHash>,
     latest_withdrawal_bundle_event_block_hash: &mut Option<bitcoin::BlockHash>,
     event_block_hash: bitcoin::BlockHash,
@@ -866,10 +874,17 @@ fn connect_event(
                 .map_err(DbError::from)?;
             let utxo_hash = hash(&PointedOutputRef { outpoint, output });
             accumulator_diff.insert(utxo_hash.into());
-            two_way_peg_events.push(TwoWayPegEvent::Deposit {
-                outpoint,
-                output: output.clone(),
-            });
+            state.record_block_index_events(
+                rwtxn,
+                block_height,
+                BlockIndexEvents {
+                    deposits: vec![BlockIndexOutput {
+                        outpoint,
+                        output: output.clone(),
+                    }],
+                    ..Default::default()
+                },
+            )?;
             *latest_deposit_block_hash = Some(event_block_hash);
         }
         BlockEvent::WithdrawalBundle(withdrawal_bundle_event) => {
@@ -878,7 +893,6 @@ fn connect_event(
                 rwtxn,
                 block_height,
                 accumulator_diff,
-                two_way_peg_events,
                 &event_block_hash,
                 withdrawal_bundle_event,
             )?;
@@ -905,7 +919,6 @@ pub fn connect(
         .map_err(DbError::from)?
         .unwrap_or_default();
     let mut accumulator_diff = AccumulatorDiff::default();
-    let mut two_way_peg_events = Vec::new();
     let mut latest_deposit_block_hash = None;
     let mut latest_withdrawal_bundle_event_block_hash = None;
     for (event_block_hash, event_block_info) in &two_way_peg_data.block_info {
@@ -915,7 +928,6 @@ pub fn connect(
                 rwtxn,
                 block_height,
                 &mut accumulator_diff,
-                &mut two_way_peg_events,
                 &mut latest_deposit_block_hash,
                 &mut latest_withdrawal_bundle_event_block_hash,
                 *event_block_hash,
@@ -967,15 +979,8 @@ pub fn connect(
         state,
         rwtxn,
         &mut accumulator_diff,
-        &mut two_way_peg_events,
         block_height,
     )?;
-    if !two_way_peg_events.is_empty() {
-        state
-            .two_way_peg_events
-            .put(rwtxn, &block_height, &two_way_peg_events)
-            .map_err(DbError::from)?;
-    }
     let () = accumulator.apply_diff(accumulator_diff)?;
     state
         .utreexo_accumulator
@@ -1005,11 +1010,7 @@ pub fn maybe_create_withdrawal_bundle(
         .try_get(rwtxn, &())?
         .unwrap_or_default();
     let mut accumulator_diff = AccumulatorDiff::default();
-    // The events of the 2WPD that this block connected come first.
-    let mut two_way_peg_events = state
-        .two_way_peg_events
-        .try_get(rwtxn, &block_height)?
-        .unwrap_or_default();
+    let mut bundle_spends = Vec::with_capacity(bundle.spend_utxos().len());
     // Spend the selected outputs.
     for (outpoint, output) in bundle.spend_utxos() {
         let key = OutPointKey::from(outpoint);
@@ -1029,14 +1030,19 @@ pub fn maybe_create_withdrawal_bundle(
             output,
         });
         accumulator_diff.remove(utxo_hash.into());
-        two_way_peg_events.push(TwoWayPegEvent::BundleSpend {
+        bundle_spends.push(BlockIndexSpend {
             outpoint: *outpoint,
             m6id,
         });
     }
-    state
-        .two_way_peg_events
-        .put(rwtxn, &block_height, &two_way_peg_events)?;
+    state.record_block_index_events(
+        rwtxn,
+        block_height,
+        BlockIndexEvents {
+            bundle_spends,
+            ..Default::default()
+        },
+    )?;
     state.pending_withdrawal_bundle.put(rwtxn, &(), &m6id)?;
     let bundle_status = if let Some((_bundle, mut bundle_status)) =
         state.withdrawal_bundles.try_get(rwtxn, &m6id)?
@@ -1361,6 +1367,8 @@ pub fn disconnect(
     let block_height = state
         .try_get_height(rwtxn)?
         .expect("Height should not be None");
+    // This also deletes the bundle creation events of the block.
+    state.delete_block_index_events(rwtxn, block_height)?;
     let mut accumulator = state
         .utreexo_accumulator
         .try_get(rwtxn, &())
@@ -1369,10 +1377,6 @@ pub fn disconnect(
     let mut accumulator_diff = AccumulatorDiff::default();
     let mut latest_deposit_block_hash = None;
     let mut latest_withdrawal_bundle_event_block_hash = None;
-    state
-        .two_way_peg_events
-        .delete(rwtxn, &block_height)
-        .map_err(DbError::from)?;
     // Undo a stale-bundle drop performed at this height. Drops are
     // connected after the block's events, so they are undone before
     // disconnecting the events.
@@ -1542,15 +1546,15 @@ mod test {
             },
         },
         types::{
-            AccumulatorDiff, Address, Coinbase, FilledTransaction, InPoint,
-            M6id, OutPoint, OutPointKey, Output, OutputContent,
-            PointedOutputRef, SpentOutput, Transaction, Txid, WithdrawalBundle,
+            AccumulatorDiff, Address, BlockIndexEvents, BlockIndexOutput,
+            BlockIndexSpend, Coinbase, FilledTransaction, InPoint, M6id,
+            OutPoint, OutPointKey, Output, OutputContent, PointedOutputRef,
+            SpentOutput, Transaction, Txid, WithdrawalBundle,
             WithdrawalBundleEvent, WithdrawalBundleEventStatus,
             WithdrawalBundleStatus, hash,
             proto::mainchain::{
                 BlockEvent, BlockInfo, Deposit, TwoWayPegData, two_way_peg_data,
             },
-            state::TwoWayPegEvent,
         },
     };
 
@@ -1736,6 +1740,19 @@ mod test {
         anyhow::ensure!(
             bundle.spend_utxos().contains_key(&withdrawal_outpoint)
         );
+        // the block index records the spend at the creation height
+        let events = state
+            .get_block_index_events(&rwtxn, WITHDRAWAL_BUNDLE_FAILURE_GAP)?;
+        anyhow::ensure!(
+            events
+                == BlockIndexEvents {
+                    bundle_spends: vec![BlockIndexSpend {
+                        outpoint: withdrawal_outpoint,
+                        m6id: pending_m6id,
+                    }],
+                    ..Default::default()
+                }
+        );
         rwtxn.commit()?;
         Ok(())
     }
@@ -1784,7 +1801,6 @@ mod test {
             &mut rwtxn,
             failed_height,
             &mut accumulator_diff,
-            &mut Vec::new(),
             m6id,
         )?;
         // the recreated output exists, with identical content
@@ -1797,6 +1813,18 @@ mod test {
             .utxos
             .get(&rwtxn, &OutPointKey::from(&recreated_outpoint))?;
         anyhow::ensure!(recreated == withdrawal_output);
+        // the block index records the recreation at the failure height
+        let events = state.get_block_index_events(&rwtxn, failed_height)?;
+        anyhow::ensure!(
+            events
+                == BlockIndexEvents {
+                    bundle_returns: vec![BlockIndexOutput {
+                        outpoint: recreated_outpoint,
+                        output: withdrawal_output.clone(),
+                    }],
+                    ..Default::default()
+                }
+        );
         // the original STXO record is untouched
         let stxo = state
             .stxos
@@ -1826,9 +1854,9 @@ mod test {
     // the events of a height list the deposits first, then the outputs
     // that the new bundle spends; a failure lists the recreated outputs
     #[test]
-    fn two_way_peg_events_follow_the_bundle() -> anyhow::Result<()> {
+    fn block_index_events_follow_the_bundle() -> anyhow::Result<()> {
         let (_temp_dir, env, state) =
-            fresh_state("two_way_peg_events_follow_the_bundle")?;
+            fresh_state("block_index_events_follow_the_bundle")?;
         let mut rwtxn = env.write_txn()?;
         let height = WITHDRAWAL_BUNDLE_FAILURE_GAP;
         state.height.put(&mut rwtxn, &(), &(height - 1))?;
@@ -1871,17 +1899,18 @@ mod test {
         maybe_create_withdrawal_bundle(&state, &mut rwtxn)?;
         let m6id = state.pending_withdrawal_bundle.get(&rwtxn, &())?;
         anyhow::ensure!(
-            state.get_two_way_peg_events(&rwtxn, height)?
-                == vec![
-                    TwoWayPegEvent::Deposit {
+            state.get_block_index_events(&rwtxn, height)?
+                == BlockIndexEvents {
+                    deposits: vec![BlockIndexOutput {
                         outpoint: OutPoint::Deposit(deposit_outpoint),
                         output: deposit_output,
-                    },
-                    TwoWayPegEvent::BundleSpend {
+                    }],
+                    bundle_spends: vec![BlockIndexSpend {
                         outpoint: withdrawal_outpoint,
                         m6id,
-                    },
-                ]
+                    }],
+                    ..Default::default()
+                }
         );
         connect_withdrawal_bundle_submitted(
             &state,
@@ -1911,16 +1940,18 @@ mod test {
         };
         connect(&state, &mut rwtxn, &failed_twpd)?;
         anyhow::ensure!(
-            state.get_two_way_peg_events(&rwtxn, height + 1)?
-                == vec![TwoWayPegEvent::BundleReturn {
-                    outpoint: OutPoint::UnsuccessfulWithdrawal {
-                        m6id,
-                        height: height + 1,
-                        vout: 0,
-                    },
-                    output: withdrawal_output,
-                    m6id,
-                }]
+            state.get_block_index_events(&rwtxn, height + 1)?
+                == BlockIndexEvents {
+                    bundle_returns: vec![BlockIndexOutput {
+                        outpoint: OutPoint::UnsuccessfulWithdrawal {
+                            m6id,
+                            height: height + 1,
+                            vout: 0,
+                        },
+                        output: withdrawal_output,
+                    }],
+                    ..Default::default()
+                }
         );
         Ok(())
     }
@@ -1977,6 +2008,17 @@ mod test {
                 .try_get(&rwtxn, &OutPointKey::from(&recreated_outpoint))?
                 .is_some()
         );
+        let events = state.get_block_index_events(&rwtxn, drop_height)?;
+        anyhow::ensure!(
+            events
+                == BlockIndexEvents {
+                    bundle_returns: vec![BlockIndexOutput {
+                        outpoint: recreated_outpoint,
+                        output: withdrawal_output.clone(),
+                    }],
+                    ..Default::default()
+                }
+        );
         // no fresh bundle yet: the failure gap applies after a drop
         state.height.put(&mut rwtxn, &(), &drop_height)?;
         maybe_create_withdrawal_bundle(&state, &mut rwtxn)?;
@@ -1999,6 +2041,17 @@ mod test {
             state.try_get_pending_withdrawal_bundle(&rwtxn)?.unwrap();
         anyhow::ensure!(bundle.compute_m6id() != stale_m6id);
         anyhow::ensure!(bundle.spend_utxos().contains_key(&recreated_outpoint));
+        let events = state.get_block_index_events(
+            &rwtxn,
+            drop_height + WITHDRAWAL_BUNDLE_FAILURE_GAP,
+        )?;
+        anyhow::ensure!(
+            events.bundle_spends
+                == vec![BlockIndexSpend {
+                    outpoint: recreated_outpoint,
+                    m6id: bundle.compute_m6id(),
+                }]
+        );
         rwtxn.commit()?;
         Ok(())
     }
@@ -2044,7 +2097,6 @@ mod test {
             &mut rwtxn,
             3,
             &mut accumulator_diff,
-            &mut Vec::new(),
             &bitcoin::BlockHash::from_byte_array([9; 32]),
             m6id,
         );
@@ -2274,22 +2326,23 @@ mod test {
             let () = connect(&state, &mut rwtxn, &two_way_peg_data)?;
             rwtxn.commit()?;
         }
-        let expected = vec![
-            TwoWayPegEvent::Deposit {
+        let expected = BlockIndexEvents {
+            deposits: vec![BlockIndexOutput {
                 outpoint: OutPoint::Deposit(deposit_outpoint),
                 output,
-            },
-            TwoWayPegEvent::BundleSpend {
+            }],
+            bundle_spends: vec![BlockIndexSpend {
                 outpoint: OutPoint::Deposit(deposit_outpoint),
                 m6id,
-            },
-        ];
+            }],
+            ..Default::default()
+        };
         {
             let rotxn = env.read_txn()?;
-            let events = state.get_two_way_peg_events(&rotxn, 0)?;
+            let events = state.get_block_index_events(&rotxn, 0)?;
             anyhow::ensure!(
                 events == expected,
-                "the events must keep the order the node applied: {events:?}"
+                "unexpected events: {events:?}"
             );
         }
 
@@ -2298,7 +2351,7 @@ mod test {
         let mut rwtxn = env.write_txn()?;
         state.height.put(&mut rwtxn, &(), &0)?;
         let () = disconnect(&state, &mut rwtxn, &two_way_peg_data)?;
-        anyhow::ensure!(state.get_two_way_peg_events(&rwtxn, 0)?.is_empty());
+        anyhow::ensure!(state.get_block_index_events(&rwtxn, 0)?.is_empty());
         Ok(())
     }
 
@@ -2324,15 +2377,15 @@ mod test {
             .collect()?;
         let deposit_blocks: Vec<_> =
             state.deposit_blocks.iter(rotxn)?.collect()?;
-        let two_way_peg_events: Vec<_> =
-            state.two_way_peg_events.iter(rotxn)?.collect()?;
+        let block_index_events: Vec<_> =
+            state.block_index_events.iter(rotxn)?.collect()?;
         let bytes = bincode::serialize(&(
             utxos,
             stxos,
             withdrawal_bundles,
             withdrawal_bundle_event_blocks,
             deposit_blocks,
-            two_way_peg_events,
+            block_index_events,
             state.pending_withdrawal_bundle.try_get(rotxn, &())?,
             state.latest_failed_withdrawal_bundle.try_get(rotxn, &())?,
             state.utreexo_accumulator.try_get(rotxn, &())?,
@@ -2519,6 +2572,17 @@ mod test {
                 state.utxos.try_get(&rwtxn, &deposit_key)?.is_some()
             );
             anyhow::ensure!(state.deposit_blocks.last(&rwtxn)?.is_some());
+            let events = state.get_block_index_events(&rwtxn, 1)?;
+            anyhow::ensure!(
+                events
+                    == BlockIndexEvents {
+                        deposits: vec![BlockIndexOutput {
+                            outpoint: OutPoint::Deposit(deposit_outpoint),
+                            output: value_output(Address::ALL_ZEROS, 1000),
+                        }],
+                        ..Default::default()
+                    }
+            );
             rwtxn.commit()?;
             block1
         };
@@ -2535,6 +2599,9 @@ mod test {
                 state.utxos.try_get(&rwtxn, &deposit_key)?.is_none()
             );
             anyhow::ensure!(state.deposit_blocks.last(&rwtxn)?.is_none());
+            anyhow::ensure!(
+                state.get_block_index_events(&rwtxn, 1)?.is_empty()
+            );
             rwtxn.commit()?;
         }
 
