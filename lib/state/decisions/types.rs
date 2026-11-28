@@ -1,3 +1,4 @@
+use crate::math::voting::constants::BITCOIN_HIVEMIND_NEUTRAL_VALUE;
 use crate::state::Error;
 use crate::types::{SECONDS_PER_QUARTER, Txid};
 use serde::{Deserialize, Serialize};
@@ -7,11 +8,11 @@ pub use truthcoin_dc_types::decision::{DecisionId, DecisionType};
 
 pub const MAX_CATEGORY_OPTIONS: usize = 256;
 pub const MAX_OPTION_LABEL_BYTES: usize = 64;
+pub const MAX_SCALED_STEPS: f64 = 1e9;
 
 fn is_step_aligned(delta: f64, step: f64) -> bool {
-    let k = (delta / step).round();
-    let tolerance = (step.abs() * 1e-9).max(1e-12);
-    (delta - k * step).abs() <= tolerance
+    let steps = delta / step;
+    (steps - steps.round()).abs() <= 1e-6
 }
 
 #[derive(
@@ -99,6 +100,15 @@ impl Decision {
                         ),
                     });
                 }
+                let steps = min.abs().max(max.abs()).max(max - min) / increment;
+                if steps > MAX_SCALED_STEPS {
+                    return Err(Error::InvalidScaled {
+                        reason: format!(
+                            "bounds span {steps} increments, more than \
+                             {MAX_SCALED_STEPS}"
+                        ),
+                    });
+                }
             }
             DecisionType::Category { options } => {
                 if options.len() < 2 {
@@ -158,6 +168,56 @@ impl Decision {
 
     pub fn inconclusive_index(&self) -> Option<u16> {
         self.option_count().map(|n| n as u16)
+    }
+
+    /// Rejects a normalized vote that is not an answer to this decision:
+    /// binary 0, 1 or 0.5, a categorical index up to the Inconclusive
+    /// option, a scaled value on the increment grid or the 0.5 midpoint
+    pub fn validate_normalized(&self, vote: f64) -> Result<(), Error> {
+        let reason = match &self.decision_type {
+            DecisionType::Binary => {
+                (![0.0, BITCOIN_HIVEMIND_NEUTRAL_VALUE, 1.0].contains(&vote))
+                    .then(|| {
+                        format!(
+                            "Binary vote {vote} must be 0, 1 or 0.5 \
+                         (Inconclusive)"
+                        )
+                    })
+            }
+            DecisionType::Scaled {
+                min,
+                max,
+                increment,
+            } => (!(0.0..=1.0).contains(&vote)
+                || (vote != BITCOIN_HIVEMIND_NEUTRAL_VALUE
+                    && !is_step_aligned(vote * (max - min), *increment)))
+            .then(|| {
+                format!(
+                    "Scaled vote {} must lie in [{min}, {max}] on \
+                         increment {increment}, or be the midpoint",
+                    self.denormalize_value(vote)
+                )
+            }),
+            DecisionType::Category { options } => {
+                let count = options.len();
+                (vote < 0.0 || vote.fract() != 0.0 || vote > count as f64).then(
+                    || {
+                        format!(
+                            "Categorical vote {vote} must be an option \
+                             index in 0..={count} ({count} = Inconclusive)"
+                        )
+                    },
+                )
+            }
+        };
+        reason.map_or(Ok(()), |reason| Err(Error::InvalidVoteValue { reason }))
+    }
+
+    /// The normalized Inconclusive vote: the Inconclusive option on a
+    /// categorical decision, the midpoint on a binary or scaled one
+    pub fn inconclusive_vote(&self) -> f64 {
+        self.inconclusive_index()
+            .map_or(BITCOIN_HIVEMIND_NEUTRAL_VALUE, f64::from)
     }
 
     pub fn get_category_labels(&self) -> Option<&[String]> {
@@ -241,63 +301,9 @@ impl Decision {
         &self,
         user_value: f64,
     ) -> Result<f64, Error> {
-        if user_value.is_nan() {
-            return Ok(f64::NAN);
-        }
-
-        match &self.decision_type {
-            DecisionType::Scaled {
-                min,
-                max,
-                increment,
-            } => {
-                if user_value < *min || user_value > *max {
-                    return Err(Error::InvalidVoteValue {
-                        reason: format!(
-                            "Value {user_value} is outside \
-                             allowed range [{min}, {max}]"
-                        ),
-                    });
-                }
-                if !is_step_aligned(user_value - min, *increment) {
-                    return Err(Error::InvalidVoteValue {
-                        reason: format!(
-                            "Value {user_value} is not a multiple of \
-                             increment {increment} from min {min}"
-                        ),
-                    });
-                }
-            }
-            DecisionType::Binary => {
-                if !(0.0..=1.0).contains(&user_value) {
-                    return Err(Error::InvalidVoteValue {
-                        reason: format!(
-                            "Binary vote value {user_value} \
-                             must be between 0.0 and 1.0"
-                        ),
-                    });
-                }
-            }
-            DecisionType::Category { options } => {
-                let idx = user_value as usize;
-                if user_value < 0.0
-                    || user_value != (idx as f64)
-                    || idx > options.len()
-                {
-                    return Err(Error::InvalidVoteValue {
-                        reason: format!(
-                            "Categorical vote value \
-                             {user_value} must be a valid \
-                             option index (0..={}, where {} = Inconclusive)",
-                            options.len(),
-                            options.len()
-                        ),
-                    });
-                }
-            }
-        }
-
-        Ok(self.normalize_value(user_value))
+        let normalized = self.normalize_value(user_value);
+        self.validate_normalized(normalized)?;
+        Ok(normalized)
     }
 
     pub fn get_display_range(&self) -> (f64, f64) {

@@ -319,9 +319,6 @@ fn format_vote(value: &VoteValue, decision: &Decision) -> (String, Color32) {
             };
             (label, Color32::from_rgb(200, 170, 100))
         }
-        VoteValue::Abstain => {
-            ("Abstain".to_string(), Color32::from_rgb(150, 150, 150))
-        }
     }
 }
 
@@ -332,6 +329,5 @@ fn format_vote_unknown(value: &VoteValue) -> (String, Color32) {
         }
         VoteValue::Scalar(f) => (format!("{f:.4}"), Color32::GRAY),
         VoteValue::Categorical(idx) => (format!("{idx}"), Color32::GRAY),
-        VoteValue::Abstain => ("Abstain".to_string(), Color32::GRAY),
     }
 }

@@ -37,6 +37,10 @@ pub enum MarketUtxoReason {
     FeePayout,
     /// The refund to the market creator at settlement
     CreatorRefund,
+    /// The pool of a period's decision listing fees
+    ListingPool,
+    /// A share of a listing fee pool, to a reputation holder
+    ListingPayout,
 }
 
 /// An output that market code created or removed outside any transaction

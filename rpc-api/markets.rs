@@ -29,6 +29,8 @@ pub struct MarketBuyRequest {
     pub market_id: String,
     pub outcome_index: usize,
     pub shares_amount: i64,
+    /// The most the buy may cost, as LMSR cost plus trading fee. The miner
+    /// fee, the larger of 1,000 sats and 1 sat/byte, comes on top.
     pub max_cost: Option<u64>,
     pub dry_run: Option<bool>,
 }
@@ -122,7 +124,8 @@ pub struct DecisionClaimRequest {
     /// `decision_type == "scaled"`. Defaults to `1.0` when omitted.
     /// `(max - min)` must be an integer multiple of `increment`.
     pub increment: Option<f64>,
-    pub tx_fee_sats: u64,
+    /// Miner fee rate in sat/byte, default 1
+    pub fee_rate: Option<u64>,
     pub max_listing_fee_sats: Option<u64>,
 }
 
@@ -362,7 +365,7 @@ pub struct MarketOutcome {
     pub price: f64,
     pub volume_sats: u64,
     /// Index into the full Cartesian state tensor, including non-tradeable
-    /// abstain coordinates.
+    /// Inconclusive coordinates.
     pub full_state_index: usize,
     /// One coordinate per ordered market dimension.
     pub coordinates: Vec<usize>,
@@ -503,7 +506,8 @@ pub struct MarketCreateRequest {
     pub tx_pow_hash_selector: Option<u8>,
     pub tx_pow_ordering: Option<u8>,
     pub tx_pow_difficulty: Option<u8>,
-    pub tx_fee_sats: u64,
+    /// Miner fee rate in sat/byte, default 1
+    pub fee_rate: Option<u64>,
     /// Optional cap on the total listing fee paid for new claims.
     /// If the computed total exceeds this, the RPC errors before broadcasting.
     pub max_listing_fee_sats: Option<u64>,
@@ -561,8 +565,11 @@ pub struct BallotItem {
     /// The vote value in real units (e.g., 270 for electoral votes).
     /// For scaled decisions, the value must equal `min + k * increment`
     /// for some non-negative integer `k`, with `vote_value <= max`.
-    /// For binary decisions, use 0.0 (No) or 1.0 (Yes).
-    /// `None` abstains.
+    /// For binary decisions, use 0.0 (No), 1.0 (Yes) or 0.5 (Inconclusive).
+    /// `None` votes Inconclusive: 0.5 on a binary decision, the range
+    /// midpoint on a scaled one, and the Inconclusive option on a
+    /// categorical one. Prefer `None` to typing a scaled midpoint, which
+    /// float rounding can push off 0.5.
     pub vote_value: Option<f64>,
 }
 

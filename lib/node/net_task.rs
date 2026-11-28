@@ -2135,7 +2135,7 @@ mod test {
                     outputs: vec![Output {
                         address: sender,
                         content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(900),
+                            bitcoin::Amount::from_sat(700),
                         ),
                     }]
                     .into(),
@@ -2192,7 +2192,7 @@ mod test {
                 1_700_000_000,
             )?;
             assert_eq!(selected_count, expected_count);
-            assert_eq!(fee.to_sat(), 100 * expected_count as u64);
+            assert_eq!(fee.to_sat(), 300 * expected_count as u64);
             assert_eq!(
                 node.state.reputation().get_reputation(&rwtxn, &sender)?,
                 Votecoin(start_reputation - transferred)
@@ -2429,6 +2429,99 @@ mod test {
         })
     }
 
+    /// Connect an empty genesis block
+    fn connect_genesis(
+        node: &Node,
+        rwtxn: &mut sneed::RwTxn,
+    ) -> anyhow::Result<()> {
+        let body = Body::new(vec![], Coinbase::default());
+        let header = Header {
+            merkle_root: Body::compute_merkle_root(
+                &body.coinbase,
+                &Vec::<crate::types::FilledTransaction>::new(),
+                &body.authorizations,
+                &body.actor_proofs,
+            )?,
+            prev_side_hash: None,
+            prev_main_hash: bitcoin::BlockHash::all_zeros(),
+            roots: Vec::new(),
+        };
+        node.archive.put_header(rwtxn, &header)?;
+        node.state.connect_block(rwtxn, &header, &body, 0)?;
+        Ok(())
+    }
+
+    /// Fund each spec's signer with one output and commit, then submit a
+    /// signed transaction per spec that spends it
+    fn fund_and_submit<'a>(
+        node: &Node,
+        mut rwtxn: sneed::RwTxn,
+        specs: impl IntoIterator<
+            Item = (
+                &'a crate::types::authorization::SigningKey,
+                crate::types::TxData,
+            ),
+        >,
+    ) -> anyhow::Result<Vec<Result<(), crate::node::Error>>> {
+        use crate::types::{
+            Authorization, AuthorizedTransaction, authorization,
+        };
+        let mut diff = AccumulatorDiff::default();
+        let mut transactions = Vec::new();
+        for (index, (signer, data)) in (0..).zip(specs) {
+            let address = authorization::get_address(&signer.into());
+            let pointed = PointedOutput {
+                outpoint: OutPoint::Regular {
+                    txid: hash(&index).into(),
+                    vout: 0,
+                },
+                output: Output {
+                    address,
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        1_000,
+                    )),
+                },
+            };
+            node.state.utxos.put(
+                &mut rwtxn,
+                &OutPointKey::from(&pointed.outpoint),
+                &pointed.output,
+            )?;
+            diff.insert((&pointed).into());
+            let transaction = Transaction {
+                inputs: vec![(pointed.outpoint, hash(&pointed))].into(),
+                data: Some(data),
+                ..Default::default()
+            };
+            transactions.push((signer, transaction));
+        }
+        let mut accumulator = Accumulator::default();
+        accumulator.apply_diff(diff)?;
+        node.state
+            .utreexo_accumulator
+            .put(&mut rwtxn, &(), &accumulator)?;
+        rwtxn.commit()?;
+        let mut rng = rand::rng();
+        transactions
+            .into_iter()
+            .map(|(signer, transaction)| {
+                let authorization = Authorization {
+                    verifying_key: signer.into(),
+                    signature: authorization::sign_tx(
+                        &mut rng,
+                        signer,
+                        &transaction,
+                    )?,
+                };
+                Ok(node.submit_transaction(AuthorizedTransaction {
+                    transaction,
+                    authorizations: vec![authorization],
+                    actor_proof: None,
+                }))
+            })
+            .collect()
+    }
+
     /// Block selection takes reveals first and one ballot per voter.
     #[test]
     fn block_selection_ballot_order() -> anyhow::Result<()> {
@@ -2438,12 +2531,10 @@ mod test {
                 voting::types::{SealedBallot, VotingPeriodId},
             },
             types::{
-                Address, Authorization, AuthorizedTransaction, BallotItem,
-                Body, Coinbase, Header, RevealBallot, TxData,
+                BallotItem, RevealBallot, TxData,
                 authorization::{self, SigningKey},
             },
         };
-        use bitcoin::hashes::Hash as _;
 
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
@@ -2468,7 +2559,7 @@ mod test {
                     .iter()
                     .map(|decision_id| BallotItem {
                         decision_id_bytes: decision_id.as_bytes(),
-                        vote_value: Some(1.0),
+                        vote_value: 1.0,
                     })
                     .collect(),
                 salt: [3; 32],
@@ -2491,30 +2582,9 @@ mod test {
                     },
                 ),
                 (&other_key, seal(other, [2; 32])),
-                (
-                    &other_key,
-                    TxData::TransferReputation {
-                        sender: other,
-                        dest: Address([9; 20]),
-                        amount: crate::types::Votecoin(100_000),
-                    },
-                ),
             ];
             let mut rwtxn = node.env.write_txn()?;
-            let body = Body::new(vec![], Coinbase::default());
-            let header = Header {
-                merkle_root: Body::compute_merkle_root(
-                    &body.coinbase,
-                    &Vec::<crate::types::FilledTransaction>::new(),
-                    &body.authorizations,
-                    &body.actor_proofs,
-                )?,
-                prev_side_hash: None,
-                prev_main_hash: bitcoin::BlockHash::all_zeros(),
-                roots: Vec::new(),
-            };
-            node.archive.put_header(&mut rwtxn, &header)?;
-            node.state.connect_block(&mut rwtxn, &header, &body, 0)?;
+            connect_genesis(&node, &mut rwtxn)?;
             for address in [voter, other] {
                 node.state.reputation().set_reputation(
                     &mut rwtxn,
@@ -2561,68 +2631,14 @@ mod test {
                     revealed: false,
                 },
             )?;
-            let mut diff = AccumulatorDiff::default();
-            let mut transactions = Vec::new();
-            for (index, (signer, data)) in (0..).zip(specs) {
-                let address = authorization::get_address(&signer.into());
-                let pointed = PointedOutput {
-                    outpoint: OutPoint::Regular {
-                        txid: hash(&index).into(),
-                        vout: 0,
-                    },
-                    output: Output {
-                        address,
-                        content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(1_000),
-                        ),
-                    },
-                };
-                node.state.utxos.put(
-                    &mut rwtxn,
-                    &OutPointKey::from(&pointed.outpoint),
-                    &pointed.output,
-                )?;
-                diff.insert((&pointed).into());
-                let transaction = Transaction {
-                    inputs: vec![(pointed.outpoint, hash(&pointed))].into(),
-                    data: Some(data),
-                    ..Default::default()
-                };
-                transactions.push((signer, transaction));
-            }
-            let mut accumulator = Accumulator::default();
-            accumulator.apply_diff(diff)?;
-            node.state.utreexo_accumulator.put(
-                &mut rwtxn,
-                &(),
-                &accumulator,
-            )?;
-            rwtxn.commit()?;
-            let mut submitted = Vec::new();
-            for (signer, transaction) in transactions {
-                let authorization = Authorization {
-                    verifying_key: signer.into(),
-                    signature: authorization::sign_tx(
-                        &mut rng,
-                        signer,
-                        &transaction,
-                    )?,
-                };
-                submitted.push(node.submit_transaction(
-                    AuthorizedTransaction {
-                        transaction,
-                        authorizations: vec![authorization],
-                        actor_proof: None,
-                    },
-                ));
-            }
+            let submitted = fund_and_submit(&node, rwtxn, specs)?;
             assert!(submitted[0].is_ok());
             assert!(submitted[1].is_err());
             assert!(submitted[2..].iter().all(Result::is_ok));
-            assert_eq!(node.get_all_transactions()?.len(), 4);
+            assert_eq!(node.get_all_transactions()?.len(), 3);
             let ballot = [BallotItem {
                 decision_id_bytes: voting.as_bytes(),
-                vote_value: Some(1.0),
+                vote_value: 1.0,
             }];
             assert!(
                 node.prepare_ballot(voting.voting_period(), voter, &ballot)
@@ -2632,15 +2648,6 @@ mod test {
             let (selected, fee) = node.get_transactions(100)?;
             assert_eq!(selected.len(), 3);
             assert!(selected[0].transaction.is_reveal_ballot());
-            assert!(
-                !selected
-                    .iter()
-                    .any(|tx| tx.transaction.is_transfer_reputation())
-                    || !selected.iter().any(|tx| tx
-                        .transaction
-                        .submit_ballot()
-                        .is_some_and(|ballot| ballot.voter == other))
-            );
             assert_eq!(fee.to_sat(), 3_000);
             let (selected, _) = node.get_transactions(1)?;
             assert!(selected[0].transaction.is_reveal_ballot());
@@ -2656,11 +2663,86 @@ mod test {
             )?;
             rwtxn.commit()?;
             let remaining = node.get_all_transactions()?;
-            assert_eq!(remaining.len(), 2);
+            assert_eq!(remaining.len(), 1);
             assert!(remaining.iter().all(|tx| !matches!(
                 tx.transaction.data,
                 Some(TxData::SubmitBallot { .. })
             )));
+            Ok(())
+        })
+    }
+
+    /// Block selection never takes a voter's ballot and its transfer
+    #[test]
+    fn block_selection_seal_transfer() -> anyhow::Result<()> {
+        use crate::{
+            state::decisions::{Decision, DecisionId, DecisionType},
+            types::{
+                Address, TxData,
+                authorization::{self, SigningKey},
+            },
+        };
+
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let (_temp_dir, node) = temp_node(&runtime)?;
+            let () = connect_main_tip(&node)?;
+            node.task_handles.net.task.abort();
+            while !node.task_handles.net.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let mut rng = rand::rng();
+            let key = SigningKey::new(&mut rng);
+            let voter = authorization::get_address(&(&key).into());
+            let voting = DecisionId::new(false, 2, 0)?;
+            let specs = [
+                (
+                    &key,
+                    TxData::SubmitBallot {
+                        voter,
+                        voting_period: voting.voting_period(),
+                        commitment: [2; 32],
+                    },
+                ),
+                (
+                    &key,
+                    TxData::TransferReputation {
+                        sender: voter,
+                        dest: Address([9; 20]),
+                        amount: crate::types::Votecoin(100_000),
+                    },
+                ),
+            ];
+            let mut rwtxn = node.env.write_txn()?;
+            connect_genesis(&node, &mut rwtxn)?;
+            node.state.reputation().set_reputation(
+                &mut rwtxn,
+                &voter,
+                crate::types::Votecoin::TOTAL,
+            )?;
+            let decision = Decision::new(
+                voter.0,
+                DecisionType::Binary,
+                String::new(),
+                String::new(),
+                None,
+                None,
+                vec![],
+            )?;
+            node.state.decisions().claim_decision(
+                &mut rwtxn,
+                voting,
+                decision,
+                [1; 32].into(),
+                Some(0),
+            )?;
+            node.state
+                .decisions()
+                .transition_decision_to_voting(&mut rwtxn, voting, 1)?;
+            let submitted = fund_and_submit(&node, rwtxn, specs)?;
+            assert!(submitted.iter().all(Result::is_ok));
+            let (selected, _) = node.get_transactions(100)?;
+            assert_eq!(selected.len(), 1);
             Ok(())
         })
     }
@@ -2695,7 +2777,7 @@ mod test {
                     output: Output {
                         address,
                         content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(1_000),
+                            bitcoin::Amount::from_sat(100_000),
                         ),
                     },
                 };
@@ -2822,7 +2904,7 @@ mod test {
                     outputs: vec![Output {
                         address,
                         content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(41_000),
+                            bitcoin::Amount::from_sat(34_000),
                         ),
                     }]
                     .into(),
@@ -2862,7 +2944,7 @@ mod test {
 
             let (selected, fee) = node.get_transactions(1_000)?;
             assert_eq!(selected.len(), state::State::body_sigops_limit(0) / 43);
-            assert_eq!(fee.to_sat(), selected.len() as u64 * 1_000);
+            assert_eq!(fee.to_sat(), selected.len() as u64 * 8_000);
             let sigops: usize = selected
                 .iter()
                 .map(|tx| {
@@ -2951,10 +3033,10 @@ mod test {
                 )?;
                 Ok(tx)
             };
-            let first_tx = make_tx(vec![inputs[0]].into(), 900)?;
+            let first_tx = make_tx(vec![inputs[0]].into(), 600)?;
             let conflict_tx =
-                make_tx(vec![inputs[1], inputs[0]].into(), 1_800)?;
-            let next_tx = make_tx(vec![inputs[1]].into(), 900)?;
+                make_tx(vec![inputs[1], inputs[0]].into(), 1_200)?;
+            let next_tx = make_tx(vec![inputs[1]].into(), 600)?;
             node.mempool.put(&mut rwtxn, &first_tx)?;
             rwtxn.commit()?;
 
@@ -3703,7 +3785,7 @@ mod test {
                         Output {
                             address: creator,
                             content: OutputContent::Value(
-                                bitcoin::Amount::from_sat(3_900),
+                                bitcoin::Amount::from_sat(3_000),
                             ),
                         },
                     ]
@@ -3743,7 +3825,7 @@ mod test {
                     outputs: vec![Output {
                         address: Address([4; 20]),
                         content: OutputContent::Value(
-                            bitcoin::Amount::from_sat(3_000),
+                            bitcoin::Amount::from_sat(2_600),
                         ),
                     }]
                     .into(),
@@ -3765,7 +3847,7 @@ mod test {
                 selected_txids,
                 vec![market_txs[kept].txid(), child_txids[kept]]
             );
-            assert_eq!(fee.to_sat(), 2_000);
+            assert_eq!(fee.to_sat(), 2_400);
             // The block template's dropped transactions leave the mempool, so
             // they hold no inputs or claims there.
             {

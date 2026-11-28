@@ -57,6 +57,46 @@ impl<T> JsonParser<T> {
     }
 }
 
+/// A vote value, or `None` for "inconclusive"
+fn parse_vote_value(value: &str) -> anyhow::Result<Option<f64>> {
+    match value.trim() {
+        word if word.eq_ignore_ascii_case("inconclusive") => Ok(None),
+        number => number
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid vote value {number:?}: expected a number or \
+                     \"inconclusive\""
+                )
+            }),
+    }
+}
+
+/// Parse a batch ballot "id1:val1,id2:inconclusive", rejecting any
+/// malformed entry
+fn parse_ballot(
+    batch: &str,
+) -> anyhow::Result<Vec<truthcoin_dc_app_rpc_api::markets::BallotItem>> {
+    batch
+        .split(',')
+        .map(|pair| {
+            let (decision_id, value) =
+                pair.trim().split_once(':').ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid ballot entry {pair:?}: expected id:value"
+                    )
+                })?;
+            Ok(truthcoin_dc_app_rpc_api::markets::BallotItem {
+                decision_id: decision_id.trim().to_string(),
+                vote_value: parse_vote_value(value)?,
+            })
+        })
+        .collect()
+}
+
 pub fn json_response<T>(data: &T) -> anyhow::Result<String>
 where
     T: serde::Serialize,
@@ -171,16 +211,18 @@ pub enum Command {
         dest: Address,
         #[arg(long)]
         value_sats: u64,
+        /// Miner fee rate in sat/byte, default 1
         #[arg(long)]
-        fee_sats: u64,
+        fee_rate: Option<u64>,
     },
     /// Create a tx that transfers funds to each address in a JSON map of
     /// address to value in sats, such as `{"<address>": 1000}`
     CreateTransferMany {
         #[arg(value_parser = JsonParser::<TransferDests>::parse)]
         dests: TransferDests,
+        /// Miner fee rate in sat/byte, default 1
         #[arg(long)]
-        fee_sats: u64,
+        fee_rate: Option<u64>,
     },
     /// Creates a tx that initiates a withdrawal to the specified mainchain
     /// address
@@ -188,8 +230,9 @@ pub enum Command {
         mainchain_address: bitcoin::Address<bitcoin::address::NetworkUnchecked>,
         #[arg(long)]
         amount_sats: u64,
+        /// Miner fee rate in sat/byte, default 1
         #[arg(long)]
-        fee_sats: u64,
+        fee_rate: Option<u64>,
         #[arg(long)]
         mainchain_fee_sats: u64,
     },
@@ -419,9 +462,9 @@ pub enum Command {
         option_1_label: Option<String>,
         #[arg(long, value_delimiter = ',')]
         option_labels: Option<Vec<String>>,
-        /// Miner fee (sats)
-        #[arg(long, default_value = "1000")]
-        tx_fee_sats: u64,
+        /// Miner fee rate in sat/byte, default 1
+        #[arg(long)]
+        fee_rate: Option<u64>,
         /// Optional cap on the protocol-set listing fee
         #[arg(long)]
         max_listing_fee_sats: Option<u64>,
@@ -452,8 +495,9 @@ pub enum Command {
         tx_pow_ordering: Option<u8>,
         #[arg(long)]
         tx_pow_difficulty: Option<u8>,
-        #[arg(long, default_value = "1000")]
-        tx_fee_sats: u64,
+        /// Miner fee rate in sat/byte, default 1
+        #[arg(long)]
+        fee_rate: Option<u64>,
         #[arg(long)]
         max_listing_fee_sats: Option<u64>,
     },
@@ -479,6 +523,8 @@ pub enum Command {
         outcome_index: usize,
         #[arg(long)]
         shares_amount: i64,
+        /// Most the buy may cost (sats), as LMSR cost plus trading fee. The
+        /// miner fee comes on top.
         #[arg(long)]
         max_cost: u64,
     },
@@ -568,19 +614,21 @@ pub enum Command {
     #[command(name = "voter-addresses")]
     VoterAddresses,
     /// Seal a ballot covering every decision in the period - use
-    /// comma-separated "id:value" for batch, "id:abstain" to abstain
+    /// comma-separated "id:value" for batch, "id:inconclusive" for Inconclusive
     #[command(name = "vote-submit", alias = "vote")]
     VoteSubmit {
-        /// Single vote: --decision-id X --vote-value Y, or batch: --votes "id1:val1,id2:abstain"
+        /// Single vote: --decision-id X --vote-value Y, or batch:
+        /// --votes "id1:val1,id2:inconclusive"
         #[arg(long)]
         decision_id: Option<String>,
+        /// A number, or "inconclusive"
         #[arg(long)]
-        vote_value: Option<f64>,
+        vote_value: Option<String>,
         #[arg(long)]
         votes: Option<String>,
-        /// Defaults to the minimum fee for the ballot's size
+        /// Miner fee rate in sat/byte, default 1
         #[arg(long)]
-        fee_sats: Option<u64>,
+        fee_rate: Option<u64>,
         /// Defaults to the one wallet address that holds votecoin
         #[arg(long)]
         voter: Option<Address>,
@@ -591,9 +639,9 @@ pub enum Command {
     VoteReveal {
         #[arg(long)]
         period: u32,
-        /// Defaults to the minimum fee for the reveal's size
+        /// Miner fee rate in sat/byte, default 1
         #[arg(long)]
-        fee_sats: Option<u64>,
+        fee_rate: Option<u64>,
         /// Defaults to the one wallet address that holds votecoin
         #[arg(long)]
         voter: Option<Address>,
@@ -620,8 +668,9 @@ pub enum Command {
         dest: Address,
         #[arg(long)]
         amount: Votecoin,
-        #[arg(long, default_value = "1000")]
-        fee_sats: u64,
+        /// Miner fee rate in sat/byte, default 1
+        #[arg(long)]
+        fee_rate: Option<u64>,
         /// Defaults to the one wallet address that holds votecoin
         #[arg(long)]
         sender: Option<Address>,
@@ -654,8 +703,9 @@ pub enum Command {
     #[command(name = "take-offer")]
     TakeOffer {
         offer_id: OfferId,
-        #[arg(long, default_value = "1000")]
-        fee_sats: u64,
+        /// Miner fee rate in sat/byte, default 1
+        #[arg(long)]
+        fee_rate: Option<u64>,
         /// Defaults to a new wallet address
         #[arg(long)]
         buyer: Option<Address>,
@@ -664,8 +714,9 @@ pub enum Command {
     #[command(name = "cancel-offer")]
     CancelOffer {
         offer_id: OfferId,
-        #[arg(long, default_value = "1000")]
-        fee_sats: u64,
+        /// Miner fee rate in sat/byte, default 1
+        #[arg(long)]
+        fee_rate: Option<u64>,
     },
 }
 
@@ -742,28 +793,28 @@ where
         Command::CreateTransfer {
             dest,
             value_sats,
-            fee_sats,
+            fee_rate,
         } => {
             let txid = rpc_client
-                .create_transfer(dest, value_sats, fee_sats)
+                .create_transfer(dest, value_sats, fee_rate)
                 .await?;
             format!("{txid}")
         }
-        Command::CreateTransferMany { dests, fee_sats } => {
-            let txid = rpc_client.create_transfer_many(dests, fee_sats).await?;
+        Command::CreateTransferMany { dests, fee_rate } => {
+            let txid = rpc_client.create_transfer_many(dests, fee_rate).await?;
             format!("{txid}")
         }
         Command::CreateWithdrawal {
             mainchain_address,
             amount_sats,
-            fee_sats,
+            fee_rate,
             mainchain_fee_sats,
         } => {
             let txid = rpc_client
                 .create_withdrawal(
                     mainchain_address,
                     amount_sats,
-                    fee_sats,
+                    fee_rate,
                     mainchain_fee_sats,
                 )
                 .await?;
@@ -1055,7 +1106,7 @@ where
             option_0_label,
             option_1_label,
             option_labels,
-            tx_fee_sats,
+            fee_rate,
             max_listing_fee_sats,
         } => {
             use truthcoin_dc_app_rpc_api::markets::{
@@ -1095,7 +1146,7 @@ where
                 min,
                 max,
                 increment,
-                tx_fee_sats,
+                fee_rate,
                 max_listing_fee_sats,
             };
 
@@ -1117,7 +1168,7 @@ where
             tx_pow_hash_selector,
             tx_pow_ordering,
             tx_pow_difficulty,
-            tx_fee_sats,
+            fee_rate,
             max_listing_fee_sats,
         } => {
             use truthcoin_dc_app_rpc_api::markets::{
@@ -1137,7 +1188,7 @@ where
                 tx_pow_hash_selector,
                 tx_pow_ordering,
                 tx_pow_difficulty,
-                tx_fee_sats,
+                fee_rate,
                 max_listing_fee_sats,
             };
             let resp = rpc_client.market_create(request).await?;
@@ -1428,34 +1479,16 @@ where
             decision_id,
             vote_value,
             votes,
-            fee_sats,
+            fee_rate,
             voter,
         } => {
             use truthcoin_dc_app_rpc_api::markets::BallotItem;
             let vote_items = if let Some(batch) = votes {
-                // Parse batch format: "id1:val1,id2:val2"
-                batch
-                    .split(',')
-                    .filter_map(|pair| {
-                        let parts: Vec<&str> = pair.trim().split(':').collect();
-                        if parts.len() == 2 {
-                            let val = match parts[1] {
-                                "abstain" => None,
-                                val => Some(val.parse().ok()?),
-                            };
-                            Some(BallotItem {
-                                decision_id: parts[0].to_string(),
-                                vote_value: val,
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+                parse_ballot(&batch)?
             } else if let (Some(id), Some(val)) = (decision_id, vote_value) {
                 vec![BallotItem {
                     decision_id: id,
-                    vote_value: Some(val),
+                    vote_value: parse_vote_value(&val)?,
                 }]
             } else {
                 return Ok(
@@ -1464,15 +1497,15 @@ where
                 );
             };
             let txid =
-                rpc_client.vote_submit(vote_items, fee_sats, voter).await?;
+                rpc_client.vote_submit(vote_items, fee_rate, voter).await?;
             format!("Vote submitted: {txid}")
         }
         Command::VoteReveal {
             period,
-            fee_sats,
+            fee_rate,
             voter,
         } => {
-            let txid = rpc_client.vote_reveal(period, fee_sats, voter).await?;
+            let txid = rpc_client.vote_reveal(period, fee_rate, voter).await?;
             format!("Ballot revealed: {txid}")
         }
         Command::VoteList {
@@ -1496,11 +1529,11 @@ where
         Command::VotecoinTransfer {
             dest,
             amount,
-            fee_sats,
+            fee_rate,
             sender,
         } => {
             let txid = rpc_client
-                .transfer_votecoin(dest, amount, fee_sats, sender)
+                .transfer_votecoin(dest, amount, fee_rate, sender)
                 .await?;
             format!("Votecoin transferred: {txid}")
         }
@@ -1525,14 +1558,14 @@ where
         }
         Command::TakeOffer {
             offer_id,
-            fee_sats,
+            fee_rate,
             buyer,
         } => {
-            let txid = rpc_client.take_offer(offer_id, fee_sats, buyer).await?;
+            let txid = rpc_client.take_offer(offer_id, fee_rate, buyer).await?;
             format!("Offer taken: {txid}")
         }
-        Command::CancelOffer { offer_id, fee_sats } => {
-            let txid = rpc_client.cancel_offer(offer_id, fee_sats).await?;
+        Command::CancelOffer { offer_id, fee_rate } => {
+            let txid = rpc_client.cancel_offer(offer_id, fee_rate).await?;
             format!("Offer cancelled: {txid}")
         }
     })
@@ -1628,15 +1661,15 @@ mod tests {
                 "truthcoin-cli",
                 "create-transfer-many",
                 &format!("{{\"{address}\": 1000}}{suffix}"),
-                "--fee-sats",
-                "500",
+                "--fee-rate",
+                "5",
             ]);
-            let Command::CreateTransferMany { dests, fee_sats } = cli.command
+            let Command::CreateTransferMany { dests, fee_rate } = cli.command
             else {
                 panic!("the command is not create-transfer-many");
             };
             assert_eq!(dests.0, BTreeMap::from([(address, 1000)]));
-            assert_eq!(fee_sats, 500);
+            assert_eq!(fee_rate, Some(5));
         }
     }
 
@@ -1648,8 +1681,8 @@ mod tests {
             "truthcoin-cli",
             "create-transfer-many",
             &format!("{{\"{address}\": 1000}} {{\"{other_address}\": 2000}}"),
-            "--fee-sats",
-            "500",
+            "--fee-rate",
+            "5",
         ]);
         assert!(result.is_err(), "the CLI accepted a second map: {result:?}");
     }
@@ -1662,8 +1695,8 @@ mod tests {
             "truthcoin-cli",
             "create-transfer-many",
             &format!("{{\"{address}\": 1000}} invalid"),
-            "--fee-sats",
-            "500",
+            "--fee-rate",
+            "5",
         ]);
         assert!(result.is_err(), "the CLI accepted extra text: {result:?}");
     }
@@ -1688,9 +1721,30 @@ mod tests {
             "truthcoin-cli",
             "create-transfer-many",
             &format!("{{\"{address}\": 1000, \"{address}\": 5000}}"),
-            "--fee-sats",
-            "500",
+            "--fee-rate",
+            "5",
         ]);
         assert!(result.is_err());
+    }
+
+    /// Ballots parse numbers and "inconclusive", rejecting bad entries
+    #[test]
+    fn ballot_parsing() {
+        let items = parse_ballot("aa:1, bb :inconclusive,cc:0.5").unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.decision_id.as_str(), item.vote_value))
+                .collect::<Vec<_>>(),
+            vec![("aa", Some(1.0)), ("bb", None), ("cc", Some(0.5))]
+        );
+        assert!(parse_ballot("aa:1,bb:abstain").is_err());
+        assert!(parse_ballot("aa:1,bb").is_err());
+        assert_eq!(parse_vote_value("Inconclusive").unwrap(), None);
+        assert!(parse_vote_value("yes").is_err());
+        for word in ["nan", "NaN", "inf", "-inf", "infinity"] {
+            assert!(parse_vote_value(word).is_err(), "{word}");
+        }
+        assert!(parse_ballot("aa:1,bb:nan").is_err());
     }
 }

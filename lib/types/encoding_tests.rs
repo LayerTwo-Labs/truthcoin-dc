@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-fn outpoints() -> [OutPoint; 6] {
+fn outpoints() -> [OutPoint; 7] {
     [
         OutPoint::Regular {
             txid: Txid([1; 32]),
@@ -44,6 +44,10 @@ fn outpoints() -> [OutPoint; 6] {
             m6id: M6id(bitcoin::Txid::from_byte_array([11; 32])),
             height: 12,
             vout: 13,
+        },
+        OutPoint::ListingFees {
+            period: 44,
+            block_height: 45,
         },
     ]
 }
@@ -79,7 +83,7 @@ fn outputs() -> anyhow::Result<[Output; 3]> {
 }
 
 fn transactions() -> anyhow::Result<[Transaction; 2]> {
-    let [regular, coinbase, deposit, market_funds, payout, _] = outpoints();
+    let [regular, coinbase, deposit, market_funds, payout, _, _] = outpoints();
     let trade = Transaction {
         inputs: vec![
             (regular, [44; 32]),
@@ -156,7 +160,7 @@ fn block() -> anyhow::Result<Block> {
     Ok(Block { header, body })
 }
 
-fn filled_outputs() -> anyhow::Result<[Output; 3]> {
+fn filled_outputs() -> anyhow::Result<[Output; 4]> {
     Ok([
         Output {
             address: Address([35; 20]),
@@ -178,13 +182,20 @@ fn filled_outputs() -> anyhow::Result<[Output; 3]> {
                 is_fee: true,
             },
         },
+        Output {
+            address: Address([46; 20]),
+            content: OutputContent::ListingFees {
+                period: 47,
+                amount: bitcoin::Amount::from_sat(48),
+            },
+        },
     ])
 }
 
 /// Borsh, bincode and database key encodings of each outpoint, as hex
 #[test]
 fn outpoint_encodings() -> anyhow::Result<()> {
-    const EXPECTED: [&str; 18] = [
+    const EXPECTED: [&str; 21] = [
         "00010101010101010101010101010101010101010101010101010101010101010102000000",
         "00000000010101010101010101010101010101010101010101010101010101010101010102000000",
         "0001010101010101010101010101010101010101010101010101010101010101010200000000000000",
@@ -203,6 +214,9 @@ fn outpoint_encodings() -> anyhow::Result<()> {
         "050b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0c0000000d000000",
         "0500000020000000000000000b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0c0000000d000000",
         "050b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0c0000000d000000",
+        "062c0000002d000000",
+        "060000002c0000002d000000",
+        "062c0000002d0000000000000000000000000000000000000000000000000000000000000000000000",
     ];
     let mut encodings = Vec::new();
     for outpoint in outpoints() {
@@ -264,10 +278,11 @@ fn block_encodings() -> anyhow::Result<()> {
 /// Bincode encoding of each spent output, as the stxo database holds it
 #[test]
 fn spent_output_encodings() -> anyhow::Result<()> {
-    const EXPECTED: [&str; 3] = [
+    const EXPECTED: [&str; 4] = [
         "23232323232323232323232323232323232323230000000024000000000000000100000020000000000000002b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
         "252525252525252525252525252525252525252501000000260000000000000027000000000000002a0000000000000062633171617230737272723778666b7679356c3634336c79646e77397265353967747a7a7766356d64710100000020000000000000002b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
         "2828282828282828282828282828282828282828020000002929292929292a00000000000000010100000020000000000000002b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+        "2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e030000002f00000030000000000000000100000020000000000000002b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
     ];
     let mut encodings = Vec::new();
     for output in filled_outputs()? {

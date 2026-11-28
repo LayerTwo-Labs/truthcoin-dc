@@ -290,6 +290,7 @@ impl VotingSystem {
             }
         }
 
+        let mut reveal_heights = HashMap::new();
         let mut vote_matrix = SparseVoteMatrix::new(voters, decisions);
         let mut unguaranteed_votes: BTreeMap<
             DecisionId,
@@ -300,10 +301,10 @@ impl VotingSystem {
             let Some(&weight) = reputations.get(&vote_key.voter_address) else {
                 continue;
             };
-            let Some(vote_value) = vote_entry.to_float_opt() else {
-                continue;
-            };
+            let vote_value = vote_entry.to_float();
             if vote_key.decision_id.is_standard() {
+                reveal_heights
+                    .insert(vote_key.voter_address, vote_entry.block_height);
                 vote_matrix
                     .set_vote(
                         vote_key.voter_address,
@@ -330,6 +331,7 @@ impl VotingSystem {
                     &weight_vector,
                     &scaled_decisions,
                     &categorical_decisions,
+                    &reveal_heights,
                 )
                 .map_err(|e| Error::InvalidTransaction {
                     reason: format!("Failed to calculate consensus: {e:?}"),
@@ -400,7 +402,7 @@ impl VotingSystem {
                 None => {
                     let default_value = categorical_default(*decision_id);
                     tracing::info!(
-                        "Decision {} has unanimous abstention \
+                        "Decision {} has no votes \
                          — using default {:.4}",
                         const_hex::encode(decision_id.as_bytes()),
                         default_value
@@ -621,13 +623,13 @@ impl VotingSystem {
         }
 
         let resolved_count = result.resolved_decision_count();
-        let abstained_count = result.abstained_decision_count();
+        let unresolved_count = result.unresolved_decision_count();
 
         tracing::info!(
             period_id = result.period_id.0,
             block_height = result.block_height,
             resolved = resolved_count,
-            abstained = abstained_count,
+            unresolved = unresolved_count,
             "Consensus commit completed successfully"
         );
 
@@ -800,17 +802,14 @@ impl VotingSystem {
         rotxn: &RoTxn,
         period_id: VotingPeriodId,
     ) -> Result<HashMap<(crate::types::Address, DecisionId), f64>, Error> {
-        let vote_entries =
-            self.databases.get_votes_for_period(rotxn, period_id)?;
-        let mut matrix = HashMap::new();
-
-        for (key, entry) in vote_entries {
-            if let Some(vote_value) = entry.to_float_opt() {
-                matrix.insert((key.voter_address, key.decision_id), vote_value);
-            }
-        }
-
-        Ok(matrix)
+        Ok(self
+            .databases
+            .get_votes_for_period(rotxn, period_id)?
+            .into_iter()
+            .map(|(key, entry)| {
+                ((key.voter_address, key.decision_id), entry.to_float())
+            })
+            .collect())
     }
 
     pub fn get_participation_stats(
@@ -1419,7 +1418,7 @@ mod conservation_tests {
             voting_period: decision_id.voting_period(),
             votes: vec![crate::types::BallotItem {
                 decision_id_bytes: decision_id.as_bytes(),
-                vote_value: Some(vote_value),
+                vote_value,
             }],
             salt: [salt; 32],
         }
@@ -1513,7 +1512,7 @@ mod conservation_tests {
         Ok((env, state, decision_id))
     }
 
-    /// Reputation transfers are locked from the sealed ballot until resolution
+    /// Transfers lock from seal to resolution, and for all while revealing
     #[test]
     fn ballot_locks_reputation() -> anyhow::Result<()> {
         use crate::{
@@ -1555,11 +1554,9 @@ mod conservation_tests {
         assert!(!is_locked(&rwtxn)?);
         connect_height(&state, &mut rwtxn, 11, &seals)?;
         assert!(is_locked(&rwtxn)?);
+        let unsealed = transfer_tx(outsider, addr(4), 10_000);
         VoteValidator::validate_reputation_transfer(
-            &state,
-            &rwtxn,
-            &transfer_tx(outsider, addr(4), 10_000),
-            None,
+            &state, &rwtxn, &unsealed, None,
         )?;
         connect_height(&state, &mut rwtxn, 20, &[])?;
         assert_eq!(
@@ -1569,7 +1566,16 @@ mod conservation_tests {
             DecisionState::Revealing,
         );
         assert!(is_locked(&rwtxn)?);
+        assert!(
+            VoteValidator::validate_reputation_transfer(
+                &state, &rwtxn, &unsealed, None,
+            )
+            .is_err()
+        );
         connect_height(&state, &mut rwtxn, 21, &reveals)?;
+        VoteValidator::validate_reputation_transfer(
+            &state, &rwtxn, &unsealed, None,
+        )?;
         assert_eq!(
             state
                 .decisions()
@@ -1834,7 +1840,7 @@ mod conservation_tests {
                 .iter()
                 .map(|(decision_id, vote_value)| crate::types::BallotItem {
                     decision_id_bytes: decision_id.as_bytes(),
-                    vote_value: Some(*vote_value),
+                    vote_value: *vote_value,
                 })
                 .collect(),
             salt: [salt; 32],
@@ -2100,6 +2106,7 @@ mod conservation_tests {
         Ok(())
     }
 
+    /// A seal locks its voter's offers; the reveal window locks everyone's
     #[test]
     fn ballot_locks_offers() -> anyhow::Result<()> {
         use crate::{
@@ -2119,12 +2126,8 @@ mod conservation_tests {
         )?;
         let mut rwtxn = env.write_txn()?;
         connect_height(&state, &mut rwtxn, 10, &[])?;
-        connect_height(
-            &state,
-            &mut rwtxn,
-            11,
-            &[sealed_ballot_tx(&binary_ballot(voter, decision_id, 1.0, 1))],
-        )?;
+        let ballot = binary_ballot(voter, decision_id, 1.0, 1);
+        connect_height(&state, &mut rwtxn, 11, &[sealed_ballot_tx(&ballot)])?;
         let period = state.current_period(&rwtxn)?;
 
         assert!(
@@ -2145,6 +2148,28 @@ mod conservation_tests {
             )
             .is_err()
         );
+
+        connect_height(&state, &mut rwtxn, 20, &[])?;
+        let revealing_offer =
+            offer_of(&outsider_key, state.current_period(&rwtxn)?, 1);
+        assert!(
+            OfferValidator::validate_open_offer(
+                &state,
+                &rwtxn,
+                &revealing_offer
+            )
+            .is_err()
+        );
+        assert!(
+            OfferValidator::validate_take_offer(
+                &state,
+                &rwtxn,
+                &take_offer_tx(&revealing_offer, addr(5)),
+            )
+            .is_err()
+        );
+        connect_height(&state, &mut rwtxn, 21, &[reveal_ballot_tx(&ballot)])?;
+        OfferValidator::validate_open_offer(&state, &rwtxn, &revealing_offer)?;
         Ok(())
     }
 

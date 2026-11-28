@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::state::Error;
 use crate::state::decisions::{DecisionId, DecisionType};
@@ -50,22 +50,18 @@ impl MarketValidator {
             HashMap::new();
         let mut pending_types: HashMap<DecisionId, DecisionType> =
             HashMap::new();
-        let mut total_listing_fee: u64 = 0;
+        let mut listing_fees = BTreeMap::new();
 
         for payload in view.new_claims {
-            let fee = DecisionValidator::validate_claim_payload(
+            for (period, fee) in DecisionValidator::validate_claim_payload(
                 state,
                 rotxn,
                 payload,
                 market_maker_address,
                 override_height,
-            )?;
-            total_listing_fee =
-                total_listing_fee.checked_add(fee).ok_or_else(|| {
-                    Error::InvalidTransaction {
-                        reason: "Listing fee overflow".to_string(),
-                    }
-                })?;
+            )? {
+                super::add_listing_fee(&mut listing_fees, period, fee)?;
+            }
 
             for entry in &payload.decisions {
                 let decision_id =
@@ -280,20 +276,8 @@ impl MarketValidator {
 
         let storage_fee =
             crate::math::markets::market_storage_fee(outcome_count);
-        let total_fee =
-            total_listing_fee.checked_add(storage_fee).ok_or_else(|| {
-                Error::InvalidTransaction {
-                    reason: "Market fee overflow".to_string(),
-                }
-            })?;
-        let tx_fee = crate::validation::tx_fee(tx)?.to_sat();
-        if tx_fee < total_fee {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Market fee is {tx_fee} sats but must be at least {total_fee} sats"
-                ),
-            });
-        }
+        super::validate_listing_outputs(tx, &listing_fees)?;
+        super::validate_fee_floor(tx, bitcoin::Amount::from_sat(storage_fee))?;
 
         Ok(())
     }
@@ -305,7 +289,6 @@ impl MarketValidator {
         tx: &FilledTransaction,
         _override_height: Option<u32>,
     ) -> Result<(), Error> {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
         use crate::state::markets::MarketState;
         use crate::types::tx_pow::POW_BOUND_WINDOW_BLOCKS;
 
@@ -411,7 +394,7 @@ impl MarketValidator {
             }
         }
 
-        // Each leg must be a tradeable outcome. Abstain/invalid states
+        // Each leg must be a tradeable outcome. Inconclusive/invalid states
         // (voter-only) are not part of the tradeable outcome space and fall
         // outside `market.shares().len()`.
         crate::math::trading::check_deltas(
@@ -437,9 +420,13 @@ impl MarketValidator {
             })?
             .to_sat();
 
+        let miner_fee =
+            super::trade_miner_fee(&tx.transaction, tx.actor_address.is_some())
+                .map_err(Error::BincodeSerialize)?
+                .to_sat();
         let required_input = u64::try_from(trade.max_cost.max(0))
             .ok()
-            .and_then(|max_cost| max_cost.checked_add(TRADE_MINER_FEE_SATS))
+            .and_then(|max_cost| max_cost.checked_add(miner_fee))
             .ok_or_else(|| Error::InvalidTransaction {
                 reason: "Trade max cost overflows".to_string(),
             })?;
@@ -447,7 +434,7 @@ impl MarketValidator {
             return Err(Error::InvalidTransaction {
                 reason: format!(
                     "Input value {input_value} sats insufficient for max cost \
-                     {} sats plus miner fee {TRADE_MINER_FEE_SATS} sats",
+                     {} sats plus miner fee {miner_fee} sats",
                     trade.max_cost.max(0)
                 ),
             });
@@ -502,8 +489,6 @@ impl MarketValidator {
         tx: &FilledTransaction,
         _override_height: Option<u32>,
     ) -> Result<(), Error> {
-        use crate::math::trading::TRADE_MINER_FEE_SATS;
-
         let amplify =
             tx.amplify_beta().ok_or_else(|| Error::InvalidTransaction {
                 reason: "Not an amplify_beta transaction".to_string(),
@@ -571,18 +556,22 @@ impl MarketValidator {
             })?
             .to_sat();
 
-        let required = amplify
-            .amount
-            .checked_add(TRADE_MINER_FEE_SATS)
-            .ok_or_else(|| Error::InvalidTransaction {
-                reason: "AmplifyBeta amount overflow".to_string(),
+        let miner_fee =
+            super::trade_miner_fee(&tx.transaction, tx.actor_address.is_some())
+                .map_err(Error::BincodeSerialize)?
+                .to_sat();
+        let required =
+            amplify.amount.checked_add(miner_fee).ok_or_else(|| {
+                Error::InvalidTransaction {
+                    reason: "AmplifyBeta amount overflow".to_string(),
+                }
             })?;
 
         if input_value < required {
             return Err(Error::InvalidTransaction {
                 reason: format!(
                     "Input value {input_value} sats insufficient for \
-                     amplify amount {} + miner fee {TRADE_MINER_FEE_SATS} sats",
+                     amplify amount {} + miner fee {miner_fee} sats",
                     amplify.amount
                 ),
             });
@@ -992,13 +981,18 @@ mod tests {
                 }],
             });
         }
+        let rotxn = env.read_txn().unwrap();
+        pay_listing_fees(&state, &rotxn, &mut tx);
         let storage_fee =
             crate::math::markets::market_storage_fee(outcome_count);
-        let fee = storage_fee + claim_fee;
-        let rotxn = env.read_txn().unwrap();
-        for paid in [fee, fee - 1, claim_fee] {
-            tx.spent_utxos[0].content =
-                OutputContent::Value(bitcoin::Amount::from_sat(10_000 + paid));
+        let fee = storage_fee
+            + crate::validation::min_tx_fee(&tx.transaction, false)
+                .unwrap()
+                .to_sat();
+        for paid in [fee, fee - 1] {
+            tx.spent_utxos[0].content = OutputContent::Value(
+                bitcoin::Amount::from_sat(10_000 + claim_fee + paid),
+            );
             let result = MarketValidator::validate_market_creation(
                 &state,
                 &rotxn,
@@ -1009,7 +1003,47 @@ mod tests {
         }
     }
 
-    /// A binary market validates only when paying exactly its storage fee
+    /// Add outputs paying the listing fees that a market creation's new
+    /// claims owe into their pools, and fund them
+    fn pay_listing_fees(
+        state: &State,
+        rotxn: &RoTxn,
+        tx: &mut FilledTransaction,
+    ) {
+        use crate::{
+            state::markets::payouts::generate_listing_pool_address,
+            types::GetValue as _,
+        };
+
+        let Some(TransactionData::CreateMarket { new_claims, .. }) =
+            &tx.transaction.data
+        else {
+            return;
+        };
+        let mut owed: BTreeMap<u32, u64> = BTreeMap::new();
+        for entry in new_claims.iter().flat_map(|claim| &claim.decisions) {
+            let id = DecisionId::from_bytes(entry.decision_id_bytes).unwrap();
+            *owed.entry(id.period_index()).or_default() +=
+                state.decisions().fee_for_decision_id(rotxn, id).unwrap();
+        }
+        tx.transaction
+            .outputs
+            .0
+            .extend(owed.iter().map(|(&period, &sats)| Output {
+                address: generate_listing_pool_address(period),
+                content: OutputContent::ListingFees {
+                    period,
+                    amount: bitcoin::Amount::from_sat(sats),
+                },
+            }));
+        let funded =
+            tx.spent_utxos[0].get_value().to_sat() + owed.values().sum::<u64>();
+        tx.spent_utxos[0].content =
+            OutputContent::Value(bitcoin::Amount::from_sat(funded));
+    }
+
+    /// A binary market validates only when paying its storage fee and the
+    /// minimum fee rate
     #[test]
     fn binary_storage_fee() {
         check_market_fee(DecisionType::Binary, false);
@@ -1133,6 +1167,7 @@ mod tests {
                     }
                 }));
             }
+            pay_listing_fees(&state, &rotxn, &mut tx);
             MarketValidator::validate_market_creation(&state, &rotxn, &tx, None)
         };
 
@@ -1141,6 +1176,72 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(over_cap.contains("cap"), "{over_cap}");
+    }
+
+    /// A market creation claiming in two periods pays each period's pool in
+    /// its own output, neither merged nor missing
+    #[test]
+    fn claims_two_periods() {
+        use crate::types::{ClaimDecisionPayload, GetValue as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = heed::EnvOpenOptions::new();
+        opts.map_size(64 * 1024 * 1024)
+            .max_dbs(State::NUM_DBS + Archive::NUM_DBS);
+        let env = unsafe { sneed::Env::open(&opts, dir.path()) }.unwrap();
+        let state = State::new(&env, None, true).unwrap();
+        let mut rwtxn = env.write_txn().unwrap();
+        state
+            .put_timestamps_for_test(&mut rwtxn, 1000, 1000)
+            .unwrap();
+        state
+            .decisions()
+            .mint_genesis(&mut rwtxn, 1000, 0, 1000)
+            .unwrap();
+        rwtxn.commit().unwrap();
+        let rotxn = env.read_txn().unwrap();
+
+        let mut tx = create_market_with_new_claim_tx(
+            Address([9; 20]),
+            DecisionId::new(false, 2, 0).unwrap(),
+        );
+        if let Some(TransactionData::CreateMarket { new_claims, .. }) =
+            &mut tx.transaction.data
+        {
+            new_claims.push(ClaimDecisionPayload {
+                decision_type: DecisionType::Binary,
+                decisions: vec![DecisionClaimEntry {
+                    decision_id_bytes: DecisionId::new(false, 3, 0)
+                        .unwrap()
+                        .as_bytes(),
+                    header: "decision".to_string(),
+                    description: String::new(),
+                    option_0_label: None,
+                    option_1_label: None,
+                    option_labels: None,
+                    tags: None,
+                }],
+            });
+        }
+        pay_listing_fees(&state, &rotxn, &mut tx);
+        let validate = |tx: &FilledTransaction| {
+            MarketValidator::validate_market_creation(&state, &rotxn, tx, None)
+        };
+        validate(&tx).unwrap();
+
+        let mut merged = tx.clone();
+        let second = merged.transaction.outputs.0.pop().unwrap();
+        let first = merged.transaction.outputs.0.last_mut().unwrap();
+        let OutputContent::ListingFees { amount, .. } = &mut first.content
+        else {
+            unreachable!()
+        };
+        *amount += second.get_value();
+        assert!(validate(&merged).is_err());
+
+        let mut missing = tx;
+        missing.transaction.outputs.0.pop();
+        assert!(validate(&missing).is_err());
     }
 
     /// New decision claims must fall in the current period's window
@@ -1172,10 +1273,11 @@ mod tests {
         let rotxn = env.read_txn().unwrap();
 
         let maker = Address([9; 20]);
-        let in_window = create_market_with_new_claim_tx(
+        let mut in_window = create_market_with_new_claim_tx(
             maker,
             DecisionId::new(false, 25, 0).unwrap(),
         );
+        pay_listing_fees(&state, &rotxn, &mut in_window);
         MarketValidator::validate_market_creation(
             &state, &rotxn, &in_window, None,
         )

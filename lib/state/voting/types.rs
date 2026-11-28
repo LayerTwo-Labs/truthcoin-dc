@@ -89,22 +89,16 @@ pub enum VoteValue {
     Binary(bool),
     Scalar(f64),
     Categorical(u16),
-    Abstain,
 }
 
 impl VoteValue {
-    pub fn to_float_opt(&self) -> Option<f64> {
+    pub fn to_float(&self) -> f64 {
         match self {
-            VoteValue::Binary(false) => Some(0.0),
-            VoteValue::Binary(true) => Some(1.0),
-            VoteValue::Scalar(value) => Some(*value),
-            VoteValue::Categorical(idx) => Some(*idx as f64),
-            VoteValue::Abstain => None,
+            VoteValue::Binary(false) => 0.0,
+            VoteValue::Binary(true) => 1.0,
+            VoteValue::Scalar(value) => *value,
+            VoteValue::Categorical(idx) => f64::from(*idx),
         }
-    }
-
-    pub fn is_abstain(&self) -> bool {
-        matches!(self, VoteValue::Abstain)
     }
 
     pub fn binary(value: bool) -> Self {
@@ -117,10 +111,6 @@ impl VoteValue {
 
     pub fn categorical(index: u16) -> Self {
         VoteValue::Categorical(index)
-    }
-
-    pub fn abstain() -> Self {
-        VoteValue::Abstain
     }
 }
 
@@ -365,8 +355,8 @@ impl VoteMatrixEntry {
         }
     }
 
-    pub fn to_float_opt(&self) -> Option<f64> {
-        self.value.to_float_opt()
+    pub fn to_float(&self) -> f64 {
+        self.value.to_float()
     }
 }
 
@@ -517,7 +507,7 @@ impl ConsensusResult {
         self.decision_resolutions.len()
     }
 
-    pub fn abstained_decision_count(&self) -> usize {
+    pub fn unresolved_decision_count(&self) -> usize {
         self.total_decision_count
             .saturating_sub(self.decision_resolutions.len())
     }
@@ -540,19 +530,10 @@ mod tests {
 
     #[test]
     fn test_vote_value() {
-        let binary_true = VoteValue::binary(true);
-        assert_eq!(binary_true.to_float_opt(), Some(1.0));
-        assert!(!binary_true.is_abstain());
-
-        let binary_false = VoteValue::binary(false);
-        assert_eq!(binary_false.to_float_opt(), Some(0.0));
-
-        let scalar = VoteValue::scalar(0.75);
-        assert_eq!(scalar.to_float_opt(), Some(0.75));
-
-        let abstain = VoteValue::abstain();
-        assert!(abstain.is_abstain());
-        assert_eq!(abstain.to_float_opt(), None);
+        assert_eq!(VoteValue::binary(true).to_float(), 1.0);
+        assert_eq!(VoteValue::binary(false).to_float(), 0.0);
+        assert_eq!(VoteValue::scalar(0.75).to_float(), 0.75);
+        assert_eq!(VoteValue::categorical(2).to_float(), 2.0);
     }
 
     #[test]
@@ -604,13 +585,5 @@ mod tests {
 
         assert_eq!(stats.participation_rate(), 0.8);
         assert_eq!(stats.consensus_rate(), 0.8);
-    }
-
-    #[test]
-    fn test_vote_value_to_float_opt() {
-        assert_eq!(VoteValue::binary(true).to_float_opt(), Some(1.0));
-        assert_eq!(VoteValue::binary(false).to_float_opt(), Some(0.0));
-        assert_eq!(VoteValue::scalar(0.75).to_float_opt(), Some(0.75));
-        assert_eq!(VoteValue::abstain().to_float_opt(), None);
     }
 }

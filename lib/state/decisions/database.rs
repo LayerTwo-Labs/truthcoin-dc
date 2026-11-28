@@ -1,11 +1,11 @@
 use crate::math::decisions::NONSTANDARD_SLOTS_PER_PERIOD_MAX;
 use crate::state::Error;
-use crate::types::Txid;
+use crate::types::{OutPoint, Txid};
 use crate::validation::DecisionValidationInterface;
 use fallible_iterator::FallibleIterator;
 use heed::types::SerdeBincode;
 use sneed::{DatabaseUnique, Env, RoTxn, RwTxn};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::pricing::{
     self, GENESIS_P_PERIOD_SATS, PeriodPricing, apply_reprice_with_floor,
@@ -40,11 +40,13 @@ pub struct Dbs {
         SerdeBincode<u32>,
         SerdeBincode<Vec<PeriodPricingUndoEntry>>,
     >,
+    /// The UTXO pooling the listing fees paid for each period's decisions
+    listing_pools: DatabaseUnique<SerdeBincode<u32>, SerdeBincode<OutPoint>>,
     config: DecisionConfig,
 }
 
 impl Dbs {
-    pub const NUM_DBS: u32 = 6;
+    pub const NUM_DBS: u32 = 7;
 
     fn get_claimed_decision_ids_for_period(
         &self,
@@ -137,8 +139,35 @@ impl Dbs {
                 rwtxn,
                 "period_pricing_undo",
             )?,
+            listing_pools: DatabaseUnique::create(env, rwtxn, "listing_pools")?,
             config,
         })
+    }
+
+    /// The UTXO pooling the listing fees of `period`
+    pub fn get_listing_pool(
+        &self,
+        rotxn: &RoTxn,
+        period: u32,
+    ) -> Result<Option<OutPoint>, Error> {
+        Ok(self.listing_pools.try_get(rotxn, &period)?)
+    }
+
+    pub fn set_listing_pool(
+        &self,
+        rwtxn: &mut RwTxn,
+        period: u32,
+        pool: Option<OutPoint>,
+    ) -> Result<(), Error> {
+        match pool {
+            Some(outpoint) => {
+                self.listing_pools.put(rwtxn, &period, &outpoint)?
+            }
+            None => {
+                self.listing_pools.delete(rwtxn, &period)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn get_current_period(
@@ -587,17 +616,20 @@ impl Dbs {
         Ok(result)
     }
 
-    /// Voting periods with decisions that are voting or revealing
+    /// Voting periods with decisions that are voting or revealing, each
+    /// mapped to whether any of its decisions is in its reveal window
     pub fn get_open_voting_periods(
         &self,
         rotxn: &RoTxn,
-    ) -> Result<BTreeSet<u32>, Error> {
-        Ok(self
-            .open_decision_states(rotxn)?
-            .into_iter()
-            .filter(|(_, state)| state.allows_voting() || state.allows_reveal())
-            .map(|(decision_id, _)| decision_id.voting_period())
-            .collect())
+    ) -> Result<BTreeMap<u32, bool>, Error> {
+        let mut periods = BTreeMap::new();
+        for (decision_id, state) in self.open_decision_states(rotxn)? {
+            if state.allows_voting() || state.allows_reveal() {
+                *periods.entry(decision_id.voting_period()).or_insert(false) |=
+                    state.allows_reveal();
+            }
+        }
+        Ok(periods)
     }
 
     pub fn get_claimed_decisions_needing_voting(

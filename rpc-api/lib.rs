@@ -780,27 +780,30 @@ pub mod wallet {
             fee_sats: u64,
         ) -> RpcResult<bitcoin::Txid>;
 
-        /// Create a tx that transfers funds to the specified address
+        /// Create a tx that transfers funds to the specified address, paying
+        /// `fee_rate` sat/byte (default 1)
         #[method(name = "create_transfer")]
         async fn create_transfer(
             &self,
             dest: Address,
             value_sats: u64,
-            fee_sats: u64,
+            fee_rate: Option<u64>,
         ) -> RpcResult<Txid>;
 
         /// Create a tx that transfers funds to each address in `dests`,
         /// which maps an address to a value in sats. The outputs come in
-        /// address order, and the change output comes last.
+        /// address order, and the change output comes last. The tx pays
+        /// `fee_rate` sat/byte (default 1).
         #[method(name = "create_transfer_many")]
         async fn create_transfer_many(
             &self,
             dests: TransferDests,
-            fee_sats: u64,
+            fee_rate: Option<u64>,
         ) -> RpcResult<Txid>;
 
         /// Creates a tx that initiates a withdrawal to the specified mainchain
-        /// address
+        /// address. The tx pays `fee_rate` sat/byte (default 1) on the
+        /// sidechain, and `mainchain_fee_sats` on the mainchain.
         #[method(name = "create_withdrawal")]
         async fn create_withdrawal(
             &self,
@@ -811,7 +814,7 @@ pub mod wallet {
                 bitcoin::address::NetworkUnchecked,
             >,
             amount_sats: u64,
-            fee_sats: u64,
+            fee_rate: Option<u64>,
             mainchain_fee_sats: u64,
         ) -> RpcResult<Txid>;
 
@@ -948,13 +951,14 @@ pub mod wallet {
 
         /// Transfer votecoin to the specified address, from `sender` or else
         /// the one wallet address that holds votecoin. The sender pays the
-        /// fee from its own coins, or from any wallet coin if it has none.
+        /// fee, at `fee_rate` sat/byte (default 1), from its own coins, or
+        /// from any wallet coin if it has none.
         #[method(name = "transfer_votecoin")]
         async fn transfer_votecoin(
             &self,
             dest: Address,
             amount: Votecoin,
-            fee_sats: u64,
+            fee_rate: Option<u64>,
             sender: Option<Address>,
         ) -> RpcResult<Txid>;
 
@@ -972,21 +976,23 @@ pub mod wallet {
         ) -> RpcResult<OfferId>;
 
         /// Take an offer from the board: pay its price and receive its
-        /// votecoin at `buyer`, or else at a new wallet address
+        /// votecoin at `buyer`, or else at a new wallet address. The tx pays
+        /// `fee_rate` sat/byte (default 1).
         #[method(name = "take_offer")]
         async fn take_offer(
             &self,
             offer_id: OfferId,
-            fee_sats: u64,
+            fee_rate: Option<u64>,
             buyer: Option<Address>,
         ) -> RpcResult<Txid>;
 
-        /// Cancel an offer of a wallet address before it expires
+        /// Cancel an offer of a wallet address before it expires, paying
+        /// `fee_rate` sat/byte (default 1)
         #[method(name = "cancel_offer")]
         async fn cancel_offer(
             &self,
             offer_id: OfferId,
-            fee_sats: u64,
+            fee_rate: Option<u64>,
         ) -> RpcResult<Txid>;
 
         /// Claim one or more decisions.
@@ -1043,7 +1049,7 @@ pub mod wallet {
         ) -> RpcResult<String>;
 
         /// Seal the voter's one ballot for a period, voting on every
-        /// decision in it. The fee defaults to the minimum for its size.
+        /// decision in it, paying `fee_rate` sat/byte (default 1).
         /// The voter is `voter`, or else the one wallet address that holds
         /// votecoin.
         #[open_api_method(output_schema(ToSchema = "String"))]
@@ -1051,18 +1057,18 @@ pub mod wallet {
         async fn vote_submit(
             &self,
             votes: Vec<BallotItem>,
-            fee_sats: Option<u64>,
+            fee_rate: Option<u64>,
             voter: Option<Address>,
         ) -> RpcResult<String>;
 
         /// Reveal the voter's sealed ballot for a period once its voting
-        /// closes. The fee defaults to the minimum for its size.
+        /// closes, paying `fee_rate` sat/byte (default 1).
         #[open_api_method(output_schema(ToSchema = "String"))]
         #[method(name = "vote_reveal")]
         async fn vote_reveal(
             &self,
             voting_period: u32,
-            fee_sats: Option<u64>,
+            fee_rate: Option<u64>,
             voter: Option<Address>,
         ) -> RpcResult<String>;
 

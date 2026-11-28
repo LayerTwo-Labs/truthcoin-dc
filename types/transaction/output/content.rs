@@ -17,6 +17,10 @@ enum DefaultRepr {
         amount: bitcoin::Amount,
         is_fee: bool,
     },
+    ListingFees {
+        period: u32,
+        amount: bitcoin::Amount,
+    },
 }
 
 /// Human-readable representation for Serde
@@ -43,6 +47,12 @@ enum HumanReadableRepr {
         #[schema(value_type = u64)]
         amount: bitcoin::Amount,
         is_fee: bool,
+    },
+    ListingFees {
+        period: u32,
+        #[serde(with = "bitcoin::amount::serde::as_sat")]
+        #[schema(value_type = u64)]
+        amount: bitcoin::Amount,
     },
 }
 
@@ -73,6 +83,12 @@ pub enum Content {
         amount: bitcoin::Amount,
         is_fee: bool,
     },
+    /// Decision listing fees paid into the pool of a decision period
+    ListingFees {
+        period: u32,
+        #[borsh(serialize_with = "util::borsh::serialize::bitcoin_amount")]
+        amount: bitcoin::Amount,
+    },
 }
 
 impl Content {
@@ -91,6 +107,9 @@ impl Content {
     pub fn is_market_author_fee(&self) -> bool {
         matches!(self, Self::MarketFunds { is_fee: true, .. })
     }
+    pub fn is_listing_fees(&self) -> bool {
+        matches!(self, Self::ListingFees { .. })
+    }
 }
 
 impl GetValue for Content {
@@ -104,7 +123,8 @@ impl GetValue for Content {
             Self::Withdrawal {
                 value, main_fee, ..
             } => value.checked_add(*main_fee).unwrap_or(bitcoin::Amount::MAX),
-            Self::MarketFunds { amount, .. } => *amount,
+            Self::MarketFunds { amount, .. }
+            | Self::ListingFees { amount, .. } => *amount,
         }
     }
 }
@@ -131,6 +151,9 @@ impl From<Content> for DefaultRepr {
                 amount,
                 is_fee,
             },
+            Content::ListingFees { period, amount } => {
+                Self::ListingFees { period, amount }
+            }
         }
     }
 }
@@ -157,6 +180,9 @@ impl From<Content> for HumanReadableRepr {
                 amount,
                 is_fee,
             },
+            Content::ListingFees { period, amount } => {
+                Self::ListingFees { period, amount }
+            }
         }
     }
 }
@@ -183,6 +209,9 @@ impl From<DefaultRepr> for Content {
                 amount,
                 is_fee,
             },
+            DefaultRepr::ListingFees { period, amount } => {
+                Self::ListingFees { period, amount }
+            }
         }
     }
 }
@@ -209,6 +238,9 @@ impl From<HumanReadableRepr> for Content {
                 amount,
                 is_fee,
             },
+            HumanReadableRepr::ListingFees { period, amount } => {
+                Self::ListingFees { period, amount }
+            }
         }
     }
 }

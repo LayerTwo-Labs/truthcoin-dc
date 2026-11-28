@@ -33,7 +33,6 @@ use crate::{
 const DEPOSIT_AMOUNT: Amount = Amount::from_sat(21_000_000);
 const DEPOSIT_FEE: Amount = Amount::from_sat(1_000_000);
 const TRANSFER_VALUES: [u64; 3] = [1_000_000, 2_000_000, 3_000_000];
-const TRANSFER_FEE: u64 = 1_000;
 
 /// Initial setup for the test
 async fn setup(
@@ -86,7 +85,7 @@ async fn transfer_many_task(
     }
     let txid = sidechain
         .rpc_client
-        .create_transfer_many(TransferDests(dests.clone()), TRANSFER_FEE)
+        .create_transfer_many(TransferDests(dests.clone()), None)
         .await?;
     tracing::info!(%txid, "Created a transfer to {} addresses", dests.len());
 

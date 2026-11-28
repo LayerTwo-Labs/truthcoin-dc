@@ -72,66 +72,25 @@ pub(crate) fn check_ballot_conflicts(
     }
 }
 
-pub const MIN_BALLOT_FEERATE_SATS_PER_BYTE: u64 = 1;
-
-/// Minimum fee of a ballot commit or reveal, by the serialized size of its
-/// inputs, outputs and data. The utreexo proof is left out, because the node
-/// regenerates it as the chain grows.
-pub fn min_ballot_fee(
-    transaction: &crate::types::Transaction,
-) -> Result<bitcoin::Amount, bincode::Error> {
-    let size = bincode::serialized_size(&(
-        &transaction.inputs,
-        &transaction.outputs,
-        &transaction.data,
-    ))?;
-    Ok(bitcoin::Amount::from_sat(
-        size * MIN_BALLOT_FEERATE_SATS_PER_BYTE,
-    ))
-}
-
-fn validate_ballot_fee(filled_tx: &FilledTransaction) -> Result<(), Error> {
-    let fee = super::tx_fee(filled_tx)?;
-    let min_fee = min_ballot_fee(&filled_tx.transaction)
-        .map_err(Error::BincodeSerialize)?;
-    if fee < min_fee {
-        return Err(Error::InvalidTransaction {
-            reason: format!("Ballot fee {fee} is below the minimum {min_fee}"),
-        });
-    }
-    Ok(())
-}
-
 pub struct VoteValidator;
 
 impl VoteValidator {
     pub fn convert_vote_value(
-        vote_value: Option<f64>,
+        vote_value: f64,
+        decision: &crate::state::decisions::Decision,
     ) -> crate::state::voting::types::VoteValue {
-        Self::convert_vote_value_with_decision(vote_value, None)
-    }
-
-    pub fn convert_vote_value_with_decision(
-        vote_value: Option<f64>,
-        decision: Option<&crate::state::decisions::Decision>,
-    ) -> crate::state::voting::types::VoteValue {
+        use crate::state::decisions::DecisionType;
         use crate::state::voting::types::VoteValue;
-
-        let Some(vote_value) = vote_value else {
-            return VoteValue::Abstain;
-        };
-
-        if let Some(d) = decision
-            && d.is_categorical()
-        {
-            let idx = vote_value.round() as u16;
-            return VoteValue::Categorical(idx);
-        }
-
-        if vote_value == 0.0 || vote_value == 1.0 {
-            VoteValue::Binary(vote_value == 1.0)
-        } else {
-            VoteValue::Scalar(vote_value)
+        match &decision.decision_type {
+            DecisionType::Category { .. } => {
+                VoteValue::Categorical(vote_value as u16)
+            }
+            DecisionType::Binary if vote_value == 0.0 || vote_value == 1.0 => {
+                VoteValue::Binary(vote_value == 1.0)
+            }
+            DecisionType::Binary | DecisionType::Scaled { .. } => {
+                VoteValue::Scalar(vote_value)
+            }
         }
     }
 
@@ -169,45 +128,6 @@ impl VoteValidator {
         })?;
 
         Ok(decision)
-    }
-
-    fn validate_vote_value(
-        decision: &crate::state::decisions::Decision,
-        vote_value: f64,
-    ) -> Result<(), Error> {
-        if vote_value.is_nan() {
-            return Err(Error::InvalidTransaction {
-                reason: "Vote value is NaN; omit the value to abstain"
-                    .to_string(),
-            });
-        }
-
-        if decision.is_categorical() {
-            let max_idx = decision.option_count().unwrap_or(0) as f64;
-            let idx = vote_value as usize;
-            let is_integer_in_range = vote_value >= 0.0
-                && vote_value == (idx as f64)
-                && vote_value <= max_idx;
-            if !is_integer_in_range {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Categorical vote value {vote_value} must be an integer \
-                         index in 0..={max_idx} (where {max_idx} = Inconclusive)"
-                    ),
-                });
-            }
-            return Ok(());
-        }
-
-        if !(0.0..=1.0).contains(&vote_value) {
-            return Err(Error::InvalidTransaction {
-                reason: format!(
-                    "Vote value {vote_value} outside valid normalized range [0.0, 1.0]"
-                ),
-            });
-        }
-
-        Ok(())
     }
 
     pub(crate) fn validate_actor_identity(
@@ -306,7 +226,19 @@ impl VoteValidator {
         rotxn: &RoTxn,
         addresses: &[crate::types::Address],
     ) -> Result<(), Error> {
-        for period in state.decisions().get_open_voting_periods(rotxn)? {
+        let open_periods = state.decisions().get_open_voting_periods(rotxn)?;
+        if let Some(period) = open_periods
+            .iter()
+            .find_map(|(&period, &revealing)| revealing.then_some(period))
+        {
+            return Err(Error::InvalidTransaction {
+                reason: format!(
+                    "Reputation is locked for everyone while period {period} \
+                     is revealing"
+                ),
+            });
+        }
+        for &period in open_periods.keys() {
             let period_id =
                 crate::state::voting::types::VotingPeriodId::new(period);
             for &address in addresses {
@@ -369,7 +301,6 @@ impl VoteValidator {
 
         Self::validate_actor_identity(filled_tx, ballot.voter)?;
         Self::validate_voter_eligibility(state, rotxn, &ballot.voter)?;
-        validate_ballot_fee(filled_tx)?;
 
         if Self::period_decisions_in_state(
             state,
@@ -421,8 +352,8 @@ impl VoteValidator {
         Ok(())
     }
 
-    /// The ballot votes at most once on each decision of `expected`, with a
-    /// valid value or an abstain, and on every standard decision of it
+    /// The ballot votes at most once on each decision of `expected`, always
+    /// with a valid value, and on every standard decision of it
     fn validate_ballot_votes(
         state: &crate::state::State,
         rotxn: &RoTxn,
@@ -452,11 +383,9 @@ impl VoteValidator {
                     ),
                 });
             }
-            if let Some(vote_value) = vote_item.vote_value {
-                let decision =
-                    Self::validate_decision_entry(state, rotxn, decision_id)?;
-                Self::validate_vote_value(&decision, vote_value)?;
-            }
+            let decision =
+                Self::validate_decision_entry(state, rotxn, decision_id)?;
+            decision.validate_normalized(vote_item.vote_value)?;
         }
         if let Some(missing) = expected
             .iter()
@@ -518,7 +447,6 @@ impl VoteValidator {
         })?;
 
         Self::validate_actor_identity(filled_tx, reveal.voter)?;
-        validate_ballot_fee(filled_tx)?;
 
         let revealing = Self::period_decisions_in_state(
             state,
@@ -588,37 +516,52 @@ mod tests {
     use super::*;
     use crate::state::voting::types::VoteValue;
 
-    /// A missing vote value converts to an abstention
+    /// Binary 0 and 1 convert to binary votes, 0.5 to a scalar vote
     #[test]
-    fn convert_none() {
-        assert_eq!(VoteValidator::convert_vote_value(None), VoteValue::Abstain);
+    fn convert_binary() {
+        use crate::state::decisions::{Decision, DecisionType};
+        let decision = Decision::new(
+            [0u8; 20],
+            DecisionType::Binary,
+            "Test".into(),
+            String::new(),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let convert =
+            |value| VoteValidator::convert_vote_value(value, &decision);
+        assert_eq!(convert(0.0), VoteValue::Binary(false));
+        assert_eq!(convert(1.0), VoteValue::Binary(true));
+        assert_eq!(convert(0.5), VoteValue::Scalar(0.5));
     }
 
-    /// 0.0 converts to a binary false vote
+    /// A scaled vote at either end of its range stays a scaled vote
     #[test]
-    fn convert_zero() {
-        assert_eq!(
-            VoteValidator::convert_vote_value(Some(0.0)),
-            VoteValue::Binary(false)
-        );
-    }
+    fn convert_scaled_ends() {
+        use crate::state::decisions::{Decision, DecisionType};
 
-    /// 1.0 converts to a binary true vote
-    #[test]
-    fn convert_one() {
-        assert_eq!(
-            VoteValidator::convert_vote_value(Some(1.0)),
-            VoteValue::Binary(true)
-        );
-    }
-
-    /// A fractional value converts to a scalar vote
-    #[test]
-    fn convert_fractional() {
-        assert_eq!(
-            VoteValidator::convert_vote_value(Some(0.5)),
-            VoteValue::Scalar(0.5)
-        );
+        let decision = Decision::new(
+            [0u8; 20],
+            DecisionType::Scaled {
+                min: 0.0,
+                max: 5.0,
+                increment: 1.0,
+            },
+            "Test".into(),
+            String::new(),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        for value in [0.0, 1.0] {
+            assert_eq!(
+                VoteValidator::convert_vote_value(value, &decision),
+                VoteValue::Scalar(value)
+            );
+        }
     }
 
     #[test]
@@ -639,75 +582,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            VoteValidator::convert_vote_value_with_decision(
-                Some(2.0),
-                Some(&decision)
-            ),
+            VoteValidator::convert_vote_value(2.0, &decision),
             VoteValue::Categorical(2)
         );
-    }
-
-    #[test]
-    fn vote_value_in_range_ok() {
-        use crate::state::decisions::{Decision, DecisionType};
-
-        let d = Decision::new(
-            [0u8; 20],
-            DecisionType::Binary,
-            "T".into(),
-            String::new(),
-            None,
-            None,
-            vec![],
-        )
-        .unwrap();
-
-        assert!(VoteValidator::validate_vote_value(&d, 0.0).is_ok());
-        assert!(VoteValidator::validate_vote_value(&d, 0.5).is_ok());
-        assert!(VoteValidator::validate_vote_value(&d, 1.0).is_ok());
-    }
-
-    #[test]
-    fn vote_value_out_of_range_err() {
-        use crate::state::decisions::{Decision, DecisionType};
-
-        let d = Decision::new(
-            [0u8; 20],
-            DecisionType::Binary,
-            "T".into(),
-            String::new(),
-            None,
-            None,
-            vec![],
-        )
-        .unwrap();
-
-        assert!(VoteValidator::validate_vote_value(&d, 1.5).is_err());
-        assert!(VoteValidator::validate_vote_value(&d, -0.1).is_err());
-        assert!(VoteValidator::validate_vote_value(&d, f64::NAN).is_err());
-    }
-
-    /// The index past the last option (inconclusive) is a valid vote
-    #[test]
-    fn categorical_inconclusive_ok() {
-        use crate::state::decisions::{Decision, DecisionType};
-
-        let d = Decision::new(
-            [0u8; 20],
-            DecisionType::Category {
-                options: vec!["A".into(), "B".into(), "C".into()],
-            },
-            "T".into(),
-            String::new(),
-            None,
-            None,
-            vec![],
-        )
-        .unwrap();
-
-        assert!(VoteValidator::validate_vote_value(&d, 0.0).is_ok());
-        assert!(VoteValidator::validate_vote_value(&d, 2.0).is_ok());
-        assert!(VoteValidator::validate_vote_value(&d, 3.0).is_ok());
     }
 
     /// Indices at and just below the option limit validate and convert intact
@@ -733,46 +610,17 @@ mod tests {
         let limit = crate::state::decisions::MAX_CATEGORY_OPTIONS as u16;
         for index in [limit - 1, limit] {
             let value = f64::from(index);
-            assert!(
-                VoteValidator::validate_vote_value(&decision, value).is_ok()
-            );
+            assert!(decision.validate_normalized(value).is_ok());
             assert_eq!(
-                VoteValidator::convert_vote_value_with_decision(
-                    Some(value),
-                    Some(&decision),
-                ),
+                VoteValidator::convert_vote_value(value, &decision),
                 VoteValue::Categorical(index),
             );
         }
         assert!(
-            VoteValidator::validate_vote_value(
-                &decision,
-                f64::from(limit) + 1.0
-            )
-            .is_err()
+            decision
+                .validate_normalized(f64::from(limit) + 1.0)
+                .is_err()
         );
-    }
-
-    #[test]
-    fn categorical_out_of_range_err() {
-        use crate::state::decisions::{Decision, DecisionType};
-
-        let d = Decision::new(
-            [0u8; 20],
-            DecisionType::Category {
-                options: vec!["A".into(), "B".into(), "C".into()],
-            },
-            "T".into(),
-            String::new(),
-            None,
-            None,
-            vec![],
-        )
-        .unwrap();
-
-        assert!(VoteValidator::validate_vote_value(&d, 4.0).is_err());
-        assert!(VoteValidator::validate_vote_value(&d, -1.0).is_err());
-        assert!(VoteValidator::validate_vote_value(&d, 1.5).is_err());
     }
 
     /// Debits the sender, credits the receiver, refuses overdraft and overflow
@@ -938,7 +786,7 @@ mod tests {
         fn item(
             &self,
             idx: usize,
-            vote_value: Option<f64>,
+            vote_value: f64,
         ) -> crate::types::BallotItem {
             crate::types::BallotItem {
                 decision_id_bytes: self.decision_ids[idx].as_bytes(),
@@ -981,10 +829,7 @@ mod tests {
         }
     }
 
-    fn reveal_tx_with_fee(
-        reveal: &crate::types::RevealBallot,
-        fee_sats: u64,
-    ) -> FilledTransaction {
+    fn reveal_tx(reveal: &crate::types::RevealBallot) -> FilledTransaction {
         filled_tx(
             reveal.voter,
             crate::types::TransactionData::RevealBallot {
@@ -993,16 +838,8 @@ mod tests {
                 votes: reveal.votes.clone(),
                 salt: reveal.salt,
             },
-            fee_sats,
+            FEE_SATS,
         )
-    }
-
-    fn reveal_tx(reveal: &crate::types::RevealBallot) -> FilledTransaction {
-        reveal_tx_with_fee(reveal, FEE_SATS)
-    }
-
-    fn min_fee_sats(tx: &FilledTransaction) -> u64 {
-        super::min_ballot_fee(&tx.transaction).unwrap().to_sat()
     }
 
     #[test]
@@ -1034,47 +871,11 @@ mod tests {
         );
     }
 
-    /// Seal and reveal txs must pay the minimum fee for their size
-    #[test]
-    fn ballot_minimum_fee() {
-        let f = voting_fixture();
-        let min_seal_fee = min_fee_sats(&f.submit(FEE_SATS));
-        let validate_seal = |fee_sats| {
-            let rotxn = f.env.read_txn().unwrap();
-            VoteValidator::validate_ballot(
-                &f.state,
-                &rotxn,
-                &f.submit(fee_sats),
-                None,
-            )
-        };
-        assert!(min_seal_fee > 0);
-        assert!(validate_seal(min_seal_fee - 1).is_err());
-        validate_seal(min_seal_fee).unwrap();
-
-        let reveal = f.reveal(vec![f.item(0, Some(1.0)), f.item(1, None)]);
-        f.seal(reveal.commitment(), false);
-        f.close_voting();
-        let min_reveal_fee = min_fee_sats(&reveal_tx(&reveal));
-        let validate_reveal = |fee_sats| {
-            let rotxn = f.env.read_txn().unwrap();
-            VoteValidator::validate_reveal(
-                &f.state,
-                &rotxn,
-                &reveal_tx_with_fee(&reveal, fee_sats),
-                None,
-            )
-        };
-        assert!(min_reveal_fee > min_seal_fee);
-        assert!(validate_reveal(min_reveal_fee - 1).is_err());
-        validate_reveal(min_reveal_fee).unwrap();
-    }
-
     /// A reveal is only valid once voting has closed
     #[test]
     fn reveal_after_voting() {
         let f = voting_fixture();
-        let reveal = f.reveal(vec![f.item(0, Some(1.0)), f.item(1, None)]);
+        let reveal = f.reveal(vec![f.item(0, 1.0), f.item(1, 0.5)]);
         f.seal(reveal.commitment(), false);
         let validate = || {
             let rotxn = f.env.read_txn().unwrap();
@@ -1095,7 +896,7 @@ mod tests {
     #[test]
     fn reveal_opens_seal() {
         let f = voting_fixture();
-        let reveal = f.reveal(vec![f.item(0, Some(1.0)), f.item(1, Some(0.0))]);
+        let reveal = f.reveal(vec![f.item(0, 1.0), f.item(1, 0.0)]);
         f.close_voting();
         let validate = |reveal: &crate::types::RevealBallot| {
             let rotxn = f.env.read_txn().unwrap();
@@ -1115,7 +916,7 @@ mod tests {
         };
         assert!(validate(&forged).is_err());
         let flipped = crate::types::RevealBallot {
-            votes: vec![f.item(0, Some(0.0)), f.item(1, Some(0.0))],
+            votes: vec![f.item(0, 0.0), f.item(1, 0.0)],
             ..reveal.clone()
         };
         assert!(validate(&flipped).is_err());
@@ -1139,20 +940,15 @@ mod tests {
             )
         };
 
-        prepare(vec![f.item(0, Some(1.0)), f.item(1, None)]).unwrap();
-        prepare(vec![
-            f.item(0, Some(1.0)),
-            f.item(1, None),
-            f.item(2, Some(0.0)),
-        ])
-        .unwrap();
-        assert!(prepare(vec![f.item(0, Some(1.0)), f.item(2, None)]).is_err());
+        prepare(vec![f.item(0, 1.0), f.item(1, 0.5)]).unwrap();
+        prepare(vec![f.item(0, 1.0), f.item(1, 0.5), f.item(2, 0.0)]).unwrap();
+        assert!(prepare(vec![f.item(0, 1.0), f.item(2, 0.0)]).is_err());
         assert!(
             prepare(vec![
-                f.item(0, Some(1.0)),
-                f.item(1, None),
-                f.item(2, None),
-                f.item(2, None),
+                f.item(0, 1.0),
+                f.item(1, 0.5),
+                f.item(2, 0.0),
+                f.item(2, 0.0),
             ])
             .is_err()
         );
@@ -1175,14 +971,10 @@ mod tests {
             )
         };
 
-        assert!(validate(vec![f.item(0, Some(1.0))]).is_err());
-        assert!(
-            validate(vec![f.item(0, Some(1.0)), f.item(0, Some(1.0))]).is_err()
-        );
-        assert!(
-            validate(vec![f.item(0, Some(1.5)), f.item(1, Some(1.0))]).is_err()
-        );
-        validate(vec![f.item(0, None), f.item(1, None)]).unwrap();
+        assert!(validate(vec![f.item(0, 1.0)]).is_err());
+        assert!(validate(vec![f.item(0, 1.0), f.item(0, 1.0)]).is_err());
+        assert!(validate(vec![f.item(0, 1.5), f.item(1, 1.0)]).is_err());
+        validate(vec![f.item(0, 0.5), f.item(1, 1.0)]).unwrap();
     }
 
     /// prepare_ballot applies the reveal rules and refuses a sealed voter
@@ -1199,14 +991,12 @@ mod tests {
                 &votes,
             )
         };
-        let full = || vec![f.item(0, Some(1.0)), f.item(1, None)];
+        let full = || vec![f.item(0, 1.0), f.item(1, 0.5)];
 
         prepare(full()).unwrap();
-        assert!(prepare(vec![f.item(0, Some(1.0))]).is_err());
-        assert!(
-            prepare(vec![f.item(0, Some(f64::NAN)), f.item(1, None)]).is_err()
-        );
-        assert!(prepare(vec![f.item(0, Some(1.5)), f.item(1, None)]).is_err());
+        assert!(prepare(vec![f.item(0, 1.0)]).is_err());
+        assert!(prepare(vec![f.item(0, f64::NAN), f.item(1, 0.5)]).is_err());
+        assert!(prepare(vec![f.item(0, 1.5), f.item(1, 0.5)]).is_err());
 
         f.seal([1; 32], false);
         assert!(prepare(full()).is_err());

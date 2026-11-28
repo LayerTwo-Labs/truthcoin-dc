@@ -9,7 +9,9 @@ use truthcoin_dc::wallet::CreateMarketInput;
 use truthcoin_dc_app_rpc_api::markets::PeriodPricingSummary;
 
 use crate::app::App;
-use crate::rpc_server::{SlotRequest, allocate_decision_slots};
+use crate::rpc_server::{
+    SlotRequest, allocate_decision_slots, listing_fees_by_period,
+};
 
 const DEFAULT_LIQUIDITY_SATS: u64 = 10_000;
 
@@ -611,10 +613,13 @@ impl CreateMarket {
             })
             .collect();
 
-        let total_listing_fee: u64 = allocated
-            .iter()
-            .try_fold(0u64, |acc, slot| acc.checked_add(slot.listing_fee_sats))
-            .unwrap_or(u64::MAX);
+        let listing_fees = match listing_fees_by_period(&allocated) {
+            Ok(listing_fees) => listing_fees,
+            Err(e) => {
+                self.error = Some(format!("Invalid listing fees: {e}"));
+                return;
+            }
+        };
 
         let (pow_selector, pow_ordering, pow_difficulty) = if self
             .tx_pow_enabled
@@ -685,10 +690,6 @@ impl CreateMarket {
             new_claims,
         };
 
-        let tx_fee = bitcoin::Amount::from_sat(
-            1000u64.saturating_add(total_listing_fee),
-        );
-
         let options = match app.spend_options() {
             Ok(options) => options,
             Err(err) => {
@@ -697,7 +698,12 @@ impl CreateMarket {
                 return;
             }
         };
-        match app.wallet.create_market(options, input, tx_fee) {
+        match app.wallet.create_market(
+            options,
+            input,
+            &listing_fees,
+            truthcoin_dc::validation::MIN_FEERATE_SATS_PER_BYTE,
+        ) {
             Ok((tx, _market_id)) => {
                 if let Err(e) = app.sign_and_send(tx) {
                     self.error = Some(format!("Failed to send: {e:#}"));

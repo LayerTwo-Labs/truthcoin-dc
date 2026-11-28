@@ -31,7 +31,6 @@ use crate::{
 const DEPOSIT_AMOUNT: Amount = Amount::from_sat(21_000_000);
 const DEPOSIT_FEE: Amount = Amount::from_sat(1_000_000);
 const TRANSFER_AMOUNT: u64 = 1_000_000;
-const TRANSFER_FEE: u64 = 1_000;
 
 /// The block index of each block in the active chain, from genesis to the tip
 async fn block_indexes(
@@ -103,7 +102,7 @@ async fn block_index_task(
     let dest = sidechain.rpc_client.get_new_address().await?;
     let txid = sidechain
         .rpc_client
-        .create_transfer(dest, TRANSFER_AMOUNT, TRANSFER_FEE)
+        .create_transfer(dest, TRANSFER_AMOUNT, None)
         .await?;
     tracing::info!(%txid, "Created a transfer");
 

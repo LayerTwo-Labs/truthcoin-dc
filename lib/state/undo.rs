@@ -95,3 +95,27 @@ pub struct ConsolidationUndoEntry {
     /// Trader change UTXOs created, one per trade (to delete on revert)
     pub trade_change_utxos: Vec<OutPoint>,
 }
+
+/// Undo data for the listing fee pools that a block consolidated or paid out
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ListingPoolUndoData {
+    pub consolidations: Vec<ListingPoolConsolidation>,
+    pub payouts: Vec<ListingPoolPayout>,
+}
+
+/// A period's listing fee outputs and old pool, merged into a new pool
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListingPoolConsolidation {
+    pub period: u32,
+    pub consumed: Vec<(OutPoint, Output)>,
+    pub old_pool: Option<OutPoint>,
+    pub new_pool: OutPoint,
+}
+
+/// A period's pool, paid out to the reputation holders
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ListingPoolPayout {
+    pub period: u32,
+    pub pool: (OutPoint, Output),
+    pub payouts: Vec<OutPoint>,
+}

@@ -149,7 +149,8 @@ fn scan_wallet_addresses(
                 OutPoint::Regular { .. }
                 | OutPoint::MarketFunds { .. }
                 | OutPoint::Payout { .. }
-                | OutPoint::UnsuccessfulWithdrawal { .. } => (),
+                | OutPoint::UnsuccessfulWithdrawal { .. }
+                | OutPoint::ListingFees { .. } => (),
             }
         }
     }

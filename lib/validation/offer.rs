@@ -43,6 +43,19 @@ impl OfferValidator {
         rotxn: &RoTxn,
         signed_offer: &SignedOffer,
     ) -> Result<(), Error> {
+        Self::validate_offer_terms(state, rotxn, signed_offer)?;
+        VoteValidator::ensure_reputation_unlocked(
+            state,
+            rotxn,
+            &[signed_offer.offer.seller],
+        )
+    }
+
+    fn validate_offer_terms(
+        state: &State,
+        rotxn: &RoTxn,
+        signed_offer: &SignedOffer,
+    ) -> Result<(), Error> {
         let offer = &signed_offer.offer;
         if !signed_offer.is_signed_by_seller() {
             return Err(Self::invalid(format!(
@@ -66,7 +79,7 @@ impl OfferValidator {
                 offer.seller, offer.amount
             )));
         }
-        VoteValidator::ensure_reputation_unlocked(state, rotxn, &[offer.seller])
+        Ok(())
     }
 
     pub fn validate_take_offer(
@@ -79,11 +92,15 @@ impl OfferValidator {
                 Self::invalid("Not a take offer transaction".into())
             })?;
         let offer = &signed_offer.offer;
-        Self::validate_open_offer(state, rotxn, signed_offer)?;
+        Self::validate_offer_terms(state, rotxn, signed_offer)?;
         if buyer == offer.seller {
             return Err(Self::invalid("Seller cannot take own offer".into()));
         }
-        VoteValidator::ensure_reputation_unlocked(state, rotxn, &[buyer])?;
+        VoteValidator::ensure_reputation_unlocked(
+            state,
+            rotxn,
+            &[offer.seller, buyer],
+        )?;
         let paid = filled_tx
             .transaction
             .outputs

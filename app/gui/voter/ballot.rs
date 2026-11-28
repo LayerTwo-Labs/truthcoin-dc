@@ -327,7 +327,7 @@ impl Ballot {
             if row.abstain {
                 items.push(BallotItem {
                     decision_id_bytes: row.decision_id.as_bytes(),
-                    vote_value: None,
+                    vote_value: row.decision.inconclusive_vote(),
                 });
                 continue;
             }
@@ -348,7 +348,7 @@ impl Ballot {
                 };
             items.push(BallotItem {
                 decision_id_bytes: row.decision_id.as_bytes(),
-                vote_value: Some(normalized),
+                vote_value: normalized,
             });
         }
 
@@ -380,7 +380,7 @@ impl Ballot {
             voter,
             items,
             period,
-            None,
+            truthcoin_dc::validation::MIN_FEERATE_SATS_PER_BYTE,
             options,
         ) {
             Ok(tx) => tx,

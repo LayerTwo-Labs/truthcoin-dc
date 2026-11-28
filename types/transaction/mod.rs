@@ -93,10 +93,10 @@ pub struct ShareDelta {
 pub struct BallotItem {
     /// 4 byte decision ID
     pub decision_id_bytes: [u8; 4],
-    /// The vote value (0.0-1.0 for binary, scaled range for scaled decisions),
-    /// or `None` to abstain
-    #[borsh(serialize_with = "crate::util::borsh::serialize::option_f64")]
-    pub vote_value: Option<f64>,
+    /// The normalized vote value: 0.0-1.0 for binary and scaled decisions,
+    /// the option index for categorical ones
+    #[borsh(serialize_with = "crate::util::borsh::serialize::f64")]
+    pub vote_value: f64,
 }
 
 #[derive(
@@ -723,11 +723,11 @@ mod test {
         for value in [0.0, 1.0, -2.5, f64::MAX, f64::INFINITY] {
             let item = BallotItem {
                 decision_id_bytes: [1; 4],
-                vote_value: Some(value),
+                vote_value: value,
             };
             assert_eq!(
                 borsh::to_vec(&item).unwrap(),
-                borsh::to_vec(&([1u8; 4], Some(value))).unwrap(),
+                borsh::to_vec(&([1u8; 4], value)).unwrap(),
             );
         }
         let transaction = Transaction {
@@ -736,13 +736,27 @@ mod test {
                 voting_period: 2,
                 votes: vec![BallotItem {
                     decision_id_bytes: [1; 4],
-                    vote_value: Some(f64::NAN),
+                    vote_value: f64::NAN,
                 }],
                 salt: [0; 32],
             }),
             ..Default::default()
         };
         let _ = transaction.txid();
+        let market = Transaction {
+            data: Some(TxData::CreateMarket {
+                title: String::new(),
+                description: String::new(),
+                dimension_specs: Vec::new(),
+                new_claims: Vec::new(),
+                trading_fee: Some(f64::NAN),
+                tx_pow_hash_selector: None,
+                tx_pow_ordering: None,
+                tx_pow_difficulty: None,
+            }),
+            ..Default::default()
+        };
+        let _ = market.txid();
     }
 
     // a withdrawal output must be funded for both its payout and its mainchain

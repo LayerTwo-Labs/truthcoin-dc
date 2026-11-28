@@ -3,7 +3,12 @@ use crate::state::decisions::DecisionId;
 use crate::types::{Address, ClaimDecisionPayload, FilledTransaction};
 use sneed::RoTxn;
 
-use super::{DecisionValidationInterface, MarketValidator};
+use std::collections::BTreeMap;
+
+use super::{
+    DecisionValidationInterface, MarketValidator, add_listing_fee,
+    validate_listing_outputs,
+};
 
 pub struct DecisionValidator;
 
@@ -52,16 +57,15 @@ impl DecisionValidator {
     }
 
     /// Validate a single claim payload's type constraints and slot
-    /// availability. Returns the total listing fee that this payload owes.
-    /// Caller is responsible for verifying the enclosing tx pays at least
-    /// the summed listing fees.
+    /// availability. Returns the listing fees that this payload owes, by
+    /// decision period.
     pub fn validate_claim_payload<T>(
         decisions_db: &T,
         rotxn: &RoTxn,
         payload: &ClaimDecisionPayload,
         market_maker_address: Address,
         override_height: Option<u32>,
-    ) -> Result<u64, Error>
+    ) -> Result<BTreeMap<u32, u64>, Error>
     where
         T: DecisionValidationInterface,
     {
@@ -182,19 +186,14 @@ impl DecisionValidator {
                 })?;
         }
 
-        let mut total_listing_fee: u64 = 0;
+        let mut listing_fees = BTreeMap::new();
         for entry in &payload.decisions {
             let id = DecisionId::from_bytes(entry.decision_id_bytes)?;
             let fee = decisions_db.fee_for_decision_id(rotxn, id)?;
-            total_listing_fee =
-                total_listing_fee.checked_add(fee).ok_or_else(|| {
-                    Error::InvalidTransaction {
-                        reason: "Listing fee overflow".to_string(),
-                    }
-                })?;
+            add_listing_fee(&mut listing_fees, id.period_index(), fee)?;
         }
 
-        Ok(total_listing_fee)
+        Ok(listing_fees)
     }
 
     pub fn validate_complete_decision_claim<T>(
@@ -214,7 +213,7 @@ impl DecisionValidator {
 
         let market_maker_address = MarketValidator::validate_maker_auth(tx)?;
 
-        let total_listing_fee = Self::validate_claim_payload(
+        let listing_fees = Self::validate_claim_payload(
             decisions_db,
             rotxn,
             payload,
@@ -228,36 +227,42 @@ impl DecisionValidator {
                 DecisionId::from_bytes(entry.decision_id_bytes).ok()
             }),
         )?;
-
-        if total_listing_fee > 0 {
-            let tx_fee = crate::validation::tx_fee(tx)?;
-            if tx_fee.to_sat() < total_listing_fee {
-                return Err(Error::InvalidTransaction {
-                    reason: format!(
-                        "Insufficient listing fee: tx fee is \
-                         {} sats but listing fee requires \
-                         {} sats",
-                        tx_fee.to_sat(),
-                        total_listing_fee
-                    ),
-                });
-            }
-        }
-
-        Ok(())
+        validate_listing_outputs(tx, &listing_fees)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Output, OutputContent};
 
-    fn nonstandard_claim_tx(fee_sats: u64) -> FilledTransaction {
+    const PERIOD: u32 = 2;
+
+    fn pool_output(period: u32, sats: u64) -> Output {
+        Output {
+            address:
+                crate::state::markets::payouts::generate_listing_pool_address(
+                    period,
+                ),
+            content: OutputContent::ListingFees {
+                period,
+                amount: bitcoin::Amount::from_sat(sats),
+            },
+        }
+    }
+
+    /// A non-standard claim in `PERIOD` with `outputs`, funded so that it
+    /// pays `miner_sats` to the miner
+    fn claim_tx(outputs: Vec<Output>, miner_sats: u64) -> FilledTransaction {
         use crate::types::{
-            Address, ClaimDecisionPayload, DecisionClaimEntry, OutPoint,
-            Output, OutputContent, Transaction, TransactionData, Txid,
+            ClaimDecisionPayload, DecisionClaimEntry, GetValue as _, OutPoint,
+            Transaction, TransactionData, Txid,
         };
 
+        let paid: u64 = outputs
+            .iter()
+            .map(|output| output.get_value().to_sat())
+            .sum();
         FilledTransaction {
             transaction: Transaction {
                 inputs: vec![(
@@ -268,14 +273,17 @@ mod tests {
                     [0; 32],
                 )]
                 .into(),
+                outputs: outputs.into(),
                 data: Some(TransactionData::ClaimDecision(
                     ClaimDecisionPayload {
                         decision_type:
                             crate::state::decisions::DecisionType::Binary,
                         decisions: vec![DecisionClaimEntry {
-                            decision_id_bytes: DecisionId::new(false, 2, 0)
-                                .unwrap()
-                                .as_bytes(),
+                            decision_id_bytes: DecisionId::new(
+                                false, PERIOD, 0,
+                            )
+                            .unwrap()
+                            .as_bytes(),
                             header: "decision".to_string(),
                             description: String::new(),
                             option_0_label: None,
@@ -290,27 +298,17 @@ mod tests {
             spent_utxos: vec![Output {
                 address: Address([9; 20]),
                 content: OutputContent::Value(bitcoin::Amount::from_sat(
-                    fee_sats,
+                    paid + miner_sats,
                 )),
             }],
             actor_address: None,
         }
     }
 
-    /// Non-standard claims pay the tier-zero price, floored at the minimum
-    #[test]
-    fn nonstandard_claim_fee() {
-        use crate::math::decisions::{
-            NONSTANDARD_MIN_LISTING_FEE_SATS, nonstandard_listing_fee,
-            slot_price,
-        };
-
-        assert_eq!(
-            nonstandard_listing_fee(0),
-            NONSTANDARD_MIN_LISTING_FEE_SATS
-        );
-        assert_eq!(nonstandard_listing_fee(100_000), slot_price(100_000, 0));
-
+    /// A state with minted genesis periods, and the listing fee of the
+    /// non-standard claim in `PERIOD`
+    fn claim_state() -> (tempfile::TempDir, sneed::Env, crate::state::State, u64)
+    {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = heed::EnvOpenOptions::new();
         opts.map_size(64 * 1024 * 1024)
@@ -329,20 +327,117 @@ mod tests {
         let rotxn = env.read_txn().unwrap();
         let fee = state
             .decisions()
-            .fee_for_decision_id(&rotxn, DecisionId::new(false, 2, 0).unwrap())
-            .unwrap();
-        assert!(fee >= NONSTANDARD_MIN_LISTING_FEE_SATS);
-
-        let validate = |fee_sats| {
-            DecisionValidator::validate_complete_decision_claim(
-                state.decisions(),
+            .fee_for_decision_id(
                 &rotxn,
-                &nonstandard_claim_tx(fee_sats),
-                Some(1),
+                DecisionId::new(false, PERIOD, 0).unwrap(),
             )
+            .unwrap();
+        drop(rotxn);
+        (dir, env, state, fee)
+    }
+
+    fn validate(
+        env: &sneed::Env,
+        state: &crate::state::State,
+        tx: &FilledTransaction,
+    ) -> Result<(), Error> {
+        let rotxn = env.read_txn().unwrap();
+        DecisionValidator::validate_complete_decision_claim(
+            state.decisions(),
+            &rotxn,
+            tx,
+            Some(1),
+        )
+    }
+
+    /// The minimum miner fee of a claim with `outputs`
+    fn floor(outputs: Vec<Output>) -> u64 {
+        crate::validation::min_tx_fee(&claim_tx(outputs, 0).transaction, false)
+            .unwrap()
+            .to_sat()
+    }
+
+    /// Non-standard claims pay the tier-zero price, floored at the minimum
+    #[test]
+    fn nonstandard_claim_fee() {
+        use crate::math::decisions::{
+            NONSTANDARD_MIN_LISTING_FEE_SATS, nonstandard_listing_fee,
+            slot_price,
         };
-        assert!(validate(fee - 1).is_err());
-        validate(fee).unwrap();
+
+        assert_eq!(
+            nonstandard_listing_fee(0),
+            NONSTANDARD_MIN_LISTING_FEE_SATS
+        );
+        assert_eq!(nonstandard_listing_fee(100_000), slot_price(100_000, 0));
+        let (_dir, _env, _state, fee) = claim_state();
+        assert!(fee >= NONSTANDARD_MIN_LISTING_FEE_SATS);
+    }
+
+    /// A claim paying its listing fee to its period's pool and the minimum
+    /// miner fee validates
+    #[test]
+    fn claim_pays_pool() {
+        let (_dir, env, state, fee) = claim_state();
+        let outputs = vec![pool_output(PERIOD, fee)];
+        validate(&env, &state, &claim_tx(outputs.clone(), floor(outputs)))
+            .unwrap();
+    }
+
+    /// A claim paying its listing fee only as miner fee is rejected
+    #[test]
+    fn claim_fee_only() {
+        let (_dir, env, state, fee) = claim_state();
+        let tx = claim_tx(Vec::new(), fee + floor(Vec::new()));
+        assert!(validate(&env, &state, &tx).is_err());
+    }
+
+    /// A pool output one sat short of the listing fee is rejected
+    #[test]
+    fn claim_underpays() {
+        let (_dir, env, state, fee) = claim_state();
+        let outputs = vec![pool_output(PERIOD, fee - 1)];
+        let tx = claim_tx(outputs.clone(), floor(outputs));
+        assert!(validate(&env, &state, &tx).is_err());
+    }
+
+    /// A claim quoted before a price drop overpays its pool and validates
+    #[test]
+    fn claim_overpays() {
+        let (_dir, env, state, fee) = claim_state();
+        let outputs = vec![pool_output(PERIOD, fee + 1)];
+        validate(&env, &state, &claim_tx(outputs.clone(), floor(outputs)))
+            .unwrap();
+    }
+
+    /// Listing fees paid to another period's pool are rejected
+    #[test]
+    fn claim_wrong_period() {
+        let (_dir, env, state, fee) = claim_state();
+        let outputs = vec![pool_output(PERIOD + 1, fee)];
+        let tx = claim_tx(outputs.clone(), floor(outputs));
+        assert!(validate(&env, &state, &tx).is_err());
+    }
+
+    /// A listing fee output that does not pay the pool address is rejected
+    #[test]
+    fn claim_wrong_address() {
+        let (_dir, env, state, fee) = claim_state();
+        let mut output = pool_output(PERIOD, fee);
+        output.address = Address([9; 20]);
+        let outputs = vec![output];
+        let tx = claim_tx(outputs.clone(), floor(outputs));
+        assert!(validate(&env, &state, &tx).is_err());
+    }
+
+    /// The listing fee split across two outputs of one period is rejected
+    #[test]
+    fn claim_split_output() {
+        let (_dir, env, state, fee) = claim_state();
+        let outputs =
+            vec![pool_output(PERIOD, fee - 1), pool_output(PERIOD, 1)];
+        let tx = claim_tx(outputs.clone(), floor(outputs));
+        assert!(validate(&env, &state, &tx).is_err());
     }
 
     #[test]

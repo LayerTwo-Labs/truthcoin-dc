@@ -108,6 +108,10 @@ pub fn show_utxo(ui: &mut egui::Ui, outpoint: &OutPoint, output: &Output) {
         OutPoint::UnsuccessfulWithdrawal { m6id, vout, .. } => {
             ("unsuccessful withdrawal", format!("{m6id}"), *vout)
         }
+        OutPoint::ListingFees {
+            period,
+            block_height,
+        } => ("listing_fees", format!("{period:08}"), *block_height),
     };
     let hash = &hash[0..8];
     let value = output.get_value();

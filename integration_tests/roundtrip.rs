@@ -17,8 +17,8 @@ use futures::{
 use tokio::time::sleep;
 use tracing::Instrument as _;
 use truthcoin_dc::types::{
-    Address, GetAddress as _, GetValue as _, OutputContent, ShareDelta, TxData,
-    Votecoin,
+    Address, GetAddress as _, GetValue as _, OutPoint, OutputContent,
+    ShareDelta, TxData, Votecoin,
     authorization::{Dst, Signature},
 };
 use truthcoin_dc_app_rpc_api::{
@@ -80,7 +80,7 @@ mod expected_costs {
 /// - Binary decisions: weighted_mean + catch_tl(tolerance=0.2)
 ///   - If mean < 0.4 → 0.0 (No)
 ///   - If mean > 0.6 → 1.0 (Yes)
-///   - If 0.4 ≤ mean ≤ 0.6 → 0.5 (Abstain)
+///   - If 0.4 ≤ mean ≤ 0.6 → 0.5 (Inconclusive)
 /// - Scaled decisions: weighted_median (continuous value in [0,1])
 ///
 /// Final Price Calculation (calculate_final_prices):
@@ -532,6 +532,70 @@ impl TruthcoinNodes {
 const DEPOSIT_AMOUNT: bitcoin::Amount = bitcoin::Amount::from_sat(210_000_000);
 const DEPOSIT_FEE: bitcoin::Amount = bitcoin::Amount::from_sat(1_000_000);
 
+/// Sats in the listing fee pool of a decision period
+async fn listing_pool_sats(
+    node: &PostSetup,
+    period: u32,
+) -> anyhow::Result<u64> {
+    Ok(node
+        .rpc_client
+        .list_utxos()
+        .await?
+        .iter()
+        .filter(|utxo| {
+            matches!(
+                utxo.outpoint,
+                OutPoint::ListingFees { period: pool_period, .. }
+                    if pool_period == period
+            )
+        })
+        .map(|utxo| utxo.output.get_value().to_sat())
+        .sum())
+}
+
+/// The sats of the listing fee pool of a decision period and the payouts
+/// made from it, read from the index of the block that paid it out
+async fn listing_payout(
+    node: &PostSetup,
+    period: u32,
+) -> anyhow::Result<(u64, Vec<(Address, u64)>)> {
+    use jsonrpsee::{core::client::ClientT as _, rpc_params};
+    use truthcoin_dc::types::{Block, state::MarketUtxoReason};
+
+    let mut block_hash =
+        node.rpc_client.get_best_sidechain_block_hash().await?;
+    while let Some(hash) = block_hash {
+        let index = node.rpc_client.get_block_index(hash).await?;
+        let payouts: Vec<(Address, u64)> = index
+            .market_creates
+            .iter()
+            .filter(|utxo| utxo.reason == MarketUtxoReason::ListingPayout)
+            .map(|utxo| (utxo.output.address, utxo.output.get_value().to_sat()))
+            .collect();
+        let pool: u64 = index
+            .market_deletes
+            .iter()
+            .filter(|utxo| {
+                matches!(
+                    utxo.outpoint,
+                    OutPoint::ListingFees { period: pool_period, .. }
+                        if pool_period == period
+                )
+            })
+            .map(|utxo| utxo.output.get_value().to_sat())
+            .sum();
+        if !payouts.is_empty() && pool > 0 {
+            return Ok((pool, payouts));
+        }
+        let block: Option<Block> = node
+            .rpc_client
+            .request("get_block", rpc_params![hash, false])
+            .await?;
+        block_hash = block.and_then(|block| block.header.prev_side_hash);
+    }
+    anyhow::bail!("No block paid out the listing fee pool of period {period}")
+}
+
 /// Shares an address holds in each outcome of a market
 async fn market_holdings(
     node: &PostSetup,
@@ -658,7 +722,7 @@ async fn roundtrip_task_inner(
         truthcoin_nodes
             .issuer
             .rpc_client
-            .transfer_votecoin(voter_addr, VOTER_ALLOCATION, 1000, None)
+            .transfer_votecoin(voter_addr, VOTER_ALLOCATION, None, None)
             .await?;
 
         truthcoin_nodes
@@ -953,8 +1017,9 @@ async fn roundtrip_task_inner(
     // all four land in distinct slots in a single block. The market_maker
     // for each decision becomes the issuer's address; the test counts fee
     // UTXOs per market_id, not per owner, so this is invariant-preserving.
+    let mut listing_fees_paid = 0;
     for (_voter_addr, _decision_index, header) in &decision_claims {
-        truthcoin_nodes
+        listing_fees_paid += truthcoin_nodes
             .issuer
             .rpc_client
             .decision_claim(DecisionClaimRequest {
@@ -971,10 +1036,11 @@ async fn roundtrip_task_inner(
                 min: None,
                 max: None,
                 increment: None,
-                tx_fee_sats: 1_000,
+                fee_rate: None,
                 max_listing_fee_sats: None,
             })
-            .await?;
+            .await?
+            .listing_fee_paid_sats;
     }
 
     sleep(std::time::Duration::from_millis(500)).await;
@@ -991,6 +1057,13 @@ async fn roundtrip_task_inner(
     // process_block_pricing — so any reprice that fires in this block sees
     // the 4 sales. We assert the observable path fired (claimed counted,
     // p_period within bounds) rather than reproducing the reprice formula.
+    let listing_pool = listing_pool_sats(&truthcoin_nodes.issuer, 3).await?;
+    anyhow::ensure!(
+        listing_pool == listing_fees_paid,
+        "Listing pool of period 3 holds {listing_pool} sats, but its claims \
+         paid {listing_fees_paid}"
+    );
+
     let pricing_post_phase2 = truthcoin_nodes
         .issuer
         .rpc_client
@@ -1140,7 +1213,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1000,
+            fee_rate: Some(2),
             max_listing_fee_sats: None,
         };
 
@@ -1601,7 +1674,6 @@ async fn roundtrip_task_inner(
 
     const OFFER_AMOUNT: Votecoin = Votecoin(10_000);
     const OFFER_PRICE_SATS: u64 = 100_000;
-    const OFFER_FEE_SATS: u64 = 1000;
     for (seller, seller_addr, buyer, buyer_addr) in [
         (
             &truthcoin_nodes.voter_0,
@@ -1649,7 +1721,7 @@ async fn roundtrip_task_inner(
         );
         let take_txid = buyer
             .rpc_client
-            .take_offer(offer_id, OFFER_FEE_SATS, Some(buyer_addr))
+            .take_offer(offer_id, None, Some(buyer_addr))
             .await?;
         sleep(std::time::Duration::from_secs(1)).await;
         truthcoin_nodes
@@ -1697,7 +1769,7 @@ async fn roundtrip_task_inner(
         assert!(
             buyer
                 .rpc_client
-                .take_offer(offer_id, OFFER_FEE_SATS, Some(buyer_addr))
+                .take_offer(offer_id, None, Some(buyer_addr))
                 .await
                 .is_err()
         );
@@ -1927,7 +1999,7 @@ async fn roundtrip_task_inner(
     assert!(
         voters[0]
             .rpc_client
-            .vote_submit(ballot(&vote_matrix[0]), Some(1), None)
+            .vote_submit(ballot(&vote_matrix[0]), Some(0), None)
             .await
             .is_err()
     );
@@ -1972,7 +2044,7 @@ async fn roundtrip_task_inner(
     truthcoin_nodes
         .issuer
         .rpc_client
-        .create_transfer(issuer_voter_address, 100_000, 1000)
+        .create_transfer(issuer_voter_address, 100_000, None)
         .await?;
     let mut sealed_balances = Vec::new();
     for (voter, pre_balance) in voters.iter().zip(&pre_ballot_balances) {
@@ -2049,7 +2121,7 @@ async fn roundtrip_task_inner(
     ] {
         let result = sender
             .rpc_client
-            .transfer_votecoin(dest, Votecoin(1), 1000, None)
+            .transfer_votecoin(dest, Votecoin(1), None, None)
             .await;
         anyhow::ensure!(
             matches!(&result, Err(err) if err.to_string().contains("locked")),
@@ -2218,6 +2290,27 @@ async fn roundtrip_task_inner(
         .bmm_single(&mut enforcer_post_setup)
         .await?;
     sleep(std::time::Duration::from_millis(100)).await;
+
+    anyhow::ensure!(listing_pool_sats(&truthcoin_nodes.issuer, 3).await? == 0);
+    let (paid_pool, payouts) =
+        listing_payout(&truthcoin_nodes.issuer, 3).await?;
+    let paid_out: u64 = payouts.iter().map(|(_, sats)| sats).sum();
+    anyhow::ensure!(
+        paid_pool >= listing_pool && paid_out == paid_pool,
+        "Holders received {paid_out} sats of the {paid_pool} sat listing pool \
+         of period 3, which held {listing_pool} after its claims"
+    );
+    for (holder, _) in &payouts {
+        anyhow::ensure!(
+            !truthcoin_nodes
+                .issuer
+                .rpc_client
+                .votecoin_balance(*holder)
+                .await?
+                .is_zero(),
+            "Listing payout went to {holder}, which holds no reputation"
+        );
+    }
 
     let mut post_consensus_rep: HashMap<Address, Votecoin> = HashMap::new();
     for &voter_addr in &voter_addresses {
@@ -2429,12 +2522,12 @@ async fn roundtrip_task_inner(
         } else {
             anyhow::ensure!(
                 resolution.winning_outcomes.len() == 2,
-                "Market with ABSTAIN consensus should have 2 winning outcomes (50/50 split)"
+                "Market with Inconclusive consensus should have 2 winning outcomes (50/50 split)"
             );
             for winning in &resolution.winning_outcomes {
                 anyhow::ensure!(
                     (winning.price - 0.5).abs() < tolerance,
-                    "ABSTAIN outcome should have price ~0.5"
+                    "Inconclusive outcome should have price ~0.5"
                 );
             }
         }
@@ -2693,7 +2786,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -2730,7 +2823,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -2769,7 +2862,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -2817,7 +2910,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -2870,7 +2963,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -2898,7 +2991,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -2926,7 +3019,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -2962,7 +3055,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -2996,7 +3089,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -3100,7 +3193,7 @@ async fn roundtrip_task_inner(
             tx_pow_hash_selector: None,
             tx_pow_ordering: None,
             tx_pow_difficulty: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
@@ -4420,7 +4513,7 @@ async fn roundtrip_task_inner(
         .await?;
     sleep(std::time::Duration::from_secs(2)).await;
 
-    let abstainer_votes = truthcoin_nodes
+    let inconclusive_votes = truthcoin_nodes
         .issuer
         .rpc_client
         .vote_list(VoteFilter {
@@ -4429,8 +4522,11 @@ async fn roundtrip_task_inner(
             period_id: Some(test_period + 1),
         })
         .await?;
-    anyhow::ensure!(abstainer_votes.len() == vote_matrix[6].len() - 1);
-    let abstained_outcome = truthcoin_nodes
+    anyhow::ensure!(inconclusive_votes.len() == vote_matrix[6].len());
+    anyhow::ensure!(inconclusive_votes.iter().any(|vote| {
+        vote.decision_id == bin_dec_30 && vote.vote_value == 0.5
+    }));
+    let inconclusive_outcome = truthcoin_nodes
         .issuer
         .rpc_client
         .vote_period(Some(test_period + 1))
@@ -4438,7 +4534,7 @@ async fn roundtrip_task_inner(
         .and_then(|info| info.consensus)
         .and_then(|consensus| consensus.outcomes.get(&bin_dec_30).copied());
     anyhow::ensure!(
-        abstained_outcome == Some(expected_phase2::binary::EXPECTED_BIN_30)
+        inconclusive_outcome == Some(expected_phase2::binary::EXPECTED_BIN_30)
     );
 
     // Verify consensus results for the period the decisions were voted in
@@ -4870,7 +4966,7 @@ async fn roundtrip_task_inner(
                 min: None,
                 max: None,
                 increment: None,
-                tx_fee_sats: 1_000,
+                fee_rate: None,
                 max_listing_fee_sats: None,
             })
             .await?;

@@ -141,6 +141,10 @@ pub struct State {
         SerdeBincode<u32>,
         SerdeBincode<undo::ConsolidationUndoData>,
     >,
+    listing_pool_undo: DatabaseUnique<
+        SerdeBincode<u32>,
+        SerdeBincode<undo::ListingPoolUndoData>,
+    >,
     minting_undo: DatabaseUnique<SerdeBincode<u32>, SerdeBincode<u32>>,
     reputation_transfer_undo: DatabaseUnique<
         SerdeBincode<u32>,
@@ -156,7 +160,7 @@ pub struct State {
 }
 
 impl State {
-    pub const NUM_DBS: u32 = 26
+    pub const NUM_DBS: u32 = 27
         + reputation::ReputationDbs::NUM_DBS
         + decisions::Dbs::NUM_DBS
         + MarketsDatabase::NUM_DBS
@@ -272,6 +276,8 @@ impl State {
             DatabaseUnique::create(env, &mut rwtxn, "consensus_undo")?;
         let consolidation_undo =
             DatabaseUnique::create(env, &mut rwtxn, "consolidation_undo")?;
+        let listing_pool_undo =
+            DatabaseUnique::create(env, &mut rwtxn, "listing_pool_undo")?;
         let minting_undo =
             DatabaseUnique::create(env, &mut rwtxn, "minting_undo")?;
         let reputation_transfer_undo = DatabaseUnique::create(
@@ -313,6 +319,7 @@ impl State {
             settlement_undo,
             consensus_undo,
             consolidation_undo,
+            listing_pool_undo,
             minting_undo,
             reputation_transfer_undo,
             skipped_tx_indices_undo,
@@ -792,7 +799,8 @@ impl State {
             OutPoint::Regular { .. }
             | OutPoint::MarketFunds { .. }
             | OutPoint::Payout { .. }
-            | OutPoint::UnsuccessfulWithdrawal { .. } => Ok(()),
+            | OutPoint::UnsuccessfulWithdrawal { .. }
+            | OutPoint::ListingFees { .. } => Ok(()),
         }
     }
 
@@ -838,9 +846,20 @@ impl State {
         if value_out > value_in {
             return Err(Error::NotEnoughValueIn);
         }
-        value_in
+        let fee = value_in
             .checked_sub(value_out)
-            .ok_or_else(|| AmountUnderflowError.into())
+            .ok_or(AmountUnderflowError)?;
+        let min_fee = crate::validation::min_tx_fee(
+            &transaction.transaction,
+            transaction.actor_address.is_some(),
+        )
+        .map_err(Error::BincodeSerialize)?;
+        if fee < min_fee {
+            return Err(Error::InvalidTransaction {
+                reason: format!("Fee {fee} is below the minimum {min_fee}"),
+            });
+        }
+        Ok(fee)
     }
 
     pub fn validate_transaction(
@@ -1571,6 +1590,57 @@ mod test {
         Ok(())
     }
 
+    /// A transfer paying one sat below its minimum fee is rejected, and an
+    /// actor proof raises that minimum
+    #[test]
+    fn fee_below_floor() -> anyhow::Result<()> {
+        use crate::types::{FilledTransaction, PointedOutputRef, Txid, hash};
+
+        let (_temp_dir, env, state) = fresh_state("fee-below-floor")?;
+        let archive = crate::archive::Archive::new(&env)?;
+        let spent = value_output(Address([1; 20]), 10_000);
+        let outpoint = OutPoint::Regular {
+            txid: Txid([1; 32]),
+            vout: 0,
+        };
+        let input_hash = hash(&PointedOutputRef {
+            outpoint,
+            output: &spent,
+        });
+        let transfer = |change| FilledTransaction {
+            transaction: Transaction {
+                inputs: vec![(outpoint, input_hash)].into(),
+                outputs: vec![value_output(Address([2; 20]), change)].into(),
+                ..Default::default()
+            },
+            spent_utxos: vec![spent.clone()],
+            actor_address: None,
+        };
+        let min_fee =
+            crate::validation::min_tx_fee(&transfer(0).transaction, false)?
+                .to_sat();
+        let rotxn = env.read_txn()?;
+        let validate = |change| {
+            state.validate_filled_transaction(
+                &rotxn,
+                0,
+                &transfer(change),
+                &archive,
+                None,
+            )
+        };
+        anyhow::ensure!(validate(10_000 - min_fee + 1).is_err());
+        anyhow::ensure!(validate(10_000 - min_fee)?.to_sat() == min_fee);
+        let mut proven = transfer(10_000 - min_fee);
+        proven.actor_address = Some(Address([3; 20]));
+        anyhow::ensure!(
+            state
+                .validate_filled_transaction(&rotxn, 0, &proven, &archive, None)
+                .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn sidechain_wealth() -> anyhow::Result<()> {
         use std::str::FromStr;
@@ -1630,6 +1700,18 @@ mod test {
                     .stxos
                     .put(&mut rwtxn, &OutPointKey::from(&op), &stxo)?;
             }
+
+            // An unpaid listing fee pool: 40 sats, already counted by the
+            // deposits that funded it.
+            let pool_op = OutPoint::ListingFees {
+                period: 2,
+                block_height: 6,
+            };
+            state.utxos.put(
+                &mut rwtxn,
+                &OutPointKey::from(&pool_op),
+                &value_output(Address::ALL_ZEROS, 40),
+            )?;
 
             rwtxn.commit()?;
         }

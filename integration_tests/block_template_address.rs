@@ -30,7 +30,6 @@ use crate::{
 const DEPOSIT_AMOUNT: Amount = Amount::from_sat(21_000_000);
 const DEPOSIT_FEE: Amount = Amount::from_sat(1_000_000);
 const TRANSFER_AMOUNT: u64 = 1_000_000;
-const TRANSFER_FEE: u64 = 1_000;
 /// A miner polls the template about one time each second, so an address for
 /// each poll fills the wallet database in days.
 const TEMPLATE_POLLS: usize = 10;
@@ -83,7 +82,7 @@ async fn block_template_address_task(
     let dest = sidechain.rpc_client.get_new_address().await?;
     let txid = sidechain
         .rpc_client
-        .create_transfer(dest, TRANSFER_AMOUNT, TRANSFER_FEE)
+        .create_transfer(dest, TRANSFER_AMOUNT, None)
         .await?;
     tracing::info!(%txid, "Created a transfer that pays a fee");
 

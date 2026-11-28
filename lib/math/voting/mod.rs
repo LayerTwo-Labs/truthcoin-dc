@@ -257,7 +257,6 @@ pub struct DetailedConsensusResult {
     pub first_loading: Vec<f64>,
     pub certainty: f64,
     pub updated_reputations: BTreeMap<crate::types::Address, f64>,
-    pub outliers: Vec<crate::types::Address>,
     /// Per-decision plurality result. See [`CategoricalResult::winning_option`]
     /// for the meaning of the inner `Option<u16>`.
     pub categorical_winners: HashMap<DecisionId, Option<u16>>,
@@ -268,12 +267,14 @@ pub fn calculate_consensus(
     reputation_vector: &VotingWeightVector,
     scaled_decisions: &HashSet<DecisionId>,
     categorical_decisions: &HashMap<DecisionId, u16>,
+    reveal_heights: &HashMap<crate::types::Address, u32>,
 ) -> Result<DetailedConsensusResult, VotingMathError> {
     oracle::run_consensus(
         vote_matrix,
         reputation_vector,
         scaled_decisions,
         categorical_decisions,
+        reveal_heights,
     )
 }
 

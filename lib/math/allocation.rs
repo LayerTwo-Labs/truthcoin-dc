@@ -9,6 +9,8 @@
 //!    - If over-allocated: subtract from smallest allocation
 //! 5. Assert conservation: `sum(allocations) == pool`
 
+use std::collections::BTreeMap;
+
 use super::safe_math::{Rounding, SatoshiError, to_sats, to_sats_signed};
 
 /// Result of a proportional allocation (unsigned).
@@ -250,6 +252,36 @@ pub fn allocate_proportionally_i64<K: Clone>(
     })
 }
 
+/// Split `pool` exactly in proportion to integer `holdings`. Each share is
+/// floored, and shares below `min_share` are dropped. What is left goes to
+/// the largest holder, the highest key on a tie.
+pub fn split_by_holdings<K: Copy + Ord>(
+    pool: u64,
+    holdings: &BTreeMap<K, u64>,
+    min_share: u64,
+) -> Vec<(K, u64)> {
+    let total: u128 = holdings.values().map(|units| u128::from(*units)).sum();
+    let Some((&largest, _)) = holdings
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+    else {
+        return Vec::new();
+    };
+    if total == 0 || pool == 0 {
+        return Vec::new();
+    }
+    let mut shares: BTreeMap<K, u64> = holdings
+        .iter()
+        .map(|(&key, &units)| {
+            (key, (u128::from(pool) * u128::from(units) / total) as u64)
+        })
+        .filter(|(_, share)| *share > 0 && *share >= min_share)
+        .collect();
+    let remainder = pool - shares.values().sum::<u64>();
+    *shares.entry(largest).or_default() += remainder;
+    shares.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +459,90 @@ mod tests {
         assert_eq!(result.allocations.len(), 1);
         assert_eq!(result.allocations[0].0, "a");
         assert_eq!(result.allocations[0].1, 100);
+    }
+
+    /// Holdings that divide the pool evenly split it exactly
+    #[test]
+    fn holdings_exact_split() {
+        let holdings = BTreeMap::from([("a", 600), ("b", 300), ("c", 100)]);
+        assert_eq!(
+            split_by_holdings(1_000, &holdings, 0),
+            vec![("a", 600), ("b", 300), ("c", 100)]
+        );
+    }
+
+    /// The flooring remainder goes to the largest holder
+    #[test]
+    fn holdings_remainder_largest() {
+        let holdings = BTreeMap::from([("a", 1), ("b", 1), ("c", 2)]);
+        assert_eq!(
+            split_by_holdings(10, &holdings, 0),
+            vec![("a", 2), ("b", 2), ("c", 6)]
+        );
+    }
+
+    /// Among equal largest holders the remainder goes to the highest key
+    #[test]
+    fn holdings_tie_highest_key() {
+        let holdings = BTreeMap::from([("a", 1), ("b", 1), ("c", 1)]);
+        assert_eq!(
+            split_by_holdings(10, &holdings, 0),
+            vec![("a", 3), ("b", 3), ("c", 4)]
+        );
+    }
+
+    /// A holder whose share floors to zero gets no payout
+    #[test]
+    fn holdings_dust_dropped() {
+        let holdings = BTreeMap::from([("a", 999_999), ("b", 1)]);
+        assert_eq!(split_by_holdings(100, &holdings, 0), vec![("a", 100)]);
+    }
+
+    /// Shares below the minimum go to the largest holder
+    #[test]
+    fn holdings_dust_folded() {
+        let holdings = BTreeMap::from([("a", 1), ("b", 1), ("c", 8)]);
+        assert_eq!(
+            split_by_holdings(1_000, &holdings, 101),
+            vec![("c", 1_000)]
+        );
+        assert_eq!(
+            split_by_holdings(1_000, &holdings, 100),
+            vec![("a", 100), ("b", 100), ("c", 800)]
+        );
+    }
+
+    /// An empty pool or no holdings pays nothing
+    #[test]
+    fn holdings_nothing_paid() {
+        let holdings = BTreeMap::from([("a", 1)]);
+        assert!(split_by_holdings(0, &holdings, 0).is_empty());
+        assert!(
+            split_by_holdings(100, &BTreeMap::<&str, u64>::new(), 0).is_empty()
+        );
+    }
+
+    /// Random holdings always split the whole pool
+    #[test]
+    fn holdings_zero_sum() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..500 {
+            let holdings: BTreeMap<u64, u64> = (0..1 + next() % 40)
+                .map(|key| (key, next() % 1_000_000))
+                .collect();
+            let pool = next() % 10_000_000_000;
+            let paid: u64 = split_by_holdings(pool, &holdings, next() % 1_000)
+                .iter()
+                .map(|(_, share)| share)
+                .sum();
+            let total: u64 = holdings.values().sum();
+            assert_eq!(paid, if total == 0 { 0 } else { pool });
+        }
     }
 }

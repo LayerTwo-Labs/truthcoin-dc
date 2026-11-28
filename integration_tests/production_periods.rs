@@ -201,7 +201,7 @@ async fn production_periods_task(
             min: None,
             max: None,
             increment: None,
-            tx_fee_sats: 1_000,
+            fee_rate: None,
             max_listing_fee_sats: None,
         })
         .await?;
